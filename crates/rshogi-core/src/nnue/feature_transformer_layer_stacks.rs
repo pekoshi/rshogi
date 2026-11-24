@@ -1,89 +1,28 @@
 //! FeatureTransformerLayerStacks - LayerStacksアーキテクチャ用のL1次元Feature Transformer
 //!
-//! 5 種類の FT (HalfKp / HalfKaSplit / HalfKaMerged / HalfKaHmSplit / HalfKaHmMerged)
-//! から、片側 L1 次元×両視点の中間表現を生成する。
-//! FT 軸は `LsFeatureSpec` trait + `PhantomData<FT>` で type level に表現し、
-//! monomorphization で既存 HalfKaHmMerged 専用実装と bit-identical な機械語を得る。
+//! HalfKA_hm^ 特徴量（キングバケット×BonaPiece）から、
+//! 片側 L1 次元×両視点の中間表現を生成する。
 
-use super::accumulator::{Aligned, AlignedBox, WeightBox};
+use super::accumulator::{Aligned, AlignedBox};
 use super::accumulator::{DirtyPiece, IndexList, MAX_ACTIVE_FEATURES, MAX_CHANGED_FEATURES};
 use super::accumulator_layer_stacks::{
     AccumulatorCacheLayerStacks, AccumulatorLayerStacks, AccumulatorStackLayerStacks,
 };
 use super::bona_piece::BonaPiece;
+use super::bona_piece_halfka_hm::{halfka_index, is_hm_mirror, king_bucket, pack_bonapiece};
+use super::constants::HALFKA_HM_DIMENSIONS;
 #[cfg(feature = "nnue-psqt")]
-use super::constants::MAX_LAYER_STACK_PSQT_BUCKETS;
-#[cfg(not(feature = "nnue-effect-bucket"))]
-use super::features::Feature;
-use super::features::FeatureSet;
-use super::leb128::read_layer_stacks_ft_i16;
-use super::ls_feature_spec::LsFeatureSpec;
-use super::piece_list::PieceNumber;
-use super::piece_weights::{self, PieceWeight, PieceWeights, with_piece_weights};
-#[cfg(feature = "nnue-threat")]
-use super::stats::count_threat_multiply;
+use super::constants::NUM_LAYER_STACK_BUCKETS;
+use super::features::{Feature, FeatureSet, HalfKA_hm, HalfKA_hm_FeatureSet};
+#[cfg(feature = "nnue-kzt-ft")]
+use super::kzt::{self, KZT_FT_DIMENSIONS};
+use super::leb128::read_compressed_tensor_i16_all;
 use super::stats::{count_refresh, count_update};
 #[cfg(feature = "nnue-threat")]
 use super::threat_features::{self, MAX_CHANGED_THREAT_FEATURES, THREAT_DIMENSIONS};
-#[cfg(feature = "nnue-threat")]
-use super::threat_width::{ThreatAccumulation, width as threat_width};
-#[cfg(feature = "nnue-effect-bucket")]
-use super::{EFFECT_BUCKET_CONFIG, append_active_effect_bucket};
 use crate::position::Position;
 use crate::types::Color;
 use std::io::{self, Read};
-use std::marker::PhantomData;
-
-#[cfg(all(test, not(feature = "nnue-effect-bucket")))]
-#[path = "ls_finny_tests.rs"]
-mod ls_finny_tests;
-
-#[cfg(feature = "nnue-threat")]
-struct ThreatRefreshBatch {
-    indices: [usize; 192],
-    len: usize,
-    first: bool,
-}
-
-#[cfg(feature = "nnue-threat")]
-impl ThreatRefreshBatch {
-    fn new() -> Self {
-        Self {
-            indices: [0; 192],
-            len: 0,
-            first: true,
-        }
-    }
-
-    #[inline]
-    fn push<const N: usize, FT: LsFeatureSpec>(
-        &mut self,
-        ft: &FeatureTransformerLayerStacks<N, FT>,
-        accumulation: &mut ThreatAccumulation<N>,
-        index: usize,
-    ) {
-        self.indices[self.len] = index;
-        self.len += 1;
-        if self.len == self.indices.len() {
-            self.flush(ft, accumulation);
-        }
-    }
-
-    #[inline]
-    fn flush<const N: usize, FT: LsFeatureSpec>(
-        &mut self,
-        ft: &FeatureTransformerLayerStacks<N, FT>,
-        accumulation: &mut ThreatAccumulation<N>,
-    ) {
-        if self.first {
-            ft.apply_threat_refresh_batch::<true>(accumulation, &self.indices[..self.len]);
-        } else if self.len != 0 {
-            ft.apply_threat_refresh_batch::<false>(accumulation, &self.indices[..self.len]);
-        }
-        self.first = false;
-        self.len = 0;
-    }
-}
 
 /// 特徴インデックスの範囲外アクセス時のパニック
 #[cold]
@@ -93,185 +32,239 @@ fn feature_index_oob(index: usize, max: usize) -> ! {
 }
 
 #[inline]
-fn append_changed_indices<FT: LsFeatureSpec>(
+fn append_changed_indices(
     dirty_piece: &DirtyPiece,
     perspective: Color,
     king_sq: crate::types::Square,
     removed: &mut IndexList<MAX_CHANGED_FEATURES>,
     added: &mut IndexList<MAX_CHANGED_FEATURES>,
 ) {
-    let indexer = FT::feature_indexer(perspective, king_sq);
-    let index = |bp: BonaPiece| {
-        (bp != BonaPiece::ZERO
-            && (FT::INCLUDE_KING_IN_PIECE_LIST
-                || (bp.value() as usize) < super::bona_piece::FE_END))
-            .then(|| indexer(bp))
-    };
-    removed.extend_pairs(
+    <HalfKA_hm as Feature>::append_changed_indices(
+        dirty_piece,
+        perspective,
+        king_sq,
+        removed,
         added,
-        (0..dirty_piece.dirty_num as usize).map(|i| {
-            let cp = &dirty_piece.changed_piece[i];
-            if perspective == Color::Black {
-                (index(cp.old_piece.fb), index(cp.new_piece.fb))
-            } else {
-                (index(cp.old_piece.fw), index(cp.new_piece.fw))
-            }
-        }),
     );
 }
 
 #[inline]
-fn append_active_indices<FT: LsFeatureSpec>(
+fn append_active_indices(
     pos: &Position,
     perspective: Color,
     active: &mut IndexList<MAX_ACTIVE_FEATURES>,
 ) {
-    #[cfg(feature = "nnue-effect-bucket")]
-    {
-        append_active_effect_bucket(pos, EFFECT_BUCKET_CONFIG, perspective, active);
-        // effect bucket の列挙は FT weight 行数の範囲内が前提 (add_weights の境界条件)。
-        debug_assert!(active.iter().all(|i| i < FT::DIMENSIONS));
-    }
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    <FT::Feature as Feature>::append_active_indices(pos, perspective, active);
+    <HalfKA_hm as Feature>::append_active_indices(pos, perspective, active);
 }
 
-#[inline]
-#[cfg(all(test, not(feature = "nnue-effect-bucket")))]
-fn feature_index_from_bona_piece<FT: LsFeatureSpec>(
+/// `try_apply_dirty_piece_fast` の hot path で dirty_num=2 時に **4 回** 呼ばれる。
+/// `#[inline(always)]` でクロス module call の overhead を除去。
+#[inline(always)]
+fn feature_index_from_bona_piece(
     bp: BonaPiece,
     perspective: Color,
     king_sq: crate::types::Square,
 ) -> usize {
-    FT::feature_index(bp, perspective, king_sq)
+    let kb = king_bucket(king_sq, perspective);
+    let hm_mirror = is_hm_mirror(king_sq, perspective);
+    let packed = pack_bonapiece(bp, hm_mirror);
+    halfka_index(kb, packed)
 }
 
 /// nnue-pytorch用のFeatureTransformer（L1次元出力）
-///
-/// `FT` は LS の Feature Transformer 軸 (5 種類のうち 1 つ) を表す marker type。
-/// 駒 FT 係数は [`Self::piece_weights`] で列挙し、[`Self::piece_weight`] で個別に取得できる。
 #[repr(C, align(64))]
-#[derive(Clone)]
-pub struct FeatureTransformerLayerStacks<const L1: usize, FT: LsFeatureSpec> {
-    /// バイアス `[L1]`
+pub struct FeatureTransformerLayerStacks<const L1: usize> {
+    /// バイアス [L1]
     pub biases: Aligned<[i16; L1]>,
 
-    /// 重み `[FT::DIMENSIONS][L1]`
+    /// 重み [input_dimensions][L1]
     /// 64バイトアラインメントで確保
-    pub(super) weights: PieceWeights,
+    pub weights: AlignedBox<i16>,
 
-    /// PSQT バイアス（先頭 `num_buckets` 個のみ有効、それ以降はゼロ）
-    ///
-    /// 配列のサイズは hot-path 固定 (`MAX_LAYER_STACK_PSQT_BUCKETS`) だが、有効範囲は
-    /// `num_buckets` で動的に決まる。未使用エリアは load 時に 0 で初期化され、
-    /// `psqt_add_or_sub` が `n` 引数で範囲を絞るため副作用無し。
+    /// PSQT バイアス [NUM_LAYER_STACK_BUCKETS]
     #[cfg(feature = "nnue-psqt")]
-    pub(crate) psqt_biases: [i32; MAX_LAYER_STACK_PSQT_BUCKETS],
+    pub(crate) psqt_biases: [i32; NUM_LAYER_STACK_BUCKETS],
 
-    /// PSQT 重み (長さ = `FT::DIMENSIONS × num_buckets`、layout
-    /// `psqt_weights[feature_idx * num_buckets + bucket]`)
+    /// PSQT 重み [HALFKA_HM_DIMENSIONS × NUM_LAYER_STACK_BUCKETS]
     #[cfg(feature = "nnue-psqt")]
-    pub(crate) psqt_weights: WeightBox<i32>,
-
-    /// PSQT 重みの bucket 数 (= net file の `num_buckets`)。
-    ///
-    /// `has_psqt == false` のとき `0`。このとき `add/sub_psqt_weights` は
-    /// `has_psqt` ガード (`refresh_psqt` / 各 caller) により呼ばれないため、
-    /// `0` が伝播して `index * 0 = 0` で誤動作する経路は無い。
-    #[cfg(feature = "nnue-psqt")]
-    pub(crate) psqt_num_buckets: usize,
+    pub(crate) psqt_weights: AlignedBox<i32>,
 
     /// PSQT が有効か（アーキテクチャ文字列で判定）
     #[cfg(feature = "nnue-psqt")]
     pub(crate) has_psqt: bool,
 
-    /// Threat 重み [THREAT_DIMENSIONS × T]
+    /// Threat 重み [THREAT_DIMENSIONS × L1]
     #[cfg(feature = "nnue-threat")]
-    pub(crate) threat_weights: WeightBox<i8>,
+    pub(crate) threat_weights: AlignedBox<i8>,
 
     /// Threat が有効か（アーキテクチャ文字列で判定）
     #[cfg(feature = "nnue-threat")]
     pub(crate) has_threat: bool,
 
-    _ft: PhantomData<FT>,
+    /// KZT-FT 重み [KZT_FT_DIMENSIONS × L1] (= i8、 feature `nnue-kzt-ft`)
+    #[cfg(feature = "nnue-kzt-ft")]
+    pub(crate) kzt_ft_weights: AlignedBox<i8>,
+
+    /// KZT-FT weight がロード済みか (= P2KZTF section 有無)
+    #[cfg(feature = "nnue-kzt-ft")]
+    pub(crate) has_kzt_ft: bool,
 }
 
-/// PSQT アキュムレータ (`[i32; MAX_LAYER_STACK_PSQT_BUCKETS]`) の先頭 `n` 要素に
-/// `weights[0..n]` を加算 (`ADD = true`) または減算する。
+/// PSQT アキュムレータ ([i32; NUM_LAYER_STACK_BUCKETS=8]) への 8-i32 ベクトル加減算。
 ///
-/// `n` はネットに格納された bucket 数。`[n..MAX]` は更新しない。
-/// 呼び出し元は `weights` が少なくとも `n` 個の連続した i32 を指すことを保証する。
+/// `ADD = true` で `*acc += weights[0..8]`、`false` で `*acc -= weights[0..8]`。
+/// 8 = NUM_LAYER_STACK_BUCKETS は AVX2 で i32×8 = 256bit に丁度収まる:
+///
+/// - AVX-512F: 8 lane mask で 1 命令 (BW 不要、`add_epi32` は AVX-512F のみで OK)
+/// - AVX2: i32×8 = 256bit で 1 命令完結
+/// - SSE2 / NEON / WASM SIMD128: 4 + 4
+/// - スカラー fallback
+///
+/// 各 cfg ブロックは互いに排他（後段ブロックは前段の `not(target_feature = ...)` で除外）
+/// のため、コンパイル時にちょうど一つの SIMD パス（または scalar fallback）が選択される。
+///
+/// # オーバーフロー挙動
+/// 旧スカラー実装は `*acc += weights[bucket]` で debug build では i32 overflow check が
+/// 走っていた。新実装は SIMD intrinsics (`_mm*_add_epi32` 等) で wrapping、scalar
+/// fallback も `wrapping_add` で明示 wrap。実用上 PSQT 値は ±数千オーダーで、
+/// HALFKA_HM_DIMENSIONS の累積でも i32 (±2.1e9) を溢れることはなく、挙動差は実害なし。
+///
+/// # Safety
+/// `weights` は少なくとも 8 個の i32 が連続して読める必要がある（呼び出し元が保証）。
 #[cfg(feature = "nnue-psqt")]
 #[inline(always)]
 fn psqt_add_or_sub<const ADD: bool>(
-    psqt_acc: &mut [i32; MAX_LAYER_STACK_PSQT_BUCKETS],
+    psqt_acc: &mut [i32; NUM_LAYER_STACK_BUCKETS],
     weights: *const i32,
-    n: usize,
 ) {
-    debug_assert!(n <= MAX_LAYER_STACK_PSQT_BUCKETS);
+    const { assert!(NUM_LAYER_STACK_BUCKETS == 8, "psqt_add_or_sub assumes 8 buckets") }
 
+    // AVX-512F: 8 lane mask で 1 命令
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     {
-        // SAFETY: 各 offset は n 未満。mask は両配列の [offset..n] 内のレーンだけを有効にし、
-        // AVX-512 の masked load/store は無効レーンのメモリにアクセスしない。
+        // SAFETY: 8 lane mask = 0x00FF。psqt_acc は [i32; 8] = 32 bytes、weights も 8 i32
+        // 連続。mask されたレーンのみ load/store するため境界外アクセスなし。
         unsafe {
             use std::arch::x86_64::*;
+            let mask: __mmask16 = 0x00FF;
             let acc_ptr = psqt_acc.as_mut_ptr();
-            for offset in (0..n).step_by(16) {
-                let remaining = (n - offset).min(16);
-                let mask = ((1u32 << remaining) - 1) as __mmask16;
-                let a = _mm512_maskz_loadu_epi32(mask, acc_ptr.add(offset));
-                let w = _mm512_maskz_loadu_epi32(mask, weights.add(offset));
-                let result = if ADD {
-                    _mm512_add_epi32(a, w)
-                } else {
-                    _mm512_sub_epi32(a, w)
-                };
-                _mm512_mask_storeu_epi32(acc_ptr.add(offset), mask, result);
-            }
+            let a = _mm512_maskz_loadu_epi32(mask, acc_ptr);
+            let w = _mm512_maskz_loadu_epi32(mask, weights);
+            let result = if ADD {
+                _mm512_add_epi32(a, w)
+            } else {
+                _mm512_sub_epi32(a, w)
+            };
+            _mm512_mask_storeu_epi32(acc_ptr, mask, result);
         }
     }
 
+    // AVX2: i32×8 = 256bit で 1 命令完結 (8 buckets ピッタリ)
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx2",
         not(target_feature = "avx512f")
     ))]
     {
-        // SAFETY: covered は n 未満。mask は両配列の [covered..n] 内のレーンだけを有効にし、
-        // AVX2 の masked load/store は無効レーンのメモリにアクセスしない。
+        // SAFETY: psqt_acc は [i32; 8] = 32 bytes、weights も 8 i32 連続なので
+        // 256bit unaligned load/store 1 回で完結。残レーンなし。
         unsafe {
             use std::arch::x86_64::*;
             let acc_ptr = psqt_acc.as_mut_ptr();
-            let indices = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-            let mut covered = 0usize;
-            while covered < n {
-                let remaining = (n - covered).min(8) as i32;
-                let r = _mm256_set1_epi32(remaining);
-                let mask = _mm256_cmpgt_epi32(r, indices);
-                let a = _mm256_maskload_epi32(acc_ptr.add(covered), mask);
-                let w = _mm256_maskload_epi32(weights.add(covered), mask);
+            let a = _mm256_loadu_si256(acc_ptr as *const __m256i);
+            let w = _mm256_loadu_si256(weights as *const __m256i);
+            let result = if ADD {
+                _mm256_add_epi32(a, w)
+            } else {
+                _mm256_sub_epi32(a, w)
+            };
+            _mm256_storeu_si256(acc_ptr as *mut __m256i, result);
+        }
+    }
+
+    // SSE2: 4 + 4 で完結
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "sse2",
+        not(target_feature = "avx2"),
+        not(target_feature = "avx512f")
+    ))]
+    {
+        // SAFETY: psqt_acc/weights とも 8 i32 = 32 bytes 連続。0..4 と 4..8 の 16 bytes
+        // load/store は安全。
+        unsafe {
+            use std::arch::x86_64::*;
+            let acc_ptr = psqt_acc.as_mut_ptr();
+            for chunk in [0usize, 4] {
+                let a = _mm_loadu_si128(acc_ptr.add(chunk) as *const __m128i);
+                let w = _mm_loadu_si128(weights.add(chunk) as *const __m128i);
                 let result = if ADD {
-                    _mm256_add_epi32(a, w)
+                    _mm_add_epi32(a, w)
                 } else {
-                    _mm256_sub_epi32(a, w)
+                    _mm_sub_epi32(a, w)
                 };
-                _mm256_maskstore_epi32(acc_ptr.add(covered), mask, result);
-                covered += 8;
+                _mm_storeu_si128(acc_ptr.add(chunk) as *mut __m128i, result);
             }
         }
     }
 
-    // 上記のいずれの SIMD path にも該当しない build (SSE2 のみ / NEON / WASM /
-    // その他) は、有効な PSQT bucket 数だけを更新する scalar fallback。
+    // NEON (aarch64): 4 + 4 で完結
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        // SAFETY: NEON i32x4 load/store は psqt_acc / weights の連続 4 i32 を扱う。
+        // 8 i32 = 32 bytes 確保済み。0..4 と 4..8 を別 register で処理。
+        unsafe {
+            use std::arch::aarch64::*;
+            let acc_ptr = psqt_acc.as_mut_ptr();
+            for chunk in [0usize, 4] {
+                let a = vld1q_s32(acc_ptr.add(chunk));
+                let w = vld1q_s32(weights.add(chunk));
+                let result = if ADD {
+                    vaddq_s32(a, w)
+                } else {
+                    vsubq_s32(a, w)
+                };
+                vst1q_s32(acc_ptr.add(chunk), result);
+            }
+        }
+    }
+
+    // WASM SIMD128: 4 + 4 で完結
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        // SAFETY: v128 i32x4 load/store は連続 16 bytes。psqt_acc/weights とも 32 bytes
+        // 確保済み。WASM v128.load/store はアライメントヒントが advisory（非強制）なため、
+        // [i32; 8] の 4 バイトアラインポインタを *const v128 にキャストしても安全。
+        unsafe {
+            use std::arch::wasm32::*;
+            let acc_ptr = psqt_acc.as_mut_ptr();
+            for chunk in [0usize, 4] {
+                let a = v128_load(acc_ptr.add(chunk) as *const v128);
+                let w = v128_load(weights.add(chunk) as *const v128);
+                let result = if ADD {
+                    i32x4_add(a, w)
+                } else {
+                    i32x4_sub(a, w)
+                };
+                v128_store(acc_ptr.add(chunk) as *mut v128, result);
+            }
+        }
+    }
+
+    // スカラー fallback
     #[cfg(not(any(
         all(target_arch = "x86_64", target_feature = "avx512f"),
         all(target_arch = "x86_64", target_feature = "avx2"),
+        all(target_arch = "x86_64", target_feature = "sse2"),
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128"),
     )))]
     {
-        // SAFETY: 呼び出し元は `weights` が n 個 i32 連続して読めることを保証する。
-        let w_slice: &[i32] = unsafe { std::slice::from_raw_parts(weights, n) };
-        for (acc, &w) in psqt_acc[..n].iter_mut().zip(w_slice) {
+        // SAFETY: weights は 9 i32 連続が保証されている。slice 化することで
+        // 以降のループ本体を safe に保つ。
+        let w_slice: &[i32] =
+            unsafe { std::slice::from_raw_parts(weights, NUM_LAYER_STACK_BUCKETS) };
+        for (acc, &w) in psqt_acc.iter_mut().zip(w_slice) {
             if ADD {
                 *acc = acc.wrapping_add(w);
             } else {
@@ -281,142 +274,9 @@ fn psqt_add_or_sub<const ADD: bool>(
     }
 }
 
-impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
-    /// 入力済み accumulator の出力変換テスト用。refresh / update 用の重みは持たない。
-    #[cfg(test)]
-    pub(crate) fn for_output_transform_tests() -> Self {
-        Self {
-            biases: Aligned([0; L1]),
-            weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-psqt")]
-            psqt_biases: [0; MAX_LAYER_STACK_PSQT_BUCKETS],
-            #[cfg(feature = "nnue-psqt")]
-            psqt_num_buckets: 0,
-            #[cfg(feature = "nnue-psqt")]
-            psqt_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-psqt")]
-            has_psqt: false,
-            #[cfg(feature = "nnue-threat")]
-            threat_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-threat")]
-            has_threat: false,
-            _ft: PhantomData,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_accumulator_tests() -> Self {
-        Self {
-            biases: Aligned([0; L1]),
-            weights: AlignedBox::new_zeroed(FT::DIMENSIONS * L1).into(),
-            #[cfg(feature = "nnue-psqt")]
-            psqt_biases: [0; MAX_LAYER_STACK_PSQT_BUCKETS],
-            #[cfg(feature = "nnue-psqt")]
-            psqt_num_buckets: 1,
-            #[cfg(feature = "nnue-psqt")]
-            psqt_weights: AlignedBox::new_zeroed(FT::DIMENSIONS).into(),
-            #[cfg(feature = "nnue-psqt")]
-            has_psqt: false,
-            #[cfg(feature = "nnue-threat")]
-            threat_weights: AlignedBox::new_zeroed(THREAT_DIMENSIONS * threat_width(L1)).into(),
-            #[cfg(feature = "nnue-threat")]
-            has_threat: false,
-            _ft: PhantomData,
-        }
-    }
-
-    /// 重み配列をプロセス間共有メモリへ移行する（成功時のみ）。
-    ///
-    /// 多プロセス実行時のメモリ常駐・L3 競合を削減する。ネットワーク構築が完全に
-    /// 終わった後（重みへの全書込が済んだ後）に 1 回だけ呼ぶこと。共有後の重み box は
-    /// read-only になる。空 box（PSQT/Threat 無効モデル）は内部でスキップされる。
-    pub(crate) fn share_weights(&mut self) {
-        self.weights.share("FT weights");
-        #[cfg(feature = "nnue-psqt")]
-        self.psqt_weights.share("FT psqt");
-        #[cfg(feature = "nnue-threat")]
-        self.threat_weights.share("FT threat");
-    }
-
-    /// ファイル上の駒 FT 係数をフラットなインデックスで取得する。
-    ///
-    /// `index` が [`Self::piece_weights`] の長さ以上の場合はパニックする。
-    pub fn piece_weight(&self, index: usize) -> i16 {
-        piece_weights::coefficient(&self.weights, index)
-    }
-
-    /// 駒 FT 係数をファイルと同じ順序（特徴インデックス、出力次元の順）で返す。
-    ///
-    /// 圧縮格納時は元の i16 配列を解放するため、係数は非公開の格納領域からイテレータで返す。
-    /// イテレータの `len()` で係数の総数を取得できる。
-    pub fn piece_weights(&self) -> impl ExactSizeIterator<Item = i16> + '_ {
-        piece_weights::coefficients(&self.weights)
-    }
-
-    /// 駒 FT のメモリ上の格納形式を返す。
-    pub fn piece_ft_storage(&self) -> &'static str {
-        piece_weights::storage(&self.weights)
-    }
-
-    #[cfg(test)]
-    fn unpacked_for_tests(&self) -> PieceTransformer<'_, L1, FT, i16> {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        let weights = match &self.weights {
-            PieceWeights::I16(weights) => weights,
-            PieceWeights::I8x2(_) => panic!("test requires unpacked FT weights"),
-        };
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        )))]
-        let weights = &self.weights;
-        PieceTransformer {
-            ft: self,
-            rows: weights,
-        }
-    }
-
-    fn validate_width() -> io::Result<()> {
-        // 固定幅の駒 FT 更新は SIMD ベクトル単位で処理する。
-        let lanes = if cfg!(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        )) {
-            32
-        } else if cfg!(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512bw")
-        )) {
-            16
-        } else if cfg!(any(
-            all(target_arch = "x86_64", target_feature = "sse2", not(target_feature = "avx2")),
-            all(target_arch = "wasm32", target_feature = "simd128")
-        )) {
-            8
-        } else {
-            return Ok(());
-        };
-        if L1 == 0 || !L1.is_multiple_of(lanes) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Fixed-width LayerStacks FT width must be a positive multiple of {lanes}, got {L1}"
-                ),
-            ));
-        }
-        Ok(())
-    }
-
+impl<const L1: usize> FeatureTransformerLayerStacks<L1> {
     /// ファイルから読み込み（非圧縮形式）
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
-        Self::validate_width()?;
         // バイアスを読み込み
         let mut biases = [0i16; L1];
         let mut buf = [0u8; 2];
@@ -426,7 +286,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         }
 
         // 重みを読み込み
-        let weight_size = FT::DIMENSIONS * L1;
+        let weight_size = HALFKA_HM_DIMENSIONS * L1;
         let mut weights = AlignedBox::new_zeroed(weight_size);
         for weight in weights.iter_mut() {
             reader.read_exact(&mut buf)?;
@@ -435,151 +295,134 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
 
         Ok(Self {
             biases: Aligned(biases),
-            weights: piece_weights::select(weights.into(), L1)?,
+            weights,
             #[cfg(feature = "nnue-psqt")]
-            psqt_biases: [0; MAX_LAYER_STACK_PSQT_BUCKETS],
+            psqt_biases: [0; NUM_LAYER_STACK_BUCKETS],
             #[cfg(feature = "nnue-psqt")]
-            psqt_num_buckets: 0,
-            #[cfg(feature = "nnue-psqt")]
-            psqt_weights: AlignedBox::new_zeroed(0).into(),
+            psqt_weights: AlignedBox::new_zeroed(0),
             #[cfg(feature = "nnue-psqt")]
             has_psqt: false,
             #[cfg(feature = "nnue-threat")]
-            threat_weights: AlignedBox::new_zeroed(0).into(),
+            threat_weights: AlignedBox::new_zeroed(0),
             #[cfg(feature = "nnue-threat")]
             has_threat: false,
-            _ft: PhantomData,
+            #[cfg(feature = "nnue-kzt-ft")]
+            kzt_ft_weights: AlignedBox::new_zeroed(0),
+            #[cfg(feature = "nnue-kzt-ft")]
+            has_kzt_ft: false,
         })
     }
 
     /// LEB128圧縮形式から読み込み（自動検出）
     ///
-    /// 圧縮ブロックは実際に読めたバイト数に応じて確保し、重みの確保前に要素数を検証する。
-    /// 要素数で形式を判別する:
+    /// 最初のブロックを全デコードし、要素数で形式を判別する:
     /// - 要素数 == biases のみ → YO形式（2ブロック）: 続けて weights ブロックを読む
     /// - 要素数 == biases + weights → 旧bullet-shogi形式（1ブロック）
     pub fn read_leb128<R: Read>(reader: &mut R) -> io::Result<Self> {
-        Self::read_with_source(
-            reader,
-            #[cfg(feature = "prepacked-nnue")]
-            None,
-        )
-    }
+        let weight_size = HALFKA_HM_DIMENSIONS * L1;
+        let total_size = L1 + weight_size;
 
-    pub(super) fn read_with_source<R: Read>(
-        reader: &mut R,
-        #[cfg(feature = "prepacked-nnue")] packed: Option<&super::prepacked::PackedModel>,
-    ) -> io::Result<Self> {
-        Self::validate_width()?;
-        let weight_size = FT::DIMENSIONS * L1;
-        let mut biases = [0i16; L1];
-        #[cfg(feature = "prepacked-nnue")]
-        let weights: WeightBox<i16> = if let Some(packed) = packed {
-            for bias in &mut biases {
-                let mut bytes = [0; 2];
-                reader.read_exact(&mut bytes)?;
-                *bias = i16::from_le_bytes(bytes);
+        // 最初のブロックを全値デコードして要素数で判別
+        let first_block = read_compressed_tensor_i16_all(reader)?;
+
+        if first_block.len() == total_size {
+            // 旧bullet-shogi形式（1ブロック）: biases + weights が結合
+            let mut biases = [0i16; L1];
+            biases.copy_from_slice(&first_block[..L1]);
+
+            let mut weights = AlignedBox::new_zeroed(weight_size);
+            weights.copy_from_slice(&first_block[L1..]);
+
+            return Ok(Self {
+                biases: Aligned(biases),
+                weights,
+                #[cfg(feature = "nnue-psqt")]
+                psqt_biases: [0; NUM_LAYER_STACK_BUCKETS],
+                #[cfg(feature = "nnue-psqt")]
+                psqt_weights: AlignedBox::new_zeroed(0),
+                #[cfg(feature = "nnue-psqt")]
+                has_psqt: false,
+                #[cfg(feature = "nnue-threat")]
+                threat_weights: AlignedBox::new_zeroed(0),
+                #[cfg(feature = "nnue-threat")]
+                has_threat: false,
+                #[cfg(feature = "nnue-kzt-ft")]
+                kzt_ft_weights: AlignedBox::new_zeroed(0),
+                #[cfg(feature = "nnue-kzt-ft")]
+                has_kzt_ft: false,
+            });
+        }
+
+        if first_block.len() == L1 {
+            // YO形式（2ブロック）: 次に weights ブロックを読み込み
+            let weights_block = read_compressed_tensor_i16_all(reader)?;
+            if weights_block.len() != weight_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "FT weights block size mismatch: got {}, expected {}",
+                        weights_block.len(),
+                        weight_size
+                    ),
+                ));
             }
-            packed.ft(weight_size)?
-        } else {
-            read_layer_stacks_ft_i16(reader, &mut biases, weight_size, AlignedBox::try_new_zeroed)?
-                .into()
-        };
-        #[cfg(not(feature = "prepacked-nnue"))]
-        let weights: WeightBox<i16> =
-            read_layer_stacks_ft_i16(reader, &mut biases, weight_size, AlignedBox::try_new_zeroed)?
-                .into();
-        Ok(Self {
-            biases: Aligned(biases),
-            weights: piece_weights::select(weights, L1)?,
-            #[cfg(feature = "nnue-psqt")]
-            psqt_biases: [0; MAX_LAYER_STACK_PSQT_BUCKETS],
-            #[cfg(feature = "nnue-psqt")]
-            psqt_num_buckets: 0,
-            #[cfg(feature = "nnue-psqt")]
-            psqt_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-psqt")]
-            has_psqt: false,
-            #[cfg(feature = "nnue-threat")]
-            threat_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-threat")]
-            has_threat: false,
-            _ft: PhantomData,
-        })
+
+            let mut biases = [0i16; L1];
+            biases.copy_from_slice(&first_block);
+
+            let mut weights = AlignedBox::new_zeroed(weight_size);
+            weights.copy_from_slice(&weights_block);
+
+            return Ok(Self {
+                biases: Aligned(biases),
+                weights,
+                #[cfg(feature = "nnue-psqt")]
+                psqt_biases: [0; NUM_LAYER_STACK_BUCKETS],
+                #[cfg(feature = "nnue-psqt")]
+                psqt_weights: AlignedBox::new_zeroed(0),
+                #[cfg(feature = "nnue-psqt")]
+                has_psqt: false,
+                #[cfg(feature = "nnue-threat")]
+                threat_weights: AlignedBox::new_zeroed(0),
+                #[cfg(feature = "nnue-threat")]
+                has_threat: false,
+                #[cfg(feature = "nnue-kzt-ft")]
+                kzt_ft_weights: AlignedBox::new_zeroed(0),
+                #[cfg(feature = "nnue-kzt-ft")]
+                has_kzt_ft: false,
+            });
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Unexpected LEB128 tensor size: got {}, expected {} or {}",
+                first_block.len(),
+                L1,
+                total_size
+            ),
+        ))
     }
 
     /// PSQT 重み/バイアスをファイルから読み込み
-    ///
-    /// `num_buckets` は net file の `num_buckets` field (legacy `.bin` は
-    /// `DEFAULT_NUM_BUCKETS = 9`)。有効範囲外の値には `InvalidData` を返す。
-    ///
-    /// ## 不変条件: `psqt_biases[num_buckets..MAX]` は常にゼロ
-    ///
-    /// `psqt_biases` は固定長 `[i32; MAX_LAYER_STACK_PSQT_BUCKETS]` だが、有効範囲は
-    /// 先頭 `num_buckets` 要素のみ。本関数は冒頭で `[0; MAX]` で zero 化してから
-    /// 先頭 N 要素を file から読む。`[N..MAX]` 領域は不変条件としてゼロを保つ:
-    ///
-    /// - `read_psqt` は 1 回のみ呼ばれる (`network_layer_stacks::read_with_options`
-    ///   が PSQT block ごとに 1 回 dispatch する構造)
-    /// - 評価パスの `psqt_add_or_sub` は引数 `n` で `[..n]` のみ操作し
-    ///   `[n..MAX]` を触らない
-    /// - `refresh_or_cache_with_psqt` の `*psqt_acc = *psqt_biases` は
-    ///   `[i32; MAX]` の Copy で `[N..MAX]` のゼロ部分も伝播する
-    ///   (副作用なしで PSQT acc の `[N..MAX]` も 0 のままになる)
-    ///
-    /// 上記により評価時に `[N..MAX]` 要素が undefined / non-zero 値で読まれることが無い。
     #[cfg(feature = "nnue-psqt")]
-    pub fn read_psqt<R: Read>(&mut self, reader: &mut R, num_buckets: usize) -> io::Result<()> {
-        self.read_psqt_with_source(
-            reader,
-            num_buckets,
-            #[cfg(feature = "prepacked-nnue")]
-            None,
-        )
-    }
-    #[cfg(feature = "nnue-psqt")]
-    pub(super) fn read_psqt_with_source<R: Read>(
-        &mut self,
-        reader: &mut R,
-        num_buckets: usize,
-        #[cfg(feature = "prepacked-nnue")] packed: Option<&super::prepacked::PackedModel>,
-    ) -> io::Result<()> {
-        super::net_bin_layout::validate_psqt_bucket_count(num_buckets)?;
-        if num_buckets == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "PSQT requires at least one bucket",
-            ));
-        }
+    pub fn read_psqt<R: Read>(&mut self, reader: &mut R) -> io::Result<()> {
         let mut buf4 = [0u8; 4];
 
-        // Biases: i32 × num_buckets (固定長配列の先頭 num_buckets 要素にのみ書き、
-        // それ以降はゼロのまま残す)。
-        self.psqt_biases = [0i32; MAX_LAYER_STACK_PSQT_BUCKETS];
-        for bias in self.psqt_biases[..num_buckets].iter_mut() {
+        // Biases: i32[NUM_LAYER_STACK_BUCKETS]
+        for bias in self.psqt_biases.iter_mut() {
             reader.read_exact(&mut buf4)?;
             *bias = i32::from_le_bytes(buf4);
         }
 
-        // Weights: i32 × FT::DIMENSIONS × num_buckets
-        // layout: `psqt_weights[feature_idx * num_buckets + bucket]` (feature-major、
-        // 各 feature 内で bucket 連番)。学習済みモデルの格納順を保って読み込む。
-        let weight_count = FT::DIMENSIONS * num_buckets;
-        #[cfg(feature = "prepacked-nnue")]
-        if let Some(packed) = packed {
-            self.psqt_weights = packed.psqt(weight_count)?;
-            self.psqt_num_buckets = num_buckets;
-            self.has_psqt = true;
-            return Ok(());
-        }
-        let mut psqt_weights = AlignedBox::new_zeroed(weight_count);
-        for w in psqt_weights.iter_mut() {
+        // Weights: i32[HALFKA_HM_DIMENSIONS × NUM_LAYER_STACK_BUCKETS]
+        let weight_count = HALFKA_HM_DIMENSIONS * NUM_LAYER_STACK_BUCKETS;
+        self.psqt_weights = AlignedBox::new_zeroed(weight_count);
+        for w in self.psqt_weights.iter_mut() {
             reader.read_exact(&mut buf4)?;
             *w = i32::from_le_bytes(buf4);
         }
-        self.psqt_weights = psqt_weights.into();
 
-        self.psqt_num_buckets = num_buckets;
         // 注意: 読み込みが途中で失敗した場合、psqt_biases だけが更新された
         // 中途半端な状態になるが、呼び出し元でエラーが伝播し Self は破棄されるため問題ない。
         self.has_psqt = true;
@@ -592,48 +435,24 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         self.has_psqt
     }
 
-    /// PSQT バイアスを参照（外部の解析ツール向け、固定長配列の先頭 `psqt_num_buckets` 要素のみ有効）。
+    /// PSQT バイアスを参照（外部の解析ツール向け）。
     #[cfg(feature = "nnue-psqt")]
-    pub fn psqt_biases(&self) -> &[i32; MAX_LAYER_STACK_PSQT_BUCKETS] {
+    pub fn psqt_biases(&self) -> &[i32; NUM_LAYER_STACK_BUCKETS] {
         &self.psqt_biases
     }
 
     /// PSQT 重みを参照（外部の解析ツール向け）。
-    /// レイアウト: `psqt_weights[feature_idx * psqt_num_buckets + bucket]`
+    /// レイアウト: `psqt_weights[feature_idx * NUM_LAYER_STACK_BUCKETS + bucket]`
     #[cfg(feature = "nnue-psqt")]
     pub fn psqt_weights(&self) -> &[i32] {
         &self.psqt_weights
     }
 
-    /// PSQT bucket 数 (= net file の `num_buckets`)。PSQT が無効なら 0。
-    #[cfg(feature = "nnue-psqt")]
-    pub fn psqt_num_buckets(&self) -> usize {
-        self.psqt_num_buckets
-    }
-
     /// Threat 重みをファイルから読み込み (i8, raw)
     #[cfg(feature = "nnue-threat")]
     pub fn read_threat_weights<R: Read>(&mut self, reader: &mut R) -> io::Result<()> {
-        self.read_threat_with_source(
-            reader,
-            #[cfg(feature = "prepacked-nnue")]
-            None,
-        )
-    }
-    #[cfg(feature = "nnue-threat")]
-    pub(super) fn read_threat_with_source<R: Read>(
-        &mut self,
-        reader: &mut R,
-        #[cfg(feature = "prepacked-nnue")] packed: Option<&super::prepacked::PackedModel>,
-    ) -> io::Result<()> {
-        let weight_count = THREAT_DIMENSIONS * threat_width(L1);
-        #[cfg(feature = "prepacked-nnue")]
-        if let Some(packed) = packed {
-            self.threat_weights = packed.threat(weight_count)?;
-            self.has_threat = true;
-            return Ok(());
-        }
-        let mut threat_weights: AlignedBox<i8> = AlignedBox::new_zeroed(weight_count);
+        let weight_count = THREAT_DIMENSIONS * L1;
+        self.threat_weights = AlignedBox::new_zeroed(weight_count);
         // SAFETY:
         // - `AlignedBox::new_zeroed(weight_count)` は `weight_count` 個の `i8`
         //   を保持する領域をゼロ初期化で確保している。
@@ -642,25 +461,27 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         //   よって `*mut i8 → *mut u8` のキャストは valid で、同じメモリ領域を
         //   バイト列として参照するスライスを作るのは安全。
         // - 作ったスライスは `read_exact` 呼び出しの内側でしか使わず、
-        //   関数リターン前にドロップされる。ローカル変数 `threat_weights` への
-        //   排他可変参照はこのスコープだけが持ち、重複参照は発生しない。
-        // - `weight_count == THREAT_DIMENSIONS * T` は `AlignedBox` の長さと
+        //   関数リターン前にドロップされる。`self.threat_weights` への排他可変
+        //   参照は関数シグネチャで保証されており、重複参照は発生しない。
+        // - `weight_count == THREAT_DIMENSIONS * L1` は `AlignedBox` の長さと
         //   一致するため、`from_raw_parts_mut` の length 要件を満たす。
         let slice = unsafe {
-            std::slice::from_raw_parts_mut(threat_weights.as_mut_ptr() as *mut u8, weight_count)
+            std::slice::from_raw_parts_mut(
+                self.threat_weights.as_mut_ptr() as *mut u8,
+                weight_count,
+            )
         };
         reader.read_exact(slice)?;
-        self.threat_weights = threat_weights.into();
         self.has_threat = true;
         Ok(())
     }
 
-    /// Threat 重みの行を取得（i8[T]）
+    /// Threat 重みの行を取得（i8[L1]）
     #[cfg(feature = "nnue-threat")]
     #[inline]
     fn threat_weight_row(&self, index: usize) -> &[i8] {
-        let offset = index * threat_width(L1);
-        let end = offset + threat_width(L1);
+        let offset = index * L1;
+        let end = offset + L1;
         debug_assert!(end <= self.threat_weights.len(), "threat index out of range: {index}");
         &self.threat_weights[offset..end]
     }
@@ -668,86 +489,52 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
     /// Threat 重み (i8) を i16 アキュムレータに加算（SIMD 最適化）
     ///
     /// i8 重みを i16 に sign-extend してから加算。
-    /// AVX-512BW は32要素、AVX2 は16要素ずつ符号拡張して加算する。
+    /// AVX2: `_mm256_cvtepi8_epi16` で 16 要素ずつ変換 + `_mm256_add_epi16`。
     #[cfg(feature = "nnue-threat")]
     #[inline]
-    fn add_threat_weights(&self, accumulation: &mut ThreatAccumulation<L1>, index: usize) {
-        // AVX2 ループは `T / 16` 回で全要素を処理する前提のため、
-        // T が 16 の倍数でない場合は monomorphization 時に弾く。
+    fn add_threat_weights(&self, accumulation: &mut [i16; L1], index: usize) {
+        // AVX2 ループは `L1 / 16` 回で全要素を処理する前提のため、
+        // L1 が 16 の倍数でない場合は monomorphization 時に弾く。
         const {
-            assert!(threat_width(L1).is_multiple_of(16), "Threat width must be a multiple of 16");
+            assert!(L1 % 16 == 0, "L1 must be a multiple of 16 for AVX2 SIMD loops");
         }
         let weights = self.threat_weight_row(index);
 
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            // SAFETY: 行と accumulator の長さは T。32要素単位の読み書きと
-            // prefetch はその範囲内で、非整列ロード・ストアを使う。
-            // cfg は AVX-512F/BW を保証する。
-            unsafe {
-                use std::arch::x86_64::*;
-                let a = accumulation.as_mut_ptr();
-                let w = weights.as_ptr();
-                for offset in [512, 768, 1024, 1280] {
-                    if threat_width(L1) > offset {
-                        _mm_prefetch(w.add(offset), _MM_HINT_T0);
-                    }
-                }
-                for i in 0..threat_width(L1) / 32 {
-                    let offset = i * 32;
-                    let x = _mm512_loadu_si512(a.add(offset).cast());
-                    let b = _mm256_loadu_si256(w.add(offset).cast());
-                    let y = _mm512_cvtepi8_epi16(b);
-                    _mm512_storeu_si512(a.add(offset).cast(), _mm512_add_epi16(x, y));
-                }
-            }
-            for i in threat_width(L1) / 32 * 32..threat_width(L1) {
-                accumulation[i] = accumulation[i].wrapping_add(i16::from(weights[i]));
-            }
-        }
-
-        // AVX2: 128bit i8 → 256bit i16 sign-extend + add, T/16 iterations
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(all(target_feature = "avx512f", target_feature = "avx512bw"))
-        ))]
+        // AVX2: 128bit i8 → 256bit i16 sign-extend + add, L1/16 iterations
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             // SAFETY:
             // - `acc_ptr`: 呼び出し元が `AccumulatorLayerStacks::get_threat_mut()`
-            //   等から取得する `&mut ThreatAccumulation<L1>` (親構造体 `AccumulatorLayerStacks`
+            //   等から取得する `&mut [i16; L1]` (親構造体 `AccumulatorLayerStacks`
             //   が `#[repr(C, align(64))]` で 64 バイトアライン）→
             //   `_mm256_load_si256` / `_mm256_store_si256` の 32 バイトアライン
             //   要件を満たす
             // - `w_ptr`: `AlignedBox<i8>` のポインタ。`_mm_loadu_si128`
             //   （非アラインロード）を使っているためアライメント要件は無い
             // - プリフェッチは hint のみで safety に影響しない
-            // - const assert が T は 16 の倍数であることを保証する。
+            // - ループ `L1 / 16` は const generics 由来。`L1 ∈ {512, 768, 1536}`
+            //   は全て 16 の倍数なので末端要素が取り残されない
             unsafe {
                 use std::arch::x86_64::*;
                 let acc_ptr = accumulation.as_mut_ptr();
                 let w_ptr = weights.as_ptr();
 
                 // 行内プリフェッチ: 後半の cache lines を先読み
-                // T bytes = T/64 cache lines (64B), 先頭は触れた時点で fetch される
-                if threat_width(L1) > 512 {
+                // L1 bytes = L1/64 cache lines (64B), 先頭は触れた時点で fetch される
+                if L1 > 512 {
                     _mm_prefetch(w_ptr.add(512), _MM_HINT_T0);
                 }
-                if threat_width(L1) > 768 {
+                if L1 > 768 {
                     _mm_prefetch(w_ptr.add(768), _MM_HINT_T0);
                 }
-                if threat_width(L1) > 1024 {
+                if L1 > 1024 {
                     _mm_prefetch(w_ptr.add(1024), _MM_HINT_T0);
                 }
-                if threat_width(L1) > 1280 {
+                if L1 > 1280 {
                     _mm_prefetch(w_ptr.add(1280), _MM_HINT_T0);
                 }
 
-                for i in 0..(threat_width(L1) / 16) {
+                for i in 0..(L1 / 16) {
                     let acc_vec = _mm256_load_si256(acc_ptr.add(i * 16) as *const __m256i);
                     let w8 = _mm_loadu_si128(w_ptr.add(i * 16) as *const __m128i);
                     let w16 = _mm256_cvtepi8_epi16(w8);
@@ -758,315 +545,51 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         }
 
         // スカラーフォールバック（AVX2 非対応環境のみコンパイル）
-        #[cfg(not(any(
-            all(target_arch = "x86_64", target_feature = "avx2"),
-            all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512bw"
-            )
-        )))]
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         for (a, &w) in accumulation.iter_mut().zip(weights) {
             *a = a.wrapping_add(w as i16);
-        }
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[inline]
-    fn refresh_threat_accumulator(
-        &self,
-        pos: &Position,
-        perspective: Color,
-        king_sq: crate::types::Square,
-        accumulation: &mut ThreatAccumulation<L1>,
-    ) {
-        let mut batch = ThreatRefreshBatch::new();
-        threat_features::for_each_active_threat_index(pos, perspective, king_sq, |index| {
-            batch.push(self, accumulation, index);
-        });
-        batch.flush(self, accumulation);
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[inline]
-    fn apply_threat_refresh_batch<const FIRST: bool>(
-        &self,
-        accumulation: &mut ThreatAccumulation<L1>,
-        indices: &[usize],
-    ) {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            // SAFETY: 完全な tile だけを SIMD で処理し、各行と accumulator の範囲内を
-            // 非整列 load/store する。cfg が使用する SIMD 命令を保証する。
-            unsafe {
-                use std::arch::x86_64::*;
-                for offset in (0..threat_width(L1) / 256 * 256).step_by(256) {
-                    let mut tile = [_mm512_setzero_si512(); 8];
-                    if !FIRST {
-                        for (k, v) in tile.iter_mut().enumerate() {
-                            *v = _mm512_loadu_si512(
-                                accumulation.as_ptr().add(offset + k * 32).cast(),
-                            );
-                        }
-                    }
-                    for &index in indices {
-                        let row = self.threat_weight_row(index);
-                        for (k, v) in tile.iter_mut().enumerate() {
-                            let w = _mm256_loadu_si256(row.as_ptr().add(offset + k * 32).cast());
-                            *v = _mm512_add_epi16(*v, _mm512_cvtepi8_epi16(w));
-                        }
-                    }
-                    for (k, v) in tile.iter().enumerate() {
-                        _mm512_storeu_si512(
-                            accumulation.as_mut_ptr().add(offset + k * 32).cast(),
-                            *v,
-                        );
-                    }
-                }
-            }
-            self.apply_threat_refresh_tail::<FIRST>(
-                accumulation,
-                indices,
-                threat_width(L1) / 256 * 256,
-            );
-        }
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(all(target_feature = "avx512f", target_feature = "avx512bw"))
-        ))]
-        {
-            // SAFETY: 完全な tile だけを SIMD で処理し、各行と accumulator の範囲内を
-            // 非整列 load/store する。cfg が使用する SIMD 命令を保証する。
-            unsafe {
-                use std::arch::x86_64::*;
-                for offset in (0..threat_width(L1) / 128 * 128).step_by(128) {
-                    let mut tile = [_mm256_setzero_si256(); 8];
-                    if !FIRST {
-                        for (k, v) in tile.iter_mut().enumerate() {
-                            *v = _mm256_loadu_si256(
-                                accumulation.as_ptr().add(offset + k * 16).cast(),
-                            );
-                        }
-                    }
-                    for &index in indices {
-                        let row = self.threat_weight_row(index);
-                        for (k, v) in tile.iter_mut().enumerate() {
-                            let w = _mm_loadu_si128(row.as_ptr().add(offset + k * 16).cast());
-                            *v = _mm256_add_epi16(*v, _mm256_cvtepi8_epi16(w));
-                        }
-                    }
-                    for (k, v) in tile.iter().enumerate() {
-                        _mm256_storeu_si256(
-                            accumulation.as_mut_ptr().add(offset + k * 16).cast(),
-                            *v,
-                        );
-                    }
-                }
-            }
-            self.apply_threat_refresh_tail::<FIRST>(
-                accumulation,
-                indices,
-                threat_width(L1) / 128 * 128,
-            );
-        }
-        #[cfg(not(any(
-            all(target_arch = "x86_64", target_feature = "avx2"),
-            all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512bw"
-            )
-        )))]
-        self.apply_threat_refresh_tail::<FIRST>(accumulation, indices, 0);
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[inline]
-    fn apply_threat_refresh_tail<const FIRST: bool>(
-        &self,
-        accumulation: &mut ThreatAccumulation<L1>,
-        indices: &[usize],
-        start: usize,
-    ) {
-        if start == threat_width(L1) {
-            return;
-        }
-        if FIRST {
-            accumulation[start..].fill(0);
-        }
-        for &index in indices {
-            for (a, &w) in
-                accumulation[start..].iter_mut().zip(&self.threat_weight_row(index)[start..])
-            {
-                *a = a.wrapping_add(i16::from(w));
-            }
-        }
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[inline]
-    fn refresh_threat_perspectives(
-        &self,
-        pos: &Position,
-        acc: &mut AccumulatorLayerStacks<L1>,
-        refresh: [bool; 2],
-    ) {
-        if refresh == [true; 2] {
-            let mut batches = [ThreatRefreshBatch::new(), ThreatRefreshBatch::new()];
-            threat_features::for_each_active_threat_index_both(pos, |perspective, index| {
-                let p = perspective.index();
-                batches[p].push(self, acc.get_threat_mut(p), index);
-            });
-            for (p, batch) in batches.iter_mut().enumerate() {
-                batch.flush(self, acc.get_threat_mut(p));
-            }
-        } else {
-            for perspective in [Color::Black, Color::White] {
-                let p = perspective.index();
-                if refresh[p] {
-                    self.refresh_threat_accumulator(
-                        pos,
-                        perspective,
-                        pos.king_square(perspective),
-                        acc.get_threat_mut(p),
-                    );
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[inline]
-    fn apply_threat_rows<const ADD: bool>(
-        &self,
-        accumulation: &mut ThreatAccumulation<L1>,
-        indices: &IndexList<MAX_CHANGED_THREAT_FEATURES>,
-    ) {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        if threat_width(L1).is_multiple_of(256) && !indices.is_empty() {
-            // SAFETY: T は tile 幅の倍数で、各行と accumulator の長さは T。
-            // 非整列 load/store を使い、cfg は AVX-512F/BW を保証する。
-            unsafe {
-                use std::arch::x86_64::*;
-                for offset in (0..threat_width(L1)).step_by(256) {
-                    let mut tile = [_mm512_setzero_si512(); 8];
-                    for (k, v) in tile.iter_mut().enumerate() {
-                        *v = _mm512_loadu_si512(accumulation.as_ptr().add(offset + k * 32).cast());
-                    }
-                    for index in indices.iter() {
-                        let row = self.threat_weight_row(index);
-                        for (k, v) in tile.iter_mut().enumerate() {
-                            let w = _mm256_loadu_si256(row.as_ptr().add(offset + k * 32).cast());
-                            let w = _mm512_cvtepi8_epi16(w);
-                            *v = if ADD {
-                                _mm512_add_epi16(*v, w)
-                            } else {
-                                _mm512_sub_epi16(*v, w)
-                            };
-                        }
-                    }
-                    for (k, v) in tile.iter().enumerate() {
-                        _mm512_storeu_si512(
-                            accumulation.as_mut_ptr().add(offset + k * 32).cast(),
-                            *v,
-                        );
-                    }
-                }
-            }
-            return;
-        }
-        for index in indices.iter() {
-            if ADD {
-                self.add_threat_weights(accumulation, index);
-            } else {
-                self.sub_threat_weights(accumulation, index);
-            }
         }
     }
 
     /// Threat 重み (i8) を i16 アキュムレータから減算（SIMD 最適化）
     #[cfg(feature = "nnue-threat")]
     #[inline]
-    fn sub_threat_weights(&self, accumulation: &mut ThreatAccumulation<L1>, index: usize) {
+    fn sub_threat_weights(&self, accumulation: &mut [i16; L1], index: usize) {
         const {
-            assert!(threat_width(L1).is_multiple_of(16), "Threat width must be a multiple of 16");
+            assert!(L1 % 16 == 0, "L1 must be a multiple of 16 for AVX2 SIMD loops");
         }
         let weights = self.threat_weight_row(index);
 
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            // SAFETY: 行と accumulator の長さは T。32要素単位の読み書きと
-            // prefetch はその範囲内で、非整列ロード・ストアを使う。
-            // cfg は AVX-512F/BW を保証する。
-            unsafe {
-                use std::arch::x86_64::*;
-                let a = accumulation.as_mut_ptr();
-                let w = weights.as_ptr();
-                for offset in [512, 768, 1024, 1280] {
-                    if threat_width(L1) > offset {
-                        _mm_prefetch(w.add(offset), _MM_HINT_T0);
-                    }
-                }
-                for i in 0..threat_width(L1) / 32 {
-                    let offset = i * 32;
-                    let x = _mm512_loadu_si512(a.add(offset).cast());
-                    let b = _mm256_loadu_si256(w.add(offset).cast());
-                    let y = _mm512_cvtepi8_epi16(b);
-                    _mm512_storeu_si512(a.add(offset).cast(), _mm512_sub_epi16(x, y));
-                }
-            }
-            for i in threat_width(L1) / 32 * 32..threat_width(L1) {
-                accumulation[i] = accumulation[i].wrapping_sub(i16::from(weights[i]));
-            }
-        }
-
         // AVX2: 128bit i8 → 256bit i16 sign-extend + sub
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(all(target_feature = "avx512f", target_feature = "avx512bw"))
-        ))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             // SAFETY: `add_threat_weights` と同じ契約。
-            // - `acc_ptr`: `accumulation: &mut ThreatAccumulation<L1>` の親は
-            //   `AccumulatorLayerStacks<T>` (`#[repr(C, align(64))]`) → 32 バイト
+            // - `acc_ptr`: `accumulation: &mut [i16; L1]` の親は
+            //   `AccumulatorLayerStacks<L1>` (`#[repr(C, align(64))]`) → 32 バイト
             //   アラインが保証され `_mm256_load/store_si256` の要件を満たす
             // - `w_ptr`: `AlignedBox<i8>` だが `_mm_loadu_si128` 非アラインロード
             //   を使うためアライメント要件は無い
-            // - const assert が T は 16 の倍数であることを保証する。
+            // - `L1 ∈ {512, 768, 1536}` はすべて 16 の倍数
             unsafe {
                 use std::arch::x86_64::*;
 
                 // 行内プリフェッチ
                 let w_ptr = weights.as_ptr();
-                if threat_width(L1) > 512 {
+                if L1 > 512 {
                     _mm_prefetch(w_ptr.add(512), _MM_HINT_T0);
                 }
-                if threat_width(L1) > 768 {
+                if L1 > 768 {
                     _mm_prefetch(w_ptr.add(768), _MM_HINT_T0);
                 }
-                if threat_width(L1) > 1024 {
+                if L1 > 1024 {
                     _mm_prefetch(w_ptr.add(1024), _MM_HINT_T0);
                 }
-                if threat_width(L1) > 1280 {
+                if L1 > 1280 {
                     _mm_prefetch(w_ptr.add(1280), _MM_HINT_T0);
                 }
                 let acc_ptr = accumulation.as_mut_ptr();
                 let w_ptr = weights.as_ptr();
-                for i in 0..(threat_width(L1) / 16) {
+                for i in 0..(L1 / 16) {
                     let acc_vec = _mm256_load_si256(acc_ptr.add(i * 16) as *const __m256i);
                     let w8 = _mm_loadu_si128(w_ptr.add(i * 16) as *const __m128i);
                     let w16 = _mm256_cvtepi8_epi16(w8);
@@ -1077,17 +600,102 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
         }
 
         // スカラーフォールバック（AVX2 非対応環境のみコンパイル）
-        #[cfg(not(any(
-            all(target_arch = "x86_64", target_feature = "avx2"),
-            all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512bw"
-            )
-        )))]
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         for (a, &w) in accumulation.iter_mut().zip(weights) {
             *a = a.wrapping_sub(w as i16);
         }
+    }
+
+    /// KZT-FT 重みをファイルから読み込み (i8, raw)。 threat と同形式 (= 逆量子化なし)。
+    #[cfg(feature = "nnue-kzt-ft")]
+    pub fn read_kzt_ft_weights<R: Read>(&mut self, reader: &mut R) -> io::Result<()> {
+        let weight_count = KZT_FT_DIMENSIONS * L1;
+        self.kzt_ft_weights = AlignedBox::new_zeroed(weight_count);
+        // SAFETY: `read_threat_weights` と同じ契約。
+        // - `AlignedBox::new_zeroed(weight_count)` は `weight_count` 個の `i8` を
+        //   ゼロ初期化で確保する。
+        // - `i8` と `u8` はサイズ・アラインメント同一で任意 byte pattern が両者 valid。
+        //   `*mut i8 → *mut u8` キャストは valid で、同じ領域を byte 列として参照できる。
+        // - 作った slice は `read_exact` 内でのみ使い関数リターン前に drop。
+        //   `self.kzt_ft_weights` への排他可変参照はシグネチャで保証。
+        // - `weight_count == KZT_FT_DIMENSIONS * L1` は `AlignedBox` の長さと一致。
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.kzt_ft_weights.as_mut_ptr() as *mut u8,
+                weight_count,
+            )
+        };
+        reader.read_exact(slice)?;
+        self.has_kzt_ft = true;
+        Ok(())
+    }
+
+    /// KZT-FT 重みの行を取得（i8[L1]）
+    #[cfg(feature = "nnue-kzt-ft")]
+    #[inline]
+    fn kzt_ft_weight_row(&self, index: usize) -> &[i8] {
+        let offset = index * L1;
+        let end = offset + L1;
+        debug_assert!(end <= self.kzt_ft_weights.len(), "kzt-ft index out of range: {index}");
+        &self.kzt_ft_weights[offset..end]
+    }
+
+    /// KZT-FT 重み (i8) を i16 アキュムレータに加算（SIMD 最適化、threat と同方式）
+    #[cfg(feature = "nnue-kzt-ft")]
+    #[inline]
+    fn add_kzt_ft_weights(&self, accumulation: &mut [i16; L1], index: usize) {
+        const {
+            assert!(L1.is_multiple_of(16), "L1 must be a multiple of 16 for AVX2 SIMD loops");
+        }
+        let weights = self.kzt_ft_weight_row(index);
+
+        // AVX2: 128bit i8 → 256bit i16 sign-extend + add, L1/16 iterations
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            // SAFETY: `add_threat_weights` と同一契約。
+            // - `acc_ptr`: 呼び出し元が `AccumulatorLayerStacks::get_kzt_mut()` 等から
+            //   取得する `&mut [i16; L1]` (親 `AccumulatorLayerStacks` は
+            //   `#[repr(C, align(64))]` で 64 バイトアライン) → `_mm256_load/store_si256`
+            //   の 32 バイトアライン要件を満たす。
+            // - `w_ptr`: `AlignedBox<i8>`。`_mm_loadu_si128`(非アラインロード) 使用のため
+            //   アライメント要件なし。
+            // - ループ `L1 / 16` は const generics 由来で L1 は 16 の倍数 (= 末端取り残しなし)。
+            unsafe {
+                use std::arch::x86_64::*;
+                let acc_ptr = accumulation.as_mut_ptr();
+                let w_ptr = weights.as_ptr();
+                for i in 0..(L1 / 16) {
+                    let acc_vec = _mm256_load_si256(acc_ptr.add(i * 16) as *const __m256i);
+                    let w8 = _mm_loadu_si128(w_ptr.add(i * 16) as *const __m128i);
+                    let w16 = _mm256_cvtepi8_epi16(w8);
+                    let result = _mm256_add_epi16(acc_vec, w16);
+                    _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
+                }
+            }
+        }
+
+        // スカラーフォールバック（AVX2 非対応環境のみコンパイル）
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        for (a, &w) in accumulation.iter_mut().zip(weights) {
+            *a = a.wrapping_add(w as i16);
+        }
+    }
+
+    // NOTE: v0 は常に full refresh のため sub_kzt_ft_weights (= 差分減算) は不要 (= YAGNI で
+    // 未実装)。 差分更新を導入する後段で threat の sub_threat_weights に倣って追加すること。
+
+    /// KZT-FT アキュムレータを full refresh する (= fill 0 → active feature を全 add)。
+    ///
+    /// KZT は敵玉移動 / 持駒変化 / 敵玉 zone 近傍の駒移動で広範に変わるため、 v0 は
+    /// 正しさ優先で常に full refresh する (= 差分最適化は後段)。 `kzt_acc` は perspective p
+    /// (= attacker=p) 単一側 feature 総和。
+    #[cfg(feature = "nnue-kzt-ft")]
+    #[inline]
+    fn refresh_kzt_ft(&self, pos: &Position, perspective: Color, kzt_acc: &mut [i16; L1]) {
+        kzt_acc.fill(0);
+        kzt::for_each_active_kzt_ft_index(pos, perspective, |idx| {
+            self.add_kzt_ft_weights(kzt_acc, idx);
+        });
     }
 
     /// PSQT アキュムレータのフル計算
@@ -1095,7 +703,7 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
     fn refresh_psqt(
         &self,
         active_indices: &IndexList<MAX_ACTIVE_FEATURES>,
-        psqt_acc: &mut [i32; MAX_LAYER_STACK_PSQT_BUCKETS],
+        psqt_acc: &mut [i32; NUM_LAYER_STACK_BUCKETS],
     ) {
         *psqt_acc = self.psqt_biases;
         for index in active_indices.iter() {
@@ -1105,155 +713,43 @@ impl<const L1: usize, FT: LsFeatureSpec> FeatureTransformerLayerStacks<L1, FT> {
 
     /// PSQT 重みを加算
     ///
-    /// `psqt_acc[bucket] += psqt_weights[index * n + bucket]` を `n` (=
-    /// `self.psqt_num_buckets`) bucket 分まとめて実行する。配列の `[n..MAX]` は
-    /// 触らない (load 時に 0 のまま)。
+    /// `psqt_acc[bucket] += psqt_weights[index * 9 + bucket]` を 9 bucket 分まとめて実行する。
+    /// 内部実装は `psqt_add_or_sub::<true>` で SIMD 化されている。
     #[cfg(feature = "nnue-psqt")]
     #[inline]
-    fn add_psqt_weights(&self, psqt_acc: &mut [i32; MAX_LAYER_STACK_PSQT_BUCKETS], index: usize) {
-        let n = self.psqt_num_buckets;
-        let offset = index * n;
+    fn add_psqt_weights(&self, psqt_acc: &mut [i32; NUM_LAYER_STACK_BUCKETS], index: usize) {
+        let offset = index * NUM_LAYER_STACK_BUCKETS;
         debug_assert!(
-            offset + n <= self.psqt_weights.len(),
-            "psqt_weights index out of bounds: offset={offset}, n={n}, len={}",
+            offset + NUM_LAYER_STACK_BUCKETS <= self.psqt_weights.len(),
+            "psqt_weights index out of bounds: offset={offset}, len={}",
             self.psqt_weights.len()
         );
         // SAFETY: debug_assert で境界確認済み。release では呼び出し元 (refresh / diff) が
         // active_indices を経由しており、index は features の有効範囲内。weights ポインタは
-        // n i32 連続を指す。
+        // 9 i32 連続を指す。
         let weights_ptr = unsafe { self.psqt_weights.as_ptr().add(offset) };
-        psqt_add_or_sub::<true>(psqt_acc, weights_ptr, n);
+        psqt_add_or_sub::<true>(psqt_acc, weights_ptr);
     }
 
     /// PSQT 重みを減算
     #[cfg(feature = "nnue-psqt")]
     #[inline]
-    fn sub_psqt_weights(&self, psqt_acc: &mut [i32; MAX_LAYER_STACK_PSQT_BUCKETS], index: usize) {
-        let n = self.psqt_num_buckets;
-        let offset = index * n;
+    fn sub_psqt_weights(&self, psqt_acc: &mut [i32; NUM_LAYER_STACK_BUCKETS], index: usize) {
+        let offset = index * NUM_LAYER_STACK_BUCKETS;
         debug_assert!(
-            offset + n <= self.psqt_weights.len(),
-            "psqt_weights index out of bounds: offset={offset}, n={n}, len={}",
+            offset + NUM_LAYER_STACK_BUCKETS <= self.psqt_weights.len(),
+            "psqt_weights index out of bounds: offset={offset}, len={}",
             self.psqt_weights.len()
         );
         // SAFETY: debug_assert で境界確認済み。release では呼び出し元 (refresh / diff) が
         // active_indices を経由しており、index は features の有効範囲内。weights ポインタは
-        // n i32 連続を指す。
+        // 9 i32 連続を指す。
         let weights_ptr = unsafe { self.psqt_weights.as_ptr().add(offset) };
-        psqt_add_or_sub::<false>(psqt_acc, weights_ptr, n);
+        psqt_add_or_sub::<false>(psqt_acc, weights_ptr);
     }
 
     /// 差分計算を使わずにAccumulatorを計算
-    #[inline]
     pub fn refresh_accumulator(&self, pos: &Position, acc: &mut AccumulatorLayerStacks<L1>) {
-        with_piece_weights!(self.weights, |rows| PieceTransformer { ft: self, rows }
-            .refresh_accumulator(pos, acc))
-    }
-
-    /// 差分計算でAccumulatorを更新
-    #[inline]
-    pub fn update_accumulator(
-        &self,
-        pos: &Position,
-        dirty_piece: &DirtyPiece,
-        acc: &mut AccumulatorLayerStacks<L1>,
-        prev_acc: &AccumulatorLayerStacks<L1>,
-    ) {
-        with_piece_weights!(self.weights, |rows| PieceTransformer { ft: self, rows }
-            .update_accumulator(pos, dirty_piece, acc, prev_acc))
-    }
-
-    /// 差分計算でAccumulatorを更新（キャッシュ使用版）
-    ///
-    /// 玉移動時に full refresh が必要な視点では、AccumulatorCaches（Finny Tables）
-    /// を参照して差分更新を行う。キャッシュにヒットした場合、全駒加算の代わりに
-    /// 前回のキャッシュ状態との差分のみを適用するため高速。
-    #[inline]
-    pub fn update_accumulator_with_cache(
-        &self,
-        pos: &Position,
-        dirty_piece: &DirtyPiece,
-        acc: &mut AccumulatorLayerStacks<L1>,
-        prev_acc: &AccumulatorLayerStacks<L1>,
-        cache: &mut AccumulatorCacheLayerStacks<L1>,
-    ) {
-        with_piece_weights!(self.weights, |rows| PieceTransformer { ft: self, rows }
-            .update_accumulator_with_cache(pos, dirty_piece, acc, prev_acc, cache))
-    }
-
-    /// キャッシュ使用版の refresh（両視点）
-    #[inline]
-    pub fn refresh_accumulator_with_cache(
-        &self,
-        pos: &Position,
-        acc: &mut AccumulatorLayerStacks<L1>,
-        cache: &mut AccumulatorCacheLayerStacks<L1>,
-    ) {
-        with_piece_weights!(self.weights, |rows| PieceTransformer { ft: self, rows }
-            .refresh_accumulator_with_cache(pos, acc, cache))
-    }
-
-    #[cfg(any(
-        feature = "layerstack-arch",
-        all(test, not(feature = "nnue-effect-bucket"))
-    ))]
-    #[inline]
-    pub(super) fn ensure_accumulator(
-        &self,
-        pos: &Position,
-        stack: &mut AccumulatorStackLayerStacks<L1>,
-        cache: Option<&mut AccumulatorCacheLayerStacks<L1>>,
-    ) {
-        if stack.current().accumulator.computed_accumulation {
-            return;
-        }
-        with_piece_weights!(self.weights, |rows| PieceTransformer { ft: self, rows }
-            .ensure_accumulator(pos, stack, cache))
-    }
-
-    #[cfg(all(test, feature = "nnue-threat"))]
-    fn update_with_threat_ancestor(
-        &self,
-        pos: &Position,
-        stack: &mut AccumulatorStackLayerStacks<L1>,
-        cache: Option<&mut AccumulatorCacheLayerStacks<L1>>,
-    ) {
-        with_piece_weights!(self.weights, |rows| PieceTransformer { ft: self, rows }
-            .update_with_threat_ancestor(pos, stack, cache))
-    }
-
-    /// 複数手分の差分を適用してアキュムレータを更新
-    #[inline]
-    pub fn forward_update_incremental(
-        &self,
-        pos: &Position,
-        stack: &mut AccumulatorStackLayerStacks<L1>,
-        source_idx: usize,
-    ) -> bool {
-        with_piece_weights!(self.weights, |rows| PieceTransformer { ft: self, rows }
-            .forward_update_incremental(pos, stack, source_idx))
-    }
-}
-
-// 格納形式の分岐を accumulator 操作の入口に置き、行の処理を型ごとに特殊化する。
-struct PieceTransformer<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> {
-    ft: &'a FeatureTransformerLayerStacks<L1, FT>,
-    rows: &'a [W],
-}
-
-impl<const L1: usize, FT: LsFeatureSpec, W: PieceWeight> std::ops::Deref
-    for PieceTransformer<'_, L1, FT, W>
-{
-    type Target = FeatureTransformerLayerStacks<L1, FT>;
-
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        self.ft
-    }
-}
-
-impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a, L1, FT, W> {
-    fn refresh_accumulator(&self, pos: &Position, acc: &mut AccumulatorLayerStacks<L1>) {
         for perspective in [Color::Black, Color::White] {
             let p = perspective as usize;
             let accumulation = acc.get_mut(p);
@@ -1263,7 +759,7 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
 
             // アクティブな特徴量の重みを加算
             let mut active_indices = IndexList::new();
-            append_active_indices::<FT>(pos, perspective, &mut active_indices);
+            append_active_indices(pos, perspective, &mut active_indices);
             for index in active_indices.iter() {
                 self.add_weights(accumulation, index);
             }
@@ -1273,35 +769,41 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
             if self.has_psqt {
                 self.refresh_psqt(&active_indices, &mut acc.psqt_accumulation[p]);
             }
-        }
 
-        #[cfg(feature = "nnue-threat")]
-        if self.has_threat {
-            self.refresh_threat_perspectives(pos, acc, [true; 2]);
+            // Threat アキュムレータ（bias なし: piece FT と bias を共有）
+            #[cfg(feature = "nnue-threat")]
+            if self.has_threat {
+                let king_sq = pos.king_square(perspective);
+                let threat_acc = acc.get_threat_mut(p);
+                threat_acc.fill(0);
+                threat_features::for_each_active_threat_index(pos, perspective, king_sq, |idx| {
+                    self.add_threat_weights(threat_acc, idx);
+                });
+            }
+
+            // KZT-FT アキュムレータ (= threat と同機構、 v0 は常に full refresh)。
+            #[cfg(feature = "nnue-kzt-ft")]
+            if self.has_kzt_ft {
+                let kzt_acc = acc.get_kzt_mut(p);
+                self.refresh_kzt_ft(pos, perspective, kzt_acc);
+            }
         }
 
         acc.computed_accumulation = true;
         acc.computed_score = false;
     }
 
-    fn update_accumulator(
+    /// 差分計算でAccumulatorを更新
+    pub fn update_accumulator(
         &self,
         pos: &Position,
         dirty_piece: &DirtyPiece,
         acc: &mut AccumulatorLayerStacks<L1>,
         prev_acc: &AccumulatorLayerStacks<L1>,
     ) {
-        if cfg!(feature = "nnue-effect-bucket") {
-            self.refresh_accumulator(pos, acc);
-            return;
-        }
-
-        #[cfg(feature = "nnue-threat")]
-        let mut threat_refresh = [false; 2];
-
         for perspective in [Color::Black, Color::White] {
             let p = perspective as usize;
-            let reset = <FT::Set as FeatureSet>::needs_refresh(dirty_piece, perspective);
+            let reset = HalfKA_hm_FeatureSet::needs_refresh(dirty_piece, perspective);
 
             if reset {
                 // 玉が移動した場合は全計算
@@ -1309,7 +811,7 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                 accumulation.copy_from_slice(&self.biases.0);
 
                 let mut active_indices = IndexList::new();
-                append_active_indices::<FT>(pos, perspective, &mut active_indices);
+                append_active_indices(pos, perspective, &mut active_indices);
                 for index in active_indices.iter() {
                     self.add_weights(accumulation, index);
                 }
@@ -1322,28 +824,23 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                 // 差分更新
                 let mut removed = IndexList::new();
                 let mut added = IndexList::new();
+                append_changed_indices(
+                    dirty_piece,
+                    perspective,
+                    pos.king_square(perspective),
+                    &mut removed,
+                    &mut added,
+                );
+
                 let prev = prev_acc.get(p);
                 let curr = acc.get_mut(p);
-                let fast_applied = self.try_apply_dirty_piece_fast_from_source(
-                    prev,
+                curr.copy_from_slice(prev);
+                if !self.try_apply_dirty_piece_fast(
                     curr,
                     dirty_piece,
                     perspective,
                     pos.king_square(perspective),
-                );
-                // PSQT は main accumulator の fast path 成功時も changed indices を使う。
-                // PSQT なしでは slow path に落ちた場合だけ生成すればよい。
-                if !fast_applied || cfg!(feature = "nnue-psqt") {
-                    append_changed_indices::<FT>(
-                        dirty_piece,
-                        perspective,
-                        pos.king_square(perspective),
-                        &mut removed,
-                        &mut added,
-                    );
-                }
-                if !fast_applied {
-                    curr.copy_from_slice(prev);
+                ) {
                     for index in removed.iter() {
                         self.sub_weights(curr, index);
                     }
@@ -1366,11 +863,18 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                 }
             }
 
+            // KZT-FT 更新 (= threat と独立、 v0 は常に full refresh)。
+            #[cfg(feature = "nnue-kzt-ft")]
+            if self.has_kzt_ft {
+                let kzt_acc = acc.get_kzt_mut(p);
+                self.refresh_kzt_ft(pos, perspective, kzt_acc);
+            }
+
             // Threat 更新
             //
-            // Threat は HalfKaSplit とは独立な index 空間を持ち、king_sq に依存するのは
+            // Threat は HalfKA とは独立な index 空間を持ち、king_sq に依存するのは
             // `is_hm_mirror` のみ。玉移動があっても HM mirror 境界を跨がなければ
-            // 差分更新で正しく計算できる。HalfKaSplit 用の `reset = king_moved` を流用
+            // 差分更新で正しく計算できる。HalfKA 用の `reset = king_moved` を流用
             // せず、Threat 専用の `needs_threat_refresh` を使う。
             #[cfg(feature = "nnue-threat")]
             if self.has_threat {
@@ -1379,7 +883,16 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                     threat_features::needs_threat_refresh(dirty_piece, king_sq, perspective);
                 if reset_threat {
                     // HM mirror 境界を跨いだ場合のみ全計算
-                    threat_refresh[p] = true;
+                    let threat_acc = acc.get_threat_mut(p);
+                    threat_acc.fill(0);
+                    threat_features::for_each_active_threat_index(
+                        pos,
+                        perspective,
+                        king_sq,
+                        |idx| {
+                            self.add_threat_weights(threat_acc, idx);
+                        },
+                    );
                 } else {
                     // Threat 差分更新
                     let prev_threat = prev_acc.get_threat(p);
@@ -1397,26 +910,38 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                         &mut t_added,
                     );
                     if ok {
-                        self.apply_threat_rows::<false>(curr_threat, &t_removed);
-                        self.apply_threat_rows::<true>(curr_threat, &t_added);
+                        for idx in t_removed.iter() {
+                            self.sub_threat_weights(curr_threat, idx);
+                        }
+                        for idx in t_added.iter() {
+                            self.add_threat_weights(curr_threat, idx);
+                        }
                     } else {
                         // overflow → full refresh
-                        threat_refresh[p] = true;
+                        curr_threat.fill(0);
+                        threat_features::for_each_active_threat_index(
+                            pos,
+                            perspective,
+                            king_sq,
+                            |idx| {
+                                self.add_threat_weights(curr_threat, idx);
+                            },
+                        );
                     }
                 }
             }
-        }
-
-        #[cfg(feature = "nnue-threat")]
-        if self.has_threat {
-            self.refresh_threat_perspectives(pos, acc, threat_refresh);
         }
 
         acc.computed_accumulation = true;
         acc.computed_score = false;
     }
 
-    fn update_accumulator_with_cache(
+    /// 差分計算でAccumulatorを更新（キャッシュ使用版）
+    ///
+    /// 玉移動時に full refresh が必要な視点では、AccumulatorCaches（Finny Tables）
+    /// を参照して差分更新を行う。キャッシュにヒットした場合、全駒加算の代わりに
+    /// 前回のキャッシュ状態との差分のみを適用するため高速。
+    pub fn update_accumulator_with_cache(
         &self,
         pos: &Position,
         dirty_piece: &DirtyPiece,
@@ -1424,17 +949,9 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
         prev_acc: &AccumulatorLayerStacks<L1>,
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
-        if cfg!(feature = "nnue-effect-bucket") {
-            self.refresh_accumulator(pos, acc);
-            return;
-        }
-
-        #[cfg(feature = "nnue-threat")]
-        let mut threat_refresh = [false; 2];
-
         for perspective in [Color::Black, Color::White] {
             let p = perspective as usize;
-            let reset = <FT::Set as FeatureSet>::needs_refresh(dirty_piece, perspective);
+            let reset = HalfKA_hm_FeatureSet::needs_refresh(dirty_piece, perspective);
 
             if reset {
                 count_refresh!();
@@ -1464,28 +981,23 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                 // 差分更新（キャッシュ不使用）
                 let mut removed = IndexList::new();
                 let mut added = IndexList::new();
+                append_changed_indices(
+                    dirty_piece,
+                    perspective,
+                    pos.king_square(perspective),
+                    &mut removed,
+                    &mut added,
+                );
+
                 let prev = prev_acc.get(p);
                 let curr = acc.get_mut(p);
-                let fast_applied = self.try_apply_dirty_piece_fast_from_source(
-                    prev,
+                curr.copy_from_slice(prev);
+                if !self.try_apply_dirty_piece_fast(
                     curr,
                     dirty_piece,
                     perspective,
                     pos.king_square(perspective),
-                );
-                // PSQT は main accumulator の fast path 成功時も changed indices を使う。
-                // PSQT なしでは slow path に落ちた場合だけ生成すればよい。
-                if !fast_applied || cfg!(feature = "nnue-psqt") {
-                    append_changed_indices::<FT>(
-                        dirty_piece,
-                        perspective,
-                        pos.king_square(perspective),
-                        &mut removed,
-                        &mut added,
-                    );
-                }
-                if !fast_applied {
-                    curr.copy_from_slice(prev);
+                ) {
                     for index in removed.iter() {
                         self.sub_weights(curr, index);
                     }
@@ -1508,9 +1020,16 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                 }
             }
 
+            // KZT-FT 更新 (= threat と独立、 v0 は常に full refresh)。
+            #[cfg(feature = "nnue-kzt-ft")]
+            if self.has_kzt_ft {
+                let kzt_acc = acc.get_kzt_mut(p);
+                self.refresh_kzt_ft(pos, perspective, kzt_acc);
+            }
+
             // Threat 更新（キャッシュ版も非キャッシュ版と同じロジック）
             //
-            // HalfKaSplit 用の `reset = king_moved` ではなく、Threat 専用の
+            // HalfKA 用の `reset = king_moved` ではなく、Threat 専用の
             // `needs_threat_refresh` (is_hm_mirror 境界跨ぎのみ true) を使う。
             // 詳細: `threat_features::needs_threat_refresh` doc 参照。
             #[cfg(feature = "nnue-threat")]
@@ -1519,7 +1038,16 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                 let reset_threat =
                     threat_features::needs_threat_refresh(dirty_piece, king_sq, perspective);
                 if reset_threat {
-                    threat_refresh[p] = true;
+                    let threat_acc = acc.get_threat_mut(p);
+                    threat_acc.fill(0);
+                    threat_features::for_each_active_threat_index(
+                        pos,
+                        perspective,
+                        king_sq,
+                        |idx| {
+                            self.add_threat_weights(threat_acc, idx);
+                        },
+                    );
                 } else {
                     let prev_threat = prev_acc.get_threat(p);
                     let curr_threat = acc.get_threat_mut(p);
@@ -1536,35 +1064,38 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                         &mut t_added,
                     );
                     if ok {
-                        self.apply_threat_rows::<false>(curr_threat, &t_removed);
-                        self.apply_threat_rows::<true>(curr_threat, &t_added);
+                        for idx in t_removed.iter() {
+                            self.sub_threat_weights(curr_threat, idx);
+                        }
+                        for idx in t_added.iter() {
+                            self.add_threat_weights(curr_threat, idx);
+                        }
                     } else {
-                        threat_refresh[p] = true;
+                        curr_threat.fill(0);
+                        threat_features::for_each_active_threat_index(
+                            pos,
+                            perspective,
+                            king_sq,
+                            |idx| {
+                                self.add_threat_weights(curr_threat, idx);
+                            },
+                        );
                     }
                 }
             }
-        }
-
-        #[cfg(feature = "nnue-threat")]
-        if self.has_threat {
-            self.refresh_threat_perspectives(pos, acc, threat_refresh);
         }
 
         acc.computed_accumulation = true;
         acc.computed_score = false;
     }
 
-    fn refresh_accumulator_with_cache(
+    /// キャッシュ使用版の refresh（両視点）
+    pub fn refresh_accumulator_with_cache(
         &self,
         pos: &Position,
         acc: &mut AccumulatorLayerStacks<L1>,
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
-        if cfg!(feature = "nnue-effect-bucket") {
-            self.refresh_accumulator(pos, acc);
-            return;
-        }
-
         for perspective in [Color::Black, Color::White] {
             count_refresh!();
             let p = perspective as usize;
@@ -1585,18 +1116,31 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
             {
                 self.refresh_perspective_with_cache(pos, perspective, acc.get_mut(p), cache);
             }
-        }
 
-        #[cfg(feature = "nnue-threat")]
-        if self.has_threat {
-            self.refresh_threat_perspectives(pos, acc, [true; 2]);
+            // Threat はキャッシュ非対象なのでフル再計算
+            #[cfg(feature = "nnue-threat")]
+            if self.has_threat {
+                let king_sq = pos.king_square(perspective);
+                let threat_acc = acc.get_threat_mut(p);
+                threat_acc.fill(0);
+                threat_features::for_each_active_threat_index(pos, perspective, king_sq, |idx| {
+                    self.add_threat_weights(threat_acc, idx);
+                });
+            }
+
+            // KZT-FT アキュムレータ (= threat と同機構、 v0 は常に full refresh)。
+            #[cfg(feature = "nnue-kzt-ft")]
+            if self.has_kzt_ft {
+                let kzt_acc = acc.get_kzt_mut(p);
+                self.refresh_kzt_ft(pos, perspective, kzt_acc);
+            }
         }
 
         acc.computed_accumulation = true;
         acc.computed_score = false;
     }
 
-    /// 単一視点のキャッシュ経由 refresh (piece_list 差分方式)
+    /// 単一視点のキャッシュ経由 refresh (Stockfish 風 piece_list 差分方式)
     ///
     /// 現在の `PieceList` を直接 cache に渡し、cache 内で slot-wise 差分
     /// を取って add/sub を適用する。`append_active_indices` + `sort_unstable`
@@ -1617,263 +1161,50 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
         pos: &Position,
         perspective: Color,
         accumulation: &mut [i16; L1],
-        #[cfg(feature = "nnue-psqt")] psqt_acc: &mut [i32; MAX_LAYER_STACK_PSQT_BUCKETS],
+        #[cfg(feature = "nnue-psqt")] psqt_acc: &mut [i32; NUM_LAYER_STACK_BUCKETS],
         cache: &mut AccumulatorCacheLayerStacks<L1>,
     ) {
-        if cfg!(feature = "nnue-effect-bucket") {
-            accumulation.copy_from_slice(&self.biases.0);
-            let mut active_indices = IndexList::new();
-            append_active_indices::<FT>(pos, perspective, &mut active_indices);
-            for index in active_indices.iter() {
-                self.add_weights(accumulation, index);
-            }
-            #[cfg(feature = "nnue-psqt")]
-            if self.has_psqt {
-                self.refresh_psqt(&active_indices, psqt_acc);
-            }
-            return;
-        }
-
         let king_sq = pos.king_square(perspective);
+        let kb = king_bucket(king_sq, perspective);
+        let hm = is_hm_mirror(king_sq, perspective);
 
-        let raw_piece_list = if perspective == Color::Black {
+        let piece_list = if perspective == Color::Black {
             pos.piece_list().piece_list_fb()
         } else {
             pos.piece_list().piece_list_fw()
         };
 
-        // HalfKp は玉 BonaPiece を特徴量に含めないため、`refresh_or_cache` の
-        // `if bp != ZERO` で skip されるよう玉スロット (KING / KING+1) を ZERO に
-        // マスクして cache に渡す。`INCLUDE_KING_IN_PIECE_LIST = const` なので
-        // HalfKa* 系では本分岐ごと DCE される。
-        let piece_list_owned;
-        let piece_list: &[BonaPiece; PieceNumber::NB] = if FT::INCLUDE_KING_IN_PIECE_LIST {
-            raw_piece_list
-        } else {
-            piece_list_owned = {
-                let mut pl = *raw_piece_list;
-                pl[PieceNumber::KING as usize] = BonaPiece::ZERO;
-                pl[(PieceNumber::KING + 1) as usize] = BonaPiece::ZERO;
-                pl
-            };
-            &piece_list_owned
-        };
-
-        let idx_fn = FT::feature_indexer(perspective, king_sq);
-
-        #[cfg(feature = "nnue-psqt")]
-        if self.has_psqt {
-            cache.refresh_or_cache_with_psqt(
-                (king_sq, perspective),
-                piece_list,
-                &self.biases.0,
-                &self.psqt_biases,
-                accumulation,
-                psqt_acc,
-                self.rows,
-                idx_fn,
-                |pacc, idx| self.add_psqt_weights(pacc, idx),
-                |pacc, idx| self.sub_psqt_weights(pacc, idx),
-            );
-            return;
-        }
-
+        // PSQT は cache に乗せず、 main FT acc のみ cache 経由で差分更新する。
+        // PSQT は別 path (= active_indices 全列挙 → `refresh_psqt`) で処理する。
+        // PSQT acc は accumulator-cache pipeline 内では full refresh するが、 主路 (= update
+        // 経路) では差分更新されるため、 ここの fallback は king 移動時の Finny cache
+        // hit 経路だけ。 オーバーヘッドは限定的 (= per-stack 1 回 / king move)。
         cache.refresh_or_cache(
-            (king_sq, perspective),
+            king_sq,
+            perspective,
             piece_list,
             &self.biases.0,
             accumulation,
-            self.rows,
-            idx_fn,
+            move |bp| halfka_index(kb, pack_bonapiece(bp, hm)),
+            |acc, idx| self.add_weights(acc, idx),
+            |acc, idx| self.sub_weights(acc, idx),
         );
-    }
 
-    #[cfg(any(
-        feature = "layerstack-arch",
-        all(test, not(feature = "nnue-effect-bucket"))
-    ))]
-    fn ensure_accumulator(
-        &self,
-        pos: &Position,
-        stack: &mut AccumulatorStackLayerStacks<L1>,
-        cache: Option<&mut AccumulatorCacheLayerStacks<L1>>,
-    ) {
-        #[cfg(feature = "nnue-threat")]
-        if self.has_threat {
-            self.update_with_threat_ancestor(pos, stack, cache);
-            return;
-        }
-
-        if let Some(previous) = stack.current().previous
-            && stack.entry_at(previous).accumulator.computed_accumulation
-        {
-            let dirty = stack.current().dirty_piece;
-            let (prev, curr) = stack.get_prev_and_current_accumulators(previous);
-            if let Some(cache) = cache {
-                self.update_accumulator_with_cache(pos, &dirty, curr, prev, cache);
-            } else {
-                self.update_accumulator(pos, &dirty, curr, prev);
-            }
-            return;
-        }
-
-        // 広い FT では複数手の差分より Finny refresh の方が安い。
-        let max_depth = if cfg!(feature = "nnue-effect-bucket") {
-            0
-        } else if L1 >= 1536 {
-            1
-        } else {
-            4
-        };
-        if let Some((source, _)) = stack.find_usable_accumulator(max_depth)
-            && self.forward_update_incremental(pos, stack, source)
-        {
-            return;
-        }
-
-        let current = &mut stack.current_mut().accumulator;
-        if let Some(cache) = cache {
-            self.refresh_accumulator_with_cache(pos, current, cache);
-        } else {
-            self.refresh_accumulator(pos, current);
+        #[cfg(feature = "nnue-psqt")]
+        if self.has_psqt {
+            let mut active_indices = IndexList::<MAX_ACTIVE_FEATURES>::new();
+            append_active_indices(pos, perspective, &mut active_indices);
+            self.refresh_psqt(&active_indices, psqt_acc);
         }
     }
 
-    #[cfg(all(feature = "nnue-threat", any(test, feature = "layerstack-arch")))]
-    fn update_with_threat_ancestor(
-        &self,
-        pos: &Position,
-        stack: &mut AccumulatorStackLayerStacks<L1>,
-        mut cache: Option<&mut AccumulatorCacheLayerStacks<L1>>,
-    ) {
-        let dirty = stack.current().dirty_piece;
-        let parent = stack.current().previous.filter(|&i| {
-            i < stack.current_index() && stack.entry_at(i).accumulator.computed_accumulation
-        });
-        for perspective in [Color::Black, Color::White] {
-            let p = perspective.index();
-            let reset = <FT::Set as FeatureSet>::needs_refresh(&dirty, perspective);
-            if let Some(parent) = parent.filter(|_| !reset && !cfg!(feature = "nnue-effect-bucket"))
-            {
-                count_update!();
-                let (prev, current) = stack.get_prev_and_current_accumulators(parent);
-                if !self.try_apply_dirty_piece_fast_from_source(
-                    prev.get(p),
-                    current.get_mut(p),
-                    &dirty,
-                    perspective,
-                    pos.king_square(perspective),
-                ) {
-                    let mut removed = IndexList::new();
-                    let mut added = IndexList::new();
-                    append_changed_indices::<FT>(
-                        &dirty,
-                        perspective,
-                        pos.king_square(perspective),
-                        &mut removed,
-                        &mut added,
-                    );
-                    current.get_mut(p).copy_from_slice(prev.get(p));
-                    for index in removed.iter() {
-                        self.sub_weights(current.get_mut(p), index);
-                    }
-                    for index in added.iter() {
-                        self.add_weights(current.get_mut(p), index);
-                    }
-                }
-                #[cfg(feature = "nnue-psqt")]
-                if self.has_psqt {
-                    let mut removed = IndexList::new();
-                    let mut added = IndexList::new();
-                    append_changed_indices::<FT>(
-                        &dirty,
-                        perspective,
-                        pos.king_square(perspective),
-                        &mut removed,
-                        &mut added,
-                    );
-                    current.psqt_accumulation[p] = prev.psqt_accumulation[p];
-                    for index in removed.iter() {
-                        self.sub_psqt_weights(&mut current.psqt_accumulation[p], index);
-                    }
-                    for index in added.iter() {
-                        self.add_psqt_weights(&mut current.psqt_accumulation[p], index);
-                    }
-                }
-            } else {
-                count_refresh!();
-                let acc = &mut stack.current_mut().accumulator;
-                if let Some(cache) = cache.as_deref_mut() {
-                    self.refresh_perspective_with_cache(
-                        pos,
-                        perspective,
-                        &mut acc.accumulation[p],
-                        #[cfg(feature = "nnue-psqt")]
-                        &mut acc.psqt_accumulation[p],
-                        cache,
-                    );
-                } else {
-                    acc.get_mut(p).copy_from_slice(&self.biases.0);
-                    let mut active = IndexList::new();
-                    append_active_indices::<FT>(pos, perspective, &mut active);
-                    for index in active.iter() {
-                        self.add_weights(acc.get_mut(p), index);
-                    }
-                    #[cfg(feature = "nnue-psqt")]
-                    if self.has_psqt {
-                        self.refresh_psqt(&active, &mut acc.psqt_accumulation[p]);
-                    }
-                }
-            }
-        }
-
-        let mut ancestor = threat_features::ThreatAncestor::new(pos);
-        let mut index = stack.current_index();
-        let mut source = None;
-        // 長い鎖の復元費用を制限し、駒側の Finny 選択とは切り離す。
-        for _ in 0..4 {
-            let entry = stack.entry_at(index);
-            let Some(previous) = entry.previous.filter(|&previous| previous < index) else {
-                break;
-            };
-            ancestor.undo(&entry.dirty_piece);
-            index = previous;
-            if stack.entry_at(index).accumulator.computed_accumulation {
-                source = Some(index);
-                break;
-            }
-        }
-        let mut removed = std::array::from_fn(|_| IndexList::<MAX_CHANGED_THREAT_FEATURES>::new());
-        let mut added = std::array::from_fn(|_| IndexList::<MAX_CHANGED_THREAT_FEATURES>::new());
-        let diff_ok = source.is_some()
-            && threat_features::append_threat_endpoint_diff(&ancestor, &mut removed, &mut added);
-        let refresh = [Color::Black, Color::White].map(|p| !diff_ok || !ancestor.same_mirror(p));
-        for perspective in [Color::Black, Color::White] {
-            let p = perspective.index();
-            if !refresh[p] {
-                let (prev, current) = stack.get_prev_and_current_accumulators(source.unwrap());
-                let threat = current.get_threat_mut(p);
-                threat.copy_from_slice(prev.get_threat(p));
-                self.apply_threat_rows::<false>(threat, &removed[p]);
-                self.apply_threat_rows::<true>(threat, &added[p]);
-            }
-        }
-        self.refresh_threat_perspectives(pos, &mut stack.current_mut().accumulator, refresh);
-        let acc = &mut stack.current_mut().accumulator;
-        acc.computed_accumulation = true;
-        acc.computed_score = false;
-    }
-
-    fn forward_update_incremental(
+    /// 複数手分の差分を適用してアキュムレータを更新
+    pub fn forward_update_incremental(
         &self,
         pos: &Position,
         stack: &mut AccumulatorStackLayerStacks<L1>,
         source_idx: usize,
     ) -> bool {
-        if cfg!(feature = "nnue-effect-bucket") {
-            return false;
-        }
-
         let Some(path) = stack.collect_path(source_idx) else {
             // パスが途切れた場合、または MAX_PATH_LENGTH を超えた場合
             return false;
@@ -1909,7 +1240,7 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                 let king_sq = pos.king_square(perspective);
                 let mut removed = IndexList::new();
                 let mut added = IndexList::new();
-                append_changed_indices::<FT>(
+                append_changed_indices(
                     &dirty_piece,
                     perspective,
                     king_sq,
@@ -1957,7 +1288,6 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                 // 1 ply: pos が正しい after-state なので差分更新可能
                 let entry_idx = path.iter().next().unwrap();
                 let dirty_piece = stack.entry_at(entry_idx).dirty_piece;
-                let mut threat_refresh = [false; 2];
                 for perspective in [Color::Black, Color::White] {
                     let p = perspective as usize;
                     let king_sq = pos.king_square(perspective);
@@ -1973,26 +1303,51 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                     );
                     let threat_acc = stack.current_mut().accumulator.get_threat_mut(p);
                     if ok {
-                        self.apply_threat_rows::<false>(threat_acc, &t_removed);
-                        self.apply_threat_rows::<true>(threat_acc, &t_added);
+                        for idx in t_removed.iter() {
+                            self.sub_threat_weights(threat_acc, idx);
+                        }
+                        for idx in t_added.iter() {
+                            self.add_threat_weights(threat_acc, idx);
+                        }
                     } else {
                         // overflow → full refresh
-                        threat_refresh[p] = true;
+                        threat_acc.fill(0);
+                        threat_features::for_each_active_threat_index(
+                            pos,
+                            perspective,
+                            king_sq,
+                            |idx| {
+                                self.add_threat_weights(threat_acc, idx);
+                            },
+                        );
                     }
                 }
-                self.refresh_threat_perspectives(
-                    pos,
-                    &mut stack.current_mut().accumulator,
-                    threat_refresh,
-                );
             } else {
-                count_threat_multiply!();
-                count_threat_multiply!();
-                self.refresh_threat_perspectives(
-                    pos,
-                    &mut stack.current_mut().accumulator,
-                    [true; 2],
-                );
+                // 2+ plies: full refresh（中間局面が不明）
+                for perspective in [Color::Black, Color::White] {
+                    let p = perspective as usize;
+                    let king_sq = pos.king_square(perspective);
+                    let threat_acc = stack.current_mut().accumulator.get_threat_mut(p);
+                    threat_acc.fill(0);
+                    threat_features::for_each_active_threat_index(
+                        pos,
+                        perspective,
+                        king_sq,
+                        |idx| {
+                            self.add_threat_weights(threat_acc, idx);
+                        },
+                    );
+                }
+            }
+        }
+
+        // KZT-FT: v0 は常に full refresh。 pos は current after-state なので両視点を再計算。
+        #[cfg(feature = "nnue-kzt-ft")]
+        if self.has_kzt_ft {
+            for perspective in [Color::Black, Color::White] {
+                let p = perspective as usize;
+                let kzt_acc = stack.current_mut().accumulator.get_kzt_mut(p);
+                self.refresh_kzt_ft(pos, perspective, kzt_acc);
             }
         }
 
@@ -2007,15 +1362,6 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
     /// weights と accumulation は 64 バイトアラインされている前提で aligned load/store を使用。
     #[inline]
     fn add_weights(&self, accumulation: &mut [i16; L1], index: usize) {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        if let Some(weights) = W::packed(self.rows) {
-            super::ft_packed8::update(weights, None, accumulation, [], [index]);
-            return;
-        }
         let weights = self.weight_row(index);
 
         // AVX-512 BW: 512bit = 32 x i16, L1/32 iterations
@@ -2044,7 +1390,7 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
             return;
         }
 
-        // AVX2: 256bit = 16 x i16, L1/16 iterations
+        // AVX2: 256bit = 16 x i16, L1/64 iterations (4-way unroll で pipeline 効率最大化)
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx2",
@@ -2052,19 +1398,62 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
         ))]
         {
             // SAFETY:
-            // - weights: AlignedBox で 64 バイトアライン、各行は 3072 バイト (64の倍数)
+            // - weights: AlignedBox で 64 バイトアライン
             // - accumulation: Aligned<[i16; L1]> で 64 バイトアライン
-            // - L1 要素 = 16 要素 × L1/16 回のループで完全にカバー
+            // - L1 % 64 == 0 (L1=1536: 24 iter、 768: 12 iter、 512: 8 iter)
+            // - プリフェッチは hint のみで safety に影響しない
+            // 4-way unroll: 1 iter で 64 i16 (4 × 16) 処理、 OoO 実行で 4 load/add/store を pipeline
+            const {
+                assert!(
+                    L1.is_multiple_of(64),
+                    "L1 must be a multiple of 64 for 4-way unrolled AVX2"
+                );
+            }
             unsafe {
                 use std::arch::x86_64::*;
                 let acc_ptr = accumulation.as_mut_ptr();
                 let weight_ptr = weights.as_ptr();
 
-                for i in 0..(L1 / 16) {
-                    let acc_vec = _mm256_load_si256(acc_ptr.add(i * 16) as *const __m256i);
-                    let weight_vec = _mm256_load_si256(weight_ptr.add(i * 16) as *const __m256i);
-                    let result = _mm256_add_epi16(acc_vec, weight_vec);
-                    _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
+                // Prefetch 強化: 5 places、 256 byte stride で行末まで網羅 (L1=1536 = 3072B = 6 prefetch + 先頭)
+                if L1 > 256 {
+                    _mm_prefetch(weight_ptr.add(256) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 512 {
+                    _mm_prefetch(weight_ptr.add(512) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 768 {
+                    _mm_prefetch(weight_ptr.add(768) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 1024 {
+                    _mm_prefetch(weight_ptr.add(1024) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 1280 {
+                    _mm_prefetch(weight_ptr.add(1280) as *const i8, _MM_HINT_T0);
+                }
+
+                // 4-way unroll: 64 i16/iteration
+                let n_iter = L1 / 64;
+                for i in 0..n_iter {
+                    let off0 = i * 64;
+                    let off1 = off0 + 16;
+                    let off2 = off0 + 32;
+                    let off3 = off0 + 48;
+                    let acc0 = _mm256_load_si256(acc_ptr.add(off0) as *const __m256i);
+                    let acc1 = _mm256_load_si256(acc_ptr.add(off1) as *const __m256i);
+                    let acc2 = _mm256_load_si256(acc_ptr.add(off2) as *const __m256i);
+                    let acc3 = _mm256_load_si256(acc_ptr.add(off3) as *const __m256i);
+                    let w0 = _mm256_load_si256(weight_ptr.add(off0) as *const __m256i);
+                    let w1 = _mm256_load_si256(weight_ptr.add(off1) as *const __m256i);
+                    let w2 = _mm256_load_si256(weight_ptr.add(off2) as *const __m256i);
+                    let w3 = _mm256_load_si256(weight_ptr.add(off3) as *const __m256i);
+                    let r0 = _mm256_add_epi16(acc0, w0);
+                    let r1 = _mm256_add_epi16(acc1, w1);
+                    let r2 = _mm256_add_epi16(acc2, w2);
+                    let r3 = _mm256_add_epi16(acc3, w3);
+                    _mm256_store_si256(acc_ptr.add(off0) as *mut __m256i, r0);
+                    _mm256_store_si256(acc_ptr.add(off1) as *mut __m256i, r1);
+                    _mm256_store_si256(acc_ptr.add(off2) as *mut __m256i, r2);
+                    _mm256_store_si256(acc_ptr.add(off3) as *mut __m256i, r3);
                 }
             }
             return;
@@ -2119,19 +1508,21 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
         }
     }
 
-    #[inline]
-    fn weight_row(&self, index: usize) -> &'a [i16] {
-        let weights = W::unpacked(self.rows);
-        let Some(offset) = index.checked_mul(L1) else {
-            feature_index_oob(index, weights.len() / L1);
-        };
-        let Some(end) = offset.checked_add(L1) else {
-            feature_index_oob(index, weights.len() / L1);
-        };
-        if end > weights.len() {
-            feature_index_oob(index, weights.len() / L1);
+    /// `add_weights` / `sub_weights` / `apply_*_fused` から hot path で頻繁に呼ばれる。
+    /// `#[inline(always)]` で **1 つの bound check + panic 1 件** が caller 側に展開され、
+    /// 上位 SIMD loop と pipeline 化される (= LLVM が caller の context で更に削減可能)。
+    ///
+    /// `index * L1` は overflow しない (= HALFKA_HM_DIMENSIONS=73,305 × L1=1536 ~ 1.1e8、
+    /// 64-bit usize の余裕値域)。 `checked_mul` / `checked_add` の overflow check は事実上
+    /// 不要な死コードのため、 通常 mul に置換して unnecessary panic path を削減する。
+    #[inline(always)]
+    fn weight_row(&self, index: usize) -> &[i16] {
+        let offset = index * L1;
+        let end = offset + L1;
+        if end > self.weights.len() {
+            feature_index_oob(index, self.weights.len() / L1);
         }
-        &weights[offset..end]
+        &self.weights[offset..end]
     }
 
     #[inline]
@@ -2142,50 +1533,6 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
         perspective: Color,
         king_sq: crate::types::Square,
     ) -> bool {
-        self.try_apply_dirty_piece_fast_impl::<false>(
-            perspective,
-            king_sq,
-            None,
-            accumulation,
-            dirty_piece,
-        )
-    }
-
-    /// `source` のコピーと通常差分更新を1回の走査で行う。
-    #[inline]
-    fn try_apply_dirty_piece_fast_from_source(
-        &self,
-        source: &[i16; L1],
-        accumulation: &mut [i16; L1],
-        dirty_piece: &DirtyPiece,
-        perspective: Color,
-        king_sq: crate::types::Square,
-    ) -> bool {
-        self.try_apply_dirty_piece_fast_impl::<true>(
-            perspective,
-            king_sq,
-            Some(source),
-            accumulation,
-            dirty_piece,
-        )
-    }
-
-    // 1 byte 型の引数を先頭に置き、register 渡し (Windows x64 は self を含む先頭 4 引数) にする。
-    // stack 渡しにすると、呼び出し側の 1 byte store を呼ばれた側が 4 byte で読み、store-to-load forwarding が効かない。
-    #[inline]
-    fn try_apply_dirty_piece_fast_impl<const FROM_SOURCE: bool>(
-        &self,
-        perspective: Color,
-        king_sq: crate::types::Square,
-        source: Option<&[i16; L1]>,
-        accumulation: &mut [i16; L1],
-        dirty_piece: &DirtyPiece,
-    ) -> bool {
-        if cfg!(feature = "nnue-effect-bucket") {
-            return false;
-        }
-
-        let indexer = FT::feature_indexer(perspective, king_sq);
         let changed = &dirty_piece.changed_piece;
         let old_new = |idx: usize| {
             let entry = &changed[idx];
@@ -2202,24 +1549,6 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
             (old_bp, new_bp)
         };
 
-        // HalfKp で相手玉移動は `needs_refresh` で拾えず fast path に流れる。
-        // 玉 BonaPiece (`>= FE_END`) を `FT::feature_index` に渡すと OOR になるため
-        // slow path (`append_changed_indices` が玉 BP を除外) にフォールバックする。
-        if !FT::INCLUDE_KING_IN_PIECE_LIST {
-            use super::bona_piece::FE_END;
-            let dn = dirty_piece.dirty_num as usize;
-            for entry in changed.iter().take(dn) {
-                let (old_bp, new_bp) = if perspective == Color::Black {
-                    (entry.old_piece.fb, entry.new_piece.fb)
-                } else {
-                    (entry.old_piece.fw, entry.new_piece.fw)
-                };
-                if (old_bp.value() as usize) >= FE_END || (new_bp.value() as usize) >= FE_END {
-                    return false;
-                }
-            }
-        }
-
         // dirty_num==1: 駒の移動（非捕獲）。打ち駒は old_bp==ZERO のためフォールバック。
         // dirty_num==2: 駒を取る指し手のみ。全 BonaPiece は非 ZERO のはずだが、
         //               ZERO チェックでフォールバックを保証する。
@@ -2228,18 +1557,11 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
             1 => {
                 let (old_bp, new_bp) = old_new(0);
                 if old_bp != BonaPiece::ZERO && new_bp != BonaPiece::ZERO {
-                    let sub_index = indexer(old_bp);
-                    let add_index = indexer(new_bp);
-                    if FROM_SOURCE {
-                        self.apply_sub_add_fused_from_source(
-                            source.expect("source is present when FROM_SOURCE is true"),
-                            accumulation,
-                            sub_index,
-                            add_index,
-                        );
-                    } else {
-                        self.apply_sub_add_fused(accumulation, sub_index, add_index);
-                    }
+                    self.apply_sub_add_fused(
+                        accumulation,
+                        feature_index_from_bona_piece(old_bp, perspective, king_sq),
+                        feature_index_from_bona_piece(new_bp, perspective, king_sq),
+                    );
                     true
                 } else {
                     false
@@ -2253,28 +1575,13 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                     && old_bp1 != BonaPiece::ZERO
                     && new_bp1 != BonaPiece::ZERO
                 {
-                    let sub_index0 = indexer(old_bp0);
-                    let add_index0 = indexer(new_bp0);
-                    let sub_index1 = indexer(old_bp1);
-                    let add_index1 = indexer(new_bp1);
-                    if FROM_SOURCE {
-                        self.apply_double_sub_add_fused_from_source(
-                            source.expect("source is present when FROM_SOURCE is true"),
-                            accumulation,
-                            sub_index0,
-                            add_index0,
-                            sub_index1,
-                            add_index1,
-                        );
-                    } else {
-                        self.apply_double_sub_add_fused(
-                            accumulation,
-                            sub_index0,
-                            add_index0,
-                            sub_index1,
-                            add_index1,
-                        );
-                    }
+                    self.apply_double_sub_add_fused(
+                        accumulation,
+                        feature_index_from_bona_piece(old_bp0, perspective, king_sq),
+                        feature_index_from_bona_piece(new_bp0, perspective, king_sq),
+                        feature_index_from_bona_piece(old_bp1, perspective, king_sq),
+                        feature_index_from_bona_piece(new_bp1, perspective, king_sq),
+                    );
                     true
                 } else {
                     false
@@ -2285,239 +1592,12 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
     }
 
     #[inline]
-    fn apply_sub_add_fused_from_source(
-        &self,
-        source: &[i16; L1],
-        accumulation: &mut [i16; L1],
-        sub_index: usize,
-        add_index: usize,
-    ) {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        if let Some(weights) = W::packed(self.rows) {
-            super::ft_packed8::update(
-                weights,
-                Some(source),
-                accumulation,
-                [sub_index],
-                [add_index],
-            );
-            return;
-        }
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            const { assert!(L1.is_multiple_of(32)) };
-            let sub_weights = self.weight_row(sub_index);
-            let add_weights = self.weight_row(add_index);
-
-            // SAFETY:
-            // - source / accumulation は別の AccumulatorLayerStacks の先頭フィールド
-            //   accumulation の各視点（テストでは Aligned）由来。repr(C, align(64)) と
-            //   L1 が 32 の倍数であることから、両視点とも 64 バイトアライン。
-            // - WeightBox の AlignedBox は 64 バイト境界に確保される。共有重みも
-            //   Linux はページ先頭 + 64 バイト、Windows は 64 バイト整列を検証する。
-            //   行幅 L1 * 2 も 64 の倍数で、weight_row が L1 要素の範囲を検証する。
-            // - 32 要素ずつ L1/32 回で範囲内を走査し、読み取り元と書き込み先は重ならない。
-            unsafe {
-                use std::arch::x86_64::*;
-                let source_ptr = source.as_ptr();
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr = sub_weights.as_ptr();
-                let add_ptr = add_weights.as_ptr();
-
-                for i in 0..(L1 / 32) {
-                    let source_vec = _mm512_load_si512(source_ptr.add(i * 32) as *const __m512i);
-                    let sub_vec = _mm512_load_si512(sub_ptr.add(i * 32) as *const __m512i);
-                    let add_vec = _mm512_load_si512(add_ptr.add(i * 32) as *const __m512i);
-                    let result = _mm512_add_epi16(_mm512_sub_epi16(source_vec, sub_vec), add_vec);
-                    _mm512_store_si512(acc_ptr.add(i * 32) as *mut __m512i, result);
-                }
-            }
-            return;
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512bw")
-        ))]
-        {
-            let sub_weights = self.weight_row(sub_index);
-            let add_weights = self.weight_row(add_index);
-
-            // SAFETY:
-            // - source / accumulation は別の AccumulatorLayerStacks 内
-            //   Aligned<[i16; L1]> で、ともに32バイトアライン。
-            // - weight rowも64バイトアラインかつ各行長L1は16の倍数。
-            // - L1要素を16要素ずつ完全に走査し、sourceとweightを読んでから
-            //   対応するaccumulation chunkへstoreする。
-            unsafe {
-                use std::arch::x86_64::*;
-                let source_ptr = source.as_ptr();
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr = sub_weights.as_ptr();
-                let add_ptr = add_weights.as_ptr();
-
-                for i in 0..(L1 / 16) {
-                    let source_vec = _mm256_load_si256(source_ptr.add(i * 16) as *const __m256i);
-                    let sub_vec = _mm256_load_si256(sub_ptr.add(i * 16) as *const __m256i);
-                    let add_vec = _mm256_load_si256(add_ptr.add(i * 16) as *const __m256i);
-                    let result = _mm256_add_epi16(_mm256_sub_epi16(source_vec, sub_vec), add_vec);
-                    _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
-                }
-            }
-            return;
-        }
-
-        #[allow(unreachable_code)]
-        {
-            accumulation.copy_from_slice(source);
-            self.apply_sub_add_fused(accumulation, sub_index, add_index);
-        }
-    }
-
-    #[inline]
-    fn apply_double_sub_add_fused_from_source(
-        &self,
-        source: &[i16; L1],
-        accumulation: &mut [i16; L1],
-        sub_index0: usize,
-        add_index0: usize,
-        sub_index1: usize,
-        add_index1: usize,
-    ) {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        if let Some(weights) = W::packed(self.rows) {
-            super::ft_packed8::update(
-                weights,
-                Some(source),
-                accumulation,
-                [sub_index0, sub_index1],
-                [add_index0, add_index1],
-            );
-            return;
-        }
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            const { assert!(L1.is_multiple_of(32)) };
-            let sub_weights0 = self.weight_row(sub_index0);
-            let add_weights0 = self.weight_row(add_index0);
-            let sub_weights1 = self.weight_row(sub_index1);
-            let add_weights1 = self.weight_row(add_index1);
-
-            // SAFETY: apply_sub_add_fused_from_source の AVX-512 経路と同じく、
-            // source / accumulation は AccumulatorLayerStacks の先頭フィールドの各視点
-            // （テストでは Aligned）由来で 64 バイトアライン。WeightBox の確保元も
-            // ヒープ・共有 mapping ともに 64 バイトアラインで、L1 が 32 の倍数なので
-            // 4 本の weight row の先頭も整列する。weight_row が各行の L1 要素を検証し、
-            // 32 要素ずつ L1/32 回で範囲内を走査する。読み取り元と書き込み先は重ならない。
-            unsafe {
-                use std::arch::x86_64::*;
-                let source_ptr = source.as_ptr();
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr0 = sub_weights0.as_ptr();
-                let add_ptr0 = add_weights0.as_ptr();
-                let sub_ptr1 = sub_weights1.as_ptr();
-                let add_ptr1 = add_weights1.as_ptr();
-
-                for i in 0..(L1 / 32) {
-                    let source_vec = _mm512_load_si512(source_ptr.add(i * 32) as *const __m512i);
-                    let sub_vec0 = _mm512_load_si512(sub_ptr0.add(i * 32) as *const __m512i);
-                    let add_vec0 = _mm512_load_si512(add_ptr0.add(i * 32) as *const __m512i);
-                    let sub_vec1 = _mm512_load_si512(sub_ptr1.add(i * 32) as *const __m512i);
-                    let add_vec1 = _mm512_load_si512(add_ptr1.add(i * 32) as *const __m512i);
-                    let result = _mm512_add_epi16(
-                        _mm512_add_epi16(_mm512_sub_epi16(source_vec, sub_vec0), add_vec0),
-                        _mm512_sub_epi16(add_vec1, sub_vec1),
-                    );
-                    _mm512_store_si512(acc_ptr.add(i * 32) as *mut __m512i, result);
-                }
-            }
-            return;
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512bw")
-        ))]
-        {
-            let sub_weights0 = self.weight_row(sub_index0);
-            let add_weights0 = self.weight_row(add_index0);
-            let sub_weights1 = self.weight_row(sub_index1);
-            let add_weights1 = self.weight_row(add_index1);
-
-            // SAFETY: apply_sub_add_fused_from_sourceと同じ。4本のweight rowも
-            // すべてL1要素あり、16要素単位で完全に走査する。
-            unsafe {
-                use std::arch::x86_64::*;
-                let source_ptr = source.as_ptr();
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr0 = sub_weights0.as_ptr();
-                let add_ptr0 = add_weights0.as_ptr();
-                let sub_ptr1 = sub_weights1.as_ptr();
-                let add_ptr1 = add_weights1.as_ptr();
-
-                for i in 0..(L1 / 16) {
-                    let source_vec = _mm256_load_si256(source_ptr.add(i * 16) as *const __m256i);
-                    let sub_vec0 = _mm256_load_si256(sub_ptr0.add(i * 16) as *const __m256i);
-                    let add_vec0 = _mm256_load_si256(add_ptr0.add(i * 16) as *const __m256i);
-                    let sub_vec1 = _mm256_load_si256(sub_ptr1.add(i * 16) as *const __m256i);
-                    let add_vec1 = _mm256_load_si256(add_ptr1.add(i * 16) as *const __m256i);
-                    let result = _mm256_add_epi16(
-                        _mm256_add_epi16(_mm256_sub_epi16(source_vec, sub_vec0), add_vec0),
-                        _mm256_sub_epi16(add_vec1, sub_vec1),
-                    );
-                    _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
-                }
-            }
-            return;
-        }
-
-        #[allow(unreachable_code)]
-        {
-            accumulation.copy_from_slice(source);
-            self.apply_double_sub_add_fused(
-                accumulation,
-                sub_index0,
-                add_index0,
-                sub_index1,
-                add_index1,
-            );
-        }
-    }
-
-    #[inline]
     fn apply_sub_add_fused(
         &self,
         accumulation: &mut [i16; L1],
         sub_index: usize,
         add_index: usize,
     ) {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        if let Some(weights) = W::packed(self.rows) {
-            super::ft_packed8::update(weights, None, accumulation, [sub_index], [add_index]);
-            return;
-        }
         let sub_weights = self.weight_row(sub_index);
         let add_weights = self.weight_row(add_index);
 
@@ -2559,17 +1639,36 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
             // SAFETY:
             // - accumulation / weight row はともに 32 バイトアライン（3072 = 32 × 96）。
             // - L1 要素を 16 要素ずつ L1/16 回で完全に走査する。
+            // - 依存連鎖短縮: `diff = add - sub` は acc とは独立に計算でき、 acc_load と並列実行可能。
+            //   元の `(acc - sub) + add` は acc_load → sub → add の 3-step critical path だったが
+            //   新形式は (acc_load) と (diff = add - sub) が並列、 (acc + diff) が 1-step で済む。
             unsafe {
                 use std::arch::x86_64::*;
                 let acc_ptr = accumulation.as_mut_ptr();
                 let sub_ptr = sub_weights.as_ptr();
                 let add_ptr = add_weights.as_ptr();
 
+                // Prefetch: sub / add の 2 行を行末まで網羅 (256 byte stride)
+                if L1 > 256 {
+                    _mm_prefetch(sub_ptr.add(256) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(add_ptr.add(256) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 512 {
+                    _mm_prefetch(sub_ptr.add(512) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(add_ptr.add(512) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 1024 {
+                    _mm_prefetch(sub_ptr.add(1024) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(add_ptr.add(1024) as *const i8, _MM_HINT_T0);
+                }
+
                 for i in 0..(L1 / 16) {
                     let acc_vec = _mm256_load_si256(acc_ptr.add(i * 16) as *const __m256i);
                     let sub_vec = _mm256_load_si256(sub_ptr.add(i * 16) as *const __m256i);
                     let add_vec = _mm256_load_si256(add_ptr.add(i * 16) as *const __m256i);
-                    let result = _mm256_add_epi16(_mm256_sub_epi16(acc_vec, sub_vec), add_vec);
+                    // diff = add - sub (acc に依存しない、 OoO で acc_load と並列実行)
+                    let diff = _mm256_sub_epi16(add_vec, sub_vec);
+                    let result = _mm256_add_epi16(acc_vec, diff);
                     _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
                 }
             }
@@ -2595,7 +1694,9 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                     let acc_vec = _mm_load_si128(acc_ptr.add(i * 8) as *const __m128i);
                     let sub_vec = _mm_load_si128(sub_ptr.add(i * 8) as *const __m128i);
                     let add_vec = _mm_load_si128(add_ptr.add(i * 8) as *const __m128i);
-                    let result = _mm_add_epi16(_mm_sub_epi16(acc_vec, sub_vec), add_vec);
+                    // 依存連鎖短縮
+                    let diff = _mm_sub_epi16(add_vec, sub_vec);
+                    let result = _mm_add_epi16(acc_vec, diff);
                     _mm_store_si128(acc_ptr.add(i * 8) as *mut __m128i, result);
                 }
             }
@@ -2641,21 +1742,6 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
         sub_index1: usize,
         add_index1: usize,
     ) {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        if let Some(weights) = W::packed(self.rows) {
-            super::ft_packed8::update(
-                weights,
-                None,
-                accumulation,
-                [sub_index0, sub_index1],
-                [add_index0, add_index1],
-            );
-            return;
-        }
         let sub_weights0 = self.weight_row(sub_index0);
         let add_weights0 = self.weight_row(add_index0);
         let sub_weights1 = self.weight_row(sub_index1);
@@ -2706,6 +1792,10 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
             // SAFETY:
             // - accumulation / 4 本の weight row はともに 32 バイトアライン（3072 = 32 × 96）。
             // - L1 要素を 16 要素ずつ L1/16 回で完全に走査する。
+            // - 依存連鎖短縮: `diff0 = add0 - sub0` と `diff1 = add1 - sub1` を acc と並列計算。
+            //   さらに `combined = diff0 + diff1` を acc_load と並列実行できるため、 acc が
+            //   load されてから result = acc + combined までの critical path が 1 add (1 cycle) に
+            //   短縮される (元の `(acc - sub0) + add0 + (add1 - sub1)` は acc依存の 2 連鎖だった)。
             unsafe {
                 use std::arch::x86_64::*;
                 let acc_ptr = accumulation.as_mut_ptr();
@@ -2714,16 +1804,31 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
                 let sub_ptr1 = sub_weights1.as_ptr();
                 let add_ptr1 = add_weights1.as_ptr();
 
+                // Prefetch: 4 本の weight row を 行末まで網羅 (256 byte stride、 8 prefetch hint)
+                if L1 > 256 {
+                    _mm_prefetch(sub_ptr0.add(256) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(add_ptr0.add(256) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sub_ptr1.add(256) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(add_ptr1.add(256) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 1024 {
+                    _mm_prefetch(sub_ptr0.add(1024) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(add_ptr0.add(1024) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sub_ptr1.add(1024) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(add_ptr1.add(1024) as *const i8, _MM_HINT_T0);
+                }
+
                 for i in 0..(L1 / 16) {
                     let acc_vec = _mm256_load_si256(acc_ptr.add(i * 16) as *const __m256i);
                     let sub_vec0 = _mm256_load_si256(sub_ptr0.add(i * 16) as *const __m256i);
                     let add_vec0 = _mm256_load_si256(add_ptr0.add(i * 16) as *const __m256i);
                     let sub_vec1 = _mm256_load_si256(sub_ptr1.add(i * 16) as *const __m256i);
                     let add_vec1 = _mm256_load_si256(add_ptr1.add(i * 16) as *const __m256i);
-                    let result = _mm256_add_epi16(
-                        _mm256_add_epi16(_mm256_sub_epi16(acc_vec, sub_vec0), add_vec0),
-                        _mm256_sub_epi16(add_vec1, sub_vec1),
-                    );
+                    // diff0, diff1 は acc に依存しない → acc_load と並列実行
+                    let diff0 = _mm256_sub_epi16(add_vec0, sub_vec0);
+                    let diff1 = _mm256_sub_epi16(add_vec1, sub_vec1);
+                    let combined = _mm256_add_epi16(diff0, diff1);
+                    let result = _mm256_add_epi16(acc_vec, combined);
                     _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
                 }
             }
@@ -2814,15 +1919,6 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
     /// weights と accumulation は 64 バイトアラインされている前提で aligned load/store を使用。
     #[inline]
     fn sub_weights(&self, accumulation: &mut [i16; L1], index: usize) {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        if let Some(weights) = W::packed(self.rows) {
-            super::ft_packed8::update(weights, None, accumulation, [index], []);
-            return;
-        }
         let weights = self.weight_row(index);
 
         // AVX-512 BW: 512bit = 32 x i16, L1/32 iterations
@@ -2848,24 +1944,65 @@ impl<'a, const L1: usize, FT: LsFeatureSpec, W: PieceWeight> PieceTransformer<'a
             return;
         }
 
-        // AVX2: 256bit = 16 x i16, L1/16 iterations
+        // AVX2: 256bit = 16 x i16, L1/64 iterations (4-way unroll で pipeline 効率最大化)
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx2",
             not(target_feature = "avx512bw")
         ))]
         {
-            // SAFETY: add_weights と同様
+            // SAFETY: add_weights と同様 (4-way unroll + prefetch)
+            const {
+                assert!(
+                    L1.is_multiple_of(64),
+                    "L1 must be a multiple of 64 for 4-way unrolled AVX2"
+                );
+            }
             unsafe {
                 use std::arch::x86_64::*;
                 let acc_ptr = accumulation.as_mut_ptr();
                 let weight_ptr = weights.as_ptr();
 
-                for i in 0..(L1 / 16) {
-                    let acc_vec = _mm256_load_si256(acc_ptr.add(i * 16) as *const __m256i);
-                    let weight_vec = _mm256_load_si256(weight_ptr.add(i * 16) as *const __m256i);
-                    let result = _mm256_sub_epi16(acc_vec, weight_vec);
-                    _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
+                // Prefetch 強化: 256 byte stride で行末まで網羅
+                if L1 > 256 {
+                    _mm_prefetch(weight_ptr.add(256) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 512 {
+                    _mm_prefetch(weight_ptr.add(512) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 768 {
+                    _mm_prefetch(weight_ptr.add(768) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 1024 {
+                    _mm_prefetch(weight_ptr.add(1024) as *const i8, _MM_HINT_T0);
+                }
+                if L1 > 1280 {
+                    _mm_prefetch(weight_ptr.add(1280) as *const i8, _MM_HINT_T0);
+                }
+
+                // 4-way unroll: 64 i16/iteration
+                let n_iter = L1 / 64;
+                for i in 0..n_iter {
+                    let off0 = i * 64;
+                    let off1 = off0 + 16;
+                    let off2 = off0 + 32;
+                    let off3 = off0 + 48;
+                    let acc0 = _mm256_load_si256(acc_ptr.add(off0) as *const __m256i);
+                    let acc1 = _mm256_load_si256(acc_ptr.add(off1) as *const __m256i);
+                    let acc2 = _mm256_load_si256(acc_ptr.add(off2) as *const __m256i);
+                    let acc3 = _mm256_load_si256(acc_ptr.add(off3) as *const __m256i);
+                    let w0 = _mm256_load_si256(weight_ptr.add(off0) as *const __m256i);
+                    let w1 = _mm256_load_si256(weight_ptr.add(off1) as *const __m256i);
+                    let w2 = _mm256_load_si256(weight_ptr.add(off2) as *const __m256i);
+                    let w3 = _mm256_load_si256(weight_ptr.add(off3) as *const __m256i);
+                    let r0 = _mm256_sub_epi16(acc0, w0);
+                    let r1 = _mm256_sub_epi16(acc1, w1);
+                    let r2 = _mm256_sub_epi16(acc2, w2);
+                    let r3 = _mm256_sub_epi16(acc3, w3);
+                    _mm256_store_si256(acc_ptr.add(off0) as *mut __m256i, r0);
+                    _mm256_store_si256(acc_ptr.add(off1) as *mut __m256i, r1);
+                    _mm256_store_si256(acc_ptr.add(off2) as *mut __m256i, r2);
+                    _mm256_store_si256(acc_ptr.add(off3) as *mut __m256i, r3);
                 }
             }
             return;
@@ -2926,685 +2063,42 @@ mod tests {
     use super::*;
     use crate::nnue::accumulator::ChangedBonaPiece;
     use crate::nnue::bona_piece::ExtBonaPiece;
-    #[cfg(feature = "nnue-psqt")]
-    use crate::nnue::constants::DEFAULT_NUM_BUCKETS;
-
     use crate::nnue::constants::NNUE_PYTORCH_L1;
-    use crate::nnue::ls_feature_spec::HalfKaHmMergedSpec;
     use crate::nnue::piece_list::PieceNumber;
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    use crate::types::Piece;
-    use crate::types::{File, PieceType, Rank, Square};
+    use crate::types::{File, Piece, PieceType, Rank, Square};
 
     const TEST_L1: usize = NNUE_PYTORCH_L1;
 
-    type TestSpec = HalfKaHmMergedSpec;
-    type TestFt = FeatureTransformerLayerStacks<TEST_L1, TestSpec>;
-
-    #[cfg(all(
-        feature = "nnue-threat",
-        any(feature = "layerstack-arch", not(feature = "nnue-effect-bucket"))
-    ))]
-    #[test]
-    fn threat_walk_matches_full_refresh_after_undo_and_redo() {
-        use crate::movegen::{MoveList, generate_legal_all};
-        use rand::{Rng, SeedableRng};
-        use rand_xoshiro::Xoshiro256PlusPlus;
-
-        const L1: usize = 1536;
-        let mut ft = FeatureTransformerLayerStacks::<L1, TestSpec>::for_accumulator_tests();
-        ft.has_threat = true;
-        let width = threat_width(L1);
-        for (row, weights) in ft.threat_weights.make_mut().chunks_exact_mut(width).enumerate() {
-            let seed = (row as u32).wrapping_mul(0x9e37_79b9);
-            for (lane, weight) in weights.iter_mut().enumerate() {
-                *weight = (seed.rotate_left((lane % 32) as u32) >> 24) as i8;
-            }
-        }
-        let check = |pos: &Position, stack: &AccumulatorStackLayerStacks<L1>| {
-            let mut fresh = AccumulatorLayerStacks::new();
-            ft.refresh_accumulator(pos, &mut fresh);
-            let actual = &stack.current().accumulator;
-            assert!(actual.computed_accumulation);
-            for p in 0..2 {
-                assert_eq!(actual.get_threat(p), fresh.get_threat(p), "{} p={p}", pos.to_sfen());
-            }
-        };
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x1536_7aee);
-        let mut covered = [false; 4];
-        let mut batch_lengths = [false; 5];
-        for _ in 0..4 {
-            let mut pos = Position::new();
-            pos.set_sfen(crate::position::SFEN_HIRATE).unwrap();
-            let mut stack = AccumulatorStackLayerStacks::new();
-            let mut cache = AccumulatorCacheLayerStacks::new();
-            ft.refresh_accumulator(&pos, &mut stack.current_mut().accumulator);
-            for batch in 0..40 {
-                // 5 手の batch は祖先を遡る上限 (4 手) を超えて全部の作り直しになるので、手の種類は数えない
-                let via_diff = batch % 5 != 4;
-                let mut played = Vec::new();
-                for _ in 0..=batch % 5 {
-                    let mut legal = MoveList::new();
-                    generate_legal_all(&pos, &mut legal);
-                    if legal.is_empty() {
-                        break;
-                    }
-                    let mv = legal[rng.random_range(0..legal.len())];
-                    if via_diff {
-                        covered[0] |= !pos.piece_on(mv.to()).is_none();
-                        covered[1] |= mv.is_promote();
-                        covered[2] |= mv.is_drop();
-                        covered[3] |= !mv.is_drop()
-                            && pos.piece_on(mv.from()).piece_type() == PieceType::King;
-                    }
-                    stack.push();
-                    stack.current_mut().dirty_piece = pos.do_move(mv, pos.gives_check(mv));
-                    played.push(mv);
-                }
-                if played.is_empty() {
-                    break;
-                }
-                batch_lengths[played.len() - 1] = true;
-                ft.ensure_accumulator(&pos, &mut stack, Some(&mut cache));
-                check(&pos, &stack);
-
-                for &mv in played.iter().rev() {
-                    pos.undo_move(mv);
-                    stack.pop();
-                }
-                check(&pos, &stack);
-                for mv in played {
-                    stack.push();
-                    stack.current_mut().dirty_piece = pos.do_move(mv, pos.gives_check(mv));
-                }
-                ft.ensure_accumulator(&pos, &mut stack, Some(&mut cache));
-                check(&pos, &stack);
-            }
-        }
-        assert_eq!(covered, [true; 4], "捕獲・成り・駒打ち・玉移動");
-        assert_eq!(batch_lengths, [true; 5]);
-    }
-
-    #[cfg(feature = "nnue-psqt")]
-    #[test]
-    fn read_psqt_rejects_out_of_range_bucket_counts() {
-        let mut ft = make_test_transformer();
-        for n in [0, 33, 64] {
-            let err = ft.read_psqt(&mut io::empty(), n).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-            if n > 0 {
-                assert_eq!(
-                    err.to_string(),
-                    "LayerStacks nets with PSQT support at most 32 buckets"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn fixed_width_loaders_handle_width_48_for_compiled_simd() {
-        const WIDTH: usize = 48;
-        type Ft = FeatureTransformerLayerStacks<WIDTH, TestSpec>;
-        let element_count = (1 + TestSpec::DIMENSIONS) * WIDTH;
-        let raw = vec![0; 2 * element_count];
-        let mut compressed = crate::nnue::leb128::LEB128_MAGIC.to_vec();
-        compressed.extend_from_slice(&(element_count as u32).to_le_bytes());
-        compressed.resize(compressed.len() + element_count, 0);
-
-        for result in [
-            Ft::read(&mut raw.as_slice()),
-            Ft::read_leb128(&mut compressed.as_slice()),
-        ] {
-            if cfg!(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512bw"
-            )) {
-                let error = result.err().expect("width 48 must be rejected");
-                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-                assert!(error.to_string().contains("multiple of 32, got 48"));
-            } else {
-                let ft = result.unwrap();
-                assert_eq!(ft.piece_ft_storage(), "i16");
-                assert_eq!(ft.piece_weights().len(), TestSpec::DIMENSIONS * WIDTH);
-            }
-        }
-    }
-
-    fn make_test_transformer() -> TestFt {
-        FeatureTransformerLayerStacks::<TEST_L1, TestSpec> {
+    fn make_test_transformer() -> FeatureTransformerLayerStacks<TEST_L1> {
+        FeatureTransformerLayerStacks::<TEST_L1> {
             biases: Aligned([0; TEST_L1]),
-            weights: AlignedBox::new_zeroed(TestSpec::DIMENSIONS * TEST_L1).into(),
+            weights: AlignedBox::new_zeroed(HALFKA_HM_DIMENSIONS * TEST_L1),
             #[cfg(feature = "nnue-psqt")]
-            psqt_biases: [0; MAX_LAYER_STACK_PSQT_BUCKETS],
+            psqt_biases: [0; NUM_LAYER_STACK_BUCKETS],
             #[cfg(feature = "nnue-psqt")]
-            psqt_num_buckets: 0,
-            #[cfg(feature = "nnue-psqt")]
-            psqt_weights: AlignedBox::new_zeroed(0).into(),
+            psqt_weights: AlignedBox::new_zeroed(0),
             #[cfg(feature = "nnue-psqt")]
             has_psqt: false,
             #[cfg(feature = "nnue-threat")]
-            threat_weights: AlignedBox::new_zeroed(0).into(),
+            threat_weights: AlignedBox::new_zeroed(0),
             #[cfg(feature = "nnue-threat")]
             has_threat: false,
-            _ft: PhantomData,
+            #[cfg(feature = "nnue-kzt-ft")]
+            kzt_ft_weights: AlignedBox::new_zeroed(0),
+            #[cfg(feature = "nnue-kzt-ft")]
+            has_kzt_ft: false,
         }
     }
 
-    #[cfg(feature = "nnue-threat")]
-    #[test]
-    fn shared_threat_full_refresh_matches_per_perspective_raw_accumulator() {
-        fn check<const N: usize>() {
-            let mut ft = FeatureTransformerLayerStacks::<N, TestSpec>::for_accumulator_tests();
-            ft.has_threat = true;
-            for (i, w) in ft.threat_weights.make_mut().iter_mut().enumerate() {
-                *w = (i as u8).wrapping_mul(73).wrapping_add((i / threat_width(N)) as u8) as i8;
-            }
-            threat_features::for_each_full_refresh_test_position(|pos| {
-                let mut expected = [super::super::threat_width::zero::<N>(); 2];
-                for perspective in [Color::Black, Color::White] {
-                    threat_features::for_each_active_threat_index(
-                        pos,
-                        perspective,
-                        pos.king_square(perspective),
-                        |index| {
-                            for (a, &w) in expected[perspective.index()]
-                                .iter_mut()
-                                .zip(ft.threat_weight_row(index))
-                            {
-                                *a = a.wrapping_add(i16::from(w));
-                            }
-                        },
-                    );
-                }
-                let mut actual = AccumulatorLayerStacks::<N>::new();
-                for refresh in [[true, true], [true, false], [false, true], [false, false]] {
-                    let mut sentinel = super::super::threat_width::zero::<N>();
-                    sentinel.fill(i16::MAX);
-                    actual.threat_accumulation.fill(sentinel);
-                    ft.refresh_threat_perspectives(pos, &mut actual, refresh);
-                    for p in 0..2 {
-                        assert_eq!(
-                            actual.get_threat(p),
-                            if refresh[p] { &expected[p] } else { &sentinel }
-                        );
-                    }
-                }
-                ft.refresh_accumulator(pos, &mut actual);
-                assert_eq!(actual.threat_accumulation, expected);
-                let mut cache = AccumulatorCacheLayerStacks::<N>::new();
-                ft.refresh_accumulator_with_cache(pos, &mut actual, &mut cache);
-                assert_eq!(actual.threat_accumulation, expected);
-                let mut stack = AccumulatorStackLayerStacks::<N>::new();
-                ft.update_with_threat_ancestor(pos, &mut stack, Some(&mut cache));
-                assert_eq!(stack.current().accumulator.threat_accumulation, expected);
-            });
-        }
-        check::<32>();
-        check::<288>();
-        check::<1536>();
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[test]
-    fn threat_ancestor_matches_full_refresh() {
-        use crate::movegen::{MoveList, generate_legal};
-        const N: usize = if cfg!(feature = "layerstacks-1024x16x64") {
-            1024
-        } else if cfg!(feature = "layerstacks-2304x16x64") {
-            2304
-        } else if cfg!(any(feature = "threat-width-512", feature = "threat-width-768")) {
-            1536
-        } else {
-            64
-        };
-        let mut ft = FeatureTransformerLayerStacks::<N, TestSpec>::for_accumulator_tests();
-        ft.has_threat = true;
-        let width = super::super::expected_threat_width(N);
-        assert_eq!(ft.threat_weights.len(), THREAT_DIMENSIONS * width);
-        assert_eq!(AccumulatorLayerStacks::<N>::new().get_threat(0).len(), width);
-        for (i, w) in ft.threat_weights.make_mut().iter_mut().enumerate() {
-            *w = ((i * 73 + i / width * 19) % 255) as i8;
-        }
-        for (i, w) in ft.weights.make_mut().iter_mut().enumerate() {
-            *w = ((i * 17 + i / N * 23) % 511) as i16 - 255;
-        }
-        ft.biases.0.fill(i16::MAX - 100);
-        #[cfg(feature = "nnue-psqt")]
-        {
-            ft.has_psqt = true;
-            ft.psqt_num_buckets = MAX_LAYER_STACK_PSQT_BUCKETS;
-            ft.psqt_weights =
-                AlignedBox::new_zeroed(TestSpec::DIMENSIONS * MAX_LAYER_STACK_PSQT_BUCKETS).into();
-            for (i, w) in ft.psqt_weights.make_mut().iter_mut().enumerate() {
-                *w = ((i * 37 + i / MAX_LAYER_STACK_PSQT_BUCKETS * 13) % 1023) as i32 - 511;
-            }
-            for (bucket, bias) in ft.psqt_biases.iter_mut().enumerate() {
-                *bias = bucket as i32 * 101 - 353;
-            }
-        }
-        let sfens = [
-            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
-            "+Bn1g2s1l/2skg2r1/ppppp1n1p/5bpp1/5p1P1/2P6/PP1PP1P1P/1SK2S1R1/LN1G1G1NL w Lp 24",
-            "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",
-            "l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w RGgsn5p 1",
-            "4k4/9/9/9/9/9/9/4K4/9 b RBGSNLP 1",
-        ];
-        for sfen in sfens {
-            for cached in [false, true] {
-                for stride in [1, 2, 4, 6] {
-                    let mut pos = Position::new();
-                    pos.set_sfen(sfen).unwrap();
-                    let mut stack = AccumulatorStackLayerStacks::<N>::new();
-                    let mut cache = AccumulatorCacheLayerStacks::<N>::new();
-                    ft.refresh_accumulator(&pos, &mut stack.current_mut().accumulator);
-                    let mut direct = stack.current().accumulator.clone();
-                    let mut moves = Vec::new();
-                    for ply in 0..24 {
-                        let mut list = MoveList::new();
-                        generate_legal(&pos, &mut list);
-                        if list.is_empty() {
-                            break;
-                        }
-                        let mv = list[(ply * 137 + stride * 31) % list.len()];
-                        let dirty = pos.do_move(mv, pos.gives_check(mv));
-                        stack.push();
-                        stack.current_mut().dirty_piece = dirty;
-                        moves.push(mv);
-                        let mut next_direct = AccumulatorLayerStacks::<N>::new();
-                        if cached {
-                            ft.update_accumulator_with_cache(
-                                &pos,
-                                &dirty,
-                                &mut next_direct,
-                                &direct,
-                                &mut cache,
-                            );
-                        } else {
-                            ft.update_accumulator(&pos, &dirty, &mut next_direct, &direct);
-                        }
-                        direct = next_direct;
-                        if (ply + 1) % stride == 0 {
-                            ft.update_with_threat_ancestor(
-                                &pos,
-                                &mut stack,
-                                cached.then_some(&mut cache),
-                            );
-                            let mut expected = AccumulatorLayerStacks::<N>::new();
-                            ft.refresh_accumulator(&pos, &mut expected);
-                            assert_eq!(direct.accumulation, expected.accumulation);
-                            assert_eq!(direct.threat_accumulation, expected.threat_accumulation);
-                            #[cfg(feature = "nnue-psqt")]
-                            assert_eq!(direct.psqt_accumulation, expected.psqt_accumulation);
-                            assert_eq!(
-                                stack.current().accumulator.accumulation,
-                                expected.accumulation,
-                                "piece {sfen}, ply {ply}, stride {stride}"
-                            );
-                            assert_eq!(
-                                stack.current().accumulator.threat_accumulation,
-                                expected.threat_accumulation,
-                                "threat {sfen}, ply {ply}, stride {stride}"
-                            );
-                            #[cfg(feature = "nnue-psqt")]
-                            assert_eq!(
-                                stack.current().accumulator.psqt_accumulation,
-                                expected.psqt_accumulation,
-                                "psqt {sfen}, ply {ply}, stride {stride}, cached {cached}"
-                            );
-                            if !pos.in_check() {
-                                pos.do_null_move();
-                                stack.push();
-                                ft.update_with_threat_ancestor(
-                                    &pos,
-                                    &mut stack,
-                                    cached.then_some(&mut cache),
-                                );
-                                assert_eq!(
-                                    stack.current().accumulator.threat_accumulation,
-                                    expected.threat_accumulation
-                                );
-                                assert_eq!(
-                                    stack.current().accumulator.accumulation,
-                                    expected.accumulation
-                                );
-                                #[cfg(feature = "nnue-psqt")]
-                                assert_eq!(
-                                    stack.current().accumulator.psqt_accumulation,
-                                    expected.psqt_accumulation
-                                );
-                                stack.pop();
-                                pos.undo_null_move();
-                            }
-                        }
-                    }
-                    while let Some(mv) = moves.pop() {
-                        stack.pop();
-                        pos.undo_move(mv);
-                        ft.update_with_threat_ancestor(
-                            &pos,
-                            &mut stack,
-                            cached.then_some(&mut cache),
-                        );
-                        let mut expected = AccumulatorLayerStacks::<N>::new();
-                        ft.refresh_accumulator(&pos, &mut expected);
-                        assert_eq!(
-                            stack.current().accumulator.threat_accumulation,
-                            expected.threat_accumulation
-                        );
-                        assert_eq!(stack.current().accumulator.accumulation, expected.accumulation);
-                        #[cfg(feature = "nnue-psqt")]
-                        assert_eq!(
-                            stack.current().accumulator.psqt_accumulation,
-                            expected.psqt_accumulation
-                        );
-                    }
-                    stack.reset();
-                    ft.threat_weights.make_mut()[0] = ft.threat_weights[0].wrapping_add(1);
-                    ft.update_with_threat_ancestor(&pos, &mut stack, cached.then_some(&mut cache));
-                    let mut expected = AccumulatorLayerStacks::<N>::new();
-                    ft.refresh_accumulator(&pos, &mut expected);
-                    #[cfg(feature = "nnue-psqt")]
-                    assert_eq!(
-                        stack.current().accumulator.psqt_accumulation,
-                        expected.psqt_accumulation
-                    );
-                    assert_eq!(
-                        stack.current().accumulator.threat_accumulation,
-                        expected.threat_accumulation
-                    );
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[test]
-    fn full_threat_batches_match_wrapping_scalar() {
-        fn check<const N: usize>() {
-            let mut ft = FeatureTransformerLayerStacks::<N, TestSpec>::for_output_transform_tests();
-            let mut weights = AlignedBox::<i8>::new_zeroed(threat_width(N) * 3);
-            for (i, w) in weights.iter_mut().enumerate() {
-                *w = match i % 7 {
-                    0 => i8::MIN,
-                    1 => i8::MAX,
-                    _ => (i as u8).wrapping_mul(73) as i8,
-                };
-            }
-            ft.threat_weights = weights.into();
-            for count in [0, 1, 3, 133, 173, 191, 192, 193, 385, 769] {
-                for repeated in [false, true] {
-                    let mut actual = super::super::threat_width::zero::<N>();
-                    actual.fill(i16::MAX);
-                    let mut expected = super::super::threat_width::zero::<N>();
-                    let mut batch = ThreatRefreshBatch::new();
-                    for i in 0..count {
-                        let index = if repeated { 0 } else { i % 3 };
-                        batch.push(&ft, &mut actual, index);
-                        for (a, &w) in expected.iter_mut().zip(ft.threat_weight_row(index)) {
-                            *a = a.wrapping_add(i16::from(w));
-                        }
-                    }
-                    batch.flush(&ft, &mut actual);
-                    assert_eq!(actual, expected, "width {N}, count {count}, repeated {repeated}");
-                }
-            }
-            for count in [0, 1, 3, 192] {
-                let indices = vec![0; count];
-                let mut actual = super::super::threat_width::zero::<N>();
-                for (i, a) in actual.iter_mut().enumerate() {
-                    *a = if i % 2 == 0 { i16::MAX } else { i16::MIN };
-                }
-                let mut expected = actual;
-                for &index in &indices {
-                    for (a, &w) in expected.iter_mut().zip(ft.threat_weight_row(index)) {
-                        *a = a.wrapping_add(i16::from(w));
-                    }
-                }
-                ft.apply_threat_refresh_batch::<false>(&mut actual, &indices);
-                assert_eq!(actual, expected, "continuation width {N}, count {count}");
-            }
-        }
-        check::<96>();
-        check::<128>();
-        check::<256>();
-        check::<288>();
-        check::<512>();
-        check::<768>();
-        check::<1536>();
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[test]
-    fn full_threat_refresh_matches_scalar_raw_accumulator() {
-        const N: usize = if cfg!(feature = "layerstacks-1024x16x64") {
-            1024
-        } else if cfg!(feature = "layerstacks-2304x16x64") {
-            2304
-        } else if cfg!(any(feature = "threat-width-512", feature = "threat-width-768")) {
-            1536
-        } else {
-            256
-        };
-        let mut ft = FeatureTransformerLayerStacks::<N, TestSpec>::for_accumulator_tests();
-        ft.has_threat = true;
-        let width = super::super::expected_threat_width(N);
-        assert_eq!(ft.threat_weights.len(), THREAT_DIMENSIONS * width);
-        for (i, w) in ft.threat_weights.make_mut().iter_mut().enumerate() {
-            *w = (i as u8).wrapping_mul(73).wrapping_add((i / width) as u8) as i8;
-        }
-        for sfen in [
-            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
-            "+Bn1g2s1l/2skg2r1/ppppp1n1p/5bpp1/5p1P1/2P6/PP1PP1P1P/1SK2S1R1/LN1G1G1NL w Lp 24",
-            "4k4/9/9/9/9/9/9/4K4/9 b RBGSNLP 1",
-        ] {
-            let mut pos = Position::new();
-            pos.set_sfen(sfen).unwrap();
-            let mut expected = [vec![0i16; width], vec![0i16; width]];
-            for perspective in [Color::Black, Color::White] {
-                threat_features::for_each_active_threat_index(
-                    &pos,
-                    perspective,
-                    pos.king_square(perspective),
-                    |index| {
-                        for (a, &w) in expected[perspective.index()]
-                            .iter_mut()
-                            .zip(&ft.threat_weights[index * width..(index + 1) * width])
-                        {
-                            *a = a.wrapping_add(i16::from(w));
-                        }
-                    },
-                );
-            }
-            let mut actual = AccumulatorLayerStacks::<N>::new();
-            ft.refresh_accumulator(&pos, &mut actual);
-            assert_eq!(actual.threat_accumulation.each_ref().map(|v| v.as_slice()), expected);
-            let mut cache = AccumulatorCacheLayerStacks::<N>::new();
-            ft.refresh_accumulator_with_cache(&pos, &mut actual, &mut cache);
-            assert_eq!(actual.threat_accumulation.each_ref().map(|v| v.as_slice()), expected);
-            let mut stack = AccumulatorStackLayerStacks::<N>::new();
-            ft.update_with_threat_ancestor(&pos, &mut stack, Some(&mut cache));
-            assert_eq!(
-                stack.current().accumulator.threat_accumulation.each_ref().map(|v| v.as_slice()),
-                expected
-            );
-        }
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[test]
-    fn batched_threat_rows_match_scalar() {
-        fn check<const N: usize>() {
-            let mut ft = FeatureTransformerLayerStacks::<N, TestSpec>::for_output_transform_tests();
-            let mut weights =
-                AlignedBox::<i8>::new_zeroed(super::super::threat_width::width(N) * 3);
-            for (i, w) in weights.iter_mut().enumerate() {
-                *w = ((i as u32).wrapping_mul(0x9e37_79b9) >> 24) as i8;
-            }
-            ft.threat_weights = weights.into();
-            for count in 0..=MAX_CHANGED_THREAT_FEATURES {
-                let mut indices = IndexList::<MAX_CHANGED_THREAT_FEATURES>::new();
-                for i in 0..count {
-                    assert!(indices.push(i % 3));
-                }
-                let mut actual = Aligned(super::super::threat_width::zero::<N>());
-                for (i, x) in actual.0.iter_mut().enumerate() {
-                    *x = if i % 2 == 0 {
-                        i16::MAX - (i % 7) as i16
-                    } else {
-                        i16::MIN + (i % 7) as i16
-                    };
-                }
-                let initial = actual.0;
-                let mut expected = initial;
-                for row in indices.iter() {
-                    for (i, x) in expected.iter_mut().enumerate() {
-                        *x = x.wrapping_add(i16::from(
-                            ft.threat_weights[row * super::super::threat_width::width(N) + i],
-                        ));
-                    }
-                }
-                ft.apply_threat_rows::<true>(&mut actual.0, &indices);
-                assert_eq!(actual.0, expected);
-                ft.apply_threat_rows::<false>(&mut actual.0, &indices);
-                assert_eq!(actual.0, initial);
-            }
-        }
-        check::<96>();
-        check::<64>();
-        check::<256>();
-        check::<512>();
-        check::<768>();
-    }
-
-    #[cfg(feature = "nnue-threat")]
-    #[test]
-    fn threat_row_updates_match_wrapping_scalar() {
-        fn check<const N: usize>() {
-            let mut ft = FeatureTransformerLayerStacks::<N, TestSpec>::for_output_transform_tests();
-            let mut weights =
-                AlignedBox::<i8>::new_zeroed(super::super::threat_width::width(N) * 2);
-            for (i, w) in weights.iter_mut().enumerate() {
-                *w = (i as u8).wrapping_mul(73) as i8;
-            }
-            ft.threat_weights = weights.into();
-            let mut actual = Aligned(super::super::threat_width::zero::<N>());
-            for (i, x) in actual.0.iter_mut().enumerate() {
-                *x = if i % 2 == 0 {
-                    i16::MAX - (i % 7) as i16
-                } else {
-                    i16::MIN + (i % 7) as i16
-                };
-            }
-            let initial = actual.0;
-            for row in 0..2 {
-                let mut expected = initial;
-                for (i, x) in expected.iter_mut().enumerate() {
-                    *x = x.wrapping_add(i16::from(
-                        ft.threat_weights[row * super::super::threat_width::width(N) + i],
-                    ));
-                }
-                actual.0 = initial;
-                ft.add_threat_weights(&mut actual.0, row);
-                assert_eq!(actual.0, expected);
-                ft.sub_threat_weights(&mut actual.0, row);
-                assert_eq!(actual.0, initial);
-                for (i, x) in expected.iter_mut().enumerate() {
-                    *x = initial[i].wrapping_sub(i16::from(
-                        ft.threat_weights[row * super::super::threat_width::width(N) + i],
-                    ));
-                }
-                ft.sub_threat_weights(&mut actual.0, row);
-                assert_eq!(actual.0, expected);
-            }
-        }
-        check::<96>();
-        check::<64>();
-    }
-
-    fn check_fused_from_source_wrapping_reference<const PAIRS: usize>() {
-        use rand::{Rng, SeedableRng};
-        use rand_xoshiro::Xoshiro256PlusPlus;
-
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x512f_7a16);
-        let mut ft = make_test_transformer();
-        for case in 0..16 {
-            for row in 0..(PAIRS * 2) {
-                let weights = &mut ft.weights.make_mut()[row * TEST_L1..(row + 1) * TEST_L1];
-                for weight in weights.iter_mut() {
-                    *weight = rng.random();
-                }
-                // 減算・加算の両方で MIN/MAX 境界を必ず跨ぐ。
-                weights[0] = 1;
-                weights[1] = -1;
-            }
-            let mut source = Aligned([0i16; TEST_L1]);
-            for value in &mut source.0 {
-                *value = rng.random();
-            }
-            source.0[0] = i16::MIN;
-            source.0[1] = i16::MAX;
-            let original = source;
-            let mut expected = Aligned([0i16; TEST_L1]);
-            expected.0.copy_from_slice(&source.0);
-            for pair in 0..PAIRS {
-                let sub = ft.unpacked_for_tests().weight_row(pair * 2);
-                let add = ft.unpacked_for_tests().weight_row(pair * 2 + 1);
-                let mut sub_wrapped = false;
-                let mut add_wrapped = false;
-                for (i, value) in expected.0.iter_mut().enumerate() {
-                    sub_wrapped |= value.checked_sub(sub[i]).is_none();
-                    *value = value.wrapping_sub(sub[i]);
-                    add_wrapped |= value.checked_add(add[i]).is_none();
-                    *value = value.wrapping_add(add[i]);
-                }
-                assert!(sub_wrapped && add_wrapped);
-            }
-
-            let mut actual = Aligned([0x5a5ai16; TEST_L1]);
-            match PAIRS {
-                1 => ft.unpacked_for_tests().apply_sub_add_fused_from_source(
-                    &source.0,
-                    &mut actual.0,
-                    0,
-                    1,
-                ),
-                2 => ft.unpacked_for_tests().apply_double_sub_add_fused_from_source(
-                    &source.0,
-                    &mut actual.0,
-                    0,
-                    1,
-                    2,
-                    3,
-                ),
-                _ => unreachable!(),
-            }
-            assert_eq!(actual.0, expected.0, "case={case}, pairs={PAIRS}");
-            assert_eq!(source.0, original.0);
-        }
-    }
-
-    #[test]
-    fn test_apply_sub_add_fused_from_source_matches_wrapping_reference() {
-        check_fused_from_source_wrapping_reference::<1>();
-    }
-
-    #[test]
-    fn test_apply_double_sub_add_fused_from_source_matches_wrapping_reference() {
-        check_fused_from_source_wrapping_reference::<2>();
-    }
-
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    fn fill_weight_row(ft: &mut TestFt, index: usize, seed: i16) {
+    fn fill_weight_row(ft: &mut FeatureTransformerLayerStacks<TEST_L1>, index: usize, seed: i16) {
         let start = index * TEST_L1;
-        for (i, slot) in ft.weights.make_mut()[start..start + TEST_L1].iter_mut().enumerate() {
+        for (i, slot) in ft.weights[start..start + TEST_L1].iter_mut().enumerate() {
             *slot = seed.wrapping_add((i % 29) as i16);
         }
     }
 
-    #[cfg(not(feature = "nnue-effect-bucket"))]
     fn apply_generic(
-        ft: &TestFt,
+        ft: &FeatureTransformerLayerStacks<TEST_L1>,
         accumulation: &mut [i16; TEST_L1],
         dirty_piece: &DirtyPiece,
         perspective: Color,
@@ -3612,163 +2106,22 @@ mod tests {
     ) {
         let mut removed = IndexList::new();
         let mut added = IndexList::new();
-        append_changed_indices::<TestSpec>(
-            dirty_piece,
-            perspective,
-            king_sq,
-            &mut removed,
-            &mut added,
-        );
+        append_changed_indices(dirty_piece, perspective, king_sq, &mut removed, &mut added);
         for index in removed.iter() {
-            ft.unpacked_for_tests().sub_weights(accumulation, index);
+            ft.sub_weights(accumulation, index);
         }
         for index in added.iter() {
-            ft.unpacked_for_tests().add_weights(accumulation, index);
+            ft.add_weights(accumulation, index);
         }
     }
 
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    impl FeatureTransformerLayerStacks<TEST_L1, TestSpec> {
-        fn check_weight_changes_to_two(
-            &self,
-            cache: &mut [i16; TEST_L1],
-            removed: &IndexList<{ PieceNumber::NB }>,
-            added: &IndexList<{ PieceNumber::NB }>,
-        ) {
-            let mut output = [0; TEST_L1];
-            super::super::finny::apply_weight_changes_to_two::<TEST_L1>(
-                cache,
-                None,
-                &mut output,
-                self.unpacked_for_tests().rows,
-                removed,
-                added,
-            );
-            assert_eq!(*cache, output);
-        }
-    }
-
-    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
-    fn test_check_weight_changes_to_two_matches_sequential_with_wrapping() {
-        let mut ft = make_test_transformer();
-        for (index, seed) in [0usize, 1, 2, 3].into_iter().zip([31i16, -47, 83, -109]) {
-            fill_weight_row(&mut ft, index, seed);
-        }
-
-        let mut removed = IndexList::<{ PieceNumber::NB }>::new();
-        let mut added = IndexList::<{ PieceNumber::NB }>::new();
-        assert!(removed.push(0));
-        assert!(removed.push(1));
-        assert!(added.push(2));
-        assert!(added.push(3));
-
-        let mut sequential = Aligned([0i16; TEST_L1]);
-        for (i, value) in sequential.0.iter_mut().enumerate() {
-            *value = if i % 2 == 0 {
-                i16::MAX.wrapping_sub((i % 97) as i16)
-            } else {
-                i16::MIN.wrapping_add((i % 89) as i16)
-            };
-        }
-        let mut tiled = Aligned(sequential.0);
-
-        for index in removed.iter() {
-            ft.unpacked_for_tests().sub_weights(&mut sequential.0, index);
-        }
-        for index in added.iter() {
-            ft.unpacked_for_tests().add_weights(&mut sequential.0, index);
-        }
-        ft.check_weight_changes_to_two(&mut tiled.0, &removed, &added);
-
-        assert_eq!(sequential.0, tiled.0);
+    fn test_feature_transformer_dimensions() {
+        // 次元数の確認
+        assert_eq!(TEST_L1, 1536);
+        assert_eq!(HALFKA_HM_DIMENSIONS, 73305);
     }
 
-    /// removed のみ / added のみの片側ケースが per-index 適用と一致すること。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    #[test]
-    fn test_check_weight_changes_to_two_one_sided_matches_sequential() {
-        let mut ft = make_test_transformer();
-        for (index, seed) in [0usize, 1, 2].into_iter().zip([13i16, -71, 127]) {
-            fill_weight_row(&mut ft, index, seed);
-        }
-
-        let mut init = Aligned([0i16; TEST_L1]);
-        for (i, value) in init.0.iter_mut().enumerate() {
-            *value = ((i * 5) % 251) as i16 - 125;
-        }
-
-        // removed のみ
-        {
-            let mut removed = IndexList::<{ PieceNumber::NB }>::new();
-            let added = IndexList::<{ PieceNumber::NB }>::new();
-            assert!(removed.push(0));
-            assert!(removed.push(2));
-
-            let mut sequential = Aligned(init.0);
-            let mut tiled = Aligned(init.0);
-            for index in removed.iter() {
-                ft.unpacked_for_tests().sub_weights(&mut sequential.0, index);
-            }
-            ft.check_weight_changes_to_two(&mut tiled.0, &removed, &added);
-            assert_eq!(sequential.0, tiled.0);
-        }
-
-        // added のみ
-        {
-            let removed = IndexList::<{ PieceNumber::NB }>::new();
-            let mut added = IndexList::<{ PieceNumber::NB }>::new();
-            assert!(added.push(1));
-
-            let mut sequential = Aligned(init.0);
-            let mut tiled = Aligned(init.0);
-            for index in added.iter() {
-                ft.unpacked_for_tests().add_weights(&mut sequential.0, index);
-            }
-            ft.check_weight_changes_to_two(&mut tiled.0, &removed, &added);
-            assert_eq!(sequential.0, tiled.0);
-        }
-    }
-
-    /// removed/added を両方とも容量上限 (`PieceNumber::NB` = 40) まで詰めた
-    /// 最大ケースが per-index 適用と一致すること。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    #[test]
-    fn test_check_weight_changes_to_two_full_capacity_matches_sequential() {
-        let mut ft = make_test_transformer();
-        for index in 0..(2 * PieceNumber::NB) {
-            fill_weight_row(&mut ft, index, (index as i16).wrapping_mul(37).wrapping_sub(61));
-        }
-
-        let mut removed = IndexList::<{ PieceNumber::NB }>::new();
-        let mut added = IndexList::<{ PieceNumber::NB }>::new();
-        for index in 0..PieceNumber::NB {
-            assert!(removed.push(index));
-            assert!(added.push(PieceNumber::NB + index));
-        }
-        assert_eq!(removed.iter().len(), PieceNumber::NB, "removed must be at capacity");
-        assert_eq!(added.iter().len(), PieceNumber::NB, "added must be at capacity");
-
-        let mut sequential = Aligned([0i16; TEST_L1]);
-        for (i, value) in sequential.0.iter_mut().enumerate() {
-            *value = ((i * 11) % 199) as i16 - 99;
-        }
-        let mut tiled = Aligned(sequential.0);
-
-        for index in removed.iter() {
-            ft.unpacked_for_tests().sub_weights(&mut sequential.0, index);
-        }
-        for index in added.iter() {
-            ft.unpacked_for_tests().add_weights(&mut sequential.0, index);
-        }
-        ft.check_weight_changes_to_two(&mut tiled.0, &removed, &added);
-
-        assert_eq!(sequential.0, tiled.0);
-    }
-
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // fast-diff test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_single_move() {
         let king_sq = Square::new(File::File5, Rank::Rank9);
@@ -3787,12 +2140,12 @@ mod tests {
             ),
         };
 
-        let old_index = feature_index_from_bona_piece::<TestSpec>(
+        let old_index = feature_index_from_bona_piece(
             dirty_piece.changed_piece[0].old_piece.fb,
             Color::Black,
             king_sq,
         );
-        let new_index = feature_index_from_bona_piece::<TestSpec>(
+        let new_index = feature_index_from_bona_piece(
             dirty_piece.changed_piece[0].new_piece.fb,
             Color::Black,
             king_sq,
@@ -3800,38 +2153,13 @@ mod tests {
         fill_weight_row(&mut ft, old_index, 11);
         fill_weight_row(&mut ft, new_index, 37);
 
-        let mut source = Aligned([0i16; TEST_L1]);
-        for (i, slot) in source.0.iter_mut().enumerate() {
-            *slot = match i % 3 {
-                0 => i16::MIN.wrapping_add(i as i16),
-                1 => i16::MAX.wrapping_sub(i as i16),
-                _ => (i as i16).wrapping_mul(97),
-            };
-        }
-        let mut generic = source;
-        let mut fast = source;
-        let mut from_source = Aligned([123i16; TEST_L1]);
+        let mut generic = Aligned([5i16; TEST_L1]);
+        let mut fast = Aligned([5i16; TEST_L1]);
         apply_generic(&ft, &mut generic.0, &dirty_piece, Color::Black, king_sq);
-        assert!(ft.unpacked_for_tests().try_apply_dirty_piece_fast(
-            &mut fast.0,
-            &dirty_piece,
-            Color::Black,
-            king_sq
-        ));
-        assert!(ft.unpacked_for_tests().try_apply_dirty_piece_fast_from_source(
-            &source.0,
-            &mut from_source.0,
-            &dirty_piece,
-            Color::Black,
-            king_sq,
-        ));
+        assert!(ft.try_apply_dirty_piece_fast(&mut fast.0, &dirty_piece, Color::Black, king_sq));
         assert_eq!(generic.0, fast.0);
-        assert_eq!(generic.0, from_source.0);
     }
 
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // fast-diff test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_capture() {
         let king_sq = Square::new(File::File5, Rank::Rank9);
@@ -3859,22 +2187,22 @@ mod tests {
         };
 
         let indices = [
-            feature_index_from_bona_piece::<TestSpec>(
+            feature_index_from_bona_piece(
                 dirty_piece.changed_piece[0].old_piece.fb,
                 Color::Black,
                 king_sq,
             ),
-            feature_index_from_bona_piece::<TestSpec>(
+            feature_index_from_bona_piece(
                 dirty_piece.changed_piece[0].new_piece.fb,
                 Color::Black,
                 king_sq,
             ),
-            feature_index_from_bona_piece::<TestSpec>(
+            feature_index_from_bona_piece(
                 dirty_piece.changed_piece[1].old_piece.fb,
                 Color::Black,
                 king_sq,
             ),
-            feature_index_from_bona_piece::<TestSpec>(
+            feature_index_from_bona_piece(
                 dirty_piece.changed_piece[1].new_piece.fb,
                 Color::Black,
                 king_sq,
@@ -3884,38 +2212,13 @@ mod tests {
             fill_weight_row(&mut ft, index, *seed);
         }
 
-        let mut source = Aligned([0i16; TEST_L1]);
-        for (i, slot) in source.0.iter_mut().enumerate() {
-            *slot = match i % 3 {
-                0 => i16::MIN.wrapping_add((i * 3) as i16),
-                1 => i16::MAX.wrapping_sub((i * 5) as i16),
-                _ => (i as i16).wrapping_mul(-113),
-            };
-        }
-        let mut generic = source;
-        let mut fast = source;
-        let mut from_source = Aligned([-321i16; TEST_L1]);
+        let mut generic = Aligned([7i16; TEST_L1]);
+        let mut fast = Aligned([7i16; TEST_L1]);
         apply_generic(&ft, &mut generic.0, &dirty_piece, Color::Black, king_sq);
-        assert!(ft.unpacked_for_tests().try_apply_dirty_piece_fast(
-            &mut fast.0,
-            &dirty_piece,
-            Color::Black,
-            king_sq
-        ));
-        assert!(ft.unpacked_for_tests().try_apply_dirty_piece_fast_from_source(
-            &source.0,
-            &mut from_source.0,
-            &dirty_piece,
-            Color::Black,
-            king_sq,
-        ));
+        assert!(ft.try_apply_dirty_piece_fast(&mut fast.0, &dirty_piece, Color::Black, king_sq));
         assert_eq!(generic.0, fast.0);
-        assert_eq!(generic.0, from_source.0);
     }
 
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // refresh smoke test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_single_move_white() {
         // 後手視点: fw / king_sq.inverse() の分岐をカバー
@@ -3935,12 +2238,12 @@ mod tests {
             ),
         };
 
-        let old_index = feature_index_from_bona_piece::<TestSpec>(
+        let old_index = feature_index_from_bona_piece(
             dirty_piece.changed_piece[0].old_piece.fw,
             Color::White,
             king_sq,
         );
-        let new_index = feature_index_from_bona_piece::<TestSpec>(
+        let new_index = feature_index_from_bona_piece(
             dirty_piece.changed_piece[0].new_piece.fw,
             Color::White,
             king_sq,
@@ -3951,18 +2254,10 @@ mod tests {
         let mut generic = Aligned([5i16; TEST_L1]);
         let mut fast = Aligned([5i16; TEST_L1]);
         apply_generic(&ft, &mut generic.0, &dirty_piece, Color::White, king_sq);
-        assert!(ft.unpacked_for_tests().try_apply_dirty_piece_fast(
-            &mut fast.0,
-            &dirty_piece,
-            Color::White,
-            king_sq
-        ));
+        assert!(ft.try_apply_dirty_piece_fast(&mut fast.0, &dirty_piece, Color::White, king_sq));
         assert_eq!(generic.0, fast.0);
     }
 
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // refresh smoke test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
     #[test]
     fn test_try_apply_dirty_piece_fast_matches_generic_capture_white() {
         // 後手視点: dirty_num==2 の fw 分岐をカバー
@@ -3992,22 +2287,22 @@ mod tests {
         };
 
         let indices = [
-            feature_index_from_bona_piece::<TestSpec>(
+            feature_index_from_bona_piece(
                 dirty_piece.changed_piece[0].old_piece.fw,
                 Color::White,
                 king_sq,
             ),
-            feature_index_from_bona_piece::<TestSpec>(
+            feature_index_from_bona_piece(
                 dirty_piece.changed_piece[0].new_piece.fw,
                 Color::White,
                 king_sq,
             ),
-            feature_index_from_bona_piece::<TestSpec>(
+            feature_index_from_bona_piece(
                 dirty_piece.changed_piece[1].old_piece.fw,
                 Color::White,
                 king_sq,
             ),
-            feature_index_from_bona_piece::<TestSpec>(
+            feature_index_from_bona_piece(
                 dirty_piece.changed_piece[1].new_piece.fw,
                 Color::White,
                 king_sq,
@@ -4020,12 +2315,7 @@ mod tests {
         let mut generic = Aligned([7i16; TEST_L1]);
         let mut fast = Aligned([7i16; TEST_L1]);
         apply_generic(&ft, &mut generic.0, &dirty_piece, Color::White, king_sq);
-        assert!(ft.unpacked_for_tests().try_apply_dirty_piece_fast(
-            &mut fast.0,
-            &dirty_piece,
-            Color::White,
-            king_sq
-        ));
+        assert!(ft.try_apply_dirty_piece_fast(&mut fast.0, &dirty_piece, Color::White, king_sq));
         assert_eq!(generic.0, fast.0);
     }
 
@@ -4042,7 +2332,7 @@ mod tests {
         };
 
         let mut accumulation = Aligned([0i16; TEST_L1]);
-        assert!(!ft.unpacked_for_tests().try_apply_dirty_piece_fast(
+        assert!(!ft.try_apply_dirty_piece_fast(
             &mut accumulation.0,
             &dirty_piece,
             Color::Black,
@@ -4055,48 +2345,31 @@ mod tests {
     // =========================================================================
 
     #[cfg(feature = "nnue-psqt")]
-    fn make_test_transformer_with_psqt() -> TestFt {
-        let n = DEFAULT_NUM_BUCKETS; // legacy デフォルトの 9 で test
-        let psqt_weight_count = TestSpec::DIMENSIONS * n;
+    fn make_test_transformer_with_psqt() -> FeatureTransformerLayerStacks<TEST_L1> {
+        let psqt_weight_count = HALFKA_HM_DIMENSIONS * NUM_LAYER_STACK_BUCKETS;
         let mut psqt_weights = AlignedBox::new_zeroed(psqt_weight_count);
-        for feat in 0..TestSpec::DIMENSIONS {
-            for bucket in 0..n {
-                psqt_weights[feat * n + bucket] =
+        // 既知のパターンを設定: weight[feat][bucket] = (feat * 7 + bucket * 3) as i32
+        for feat in 0..HALFKA_HM_DIMENSIONS {
+            for bucket in 0..NUM_LAYER_STACK_BUCKETS {
+                psqt_weights[feat * NUM_LAYER_STACK_BUCKETS + bucket] =
                     (feat as i32 * 7 + bucket as i32 * 3) % 1000 - 500;
             }
         }
 
-        let mut psqt_biases = [0i32; MAX_LAYER_STACK_PSQT_BUCKETS];
-        for (i, b) in psqt_biases[..n].iter_mut().enumerate() {
-            *b = (i as i32 + 1) * 10; // [10, 20, ..., 90]
-        }
-
-        FeatureTransformerLayerStacks::<TEST_L1, TestSpec> {
+        FeatureTransformerLayerStacks::<TEST_L1> {
             biases: Aligned([0; TEST_L1]),
-            weights: AlignedBox::new_zeroed(TestSpec::DIMENSIONS * TEST_L1).into(),
-            psqt_biases,
-            psqt_num_buckets: n,
-            psqt_weights: psqt_weights.into(),
+            weights: AlignedBox::new_zeroed(HALFKA_HM_DIMENSIONS * TEST_L1),
+            psqt_biases: [10, 20, 30, 40, 50, 60, 70, 80],
+            psqt_weights,
             has_psqt: true,
             #[cfg(feature = "nnue-threat")]
-            threat_weights: AlignedBox::new_zeroed(0).into(),
+            threat_weights: AlignedBox::new_zeroed(0),
             #[cfg(feature = "nnue-threat")]
             has_threat: false,
-            _ft: PhantomData,
-        }
-    }
-
-    #[cfg(feature = "nnue-psqt")]
-    #[test]
-    fn psqt_updates_wide_buckets_and_preserves_unused_lanes() {
-        let weights: [i32; MAX_LAYER_STACK_PSQT_BUCKETS] = std::array::from_fn(|i| i as i32 + 1);
-        for n in [0, 1, 8, 9, 16, 17, 24, 31, 32] {
-            let mut accum = [100; MAX_LAYER_STACK_PSQT_BUCKETS];
-            let input = weights[..n].to_vec().into_boxed_slice();
-            psqt_add_or_sub::<true>(&mut accum, input.as_ptr(), n);
-            assert_eq!(accum, std::array::from_fn(|i| 100 + if i < n { weights[i] } else { 0 }));
-            psqt_add_or_sub::<false>(&mut accum, input.as_ptr(), n);
-            assert_eq!(accum, [100; MAX_LAYER_STACK_PSQT_BUCKETS]);
+            #[cfg(feature = "nnue-kzt-ft")]
+            kzt_ft_weights: AlignedBox::new_zeroed(0),
+            #[cfg(feature = "nnue-kzt-ft")]
+            has_kzt_ft: false,
         }
     }
 
@@ -4113,7 +2386,7 @@ mod tests {
         let _ = active_initial.push(300);
 
         // フル計算
-        let mut full_acc = [0i32; MAX_LAYER_STACK_PSQT_BUCKETS];
+        let mut full_acc = [0i32; NUM_LAYER_STACK_BUCKETS];
         ft.refresh_psqt(&active_initial, &mut full_acc);
 
         // 差分: 200 を削除、400 を追加 → [100, 300, 400]
@@ -4126,7 +2399,7 @@ mod tests {
         let _ = active_updated.push(100);
         let _ = active_updated.push(300);
         let _ = active_updated.push(400);
-        let mut full_updated = [0i32; MAX_LAYER_STACK_PSQT_BUCKETS];
+        let mut full_updated = [0i32; NUM_LAYER_STACK_BUCKETS];
         ft.refresh_psqt(&active_updated, &mut full_updated);
 
         assert_eq!(incr_acc, full_updated, "差分更新とフル計算の結果が不一致");
@@ -4142,14 +2415,13 @@ mod tests {
         let _ = active.push(0);
         let _ = active.push(1);
 
-        let mut acc = [0i32; MAX_LAYER_STACK_PSQT_BUCKETS];
+        let mut acc = [0i32; NUM_LAYER_STACK_BUCKETS];
         ft.refresh_psqt(&active, &mut acc);
 
         // feat=0: (0*7 + b*3) % 1000 - 500 = b*3 - 500
         // feat=1: (1*7 + b*3) % 1000 - 500 = 7 + b*3 - 500
         // bias + feat0 + feat1
-        let n = ft.psqt_num_buckets;
-        for (bucket, val) in acc[..n].iter().enumerate() {
+        for (bucket, val) in acc.iter().enumerate() {
             let b = bucket as i32;
             let bias = (b + 1) * 10; // [10, 20, ..., 90]
             let w0 = b * 3 - 500;
@@ -4157,227 +2429,5 @@ mod tests {
             let expected = bias + w0 + w1;
             assert_eq!(*val, expected, "bucket {bucket}: expected {expected}, got {val}");
         }
-        // 未使用 bucket は 0 のまま
-        for val in acc[n..].iter() {
-            assert_eq!(*val, 0, "unused buckets should remain zero");
-        }
-    }
-
-    // =========================================================================
-    // 5 FT smoke tests
-    // =========================================================================
-
-    use crate::nnue::ls_feature_spec::LsFeatureSpec;
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    use crate::nnue::ls_feature_spec::{
-        HalfKaHmSplitSpec, HalfKaMergedSpec, HalfKaSplitSpec, HalfKpSpec,
-    };
-    use crate::position::{Position, SFEN_HIRATE};
-
-    fn refresh_biases_for_spec<FT: LsFeatureSpec>() {
-        let weights = AlignedBox::<i16>::new_zeroed(FT::DIMENSIONS * TEST_L1);
-        let ft = FeatureTransformerLayerStacks::<TEST_L1, FT> {
-            biases: Aligned([7; TEST_L1]),
-            weights: weights.into(),
-            #[cfg(feature = "nnue-psqt")]
-            psqt_biases: [0; MAX_LAYER_STACK_PSQT_BUCKETS],
-            #[cfg(feature = "nnue-psqt")]
-            psqt_num_buckets: 0,
-            #[cfg(feature = "nnue-psqt")]
-            psqt_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-psqt")]
-            has_psqt: false,
-            #[cfg(feature = "nnue-threat")]
-            threat_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-threat")]
-            has_threat: false,
-            _ft: PhantomData,
-        };
-        let mut pos = Position::new();
-        pos.set_sfen(SFEN_HIRATE).unwrap();
-        let mut acc = AccumulatorLayerStacks::<TEST_L1>::new();
-        ft.refresh_accumulator(&pos, &mut acc);
-        assert!(acc.computed_accumulation);
-        for v in acc.get(0).iter().chain(acc.get(1).iter()) {
-            assert_eq!(*v, 7);
-        }
-    }
-
-    #[test]
-    fn refresh_biases_halfka_hm_merged() {
-        refresh_biases_for_spec::<HalfKaHmMergedSpec>();
-    }
-
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // refresh smoke test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    #[test]
-    fn refresh_biases_halfka_hm_split() {
-        refresh_biases_for_spec::<HalfKaHmSplitSpec>();
-    }
-
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // refresh smoke test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    #[test]
-    fn refresh_biases_halfka_merged() {
-        refresh_biases_for_spec::<HalfKaMergedSpec>();
-    }
-
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // refresh smoke test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    #[test]
-    fn refresh_biases_halfka_split() {
-        refresh_biases_for_spec::<HalfKaSplitSpec>();
-    }
-
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // refresh smoke test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    #[test]
-    fn refresh_biases_halfkp() {
-        refresh_biases_for_spec::<HalfKpSpec>();
-    }
-
-    /// HalfKp で `refresh_accumulator` (slow path) と `refresh_accumulator_with_cache`
-    /// (fast cache path、玉スロット ZERO マスク経由) の accumulation が
-    /// 非ゼロ weights 下で bit 一致することを保証する。
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // cache refresh test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    #[test]
-    fn refresh_with_cache_halfkp_matches_slow_path() {
-        let mut weights = AlignedBox::<i16>::new_zeroed(HalfKpSpec::DIMENSIONS * TEST_L1);
-        for (i, slot) in weights.iter_mut().enumerate() {
-            *slot = (((i as u32).wrapping_mul(2_654_435_761) >> 16) as i16) % 127 - 63;
-        }
-        let mut biases = Aligned([0i16; TEST_L1]);
-        for (i, b) in biases.0.iter_mut().enumerate() {
-            *b = ((i as i16) % 17) - 8;
-        }
-
-        let make_ft = || FeatureTransformerLayerStacks::<TEST_L1, HalfKpSpec> {
-            biases,
-            weights: weights.clone().into(),
-            #[cfg(feature = "nnue-psqt")]
-            psqt_biases: [0; MAX_LAYER_STACK_PSQT_BUCKETS],
-            #[cfg(feature = "nnue-psqt")]
-            psqt_num_buckets: 0,
-            #[cfg(feature = "nnue-psqt")]
-            psqt_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-psqt")]
-            has_psqt: false,
-            #[cfg(feature = "nnue-threat")]
-            threat_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-threat")]
-            has_threat: false,
-            _ft: PhantomData,
-        };
-        let ft_slow = make_ft();
-        let ft_cache = make_ft();
-
-        let sfens = [
-            "+B1sg1gsnl/2+N2k1b1/pP2pp2p/2p3p2/9/2PpP4/P1+p2PP1P/7R1/LN1GKGSNL w RLs3p 32",
-            "+B1sg1gsnl/2+N4b1/pP2ppk1p/2p3p2/9/2PpP4/P1+p2PP1P/7R1/LN1GKGSNL w RLs3p 32",
-        ];
-
-        let mut cache = AccumulatorCacheLayerStacks::<TEST_L1>::new();
-
-        for (idx, sfen) in sfens.iter().enumerate() {
-            let mut pos = Position::new();
-            pos.set_sfen(sfen).unwrap();
-
-            let mut acc_slow = AccumulatorLayerStacks::<TEST_L1>::new();
-            ft_slow.refresh_accumulator(&pos, &mut acc_slow);
-
-            let mut acc_cache = AccumulatorLayerStacks::<TEST_L1>::new();
-            ft_cache.refresh_accumulator_with_cache(&pos, &mut acc_cache, &mut cache);
-
-            for p in 0..2 {
-                let slow = acc_slow.get(p);
-                let fast = acc_cache.get(p);
-                for (j, (s, f)) in slow.iter().zip(fast.iter()).enumerate() {
-                    assert_eq!(s, f, "sfen #{idx} perspective {p} slot {j}: slow={s} cache={f}");
-                }
-            }
-        }
-    }
-
-    /// HalfKp の `try_apply_dirty_piece_fast` が玉 BonaPiece (`>= FE_END`) を含む
-    /// `DirtyPiece` を受け取ったとき `false` を返して slow path にフォールバック
-    /// することを直接検証する。
-    // effect bucket build は `EffectBucket=` token 付き arch を要求するため、非 EffectBucket
-    // fast-diff test は対象外。
-    #[cfg(not(feature = "nnue-effect-bucket"))]
-    #[test]
-    fn try_apply_dirty_piece_fast_halfkp_rejects_king_bp() {
-        let weights = AlignedBox::<i16>::new_zeroed(HalfKpSpec::DIMENSIONS * TEST_L1);
-        let ft = FeatureTransformerLayerStacks::<TEST_L1, HalfKpSpec> {
-            biases: Aligned([0; TEST_L1]),
-            weights: weights.into(),
-            #[cfg(feature = "nnue-psqt")]
-            psqt_biases: [0; MAX_LAYER_STACK_PSQT_BUCKETS],
-            #[cfg(feature = "nnue-psqt")]
-            psqt_num_buckets: 0,
-            #[cfg(feature = "nnue-psqt")]
-            psqt_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-psqt")]
-            has_psqt: false,
-            #[cfg(feature = "nnue-threat")]
-            threat_weights: AlignedBox::new_zeroed(0).into(),
-            #[cfg(feature = "nnue-threat")]
-            has_threat: false,
-            _ft: PhantomData,
-        };
-
-        let king_sq = Square::new(File::File5, Rank::Rank9);
-        let mut acc = Aligned([0i16; TEST_L1]);
-
-        let mut dp_king_move = DirtyPiece::new();
-        dp_king_move.dirty_num = 1;
-        dp_king_move.piece_no[0] = PieceNumber(PieceNumber::KING + 1);
-        dp_king_move.changed_piece[0] = ChangedBonaPiece {
-            old_piece: ExtBonaPiece::from_board(
-                Piece::W_KING,
-                Square::new(File::File5, Rank::Rank1),
-            ),
-            new_piece: ExtBonaPiece::from_board(
-                Piece::W_KING,
-                Square::new(File::File4, Rank::Rank1),
-            ),
-        };
-        assert!(
-            !ft.unpacked_for_tests().try_apply_dirty_piece_fast(
-                &mut acc.0,
-                &dp_king_move,
-                Color::Black,
-                king_sq
-            ),
-            "HalfKp fast path must reject king BonaPiece move"
-        );
-
-        let mut dp_pawn = DirtyPiece::new();
-        dp_pawn.dirty_num = 1;
-        dp_pawn.piece_no[0] = PieceNumber(0);
-        dp_pawn.changed_piece[0] = ChangedBonaPiece {
-            old_piece: ExtBonaPiece::from_board(
-                Piece::B_PAWN,
-                Square::new(File::File7, Rank::Rank7),
-            ),
-            new_piece: ExtBonaPiece::from_board(
-                Piece::B_PAWN,
-                Square::new(File::File7, Rank::Rank6),
-            ),
-        };
-        assert!(
-            ft.unpacked_for_tests().try_apply_dirty_piece_fast(
-                &mut acc.0,
-                &dp_pawn,
-                Color::Black,
-                king_sq
-            ),
-            "HalfKp fast path must accept non-king BonaPiece move"
-        );
     }
 }

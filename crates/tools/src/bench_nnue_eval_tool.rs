@@ -1,73 +1,61 @@
-//! NNUE評価関数のベンチマークツール
+//! NNUE隧穂ｾ｡髢｢謨ｰ縺ｮ繝吶Φ繝√・繝ｼ繧ｯ繝・・繝ｫ
 //!
-//! 3バリアント階層構造に対応したベンチマーク。
-//! 各ネットワークアーキテクチャの推論性能を測定する。
-//!
-//! ## progresskpabs bucket 計算ベンチ
-//!
-//! `--ls-progress-coeff` を指定すると、bucket index 計算のマイクロベンチも実行:
+//! 3繝舌Μ繧｢繝ｳ繝磯嚴螻､讒矩縺ｫ蟇ｾ蠢懊＠縺溘・繝ｳ繝√・繝ｼ繧ｯ縲・//! 蜷・ロ繝・ヨ繝ｯ繝ｼ繧ｯ繧｢繝ｼ繧ｭ繝・け繝√Ε縺ｮ謗ｨ隲匁ｧ閭ｽ繧呈ｸｬ螳壹☆繧九・//!
+//! ## progress8kpabs bucket 險育ｮ励・繝ｳ繝・//!
+//! `--ls-progress-coeff` 繧呈欠螳壹☆繧九→縲｜ucket index 險育ｮ励・繝槭う繧ｯ繝ｭ繝吶Φ繝√ｂ螳溯｡・
 //! ```bash
 //! cargo run --release --bin bench_nnue_eval -- \
 //!   --nnue-file <path> \
 //!   --ls-progress-coeff <progress.bin>
 //! ```
 
-use crate::nnue_routing::{
-    LayerStackBucketer, NativeRouting, ProgressCoefficients, parse_native_layer_stack_bucket_mode,
-};
 use std::hint::black_box;
+use std::mem::size_of;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 
 use rshogi_core::movegen::{MoveList, generate_legal_all};
 use rshogi_core::nnue::{
     AccumulatorCacheLayerStacks, AccumulatorLayerStacks, DirtyPiece, LayerStackBucketMode,
-    LsFeatureSpec, NNUEEvaluator, NNUENetwork, NetworkLayerStacks, ls_dispatch_ft_size,
+    LayerStacksNetwork, NNUEEvaluator, NNUENetwork, NetworkLayerStacks,
+    SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, compute_layer_stack_progress8kpabs_bucket_index,
+    get_layer_stack_progress_kpabs_weights, parse_layer_stack_bucket_mode,
+    set_layer_stack_bucket_mode, set_layer_stack_progress_kpabs_weights,
     sqr_clipped_relu_transform,
 };
 use rshogi_core::position::Position;
-use rshogi_core::types::{Color, PieceType, Value};
+use rshogi_core::types::{Color, PieceType};
 
-/// NNUE評価ベンチマーク
+/// NNUE隧穂ｾ｡繝吶Φ繝√・繝ｼ繧ｯ
 #[derive(Parser, Debug)]
 #[command(
     name = "bench_nnue_eval",
     version,
-    about = "NNUE評価関数のベンチマーク"
+    about = "NNUE隧穂ｾ｡髢｢謨ｰ縺ｮ繝吶Φ繝√・繝ｼ繧ｯ"
 )]
 struct Cli {
-    /// NNUEファイルのパス
+    /// NNUE繝輔ぃ繧､繝ｫ縺ｮ繝代せ
     #[arg(long)]
     nnue_file: PathBuf,
 
-    /// ベンチモード
-    #[arg(long, default_value = "full")]
+    /// 繝吶Φ繝√Δ繝ｼ繝・    #[arg(long, default_value = "full")]
     mode: String,
 
-    /// 反復回数（デフォルト: 50万回）
-    #[arg(long, default_value = "500000")]
+    /// 蜿榊ｾｩ蝗樊焚・医ョ繝輔か繝ｫ繝・ 50荳・屓・・    #[arg(long, default_value = "500000")]
     iterations: u64,
 
-    /// ウォームアップ回数（デフォルト: 1万回）
-    #[arg(long, default_value = "10000")]
+    /// 繧ｦ繧ｩ繝ｼ繝繧｢繝・・蝗樊焚・医ョ繝輔か繝ｫ繝・ 1荳・屓・・    #[arg(long, default_value = "10000")]
     warmup: u64,
 
-    /// 進行度重みファイル（progress.bin、f64 LE）
-    /// 指定時は bucket index 計算のマイクロベンチも実行
-    #[arg(long)]
+    /// progress8kpabs 驥阪∩繝輔ぃ繧､繝ｫ・・rogress.bin・・    /// 謖・ｮ壽凾縺ｯ bucket index 險育ｮ励・繝槭う繧ｯ繝ｭ繝吶Φ繝√ｂ螳溯｡・    #[arg(long)]
     ls_progress_coeff: Option<PathBuf>,
 
-    /// 進行度方式が推論に使う bucket 数。LayerStacks + 進行度方式では必須。
-    #[arg(long)]
-    ls_progress_buckets: Option<usize>,
-
-    /// spec のない LayerStacks ネットの bucket モード
-    #[arg(long)]
-    ls_bucket_mode: Option<String>,
+    /// LayerStacks bucket 繝｢繝ｼ繝・    #[arg(long, default_value = "progress8kpabs")]
+    ls_bucket_mode: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,13 +97,13 @@ impl BenchMode {
 const TEST_POSITIONS: &[&str] = &[
     // 初期局面
     "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
-    // 中盤局面1（矢倉模様）
+    // 中盤局面1
     "lnsg1gsnl/1r4kb1/pppppp1pp/6p2/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL w - 1",
-    // 中盤局面2（居飛車vs振り飛車）
+    // 中盤局面2
     "ln1gkg1nl/1rs3sb1/p1pppp1pp/1p4p2/9/2PP5/PPS1PPPPP/1BG4R1/LN2KGSNL w - 1",
-    // 終盤局面（駒が減った局面）
+    // 終盤局面
     "4k4/9/9/9/9/9/9/9/4K4 b 2r2b4g4s4n4l18p 1",
-    // 複雑な中盤（駒の配置が多い）
+    // 複雑な中盤
     "l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w RGgsn5p 1",
 ];
 
@@ -140,9 +128,14 @@ struct LayerStackBenchResult {
 }
 
 impl LayerStackBenchResult {
-    fn print(&self, arch_name: &str, bucket_mode: &str, bucket_counts: &[usize]) {
+    fn print(
+        &self,
+        arch_name: &str,
+        bucket_mode: LayerStackBucketMode,
+        bucket_counts: &[usize; 9],
+    ) {
         println!("=== {arch_name} / {} ===", self.bench_name);
-        println!("  bucket_mode:         {bucket_mode}");
+        println!("  bucket_mode:         {}", bucket_mode.as_str());
         println!("  dataset buckets:     {}", format_bucket_counts(bucket_counts));
         println!("  ns/op:               {:.1}", self.ns_per_op);
         println!("  throughput:          {:.0} ops/sec", self.ops_per_sec);
@@ -174,65 +167,38 @@ struct LayerStackCases<const L1: usize> {
     propagate_cases: Vec<LayerStackPropagateCase<L1>>,
     eval_cases: Vec<LayerStackEvalCase<L1>>,
     update_cache_cases: Vec<LayerStackUpdateCacheCase<L1>>,
-    /// 各 bucket への dataset 分布 (長さ = `net.num_buckets`)
-    bucket_counts: Vec<usize>,
-    /// 各 bucket への dataset 分布 (1 手進めた後、長さ = `net.num_buckets`)
-    update_bucket_counts: Vec<usize>,
+    bucket_counts: [usize; 9],
+    update_bucket_counts: [usize; 9],
 }
 
 impl BenchResult {
     fn print(&self) {
         println!("=== {} ===", self.arch_name);
         println!("  refresh_accumulator: {:.1} ns/op", self.refresh_ns_per_op);
-        println!("  evaluate (fixed position 0): {:.1} ns/op", self.eval_ns_per_op);
-        println!("  eval-only SFEN:      {}", TEST_POSITIONS[0]);
+        println!("  evaluate:            {:.1} ns/op", self.eval_ns_per_op);
         println!("  total (refresh+eval):{:.1} ns/op", self.total_ns_per_op);
         println!("  throughput:          {:.0} evals/sec", self.evals_per_sec);
         println!();
     }
 }
 
-/// 計測中に局面だけを切り替えないよう、準備済み accumulator と局面を組にする。
-struct FixedEvalCase<'a> {
-    evaluator: &'a NNUEEvaluator,
-    pos: &'a Position,
-}
-
-impl<'a> FixedEvalCase<'a> {
-    fn prepare(evaluator: &'a mut NNUEEvaluator, pos: &'a Position) -> Result<Self> {
-        evaluator.refresh(pos);
-        // 独立した fresh 評価器との照合と割り当ては、すべて計測外で行う。
-        let fresh = NNUEEvaluator::new_with_position(Arc::clone(evaluator.network()), pos);
-        anyhow::ensure!(
-            evaluator.evaluate_only(pos) == fresh.evaluate_only(pos),
-            "prepared eval-only result differs from fresh evaluation"
-        );
-        Ok(Self { evaluator, pos })
-    }
-
-    fn evaluate(&self) -> Value {
-        self.evaluator.evaluate_only(black_box(self.pos))
-    }
-}
-
-/// NNUEEvaluator を使用したベンチマーク
+/// NNUEEvaluator 繧剃ｽｿ逕ｨ縺励◆繝吶Φ繝√・繝ｼ繧ｯ
 fn bench_evaluator(
     evaluator: &mut NNUEEvaluator,
     positions: &[Position],
     warmup: u64,
     iterations: u64,
     arch_name: &str,
-) -> Result<BenchResult> {
-    anyhow::ensure!(!positions.is_empty(), "benchmark positions must not be empty");
-    anyhow::ensure!(iterations > 0, "iterations must be positive");
-    // ウォームアップ
+) -> BenchResult {
+    // 繧ｦ繧ｩ繝ｼ繝繧｢繝・・
     for i in 0..warmup {
         let pos = &positions[i as usize % positions.len()];
         evaluator.refresh(pos);
-        black_box(evaluator.evaluate_only(pos));
+        let mut pos_mut = pos.clone();
+        black_box(evaluator.evaluate_only(&mut pos_mut));
     }
 
-    // refresh_accumulator ベンチマーク
+    // refresh_accumulator 繝吶Φ繝√・繝ｼ繧ｯ
     let start = Instant::now();
     for i in 0..iterations {
         let pos = &positions[i as usize % positions.len()];
@@ -240,23 +206,23 @@ fn bench_evaluator(
     }
     let refresh_duration = start.elapsed();
 
-    // eval-only は局面0固定。refresh と結合ベンチは引き続き全局面を巡回する。
-    let case = FixedEvalCase::prepare(evaluator, &positions[0])?;
-    for _ in 0..warmup {
-        black_box(case.evaluate());
-    }
+    // evaluate 繝吶Φ繝√・繝ｼ繧ｯ
+    evaluator.refresh(&positions[0]);
     let start = Instant::now();
-    for _ in 0..iterations {
-        black_box(case.evaluate());
+    for i in 0..iterations {
+        let pos = &positions[i as usize % positions.len()];
+        let mut pos_mut = pos.clone();
+        black_box(evaluator.evaluate_only(&mut pos_mut));
     }
     let eval_duration = start.elapsed();
 
-    // 結合ベンチマーク
+    // 邨仙粋繝吶Φ繝√・繝ｼ繧ｯ
     let start = Instant::now();
     for i in 0..iterations {
         let pos = &positions[i as usize % positions.len()];
         evaluator.refresh(pos);
-        black_box(evaluator.evaluate_only(pos));
+        let mut pos_mut = pos.clone();
+        black_box(evaluator.evaluate_only(&mut pos_mut));
     }
     let total_duration = start.elapsed();
 
@@ -264,55 +230,85 @@ fn bench_evaluator(
     let eval_ns = eval_duration.as_nanos() as f64 / iterations as f64;
     let total_ns = total_duration.as_nanos() as f64 / iterations as f64;
 
-    Ok(BenchResult {
+    BenchResult {
         arch_name: arch_name.to_string(),
         refresh_ns_per_op: refresh_ns,
         eval_ns_per_op: eval_ns,
         total_ns_per_op: total_ns,
         evals_per_sec: 1_000_000_000.0 / total_ns,
-    })
+    }
 }
 
-/// progress bucket 計算のマイクロベンチマーク
-///
-/// 適用済みの routing の方式 (f32 / Q16) と係数で計測する。
-fn bench_progress_bucket(
-    positions: &[Position],
-    bucketer: &LayerStackBucketer,
-    mode: LayerStackBucketMode,
-    num_buckets: usize,
-    warmup: u64,
-    iterations: u64,
-) {
+/// progress.bin 繧定ｪｭ縺ｿ霎ｼ縺ｿ f64 竊・f32 縺ｫ螟画鋤
+fn load_progress_kpabs_weights(path: &PathBuf) -> Result<Box<[f32]>> {
+    let bytes = std::fs::read(path)?;
+    let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * size_of::<f64>();
+    anyhow::ensure!(
+        bytes.len() == expected,
+        "progress.bin size mismatch: got {} bytes, expected {}",
+        bytes.len(),
+        expected
+    );
+    let weights: Vec<f32> = bytes
+        .chunks_exact(size_of::<f64>())
+        .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()) as f32)
+        .collect();
+    Ok(weights.into_boxed_slice())
+}
+
+/// progress8kpabs bucket 險育ｮ励・繝槭う繧ｯ繝ｭ繝吶Φ繝√・繝ｼ繧ｯ
+fn bench_progress_bucket(positions: &[Position], weights: &[f32], warmup: u64, iterations: u64) {
+    // 繧ｦ繧ｩ繝ｼ繝繧｢繝・・
     for i in 0..warmup {
-        black_box(bucketer.bucket(&positions[i as usize % positions.len()]));
+        let pos = &positions[i as usize % positions.len()];
+        black_box(compute_layer_stack_progress8kpabs_bucket_index(
+            pos,
+            pos.side_to_move(),
+            weights,
+        ));
     }
 
+    // 險域ｸｬ
     let start = Instant::now();
     for i in 0..iterations {
-        black_box(bucketer.bucket(&positions[i as usize % positions.len()]));
+        let pos = &positions[i as usize % positions.len()];
+        black_box(compute_layer_stack_progress8kpabs_bucket_index(
+            pos,
+            pos.side_to_move(),
+            weights,
+        ));
     }
     let duration = start.elapsed();
 
     let ns_per_op = duration.as_nanos() as f64 / iterations as f64;
     let ops_per_sec = 1_000_000_000.0 / ns_per_op;
 
-    let mode = mode.as_str();
-    println!("=== {mode} bucket (N={num_buckets}) ===");
+    // 蜷・ｱ髱｢縺ｮ bucket 蛟､繧定｡ｨ遉ｺ
+    println!("=== progress8kpabs bucket ===");
     for (i, pos) in positions.iter().enumerate() {
-        println!("  position[{i}]: bucket={}", bucketer.bucket(pos));
+        let bucket =
+            compute_layer_stack_progress8kpabs_bucket_index(pos, pos.side_to_move(), weights);
+        println!("  position[{i}]: bucket={bucket}");
     }
     println!("  {:.1} ns/op ({:.0} ops/sec)", ns_per_op, ops_per_sec);
     println!();
-    println!("--- {mode} JSON ---");
-    println!(
-        r#"{{"mode":"{mode}","bucket_ns":{:.1},"bucket_ops_per_sec":{:.0},"num_buckets":{}}}"#,
-        ns_per_op, ops_per_sec, num_buckets
-    );
+    println!("--- progress8kpabs JSON ---");
+    println!(r#"{{"bucket_ns":{:.1},"bucket_ops_per_sec":{:.0}}}"#, ns_per_op, ops_per_sec);
     println!();
 }
 
-fn format_bucket_counts(bucket_counts: &[usize]) -> String {
+fn compute_layer_stack_bucket_index(pos: &Position, mode: LayerStackBucketMode) -> usize {
+    let side_to_move = pos.side_to_move();
+    match mode {
+        LayerStackBucketMode::Progress8KPAbs => compute_layer_stack_progress8kpabs_bucket_index(
+            pos,
+            side_to_move,
+            get_layer_stack_progress_kpabs_weights(),
+        ),
+    }
+}
+
+fn format_bucket_counts(bucket_counts: &[usize; 9]) -> String {
     let parts: Vec<String> = bucket_counts
         .iter()
         .enumerate()
@@ -326,20 +322,22 @@ fn format_bucket_counts(bucket_counts: &[usize]) -> String {
     }
 }
 
-fn configure_layer_stack_bucket(cli: &Cli, stored_buckets: usize) -> Result<LayerStackBucketMode> {
-    let mode_str =
-        cli.ls_bucket_mode.as_deref().context("LayerStacks requires --ls-bucket-mode")?;
-    let mode = parse_native_layer_stack_bucket_mode(mode_str)?;
+fn configure_layer_stack_bucket(
+    cli: &Cli,
+    progress_weights: Option<&[f32]>,
+) -> Result<LayerStackBucketMode> {
+    let mode = parse_layer_stack_bucket_mode(&cli.ls_bucket_mode).ok_or_else(|| {
+        anyhow!("invalid --ls-bucket-mode '{}'. expected: progress8kpabs", cli.ls_bucket_mode)
+    })?;
+    set_layer_stack_bucket_mode(mode);
 
-    let plan = NativeRouting::prepare(
-        Some(stored_buckets),
-        Some(mode),
-        cli.ls_progress_buckets,
-        cli.ls_progress_coeff.is_some(),
-    )
-    .context("native routing: --ls-bucket-mode / --ls-progress-buckets / --ls-progress-coeff")?
-    .expect("LayerStacks routing");
-    plan.apply(|| cli.ls_progress_coeff.as_deref().map(ProgressCoefficients::load).transpose())?;
+    if mode == LayerStackBucketMode::Progress8KPAbs {
+        let weights = progress_weights.context(
+            "--ls-bucket-mode progress8kpabs requires --ls-progress-coeff <progress.bin>",
+        )?;
+        set_layer_stack_progress_kpabs_weights(weights.to_vec().into_boxed_slice())
+            .map_err(|e| anyhow!("failed to set progress8kpabs weights: {e}"))?;
+    }
 
     Ok(mode)
 }
@@ -349,25 +347,23 @@ fn prepare_layer_stack_cases<
     const LS_L1_OUT: usize,
     const LS_L2_IN: usize,
     const LS_L2_PADDED_INPUT: usize,
-    const LS_L2_OUT: usize,
-    FT: LsFeatureSpec,
+    const LS_L3: usize,
 >(
-    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, FT, LS_L2_OUT>,
+    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, LS_L3>,
     positions: &[Position],
-    bucketer: &LayerStackBucketer,
-) -> LayerStackCases<L1> {
-    let num_buckets = net.num_buckets;
+    bucket_mode: LayerStackBucketMode,
+) -> Result<LayerStackCases<L1>> {
     let mut propagate_cases = Vec::with_capacity(positions.len());
     let mut eval_cases = Vec::with_capacity(positions.len());
     let mut update_cache_cases = Vec::with_capacity(positions.len());
-    let mut bucket_counts = vec![0usize; num_buckets];
-    let mut update_bucket_counts = vec![0usize; num_buckets];
+    let mut bucket_counts = [0usize; 9];
+    let mut update_bucket_counts = [0usize; 9];
 
     for pos in positions {
         let mut accumulator = AccumulatorLayerStacks::<L1>::new();
         net.refresh_accumulator(pos, &mut accumulator);
 
-        let bucket_index = bucketer.bucket(pos);
+        let bucket_index = compute_layer_stack_bucket_index(pos, bucket_mode);
         bucket_counts[bucket_index] += 1;
 
         let (us_acc, them_acc) = if pos.side_to_move() == Color::Black {
@@ -392,7 +388,7 @@ fn prepare_layer_stack_cases<
         if let Some(mv) = select_non_king_legal_move(pos) {
             let mut next_pos = pos.clone();
             let dirty_piece = next_pos.do_move(mv, pos.gives_check(mv));
-            let next_bucket_index = bucketer.bucket(&next_pos);
+            let next_bucket_index = compute_layer_stack_bucket_index(&next_pos, bucket_mode);
             update_bucket_counts[next_bucket_index] += 1;
 
             update_cache_cases.push(LayerStackUpdateCacheCase {
@@ -403,13 +399,13 @@ fn prepare_layer_stack_cases<
         }
     }
 
-    LayerStackCases {
+    Ok(LayerStackCases {
         propagate_cases,
         eval_cases,
         update_cache_cases,
         bucket_counts,
         update_bucket_counts,
-    }
+    })
 }
 
 fn select_non_king_legal_move(pos: &Position) -> Option<rshogi_core::types::Move> {
@@ -426,10 +422,9 @@ fn bench_layer_stack_propagate<
     const LS_L1_OUT: usize,
     const LS_L2_IN: usize,
     const LS_L2_PADDED_INPUT: usize,
-    const LS_L2_OUT: usize,
-    FT: LsFeatureSpec,
+    const LS_L3: usize,
 >(
-    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, FT, LS_L2_OUT>,
+    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, LS_L3>,
     cases: &[LayerStackPropagateCase<L1>],
     warmup: u64,
     iterations: u64,
@@ -459,23 +454,26 @@ fn bench_layer_stack_eval<
     const LS_L1_OUT: usize,
     const LS_L2_IN: usize,
     const LS_L2_PADDED_INPUT: usize,
-    const LS_L2_OUT: usize,
-    FT: LsFeatureSpec,
+    const LS_L3: usize,
 >(
-    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, FT, LS_L2_OUT>,
+    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, LS_L3>,
     cases: &[LayerStackEvalCase<L1>],
     warmup: u64,
     iterations: u64,
 ) -> LayerStackBenchResult {
+    // bench は &[Position] を保持、 evaluate_with_bucket が `&mut Position` を要求するため
+    // 各 iter で clone (bench 用、 hot path ではない)。
     for i in 0..warmup {
         let case = &cases[i as usize % cases.len()];
-        black_box(net.evaluate_with_bucket(&case.pos, &case.accumulator, case.bucket_index));
+        let mut pos = case.pos.clone();
+        black_box(net.evaluate_with_bucket(&mut pos, &case.accumulator, case.bucket_index));
     }
 
     let start = Instant::now();
     for i in 0..iterations {
         let case = &cases[i as usize % cases.len()];
-        black_box(net.evaluate_with_bucket(&case.pos, &case.accumulator, case.bucket_index));
+        let mut pos = case.pos.clone();
+        black_box(net.evaluate_with_bucket(&mut pos, &case.accumulator, case.bucket_index));
     }
     let duration = start.elapsed();
 
@@ -492,10 +490,9 @@ fn bench_layer_stack_refresh_cache<
     const LS_L1_OUT: usize,
     const LS_L2_IN: usize,
     const LS_L2_PADDED_INPUT: usize,
-    const LS_L2_OUT: usize,
-    FT: LsFeatureSpec,
+    const LS_L3: usize,
 >(
-    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, FT, LS_L2_OUT>,
+    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, LS_L3>,
     positions: &[Position],
     warmup: u64,
     iterations: u64,
@@ -530,16 +527,15 @@ fn bench_layer_stack_update_cache<
     const LS_L1_OUT: usize,
     const LS_L2_IN: usize,
     const LS_L2_PADDED_INPUT: usize,
-    const LS_L2_OUT: usize,
-    FT: LsFeatureSpec,
+    const LS_L3: usize,
 >(
-    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, FT, LS_L2_OUT>,
+    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, LS_L3>,
     cases: &[LayerStackUpdateCacheCase<L1>],
     warmup: u64,
     iterations: u64,
 ) -> Result<LayerStackBenchResult> {
     if cases.is_empty() {
-        bail!("LayerStack update-cache ベンチ用の非玉合法手付き局面がない");
+        bail!("LayerStack update-cache benchmark has no legal non-king move cases");
     }
 
     let mut cache = AccumulatorCacheLayerStacks::<L1>::new();
@@ -582,8 +578,8 @@ fn bench_layer_stack_update_cache<
 fn print_ls_json(
     mode: BenchMode,
     arch_name: &str,
-    bucket_mode: &str,
-    bucket_counts: &[usize],
+    bucket_mode: LayerStackBucketMode,
+    bucket_counts: &[usize; 9],
     result: &LayerStackBenchResult,
 ) {
     println!("--- JSON ---");
@@ -591,33 +587,30 @@ fn print_ls_json(
         r#"{{"mode":"{}","arch":"{}","bucket_mode":"{}","bucket_counts":"{}","ns_per_op":{:.1},"ops_per_sec":{:.0}}}"#,
         mode.as_str(),
         arch_name,
-        bucket_mode,
+        bucket_mode.as_str(),
         format_bucket_counts(bucket_counts),
         result.ns_per_op,
         result.ops_per_sec
     );
 }
 
-/// LayerStack ベンチマークの共通実行ロジック
+/// LayerStack 繝吶Φ繝√・繝ｼ繧ｯ縺ｮ蜈ｱ騾壼ｮ溯｡後Ο繧ｸ繝・け
 fn run_layer_stack_bench<
     const L1: usize,
     const LS_L1_OUT: usize,
     const LS_L2_IN: usize,
     const LS_L2_PADDED_INPUT: usize,
-    const LS_L2_OUT: usize,
-    FT: LsFeatureSpec,
+    const LS_L3: usize,
 >(
-    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, FT, LS_L2_OUT>,
+    net: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, LS_L3>,
     mode: BenchMode,
     positions: &[Position],
-    bucketer: &LayerStackBucketer,
-    bucket_mode: &str,
-    cli: &Cli,
+    bucket_mode: LayerStackBucketMode,
+    warmup: u64,
+    iterations: u64,
     arch_name: &str,
 ) -> Result<()> {
-    let cases = prepare_layer_stack_cases(net, positions, bucketer);
-    let warmup = cli.warmup;
-    let iterations = cli.iterations;
+    let cases = prepare_layer_stack_cases(net, positions, bucket_mode)?;
 
     let (result, bucket_counts) = match mode {
         BenchMode::LayerStackPropagate => (
@@ -647,11 +640,47 @@ fn run_layer_stack_bench<
     Ok(())
 }
 
+/// LayerStacksNetwork 縺ｮ L1 dispatch 繝槭け繝ｭ
+macro_rules! with_ls_net {
+    ($ls_net:expr, |$inner:ident| $body:expr) => {
+        match $ls_net {
+            #[cfg(feature = "layerstacks-1536x16x32")]
+            LayerStacksNetwork::L1536x16x32($inner) => $body,
+            #[cfg(feature = "layerstacks-1536x32x32")]
+            LayerStacksNetwork::L1536x32x32($inner) => $body,
+            #[cfg(feature = "layerstacks-1536x8x96")]
+            LayerStacksNetwork::L1536x8x96($inner) => $body,
+            #[cfg(feature = "layerstacks-1536x16x96")]
+            LayerStacksNetwork::L1536x16x96($inner) => $body,
+            #[cfg(feature = "layerstacks-1536x32x96")]
+            LayerStacksNetwork::L1536x32x96($inner) => $body,
+            #[cfg(feature = "layerstacks-1536x48x96")]
+            LayerStacksNetwork::L1536x48x96($inner) => $body,
+            #[cfg(feature = "layerstacks-1536x64x96")]
+            LayerStacksNetwork::L1536x64x96($inner) => $body,
+            #[cfg(feature = "layerstacks-1536x16x48")]
+            LayerStacksNetwork::L1536x16x48($inner) => $body,
+            #[cfg(feature = "layerstacks-1024x16x48")]
+            LayerStacksNetwork::L1024x16x48($inner) => $body,
+            #[cfg(feature = "layerstacks-768x32x96")]
+            LayerStacksNetwork::L768x32x96($inner) => $body,
+            #[cfg(feature = "layerstacks-768x16x32")]
+            LayerStacksNetwork::L768x16x32($inner) => $body,
+            #[cfg(feature = "layerstacks-768x8x32")]
+            LayerStacksNetwork::L768x8x32($inner) => $body,
+            #[cfg(feature = "layerstacks-512x16x32")]
+            LayerStacksNetwork::L512x16x32($inner) => $body,
+            #[allow(unreachable_patterns)]
+            _ => bail!("譛牙柑縺ｪ LayerStacks 繝舌Μ繧｢繝ｳ繝医′縺ゅｊ縺ｾ縺帙ｓ"),
+        }
+    };
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let mode = BenchMode::parse(&cli.mode)?;
 
-    // テスト局面をパース
+    // 繝・せ繝亥ｱ髱｢繧偵ヱ繝ｼ繧ｹ
     let positions: Vec<Position> = TEST_POSITIONS
         .iter()
         .map(|sfen| {
@@ -670,65 +699,42 @@ pub fn run() -> Result<()> {
     println!("Test positions: {}", positions.len());
     println!();
 
-    println!("Loading NNUE file: {}", cli.nnue_file.display());
-    let network = Arc::new(NNUENetwork::load(&cli.nnue_file)?);
-    let arch_name = network.architecture_name();
-
-    let has_routing_options = cli.ls_bucket_mode.is_some()
-        || cli.ls_progress_buckets.is_some()
-        || cli.ls_progress_coeff.is_some();
-    let routing = if let Some(spec) = network.layer_stack_bucket_spec() {
-        anyhow::ensure!(
-            !has_routing_options,
-            "NNUE ls_bucket routing conflicts with --ls-bucket-mode, --ls-progress-buckets or --ls-progress-coeff"
-        );
-        Some((LayerStackBucketer::Spec(spec), "spec"))
-    } else if let Some(stored) = network.layer_stack_num_buckets() {
-        let bucket_mode = configure_layer_stack_bucket(&cli, stored)?;
-        let num_buckets = cli.ls_progress_buckets.unwrap_or(stored);
-        let bucketer = LayerStackBucketer::from_configured(stored, num_buckets)?;
-        if cli.ls_progress_coeff.is_some() {
-            bench_progress_bucket(
-                &positions,
-                &bucketer,
-                bucket_mode,
-                num_buckets,
-                cli.warmup,
-                cli.iterations,
-            );
-        }
-        Some((bucketer, bucket_mode.as_str()))
+    let progress_weights = if let Some(ref coeff_path) = cli.ls_progress_coeff {
+        println!("Loading progress8kpabs weights: {}", coeff_path.display());
+        let weights = load_progress_kpabs_weights(coeff_path)?;
+        println!("  weights: {} elements", weights.len());
+        println!();
+        Some(weights)
     } else {
-        anyhow::ensure!(
-            !has_routing_options,
-            "LayerStacks routing options were provided for a non-LayerStacks network"
-        );
         None
     };
 
+    // progress8kpabs bucket 繝吶Φ繝√・繝ｼ繧ｯ
+    if let Some(weights) = progress_weights.as_deref() {
+        bench_progress_bucket(&positions, weights, cli.warmup, cli.iterations);
+    }
+
+    println!("Loading NNUE file: {}", cli.nnue_file.display());
+    let network = Arc::new(NNUENetwork::load(&cli.nnue_file)?);
+    let arch_name = network.architecture_name();
+    println!("Architecture: {arch_name}");
+    println!();
+
     match mode {
         BenchMode::Full => {
-            println!("Architecture: {arch_name}");
-            println!();
             let mut evaluator =
                 NNUEEvaluator::new_with_position(Arc::clone(&network), &positions[0]);
-            let result = bench_evaluator(
-                &mut evaluator,
-                &positions,
-                cli.warmup,
-                cli.iterations,
-                &arch_name,
-            )?;
+            let result =
+                bench_evaluator(&mut evaluator, &positions, cli.warmup, cli.iterations, arch_name);
 
             result.print();
 
             println!("--- JSON ---");
             println!(
-                r#"{{"mode":"full","arch":"{}","refresh_ns":{:.1},"eval_ns":{:.1},"eval_scope":"fixed-position","eval_position_index":0,"eval_sfen":"{}","total_ns":{:.1},"evals_per_sec":{:.0}}}"#,
+                r#"{{"mode":"full","arch":"{}","refresh_ns":{:.1},"eval_ns":{:.1},"total_ns":{:.1},"evals_per_sec":{:.0}}}"#,
                 result.arch_name,
                 result.refresh_ns_per_op,
                 result.eval_ns_per_op,
-                TEST_POSITIONS[0],
                 result.total_ns_per_op,
                 result.evals_per_sec
             );
@@ -737,37 +743,23 @@ pub fn run() -> Result<()> {
         | BenchMode::LayerStackEval
         | BenchMode::LayerStackRefreshCache
         | BenchMode::LayerStackUpdateCache => {
-            // LS 専用モードは静的 net の内部構造 (layer stack / accumulator cache) を
-            // 直接叩くため、feature 統合で `nnue-runtime-dimensions` が有効なビルドでも
-            // 静的 reader で読み直す。Full モードは `network` (dynamic 可) のままで良い。
-            // 読み直す前に `network` を解放してピーク常駐を二重にしない。
-            drop(network);
-            let ls_net =
-                NNUENetwork::load_static_layer_stacks(&cli.nnue_file).with_context(|| {
-                    format!("静的 LayerStacks NNUE を読み込めません: {}", cli.nnue_file.display())
-                })?;
-            // arch ラベルは静的 net の spec から取る。dynamic 側の `architecture_name()` は
-            // build 構成 (`nnue-runtime-dimensions` の有無) で文字列が変わるため。
-            let static_arch_name = ls_net.architecture_spec().name();
-            println!("Architecture: {static_arch_name}");
-            println!();
-            let (bucketer, bucket_mode) = routing.expect("LayerStacks net was configured above");
+            let bucket_mode = configure_layer_stack_bucket(&cli, progress_weights.as_deref())?;
 
-            ls_dispatch_ft_size!(
-                &ls_net,
-                |net| {
-                    run_layer_stack_bench(
-                        net,
-                        mode,
-                        &positions,
-                        &bucketer,
-                        bucket_mode,
-                        &cli,
-                        &static_arch_name,
-                    )?;
-                },
-                _ => bail!("有効な LayerStacks (FT × L1) バリアントがありません"),
-            );
+            let NNUENetwork::LayerStacks(ref ls_net) = *network else {
+                bail!("LayerStack mode requires a LayerStacks NNUE");
+            };
+
+            with_ls_net!(ls_net, |net| {
+                run_layer_stack_bench(
+                    net,
+                    mode,
+                    &positions,
+                    bucket_mode,
+                    cli.warmup,
+                    cli.iterations,
+                    arch_name,
+                )?;
+            });
         }
     }
 
@@ -778,34 +770,8 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// 外部モデルを明示して実行する数値回帰。固定局面以外の状態を先に作る。
     #[test]
-    #[ignore = "requires RSHOGI_BENCH_TEST_MODEL"]
-    fn fixed_eval_matches_fresh_after_other_positions() -> Result<()> {
-        let model = std::env::var("RSHOGI_BENCH_TEST_MODEL")?;
-        let network = Arc::new(NNUENetwork::load(model)?);
-        let positions: Vec<_> = TEST_POSITIONS
-            .iter()
-            .map(|sfen| {
-                let mut pos = Position::new();
-                pos.set_sfen(sfen).unwrap();
-                pos
-            })
-            .collect();
-        let mut evaluator = NNUEEvaluator::new_with_position(Arc::clone(&network), &positions[0]);
-        let mut saw_mismatch = false;
-        for (index, pos) in positions.iter().enumerate() {
-            let other = &positions[(index + 1) % positions.len()];
-            evaluator.refresh(other);
-            let fresh = NNUEEvaluator::new_with_position(Arc::clone(&network), pos);
-            let expected = fresh.evaluate_only(pos);
-            saw_mismatch |= evaluator.evaluate_only(pos) != expected;
-            let case = FixedEvalCase::prepare(&mut evaluator, pos)?;
-            for _ in 0..3 {
-                assert_eq!(case.evaluate(), expected);
-            }
-        }
-        assert!(saw_mismatch, "fixture model must expose stale-accumulator mismatch");
-        Ok(())
+    fn run_entry_is_reachable_in_tests() {
+        let _ = run as fn() -> Result<()>;
     }
 }

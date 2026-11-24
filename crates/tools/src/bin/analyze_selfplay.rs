@@ -9,8 +9,7 @@
 ///
 ///   # JSON出力モード
 ///   analyze_selfplay --json file1.jsonl file2.jsonl
-use rshogi_csa_client::jsonl::{is_csa_jsonl, is_incomplete_result};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -18,11 +17,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use tools::selfplay::CONTROL_HISTORY_FILE_NAME;
-use tools::sprt::{Penta, SprtMetaLog, SprtParameters, SprtStopLog, collect_sprt_penta, judge};
-
-#[path = "analyze_selfplay/adjudication_sweep.rs"]
-mod adjudication_sweep;
+use tools::sprt::{GameSide, Penta, SprtMetaLog, SprtParameters, judge};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -31,7 +26,7 @@ mod adjudication_sweep;
 #[derive(Parser)]
 #[command(about = "自己対局ログの集計")]
 struct Cli {
-    /// 集計対象の JSONL ファイルまたは run ディレクトリ（複数指定可）
+    /// 集計対象のJSONLファイルパス（複数指定可）
     #[arg(required = true)]
     files: Vec<String>,
 
@@ -39,38 +34,27 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// 開始局面ごとの先後別成績・所要時間・手順数を表示する。
-    #[arg(long)]
-    by_startpos: bool,
-
-    /// 不完全入力の部分集計でも終了コードを成功にする。SPRT 採否は常に invalid。
-    #[arg(long)]
-    allow_partial: bool,
-
     /// SPRT post-hoc 判定表示を有効化。
-    /// ラベルは CLI → meta の SPRT 情報 → meta のラベル情報（base_label 記録 /
-    /// "base" を含むラベル名等）の順で自動推定し、推定時は根拠を表示する。
-    /// 数値パラメータは CLI → meta → ハードコード fallback
-    /// (nelo0=0, nelo1=5, alpha=0.05, beta=0.05) の順で解決する。
+    /// ラベル / パラメータは tournament.rs が meta 行に書き出した SPRT 情報から自動推定する。
+    /// ラベルは meta にも CLI にも無い場合エラー。数値パラメータは meta にも CLI にも無い
+    /// 場合のみハードコード fallback (nelo0=0, nelo1=5, alpha=0.05, beta=0.05) を使う。
     #[arg(long, default_value_t = false)]
     sprt: bool,
 
-    /// H1 側（challenger / test）のラベル。未指定時は meta から推定。
+    /// H1 側（challenger / test）のラベル。未指定時は meta から推定（meta にも無ければエラー）。
     #[arg(long)]
     sprt_test_label: Option<String>,
 
-    /// H0 側（base）のラベル。未指定時は meta から推定。
+    /// H0 側（base）のラベル。未指定時は meta から推定（meta にも無ければエラー）。
     #[arg(long)]
     sprt_base_label: Option<String>,
 
     /// H0 仮説の正規化 Elo。未指定時は meta → ハードコード fallback (0.0) の順で解決。
-    /// 負値も `--sprt-nelo0 -10` の形で受け付ける。
-    #[arg(long, allow_negative_numbers = true)]
+    #[arg(long)]
     sprt_nelo0: Option<f64>,
 
     /// H1 仮説の正規化 Elo。未指定時は meta → ハードコード fallback (5.0) の順で解決。
-    /// 負値もスペース区切りで受け付ける（例: `--sprt-nelo0 -20 --sprt-nelo1 -5`。nelo0 < nelo1 必須）。
-    #[arg(long, allow_negative_numbers = true)]
+    #[arg(long)]
     sprt_nelo1: Option<f64>,
 
     /// 第一種過誤率 α。未指定時は meta → ハードコード fallback (0.05) の順で解決。
@@ -80,23 +64,6 @@ struct Cli {
     /// 第二種過誤率 β。未指定時は meta → ハードコード fallback (0.05) の順で解決。
     #[arg(long)]
     sprt_beta: Option<f64>,
-
-    /// 両側の評価の一致による裁定 (tournament / spsa の `--adjudicate-agreement`) を記録済みの対局に
-    /// 当てはめ、閾値と手数の組ごとに食い違いの率と縮む手数の割合を出す。通常の集計は行わない。
-    #[arg(long)]
-    adjudication_sweep: bool,
-
-    /// `--adjudication-sweep` の閾値 X (cp、カンマ区切り)。
-    #[arg(
-        long,
-        value_delimiter = ',',
-        default_value = "500,600,700,800,900,1000"
-    )]
-    sweep_scores: Vec<i32>,
-
-    /// `--adjudication-sweep` の各側の連続手数 N (カンマ区切り)。
-    #[arg(long, value_delimiter = ',', default_value = "2,3,4,6,8")]
-    sweep_movecounts: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,14 +73,8 @@ struct Cli {
 /// 通常JSONLのmeta行
 #[derive(Deserialize)]
 struct MetaLog {
-    #[serde(default)]
-    source: Option<String>,
     settings: MetaSettings,
     engine_cmd: EngineCommandMeta,
-    /// tournament.rs が base-vs-N モード（--base-label）時のみ出力。
-    /// SPRT post-hoc のラベル役割（base / test）推定に使う。
-    #[serde(default)]
-    base_label: Option<String>,
     /// tournament.rs が --sprt 実行時のみ出力。未指定時のラベル自動推定に使う。
     #[serde(default)]
     sprt: Option<SprtMetaLog>,
@@ -122,14 +83,10 @@ struct MetaLog {
 #[derive(Deserialize)]
 struct MetaSettings {
     games: u32,
-    #[serde(default)]
-    single_game: bool,
 }
 
 #[derive(Deserialize)]
 struct EngineCommandMeta {
-    #[serde(default)]
-    note: Option<String>,
     path_black: String,
     path_white: String,
     #[serde(default)]
@@ -139,20 +96,8 @@ struct EngineCommandMeta {
 }
 
 /// 通常JSONLのresult行
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 struct ResultLog {
-    #[serde(default)]
-    game_id: Option<u32>,
-    #[serde(default)]
-    startpos_idx: Option<usize>,
-    #[serde(default)]
-    startpos: Option<String>,
-    #[serde(default)]
-    startpos_name: Option<String>,
-    #[serde(skip)]
-    moves: StartposMoves,
-    #[serde(default)]
-    reason: Option<String>,
     outcome: String,
     /// 勝者のエンジンラベル（tournament.rs が出力、旧形式では None）
     #[serde(default)]
@@ -165,16 +110,12 @@ struct ResultLog {
     #[serde(default)]
     pair_slot: Option<u32>,
     #[serde(default)]
-    attempt: u32,
-    #[serde(default)]
     error: Option<bool>,
 }
 
 /// 通常JSONLのmove行
 #[derive(Deserialize)]
 struct MoveLog {
-    #[serde(default)]
-    move_usi: Option<String>,
     game_id: u32,
     ply: u32,
     side_to_move: String,
@@ -233,192 +174,12 @@ struct FileResult {
     /// meta.white エンジンが先手として対局した数・勝数
     b_sente_games: u32,
     b_sente_wins: u32,
-    retry: RetryAnalysisStats,
     extra: FileExtraStats,
-}
-
-#[derive(Clone, Copy, Default)]
-struct RetryAnalysisStats {
-    error_games: u32,
-    error_pairs: u32,
-    retried_pairs: u32,
-    exhausted_pairs: u32,
-}
-
-/// 各対局の move 行を捨てながら保持する、集計に必要な情報。
-#[derive(Clone)]
-struct StartposMoves {
-    elapsed_ms: u64,
-    // USI から生成した Move は上位16bitの駒情報を持たない。
-    prefix: [u16; 40],
-    prefix_len: usize,
-}
-
-impl Default for StartposMoves {
-    fn default() -> Self {
-        Self {
-            elapsed_ms: 0,
-            prefix: [0; 40],
-            prefix_len: 0,
-        }
-    }
-}
-
-impl StartposMoves {
-    fn record_prefix<const N: usize>(&self, plies: u32, prefixes: &mut BTreeSet<[u16; N]>) -> u64 {
-        if plies as usize >= N && self.prefix_len >= N {
-            prefixes.insert(std::array::from_fn(|i| self.prefix[i]));
-            1
-        } else {
-            0
-        }
-    }
-}
-
-#[derive(Default)]
-struct StartposRow {
-    names: BTreeSet<String>,
-    games: u64,
-    black_wins: u64,
-    white_wins: u64,
-    draws: u64,
-    reasons: BTreeMap<String, u64>,
-    plies: u64,
-    elapsed_ms: u64,
-    prefixes10: BTreeSet<[u16; 10]>,
-    prefixes20: BTreeSet<[u16; 20]>,
-    prefixes40: BTreeSet<[u16; 40]>,
-    prefix_games: [u64; 3],
-}
-
-impl StartposRow {
-    fn prefix_counts(&self) -> [usize; 3] {
-        [
-            self.prefixes10.len(),
-            self.prefixes20.len(),
-            self.prefixes40.len(),
-        ]
-    }
-}
-
-#[derive(Default)]
-struct StartposStats {
-    rows: BTreeMap<String, StartposRow>,
-    excluded_games: u64,
-}
-
-impl StartposStats {
-    fn record(&mut self, result: &ResultLog) {
-        let Some(startpos) = &result.startpos else {
-            self.excluded_games += 1;
-            return;
-        };
-        let row = self.rows.entry(startpos.clone()).or_default();
-        if let Some(name) = &result.startpos_name {
-            row.names.insert(name.clone());
-        }
-        row.games += 1;
-        row.black_wins += u64::from(result.outcome == "black_win");
-        row.white_wins += u64::from(result.outcome == "white_win");
-        row.draws += u64::from(result.outcome == "draw");
-        *row.reasons
-            .entry(result.reason.clone().unwrap_or_else(|| "unknown".into()))
-            .or_default() += 1;
-        row.plies += u64::from(result.plies);
-        row.elapsed_ms += result.moves.elapsed_ms;
-        row.prefix_games[0] += result.moves.record_prefix(result.plies, &mut row.prefixes10);
-        row.prefix_games[1] += result.moves.record_prefix(result.plies, &mut row.prefixes20);
-        row.prefix_games[2] += result.moves.record_prefix(result.plies, &mut row.prefixes40);
-    }
-
-    fn merge(&mut self, other: Self) {
-        self.excluded_games += other.excluded_games;
-        for (position, src) in other.rows {
-            let dst = self.rows.entry(position).or_default();
-            dst.names.extend(src.names);
-            dst.games += src.games;
-            dst.black_wins += src.black_wins;
-            dst.white_wins += src.white_wins;
-            dst.draws += src.draws;
-            dst.plies += src.plies;
-            dst.elapsed_ms += src.elapsed_ms;
-            for (reason, count) in src.reasons {
-                *dst.reasons.entry(reason).or_default() += count;
-            }
-            dst.prefixes10.extend(src.prefixes10);
-            dst.prefixes20.extend(src.prefixes20);
-            dst.prefixes40.extend(src.prefixes40);
-            for (dst_games, src_games) in dst.prefix_games.iter_mut().zip(src.prefix_games) {
-                *dst_games += src_games;
-            }
-        }
-    }
-
-    fn json(&self) -> serde_json::Value {
-        let rows: Vec<_> = self.rows.iter().map(|(position, row)| {
-            let prefixes: Vec<_> = [10, 20, 40].into_iter().enumerate().map(|(i, plies)| {
-                serde_json::json!({"plies": plies, "unique": row.prefix_counts()[i], "games": row.prefix_games[i]})
-            }).collect();
-            let mut value = serde_json::json!({"startpos": position, "games": row.games,
-                "black_wins": row.black_wins, "white_wins": row.white_wins, "draws": row.draws,
-                "black_score_rate": (row.black_wins as f64 + 0.5 * row.draws as f64) / row.games as f64,
-                "reasons": row.reasons, "average_plies": average(row.plies, row.games),
-                "average_seconds": average(row.elapsed_ms, row.games) / 1000.0, "prefixes": prefixes});
-            if !row.names.is_empty() {
-                value["startpos_name"] = row.names.iter().cloned().collect::<Vec<_>>().join(", ").into();
-            }
-            value
-        }).collect();
-        serde_json::json!({"excluded_games": self.excluded_games, "rows": rows})
-    }
-
-    fn print_text(&self) {
-        println!("\n開始局面別集計（除外 {} 局）", self.excluded_games);
-        for (i, position) in self.rows.keys().enumerate() {
-            let names = &self.rows[position].names;
-            let suffix = if names.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", names.iter().cloned().collect::<Vec<_>>().join(", "))
-            };
-            println!("{}: {}{}", i + 1, position, suffix);
-        }
-        println!(
-            "番号 対局数 先手勝 後手勝 引分 先手得点率 平均手数 平均秒 10/20/40手の相異手順数/対象局数 終局理由"
-        );
-        for (i, row) in self.rows.values().enumerate() {
-            println!(
-                "{} {} {} {} {} {:.4} {:.2} {:.3} {}/{} {}/{} {}/{} {}",
-                i + 1,
-                row.games,
-                row.black_wins,
-                row.white_wins,
-                row.draws,
-                (row.black_wins as f64 + 0.5 * row.draws as f64) / row.games as f64,
-                average(row.plies, row.games),
-                average(row.elapsed_ms, row.games) / 1000.0,
-                row.prefixes10.len(),
-                row.prefix_games[0],
-                row.prefixes20.len(),
-                row.prefix_games[1],
-                row.prefixes40.len(),
-                row.prefix_games[2],
-                row.reasons
-                    .iter()
-                    .map(|(reason, count)| format!("{reason}={count}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
 }
 
 /// 対戦カード（先手, 後手）ごとの集計
 #[derive(Default)]
 struct MatchupStats {
-    side_totals_unknown: bool,
-    a_sente_total: u32,
-    b_sente_total: u32,
     total: u32,
     done: u32,
     black_wins: u32,
@@ -451,9 +212,6 @@ struct EngineStats {
 /// 直接対決の集計（先後合算、正規化済み）
 #[derive(Default)]
 struct HeadToHeadStats {
-    side_totals_unknown: bool,
-    left_sente_total: u32,
-    left_gote_total: u32,
     done: u32,
     left_wins: u32,
     right_wins: u32,
@@ -468,96 +226,12 @@ struct HeadToHeadStats {
 
 #[derive(Default)]
 struct FileExtraStats {
-    side_totals_unknown: bool,
-    a_sente_total: u32,
-    b_sente_total: u32,
-    single_game_kind: Option<&'static str>,
-    by_startpos: Option<StartposStats>,
-    incomplete_pairs: usize,
-    reasons: BTreeMap<String, u32>,
     total_plies: u64,
     completed_games: u32,
     black_wins: u32,
     white_wins: u32,
     draws: u32,
     engine_moves: BTreeMap<String, EngineMoveStats>,
-}
-
-#[derive(Default)]
-struct ParsedGameStats {
-    black_wins: u32,
-    white_wins: u32,
-    draws: u32,
-    a_sente_games: u32,
-    a_sente_wins: u32,
-    b_sente_games: u32,
-    b_sente_wins: u32,
-    extra: FileExtraStats,
-}
-
-fn record_valid_result(
-    result: &ResultLog,
-    black: &str,
-    white: &str,
-    meta_parsed: bool,
-    slot: usize,
-    stats: &mut ParsedGameStats,
-) {
-    if let Some(by_startpos) = &mut stats.extra.by_startpos {
-        by_startpos.record(result);
-    }
-    if slot == 0 {
-        stats.extra.a_sente_total += 1;
-    } else {
-        stats.extra.b_sente_total += 1;
-    }
-    stats.extra.completed_games += 1;
-    stats.extra.total_plies += result.plies as u64;
-    if result.outcome == "draw" {
-        stats.draws += 1;
-        stats.extra.draws += 1;
-        return;
-    }
-    if let Some(winner) = tools::sprt::posthoc::result_winner_label(
-        &result.outcome,
-        result.winner.as_deref(),
-        slot,
-        black,
-        white,
-    ) {
-        let winner_id = if meta_parsed && (black == winner || white == winner) {
-            winner.to_owned()
-        } else {
-            extract_engine_id(winner)
-        };
-        if winner_id == black {
-            stats.black_wins += 1;
-        } else if winner_id == white {
-            stats.white_wins += 1;
-        }
-        match result.outcome.as_str() {
-            "black_win" => {
-                stats.extra.black_wins += 1;
-                if winner_id == black {
-                    stats.a_sente_games += 1;
-                    stats.a_sente_wins += 1;
-                } else if winner_id == white {
-                    stats.b_sente_games += 1;
-                    stats.b_sente_wins += 1;
-                }
-            }
-            "white_win" => {
-                stats.extra.white_wins += 1;
-                if winner_id == black {
-                    stats.b_sente_games += 1;
-                } else if winner_id == white {
-                    stats.a_sente_games += 1;
-                }
-            }
-            "draw" => stats.extra.draws += 1,
-            _ => {}
-        }
-    }
 }
 
 #[derive(Default)]
@@ -586,22 +260,17 @@ struct MoveBucketStats {
 
 #[derive(Default)]
 struct AggregatedExtraStats {
-    input_issues: Vec<String>,
-    reasons: BTreeMap<String, u32>,
     total_plies: u64,
     completed_games: u32,
     black_wins: u32,
     white_wins: u32,
     draws: u32,
-    retry: RetryAnalysisStats,
     engine_moves: BTreeMap<String, EngineMoveStats>,
 }
 
 /// JSON出力用
 #[derive(Serialize)]
 struct JsonOutput {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    by_startpos: Option<serde_json::Value>,
     files: u32,
     progress: Progress,
     matchups: Vec<JsonMatchup>,
@@ -656,18 +325,11 @@ struct JsonHeadToHead {
 
 #[derive(Serialize)]
 struct JsonExtra {
-    reasons: BTreeMap<String, u32>,
     average_plies: f64,
     black_win_rate_decisive: f64,
     white_win_rate_decisive: f64,
     completed_games: u32,
     draws: u32,
-    error_games: u32,
-    error_pairs: u32,
-    retried_pairs: u32,
-    exhausted_pairs: u32,
-    invalid: bool,
-    input_issues: Vec<String>,
     engine_timing: Vec<JsonEngineTiming>,
 }
 
@@ -798,42 +460,13 @@ fn parse_summary_file(path: &str) -> Result<FileResult> {
             a_sente_wins: 0,
             b_sente_games: 0,
             b_sente_wins: 0,
-            retry: RetryAnalysisStats::default(),
-            extra: FileExtraStats {
-                side_totals_unknown: true,
-                ..FileExtraStats::default()
-            },
+            extra: FileExtraStats::default(),
         });
     }
     bail!("空のsummaryファイル: {path}");
 }
 
-#[derive(Debug)]
-struct InvalidSingleGameLog(&'static str);
-
-impl std::fmt::Display for InvalidSingleGameLog {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}が不正です", self.0)
-    }
-}
-
-impl std::error::Error for InvalidSingleGameLog {}
-
-fn parse_normal_file(path: &str, by_startpos: bool) -> Result<FileResult> {
-    let mut single_game_kind = None;
-    let result = parse_normal_file_inner(path, by_startpos, &mut single_game_kind);
-    if let Some(kind) = single_game_kind {
-        result.context(InvalidSingleGameLog(kind))
-    } else {
-        result
-    }
-}
-
-fn parse_normal_file_inner(
-    path: &str,
-    by_startpos: bool,
-    single_game_kind: &mut Option<&'static str>,
-) -> Result<FileResult> {
+fn parse_normal_file(path: &str) -> Result<FileResult> {
     let file =
         std::fs::File::open(path).with_context(|| format!("ファイルを開けません: {path}"))?;
     let reader = BufReader::new(file);
@@ -841,27 +474,16 @@ fn parse_normal_file_inner(
     let mut games: u32 = 0;
     let mut black = String::new();
     let mut white = String::new();
+    let mut black_wins: u32 = 0;
+    let mut white_wins: u32 = 0;
+    let mut draws: u32 = 0;
     let mut meta_parsed = false;
-    let mut legacy_csa = false;
-    let mut stats = ParsedGameStats::default();
-    stats.extra.by_startpos = by_startpos.then(StartposStats::default);
-    let start_positions: Vec<String> = if by_startpos {
-        let meta = Path::new(path).parent().unwrap_or(Path::new(".")).join("meta.json");
-        std::fs::read(meta)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|meta| serde_json::from_value(meta["start_positions"].clone()).ok())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let mut game_moves: BTreeMap<u32, StartposMoves> = BTreeMap::new();
-    let mut pair_buffer = tools::tournament_pairs::ResultPairs::default();
-    let mut seq = 0u32;
-    let mut error_pairs = HashSet::new();
-    let mut retried_pairs = HashSet::new();
-    let mut exhausted_pairs = HashSet::new();
-    let mut error_games = 0u32;
+    // per-engine sente/gote stats (a = meta.black engine, b = meta.white engine)
+    let mut a_sente_games: u32 = 0;
+    let mut a_sente_wins: u32 = 0;
+    let mut b_sente_games: u32 = 0;
+    let mut b_sente_wins: u32 = 0;
+    let mut extra = FileExtraStats::default();
 
     for line in reader.lines() {
         let line = line?;
@@ -870,26 +492,11 @@ fn parse_normal_file_inner(
             continue;
         }
 
-        let value: serde_json::Value =
-            serde_json::from_str(trimmed).with_context(|| format!("JSONパースエラー: {path}"))?;
-        if !meta_parsed && value["type"] == "meta" {
-            let meta: MetaLog = serde_json::from_value(value)
+        // 高速フィルタ: type フィールドで判別
+        if !meta_parsed && trimmed.contains("\"type\":\"meta\"") {
+            let meta: MetaLog = serde_json::from_str(trimmed)
                 .with_context(|| format!("metaパースエラー: {path}"))?;
             games = meta.settings.games;
-            legacy_csa = meta.source.is_none() && !meta.settings.single_game;
-            *single_game_kind = if meta.settings.single_game {
-                Some("tournament 単局ログ")
-            } else if is_csa_jsonl(meta.source.as_deref(), meta.engine_cmd.note.as_deref()) {
-                Some("CSA単局ログ")
-            } else {
-                None
-            };
-            stats.extra.single_game_kind = *single_game_kind;
-            if let Some(kind) = *single_game_kind
-                && games != 1
-            {
-                bail!("{kind}のsettings.gamesは1である必要があります: {path}");
-            }
             black = meta
                 .engine_cmd
                 .label_black
@@ -899,26 +506,12 @@ fn parse_normal_file_inner(
                 .label_white
                 .unwrap_or_else(|| extract_engine_id(&meta.engine_cmd.path_white));
             meta_parsed = true;
-        } else if value["type"] == "move" {
-            let mv: MoveLog = serde_json::from_value(value)
+        } else if trimmed.contains("\"type\":\"move\"") {
+            let mv: MoveLog = serde_json::from_str(trimmed)
                 .with_context(|| format!("moveパースエラー: {path}"))?;
-            if by_startpos {
-                let moves = game_moves.entry(mv.game_id).or_default();
-                moves.elapsed_ms += mv.elapsed_ms;
-                // 対局内 ply が連続した先頭40手だけを保持する。resign 等は手順に含めない。
-                if !mv.timed_out
-                    && moves.prefix_len < 40
-                    && mv.ply as usize == moves.prefix_len + 1
-                    && let Some(usi) = &mv.move_usi
-                    && let Some(mv) = rshogi_core::types::Move::from_usi(usi)
-                    && (mv.is_normal() || mv.is_pass())
-                {
-                    moves.prefix[moves.prefix_len] = mv.raw();
-                    moves.prefix_len += 1;
-                }
-            }
+            let _ = mv.game_id;
             let engine_name = normalize_engine_name(&mv.engine, &black, &white, meta_parsed);
-            let engine_stats = stats.extra.engine_moves.entry(engine_name).or_default();
+            let engine_stats = extra.engine_moves.entry(engine_name).or_default();
             engine_stats.moves += 1;
             engine_stats.elapsed_ms_sum += mv.elapsed_ms;
             engine_stats.think_limit_ms_sum += mv.think_limit_ms;
@@ -951,162 +544,102 @@ fn parse_normal_file_inner(
                 engine_stats.by_ply_band.entry(ply_band_label(mv.ply).to_string()).or_default(),
                 mv.elapsed_ms,
             );
-        } else if value["type"] == "result" {
-            let mut result: ResultLog = serde_json::from_value(value)
+        } else if trimmed.contains("\"type\":\"result\"") {
+            let result: ResultLog = serde_json::from_str(trimmed)
                 .with_context(|| format!("resultパースエラー: {path}"))?;
-            if by_startpos {
-                if result.startpos.is_none() {
-                    result.startpos =
-                        result.startpos_idx.and_then(|idx| start_positions.get(idx).cloned());
-                }
-                result.moves =
-                    result.game_id.and_then(|id| game_moves.remove(&id)).unwrap_or_default();
-            }
-            let reason = match result.reason.as_deref() {
-                Some(reason) if reason.starts_with("error") => "error",
-                Some(reason) => reason,
-                None => "unknown",
-            };
-            *stats.extra.reasons.entry(reason.to_string()).or_default() += 1;
-            if let Some(kind) = *single_game_kind {
-                if is_incomplete_result(true, &result.outcome, result.reason.as_deref()) {
-                    bail!("{kind}は未決です: {path}");
-                }
-                if seq != 0
-                    || result.pair_index.is_some()
-                    || result.pair_slot.is_some()
-                    || result.attempt != 0
-                    || result.error.unwrap_or(false)
-                    || !matches!(result.outcome.as_str(), "black_win" | "white_win" | "draw")
-                {
-                    bail!("{kind}のresultが重複または不正です: {path}");
-                }
-                if black == white {
-                    bail!("{kind}の先後ラベルが衝突しています: {path}");
-                }
-                if result.outcome != "draw" {
-                    let expected = if result.outcome == "black_win" {
-                        &black
-                    } else {
-                        &white
-                    };
-                    if let Some(winner) = &result.winner
-                        && winner != expected
-                        && !(legacy_csa
-                            && rshogi_csa_client::jsonl::sanitize_for_filename(winner) == *expected)
-                    {
-                        bail!("{kind}のwinnerとoutcomeが一致しません: {path}");
-                    }
-                    result.winner = Some(expected.clone());
-                }
-                seq += 1;
-                record_valid_result(&result, &black, &white, meta_parsed, 0, &mut stats);
-                continue;
-            }
-            let pair_index = result.pair_index.unwrap_or(seq / 2);
-            let slot = result.pair_slot.unwrap_or(seq % 2).min(1) as usize;
-            seq += 1;
-            if result.error.unwrap_or(false) {
-                error_games += 1;
-                error_pairs.insert(pair_index);
-            }
-            if result.attempt > 0 {
-                retried_pairs.insert(pair_index);
-            }
-            let key = (pair_index, result.attempt);
-            if let Some(completed) = pair_buffer.push(Path::new(path), key, slot, result) {
-                let has_error = completed.iter().any(|game| game.error.unwrap_or(false));
-                if has_error {
-                    if key.1 >= 2 {
-                        exhausted_pairs.insert(pair_index);
-                    }
+            extra.completed_games += 1;
+            extra.total_plies += result.plies as u64;
+            if let Some(ref winner) = result.winner {
+                // winner フィールドあり: エンジン名で集計（tournament.rs 形式）
+                // meta にラベルがある場合は winner もラベルそのままなので正規化不要。
+                // 旧形式（ラベルなし）では winner がパス由来なので extract_engine_id で正規化。
+                let winner_id = if meta_parsed && (black == *winner || white == *winner) {
+                    winner.clone()
                 } else {
-                    for (slot, game) in completed.iter().enumerate() {
-                        record_valid_result(game, &black, &white, meta_parsed, slot, &mut stats);
+                    extract_engine_id(winner)
+                };
+                if winner_id == black {
+                    black_wins += 1;
+                } else if winner_id == white {
+                    white_wins += 1;
+                }
+                // outcome + winner から各対局の先手/後手を判定
+                // outcome="black_win" → 先手が勝ち → winner が先手だった
+                // outcome="white_win" → 後手が勝ち → winner が後手だった
+                match result.outcome.as_str() {
+                    "black_win" => {
+                        extra.black_wins += 1;
+                        // winner が先手
+                        if winner_id == black {
+                            a_sente_games += 1;
+                            a_sente_wins += 1;
+                        } else if winner_id == white {
+                            b_sente_games += 1;
+                            b_sente_wins += 1;
+                        }
+                        // 敗者は後手
+                        // (後手 games は done - sente_games で算出)
                     }
+                    "white_win" => {
+                        extra.white_wins += 1;
+                        // winner が後手 → 敗者が先手
+                        if winner_id == black {
+                            // black engine が後手で勝ち → white engine が先手で負け
+                            b_sente_games += 1;
+                        } else if winner_id == white {
+                            // white engine が後手で勝ち → black engine が先手で負け
+                            a_sente_games += 1;
+                        }
+                    }
+                    "draw" => {
+                        extra.draws += 1;
+                    }
+                    _ => {}
+                }
+            } else {
+                // winner なし: 旧形式または引分
+                match result.outcome.as_str() {
+                    "black_win" => {
+                        black_wins += 1;
+                        extra.black_wins += 1;
+                    }
+                    "white_win" => {
+                        white_wins += 1;
+                        extra.white_wins += 1;
+                    }
+                    "draw" => {
+                        draws += 1;
+                        extra.draws += 1;
+                    }
+                    _ => {}
                 }
             }
         }
         // move行・metrics行等はスキップ
     }
 
-    if let Some(kind) = *single_game_kind
-        && stats.extra.completed_games != 1
-    {
-        bail!("{kind}に終局resultがありません: {path}");
-    }
-    stats.extra.incomplete_pairs = pair_buffer.incomplete();
-    if pair_buffer.incomplete() != 0 {
-        eprintln!(
-            "情報: {path} — {} ペアが未完了（片スロット欠け）のため直接対決集計から除外されました",
-            pair_buffer.incomplete()
-        );
-    }
-
-    let done = stats.black_wins + stats.white_wins + stats.draws;
+    let done = black_wins + white_wins + draws;
     Ok(FileResult {
         black,
         white,
         games,
-        black_wins: stats.black_wins,
-        white_wins: stats.white_wins,
-        draws: stats.draws,
+        black_wins,
+        white_wins,
+        draws,
         done,
-        a_sente_games: stats.a_sente_games,
-        a_sente_wins: stats.a_sente_wins,
-        b_sente_games: stats.b_sente_games,
-        b_sente_wins: stats.b_sente_wins,
-        retry: RetryAnalysisStats {
-            error_games,
-            error_pairs: error_pairs.len() as u32,
-            retried_pairs: retried_pairs.len() as u32,
-            exhausted_pairs: exhausted_pairs.len() as u32,
-        },
-        extra: stats.extra,
+        a_sente_games,
+        a_sente_wins,
+        b_sente_games,
+        b_sente_wins,
+        extra,
     })
 }
 
-fn format_decisive_rate(label: &str, wins: u32, decisive: u32, total_games: u32) -> String {
-    if decisive > 0 {
-        format!(
-            "{label}決着局勝率:{:.1}%({wins}/{decisive}決着局、全{total_games}局)",
-            wins as f64 / decisive as f64 * 100.0
-        )
-    } else {
-        format!("{label}決着局勝率:-（0決着局、全{total_games}局）")
-    }
-}
-
-fn run_meta_issue(path: &std::path::Path) -> Result<Option<String>> {
-    if !path.try_exists()? {
-        return Ok(None);
-    }
-    #[derive(Deserialize)]
-    struct RunValidity {
-        run_status: Option<String>,
-        invalid: Option<bool>,
-        incomplete_pairs: Option<u64>,
-        unreturned_games: Option<u64>,
-    }
-    let meta: RunValidity = serde_json::from_reader(std::fs::File::open(path)?)?;
-    let invalid = meta.invalid.unwrap_or(false)
-        || meta.run_status.as_deref().is_some_and(|status| status != "completed")
-        || meta.incomplete_pairs.unwrap_or(0) > 0
-        || meta.unreturned_games.unwrap_or(0) > 0;
-    Ok(invalid.then(|| {
-        format!(
-            "{}: 非完了または invalid の tournament run ({})",
-            path.display(),
-            meta.run_status.as_deref().unwrap_or("legacy")
-        )
-    }))
-}
-
-fn parse_file(path: &str, by_startpos: bool) -> Result<FileResult> {
+fn parse_file(path: &str) -> Result<FileResult> {
     if path.contains(".summary.") {
         parse_summary_file(path)
     } else {
-        parse_normal_file(path, by_startpos)
+        parse_normal_file(path)
     }
 }
 
@@ -1119,8 +652,8 @@ fn parse_file(path: &str, by_startpos: bool) -> Result<FileResult> {
 /// # 動作
 /// - meta 行に SPRT 情報が書かれているのは `tournament.rs --sprt` 実行で生成された
 ///   base/test ペアの jsonl のみ
-/// - `cli_base` / `cli_test` が与えられた場合、一致しない meta は無視する（片方のみの指定でも
-///   適用。別 run のログが混在しても CLI 明示ラベルが優先して絞り込めるようにする）
+/// - `cli_base` / `cli_test` が共に与えられた場合、一致しない meta は無視する（別 run のログが
+///   混在しても CLI 明示ラベルが優先して絞り込めるようにする）
 /// - 残った meta が複数あり、`(base_label, test_label, nelo0, nelo1, alpha, beta)` が
 ///   揃って一致するなら採用。ラベル不一致は `bail!`、Wald パラメータ不一致も `bail!`
 ///   （LLR 境界が変わるため誤集計防止）
@@ -1170,17 +703,10 @@ fn collect_sprt_meta(
                 .with_context(|| format!("metaパースエラー: {path}"))?;
             let Some(sprt) = meta.sprt else { break };
 
-            // CLI で明示されたラベルと一致しない meta を無視する（片方のみの指定でも適用）。
+            // CLI でラベルが両方明示されている場合は、ラベル不一致 meta を無視する。
             // これにより、異なる run の jsonl が混在していても CLI 明示で解析対象を絞れる。
-            // infer_labels_from_meta のフィルタ規則と揃えてあり、片側指定で別 run が
-            // 混在しても不一致 bail せずに補完まで到達できる。
-            if let Some(cb) = cli_base
-                && sprt.base_label != cb
-            {
-                break;
-            }
-            if let Some(ct) = cli_test
-                && sprt.test_label != ct
+            if let (Some(cb), Some(ct)) = (cli_base, cli_test)
+                && (sprt.base_label != cb || sprt.test_label != ct)
             {
                 break;
             }
@@ -1224,59 +750,46 @@ fn collect_sprt_meta(
     Ok(found.map(|(m, _)| m))
 }
 
-/// meta 行のラベル情報から推定した SPRT のラベル役割。
-#[derive(Debug)]
-struct InferredLabels {
-    base: String,
-    test: String,
-    /// 推定根拠（notice 表示用）
-    note: String,
-    /// 根拠なしの既定（label_black=test）に落ちた場合 true。呼び出し側で警告に格上げする
-    assumed: bool,
-}
+/// 単一 JSONL ファイルから base/test ペアに該当する Penta を集計する。
+///
+/// - ファイルの meta が base/test 両方のラベルを含まなければ `Penta::ZERO`
+/// - `pair_index` が無い旧ログは `seq / 2` / `seq % 2` でペアリング
+/// - `error=true` の結果は除外
+/// - 破損 meta/result 行があれば `Err` を返す。呼び出し側（main の for ループ）は
+///   これを `eprintln!` の警告に降格してそのファイル分だけ統計から除外するため、
+///   破損ファイルが混ざると Penta が無告知で過小集計される点に注意
+///   （`--strict` フラグ等は未実装。破損を絶対に見逃したくない場合は事前に jsonl を検証すること）
+fn collect_sprt_penta(path: &str, base: &str, test: &str) -> Result<Penta> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("ファイルを開けません: {path}"))?;
+    let reader = BufReader::new(file);
 
-/// SPRT meta を持たないログ向けに、meta 行の `label_black` / `label_white` /
-/// `base_label` から base / test の役割を推定する。
-///
-/// 役割の決定優先順:
-/// 1. CLI で片方のみ指定 → もう片方をペアの残りラベルで補完
-/// 2. meta の `base_label`（tournament.rs が base-vs-N モードで記録）
-/// 3. ラベル名に "base" を含む側が一意なら、それを base
-/// 4. label_black を test とみなす既定（`assumed=true`）
-///
-/// CLI ラベルが与えられた場合、それを含まない meta は別 run とみなして無視する。
-/// 残った meta 間でラベル組（順不同）が一致しない場合、または同一ラベル組でも
-/// `base_label` 記録が矛盾する場合は bail。
-/// meta が読めない / 同一ラベル同士で役割を割り当てられない場合は `None`。
-fn infer_labels_from_meta(
-    files: &[&str],
-    cli_base: Option<&str>,
-    cli_test: Option<&str>,
-) -> Result<Option<InferredLabels>> {
-    // (label_black, label_white, meta の base_label, パス)
-    let mut found: Option<(String, String, Option<String>, String)> = None;
-    for &path in files {
-        if path.contains(".summary.") {
+    let mut meta_labels: Option<(String, String)> = None;
+    let mut pair_buffer: BTreeMap<u32, [Option<GameSide>; 2]> = BTreeMap::new();
+    // ペア完成後にバッファから remove するので、`pair_buffer` だけでは
+    // 「その pair_index は既に集計済み」かどうか判定できない。
+    // 3 件目以降の重複到着を正しく検出するため、処理済み pair_index を別に保持する。
+    let mut completed_pairs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut total = Penta::ZERO;
+    let mut seq: u32 = 0;
+    let mut warned_missing_pair_index = false;
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let Ok(file) = std::fs::File::open(path) else {
-            continue;
-        };
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // 破損行は collect_sprt_meta が同じ走査で警告済みのため、ここでは黙ってスキップ
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-                break;
-            };
-            if value.get("type").and_then(|v| v.as_str()) != Some("meta") {
-                break;
-            }
-            let meta: MetaLog = serde_json::from_value(value)
+
+        // 高速パス: 軽量 contains で meta/result 候補行だけ絞り込み、
+        // 絞り込んだ行は直接ターゲット型にパースして失敗時は bail（破損検知）。
+        // 全行を `serde_json::Value` へ変換するとホット move 行で重いため避ける。
+        // tournament.rs はコンパクト JSON を書き出すので contains で十分機能する。
+        // 注: 外部ツールで整形された jsonl（`"type": "meta"` のようにスペース入り）は
+        // ここでヒットせず SPRT 集計から無告知で外れる。現状は tournament.rs 出力のみ
+        // 想定の割り切り。整形済み jsonl を扱う要求が出たら JSON Value 判定に切り替える。
+        if meta_labels.is_none() && trimmed.contains("\"type\":\"meta\"") {
+            let meta: MetaLog = serde_json::from_str(trimmed)
                 .with_context(|| format!("metaパースエラー: {path}"))?;
             let black = meta
                 .engine_cmd
@@ -1288,114 +801,120 @@ fn infer_labels_from_meta(
                 .label_white
                 .clone()
                 .unwrap_or_else(|| extract_engine_id(&meta.engine_cmd.path_white));
-            // 同一ラベル同士は役割を割り当てられない
-            if black == white {
-                break;
+            let match_pair = (black == base && white == test) || (black == test && white == base);
+            if !match_pair {
+                return Ok(Penta::ZERO);
             }
-            // CLI 指定ラベルを含まない meta は別 run とみなして無視
-            if let Some(cb) = cli_base
-                && cb != black
-                && cb != white
-            {
-                break;
+            meta_labels = Some((black, white));
+        } else if trimmed.contains("\"type\":\"result\"") {
+            let Some((label_black_meta, label_white_meta)) = meta_labels.as_ref() else {
+                continue;
+            };
+            let result: ResultLog = serde_json::from_str(trimmed)
+                .with_context(|| format!("resultパースエラー: {path}"))?;
+            if result.error.unwrap_or(false) {
+                continue;
             }
-            if let Some(ct) = cli_test
-                && ct != black
-                && ct != white
-            {
-                break;
+            if result.pair_index.is_none() && !warned_missing_pair_index {
+                eprintln!(
+                    "警告: {path} は pair_index を含まない旧形式ログです。\n\
+                     SPRT ペアリングは result の出現順 (seq / 2, seq % 2) でフォールバックしますが、\n\
+                     並列対局ログでは完了順がずれている可能性があるため結果は正確でない場合があります。"
+                );
+                warned_missing_pair_index = true;
             }
-            match found.as_mut() {
-                None => found = Some((black, white, meta.base_label.clone(), path.to_string())),
-                Some((eb, ew, ebase, epath)) => {
-                    let same_pair =
-                        (*eb == black && *ew == white) || (*eb == white && *ew == black);
-                    if !same_pair {
-                        bail!(
-                            "入力ファイル間でラベル組が一致しません: {epath} は ({eb}, {ew})、\
-                             {path} は ({black}, {white})。\
-                             --sprt-base-label / --sprt-test-label を明示してください"
-                        );
+            let pair_idx = result.pair_index.unwrap_or(seq / 2);
+            let slot_hint = result.pair_slot.unwrap_or(seq % 2);
+            seq += 1;
+            let slot = slot_hint.min(1) as usize;
+
+            // 既に集計済みの pair_index に 3 件目以降が到着した場合は除外する。
+            // test_side 決定より前に診断することで、ログ破損 (winner/outcome 不正) で
+            // test_side の match が `continue` に落ちても警告は確実に出る。
+            if completed_pairs.contains(&pair_idx) {
+                eprintln!(
+                    "警告: {path} — pair_index={pair_idx} は既に集計済みです。\
+                     余剰データを除外します。"
+                );
+                continue;
+            }
+
+            // test 視点の Win/Draw/Loss を決定する。
+            //
+            // 優先: tournament.rs が書く `winner` フィールド (エンジンラベルそのもの)。
+            // 旧ログ (winner なし) は pair_slot から実黒を推定:
+            //   slot == 0 → meta.label_black が実際の黒
+            //   slot == 1 → meta.label_white が実際の黒（先後入替）
+            let test_side = if let Some(winner) = result.winner.as_deref() {
+                match result.outcome.as_str() {
+                    "black_win" | "white_win" => {
+                        if winner == test {
+                            GameSide::Win
+                        } else if winner == base {
+                            GameSide::Loss
+                        } else {
+                            continue;
+                        }
                     }
-                    // base_label 記録の矛盾は base/test の符号反転に直結するため黙認しない
-                    match (ebase.as_ref(), meta.base_label.as_ref()) {
-                        (Some(a), Some(b)) if a != b => bail!(
-                            "入力ファイル間で meta の base_label が一致しません: \
-                             {epath} は {a}、{path} は {b}。\
-                             --sprt-base-label を明示してください"
-                        ),
-                        (None, Some(_)) => *ebase = meta.base_label.clone(),
-                        _ => {}
-                    }
+                    "draw" => GameSide::Draw,
+                    _ => continue,
                 }
+            } else {
+                let actual_black = if slot == 0 {
+                    label_black_meta.as_str()
+                } else {
+                    label_white_meta.as_str()
+                };
+                let test_is_black = actual_black == test;
+                match result.outcome.as_str() {
+                    "black_win" => {
+                        if test_is_black {
+                            GameSide::Win
+                        } else {
+                            GameSide::Loss
+                        }
+                    }
+                    "white_win" => {
+                        if test_is_black {
+                            GameSide::Loss
+                        } else {
+                            GameSide::Win
+                        }
+                    }
+                    "draw" => GameSide::Draw,
+                    _ => continue,
+                }
+            };
+
+            let entry = pair_buffer.entry(pair_idx).or_insert([None, None]);
+            if entry[slot].is_none() {
+                entry[slot] = Some(test_side);
+            } else if entry[1 - slot].is_none() {
+                // 同 slot が 2 度到着するのは通常の tournament 出力では起き得ない。
+                // 空きスロットに入れつつ警告する。
+                eprintln!(
+                    "警告: {path} — pair_index={pair_idx} の slot={slot} が重複しています。\
+                     空きスロットに配置しますが、結果は正確でない可能性があります。"
+                );
+                entry[1 - slot] = Some(test_side);
             }
-            // meta 行を処理済み。残り行は不要なので内側ループを抜ける
-            break;
+            // else: entry[slot] も entry[1-slot] も埋まっているケースは
+            // 上の `completed_pairs` チェックで弾かれるため到達しない。
+
+            if let [Some(a), Some(b)] = *entry {
+                total += Penta::from_pair(a, b);
+                pair_buffer.remove(&pair_idx);
+                completed_pairs.insert(pair_idx);
+            }
         }
     }
-    let Some((black, white, meta_base, _)) = found else {
-        return Ok(None);
-    };
-    let other = |one: &str| {
-        if one == black {
-            white.clone()
-        } else {
-            black.clone()
-        }
-    };
-    let inferred = if let Some(cb) = cli_base {
-        InferredLabels {
-            test: other(cb),
-            base: cb.to_string(),
-            note: "--sprt-base-label 指定からもう片方を test と判断".to_string(),
-            assumed: false,
-        }
-    } else if let Some(ct) = cli_test {
-        InferredLabels {
-            base: other(ct),
-            test: ct.to_string(),
-            note: "--sprt-test-label 指定からもう片方を base と判断".to_string(),
-            assumed: false,
-        }
-    } else if let Some(mb) = meta_base.as_ref().filter(|m| **m == black || **m == white) {
-        InferredLabels {
-            test: other(mb),
-            base: mb.clone(),
-            note: "meta の base_label 記録（tournament --base-label）から判断".to_string(),
-            assumed: false,
-        }
-    } else {
-        // base_label 記録がラベル組に含まれない（別 run の混入や stale な記録）場合、
-        // 黙ってヒューリスティックに落とすと推定根拠を誤解させるため通知する
-        if let Some(mb) = &meta_base {
-            eprintln!(
-                "警告: meta の base_label ({mb}) がラベル組 ({black}, {white}) に含まれないため無視します"
-            );
-        }
-        let black_has_base = black.to_ascii_lowercase().contains("base");
-        let white_has_base = white.to_ascii_lowercase().contains("base");
-        match (black_has_base, white_has_base) {
-            (true, false) => InferredLabels {
-                test: white.clone(),
-                base: black.clone(),
-                note: "ラベル名に \"base\" を含む側を base と判断".to_string(),
-                assumed: false,
-            },
-            (false, true) => InferredLabels {
-                test: black.clone(),
-                base: white.clone(),
-                note: "ラベル名に \"base\" を含む側を base と判断".to_string(),
-                assumed: false,
-            },
-            _ => InferredLabels {
-                test: black.clone(),
-                base: white.clone(),
-                note: "役割を示す情報が無いため label_black を test とみなした".to_string(),
-                assumed: true,
-            },
-        }
-    };
-    Ok(Some(inferred))
+    if !pair_buffer.is_empty() {
+        eprintln!(
+            "情報: {path} — {} ペアが未完了（片スロット欠け）のため SPRT 集計から除外されました",
+            pair_buffer.len()
+        );
+    }
+    Ok(total)
 }
 
 fn build_sprt_json(
@@ -1429,63 +948,12 @@ fn build_sprt_json(
             wd: penta.wd,
             ww: penta.ww,
         },
-        stopped_at: None,
     }
-}
-
-/// 入力が 1 つの tournament run だけから成るとき、その meta.json から SPRT の停止時の集計を読む。
-///
-/// 複数 run の合算や、解析の仮説 (ラベル・nelo・alpha・beta) が停止時と異なる場合は使わない。
-/// 読めない meta.json は `run_meta_issue` が不完全入力として報告済みなので読み飛ばし、
-/// `sprt_stopped_at` だけが読めない場合は `issues` に積む。
-fn load_sprt_stop(
-    files: &[&str],
-    expected: &SprtMetaLog,
-    issues: &mut Vec<String>,
-) -> Option<SprtStopLog> {
-    let meta_paths: BTreeSet<_> = files
-        .iter()
-        .filter(|path| !path.contains(".summary."))
-        .map(|path| Path::new(path).parent().unwrap_or(Path::new(".")).join("meta.json"))
-        .collect();
-    let mut stops = Vec::new();
-    for path in &meta_paths {
-        let Some(meta) = std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        else {
-            continue;
-        };
-        let Some(stop) = meta.get("sprt_stopped_at").filter(|v| !v.is_null()) else {
-            continue;
-        };
-        match serde_json::from_value::<SprtStopLog>(stop.clone()) {
-            Ok(stop) => stops.push(stop),
-            Err(error) => {
-                issues.push(format!("{}: sprt_stopped_at を読めません: {error}", path.display()))
-            }
-        }
-    }
-    if stops.is_empty() {
-        return None;
-    }
-    if meta_paths.len() > 1 {
-        eprintln!("情報: 複数の tournament run を合算したため、SPRT の停止時の判定は表示しません");
-        return None;
-    }
-    let stop = stops.remove(0);
-    if stop.hypothesis != *expected {
-        eprintln!(
-            "情報: 解析の SPRT 仮説が tournament の停止時と異なるため、停止時の判定は表示しません"
-        );
-        return None;
-    }
-    Some(stop)
 }
 
 fn print_sprt_text_report(penta: Penta, output: &SprtJsonOutput) {
     println!();
-    println!("=== SPRT (post-hoc): {} (test) vs {} (base) ===", output.test, output.base);
+    println!("=== SPRT (post-hoc): {} vs {} ===", output.test, output.base);
     println!(
         "hypotheses: H0 = nelo0={:+.1}  H1 = nelo1={:+.1}  (alpha={}, beta={})",
         output.nelo0, output.nelo1, output.alpha, output.beta
@@ -1493,39 +961,16 @@ fn print_sprt_text_report(penta: Penta, output: &SprtJsonOutput) {
     println!("bounds:     LLR ∈ [{:+.3}, {:+.3}]", output.lower, output.upper);
     println!("pairs:      {}", output.pairs);
     println!("LLR:        {:+.3}", output.llr);
-    // 採択した仮説と到達した境界を、ラベルの視点とともに示す。
-    let decision_note = match output.decision.as_str() {
-        "accept_h1" => format!(
-            "H1 採択: {} (test) 対 {} (base) の LLR が上界へ到達 (H1: nelo {:+.1})",
-            output.test, output.base, output.nelo1
-        ),
-        "accept_h0" => format!(
-            "H0 採択: {} (test) 対 {} (base) の LLR が下界へ到達 (H0: nelo {:+.1})",
-            output.test, output.base, output.nelo0
-        ),
-        "running" => "境界未到達 (判定保留)".to_string(),
-        "invalid" => "不完全入力の部分集計（採否なし）".to_string(),
-        other => format!("不明な decision: {other}"),
-    };
-    println!("decision:   {} — {}", output.decision, decision_note);
+    println!("decision:   {}", output.decision);
     match &output.nelo {
-        Some(n) => println!("nelo:       {:+.2} ± {:.2} ({} 視点)", n.value, n.ci95, output.test),
+        Some(n) => println!("nelo:       {:+.2} ± {:.2}", n.value, n.ci95),
         None => println!("nelo:       n/a (variance 0)"),
     }
     match &output.logistic_elo {
-        Some(n) => println!("elo:        {:+.2} ± {:.2} ({} 視点)", n.value, n.ci95, output.test),
+        Some(n) => println!("elo:        {:+.2} ± {:.2}", n.value, n.ci95),
         None => println!("elo:        n/a"),
     }
-    println!("penta:      {} ({} 視点)", penta, output.test);
-    if let Some(stop) = &output.stopped_at {
-        println!(
-            "stopped_at: pairs={}, LLR={:+.3}, decision={}  penta={} — tournament の採否はこの判定",
-            stop.pairs,
-            stop.llr,
-            stop.decision.as_str(),
-            stop.penta
-        );
-    }
+    println!("penta:      {}", penta);
     println!("=================================");
 }
 
@@ -1545,9 +990,6 @@ struct SprtJsonOutput {
     nelo: Option<SprtNelo>,
     logistic_elo: Option<SprtNelo>,
     penta: SprtPentaJson,
-    /// tournament が最初に境界へ達した時点の集計 (meta.json の `sprt_stopped_at`)。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stopped_at: Option<SprtStopLog>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1605,59 +1047,17 @@ fn elo_ci95(wins: u32, losses: u32, draws: u32) -> Option<f64> {
     Some(1.96 * se_elo)
 }
 
-/// Pentanomial 集計を相手視点に反転する。
-fn reverse_penta(penta: Penta) -> Penta {
-    Penta {
-        ll: penta.ww,
-        dl: penta.wd,
-        dd: penta.dd,
-        wl: penta.wl,
-        wd: penta.dl,
-        ww: penta.ll,
-    }
-}
-
-/// SPRT の test/base と一致する直接対決を test 視点で表示するか判定する。
-fn should_show_right_first(
-    left: &str,
-    right: &str,
-    sprt_test: Option<&str>,
-    sprt_base: Option<&str>,
-) -> bool {
-    sprt_test == Some(right) && sprt_base == Some(left)
-}
-
 // ---------------------------------------------------------------------------
 // メイン処理
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut expanded_files = Vec::new();
-    for file in &cli.files {
-        if Path::new(file).is_dir() {
-            let mut paths = std::fs::read_dir(file)?
-                .map(|entry| entry.map(|e| e.path()))
-                .collect::<std::io::Result<Vec<_>>>()?;
-            paths.sort();
-            expanded_files.extend(
-                paths
-                    .into_iter()
-                    .filter(|p| {
-                        p.extension().is_some_and(|e| e == "jsonl")
-                            && p.file_name().is_none_or(|name| name != CONTROL_HISTORY_FILE_NAME)
-                    })
-                    .map(|p| p.to_string_lossy().into_owned()),
-            );
-        } else {
-            expanded_files.push(file.clone());
-        }
-    }
-    let mut by_startpos = cli.by_startpos.then(StartposStats::default);
 
     // 通常の .jsonl が1つでもあれば .summary.jsonl を自動除外（二重カウント防止）
-    let has_normal = expanded_files.iter().any(|f| !f.contains(".summary."));
-    let files: Vec<&str> = expanded_files
+    let has_normal = cli.files.iter().any(|f| !f.contains(".summary."));
+    let files: Vec<&str> = cli
+        .files
         .iter()
         .filter(|f| {
             if has_normal && f.contains(".summary.") {
@@ -1670,70 +1070,21 @@ fn main() -> Result<()> {
         .map(|s| s.as_str())
         .collect();
 
-    if cli.adjudication_sweep {
-        if cli.sweep_scores.iter().any(|&x| x <= 0) || cli.sweep_movecounts.contains(&0) {
-            bail!("--sweep-scores と --sweep-movecounts は 1 以上の値で指定してください");
-        }
-        let rows = adjudication_sweep::sweep(&files, &cli.sweep_scores, &cli.sweep_movecounts)?;
-        if rows.iter().all(|row| row.games == 0) {
-            bail!(
-                "集計できる局がありません。--adjudication-sweep は tournament 形式の JSONL (move 行に eval を持つもの) を読みます"
-            );
-        }
-        if cli.json {
-            println!("{}", serde_json::to_string_pretty(&rows)?);
-        } else {
-            adjudication_sweep::print_text(&rows);
-        }
-        return Ok(());
-    }
-
     // 全ファイルをパースして集計
     let mut matchups: BTreeMap<(String, String), MatchupStats> = BTreeMap::new();
     let mut engine_ids: BTreeSet<String> = BTreeSet::new();
     let mut valid_files = 0u32;
     let mut extra = AggregatedExtraStats::default();
 
-    let mut accepted_files = Vec::new();
-    let mut single_game_kind = None;
-    let mut checked_run_meta = BTreeSet::new();
     for path in &files {
-        let meta_path = std::path::Path::new(path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("meta.json");
-        if checked_run_meta.insert(meta_path.clone()) {
-            match run_meta_issue(&meta_path) {
-                Ok(Some(issue)) => extra.input_issues.push(issue),
-                Ok(None) => {}
-                Err(error) => extra.input_issues.push(format!("{}: {error}", meta_path.display())),
-            }
-        }
-        match parse_file(path, cli.by_startpos) {
+        match parse_file(path) {
             Ok(result) => {
-                single_game_kind = single_game_kind.or(result.extra.single_game_kind);
-                if result.extra.incomplete_pairs > 0 {
-                    extra
-                        .input_issues
-                        .push(format!("{path}: {} 未完了ペア", result.extra.incomplete_pairs));
-                }
                 if result.black.is_empty() || result.white.is_empty() || result.games == 0 {
                     eprintln!("警告: 有効なデータなし: {path}");
-                    extra.input_issues.push(format!("有効なデータなし: {path}"));
                     continue;
-                }
-                if let Some(dst) = &mut by_startpos {
-                    if let Some(src) = result.extra.by_startpos {
-                        dst.merge(src);
-                    } else {
-                        dst.excluded_games += u64::from(result.done);
-                    }
                 }
                 let key = (result.black.clone(), result.white.clone());
                 let stats = matchups.entry(key).or_default();
-                stats.side_totals_unknown |= result.extra.side_totals_unknown;
-                stats.a_sente_total += result.extra.a_sente_total;
-                stats.b_sente_total += result.extra.b_sente_total;
                 stats.total += result.games;
                 stats.done += result.done;
                 stats.black_wins += result.black_wins;
@@ -1746,18 +1097,11 @@ fn main() -> Result<()> {
                 stats.b_sente_wins += result.b_sente_wins;
                 engine_ids.insert(result.black);
                 engine_ids.insert(result.white);
-                for (reason, count) in result.extra.reasons {
-                    *extra.reasons.entry(reason).or_default() += count;
-                }
                 extra.total_plies += result.extra.total_plies;
                 extra.completed_games += result.extra.completed_games;
                 extra.black_wins += result.extra.black_wins;
                 extra.white_wins += result.extra.white_wins;
                 extra.draws += result.extra.draws;
-                extra.retry.error_games += result.retry.error_games;
-                extra.retry.error_pairs += result.retry.error_pairs;
-                extra.retry.retried_pairs += result.retry.retried_pairs;
-                extra.retry.exhausted_pairs += result.retry.exhausted_pairs;
                 for (engine, move_stats) in result.extra.engine_moves {
                     merge_engine_move_stats(
                         extra.engine_moves.entry(engine).or_default(),
@@ -1765,25 +1109,13 @@ fn main() -> Result<()> {
                     );
                 }
                 valid_files += 1;
-                if result.extra.single_game_kind.is_none() {
-                    accepted_files.push(*path);
-                }
             }
             Err(e) => {
-                if let Some(error) = e.downcast_ref::<InvalidSingleGameLog>() {
-                    single_game_kind = single_game_kind.or(Some(error.0));
-                }
-                eprintln!("警告: {path}: {e:#}");
-                extra.input_issues.push(format!("{path}: {e:#}"));
+                eprintln!("警告: {path}: {e}");
             }
         }
     }
 
-    if cli.sprt
-        && let Some(kind) = single_game_kind
-    {
-        bail!("{kind}は独立した対局ペアではないためSPRTに使用できません");
-    }
     if matchups.is_empty() {
         bail!("有効な対局データがありません");
     }
@@ -1837,7 +1169,6 @@ fn main() -> Result<()> {
             (w.clone(), b.clone())
         };
         let h = head_to_head.entry((left, right)).or_default();
-        h.side_totals_unknown |= v.side_totals_unknown;
         h.done += v.done;
         h.draws += v.draws;
         if b <= w {
@@ -1845,8 +1176,6 @@ fn main() -> Result<()> {
             h.left_wins += v.black_wins;
             h.right_wins += v.white_wins;
             // a(=b=left)の先手データ
-            h.left_sente_total += v.a_sente_total;
-            h.left_gote_total += v.b_sente_total;
             h.left_sente_games += v.a_sente_games;
             h.left_sente_wins += v.a_sente_wins;
             // a(=b=left)の後手データ: 相手(w)が先手の局
@@ -1857,8 +1186,6 @@ fn main() -> Result<()> {
             h.right_wins += v.black_wins;
             h.left_wins += v.white_wins;
             // w(=left)の先手データ: b_sente は meta.white が先手の局
-            h.left_sente_total += v.b_sente_total;
-            h.left_gote_total += v.a_sente_total;
             h.left_sente_games += v.b_sente_games;
             h.left_sente_wins += v.b_sente_wins;
             // w(=left)の後手データ: a(=b=right)が先手の局
@@ -1867,8 +1194,30 @@ fn main() -> Result<()> {
         }
     }
 
+    // 直接対決ペアごとの pentanomial 集計（nElo 表示用、テキスト出力時のみ）
+    let h2h_penta: BTreeMap<(String, String), Penta> = if !cli.json {
+        let mut map = BTreeMap::new();
+        for (left, right) in head_to_head.keys() {
+            let mut penta = Penta::ZERO;
+            for path in &files {
+                if path.contains(".summary.") {
+                    continue;
+                }
+                // left=base, right=test で集計 → normalized_elo() は right 視点
+                match collect_sprt_penta(path, left, right) {
+                    Ok(p) => penta += p,
+                    Err(e) => eprintln!("警告: h2h penta 集計失敗 {path}: {e}"),
+                }
+            }
+            map.insert((left.clone(), right.clone()), penta);
+        }
+        map
+    } else {
+        BTreeMap::new()
+    };
+
     // SPRT post-hoc 集計（JSON モードでは最終 JSON にフィールドとして埋め込むため事前に計算する）
-    let mut sprt_payload: Option<(Penta, SprtJsonOutput)> = if cli.sprt {
+    let sprt_payload: Option<(Penta, SprtJsonOutput)> = if cli.sprt {
         // CLI が全項目（ラベル+パラメータ）を明示している場合は meta 参照を完全スキップ。
         // 部分明示の場合は未解決項目の補完のため meta を収集するが、CLI でラベルが明示されて
         // いる場合はそれを `collect_sprt_meta` に渡して別 run の meta を無視させる。
@@ -1880,54 +1229,30 @@ fn main() -> Result<()> {
             || cli.sprt_beta.is_none();
         let meta_sprt = if needs_meta {
             collect_sprt_meta(
-                &accepted_files,
+                &files,
                 cli.sprt_base_label.as_deref(),
                 cli.sprt_test_label.as_deref(),
             )?
         } else {
             None
         };
-
-        // SPRT meta が無いログ（通常 run）では meta のラベル情報から base/test を推定する。
-        // CLI で両ラベルが明示済みなら推定不要。
-        let inferred = if meta_sprt.is_none()
-            && (cli.sprt_base_label.is_none() || cli.sprt_test_label.is_none())
-        {
-            infer_labels_from_meta(
-                &accepted_files,
-                cli.sprt_base_label.as_deref(),
-                cli.sprt_test_label.as_deref(),
-            )?
-        } else {
-            None
-        };
-        if let Some(inf) = &inferred {
-            let prefix = if inf.assumed { "警告" } else { "情報" };
-            eprintln!(
-                "{prefix}: SPRT ラベルを meta から推定: test={} / base={}（{}）。\
-                 役割が逆の場合は --sprt-base-label / --sprt-test-label を明示してください",
-                inf.test, inf.base, inf.note
-            );
-        }
 
         let base_label = cli
             .sprt_base_label
             .clone()
             .or_else(|| meta_sprt.as_ref().map(|m| m.base_label.clone()))
-            .or_else(|| inferred.as_ref().map(|i| i.base.clone()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--sprt 有効時は base ラベルが必要です（meta からの推定もできませんでした）。--sprt-base-label を明示してください"
+                    "--sprt 有効時は --sprt-base-label が必須です（meta 行に SPRT 情報が無いため自動推定できませんでした）"
                 )
             })?;
         let test_label = cli
             .sprt_test_label
             .clone()
             .or_else(|| meta_sprt.as_ref().map(|m| m.test_label.clone()))
-            .or_else(|| inferred.as_ref().map(|i| i.test.clone()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--sprt 有効時は test ラベルが必要です（meta からの推定もできませんでした）。--sprt-test-label を明示してください"
+                    "--sprt 有効時は --sprt-test-label が必須です（meta 行に SPRT 情報が無いため自動推定できませんでした）"
                 )
             })?;
         if base_label == test_label {
@@ -1941,109 +1266,23 @@ fn main() -> Result<()> {
         let beta = cli.sprt_beta.or_else(|| meta_sprt.as_ref().map(|m| m.beta)).unwrap_or(0.05);
 
         let mut total = Penta::ZERO;
-        for path in &accepted_files {
+        for path in &files {
             if path.contains(".summary.") {
                 continue;
             }
             match collect_sprt_penta(path, &base_label, &test_label) {
                 Ok(p) => total += p,
-                Err(e) => extra.input_issues.push(format!("SPRT 集計失敗 {path}: {e}")),
+                Err(e) => eprintln!("警告: SPRT 集計失敗 {path}: {e}"),
             }
         }
         let params =
             SprtParameters::new(nelo0, nelo1, alpha, beta).map_err(|e| anyhow::anyhow!(e))?;
-        let mut json = build_sprt_json(total, &base_label, &test_label, params);
-        json.stopped_at = load_sprt_stop(
-            &accepted_files,
-            &SprtMetaLog {
-                base_label: base_label.clone(),
-                test_label: test_label.clone(),
-                nelo0,
-                nelo1,
-                alpha,
-                beta,
-            },
-            &mut extra.input_issues,
-        );
+        let json = build_sprt_json(total, &base_label, &test_label, params);
         Some((total, json))
     } else {
         None
     };
 
-    // 直接対決ペアごとの pentanomial 集計（nElo 表示用、テキスト出力時のみ）。
-    // SPRT 対象ペアは集計済みの値を視点変換して再利用し、未完了ペアの通知と
-    // JSONL の走査が重複するのを避ける。
-    let h2h_penta: BTreeMap<(String, String), Penta> = if !cli.json {
-        let mut map = BTreeMap::new();
-        for (left, right) in head_to_head.keys() {
-            let reused = sprt_payload.as_ref().and_then(|(penta, output)| {
-                if output.base == *left && output.test == *right {
-                    Some(*penta)
-                } else if output.base == *right && output.test == *left {
-                    Some(reverse_penta(*penta))
-                } else {
-                    None
-                }
-            });
-            let penta = if let Some(penta) = reused {
-                penta
-            } else {
-                let mut penta = Penta::ZERO;
-                for path in &accepted_files {
-                    if path.contains(".summary.") {
-                        continue;
-                    }
-                    // left=base, right=test で集計 → normalized_elo() は right 視点
-                    match collect_sprt_penta(path, left, right) {
-                        Ok(p) => penta += p,
-                        Err(e) => {
-                            extra.input_issues.push(format!("h2h penta 集計失敗 {path}: {e}"))
-                        }
-                    }
-                }
-                penta
-            };
-            map.insert((left.clone(), right.clone()), penta);
-        }
-        map
-    } else {
-        BTreeMap::new()
-    };
-
-    let invalid = extra.retry.exhausted_pairs > 0 || !extra.input_issues.is_empty();
-    // invalid な run は tournament も採否を出さないので、停止時の判定も採否として示さない。
-    if let Some((_, output)) = sprt_payload.as_mut() {
-        if invalid {
-            output.stopped_at = None;
-        } else if let Some(stop) = &output.stopped_at
-            && stop.decision.as_str() != output.decision
-        {
-            eprintln!(
-                "警告: 停止後に回収したペアを含む最終集計の判定 ({}) が、tournament の停止時の判定 ({}) と異なります。採否は停止時の判定に従います",
-                output.decision,
-                stop.decision.as_str()
-            );
-        }
-    }
-    if invalid {
-        if let Some((_, output)) = sprt_payload.as_mut() {
-            output.decision = "invalid".into();
-        }
-        if !cli.json {
-            println!("解析状態: invalid（部分集計・採否は確定しません）");
-            for issue in &extra.input_issues {
-                println!("  {issue}");
-            }
-        }
-    }
-    if let Some(stats) = &by_startpos
-        && stats.excluded_games > 0
-    {
-        eprintln!(
-            "警告: 開始局面別集計から {} 局を除外しました（meta.json の開始局面または startpos_idx がありません・読めません）",
-            stats.excluded_games
-        );
-    }
     if cli.json {
         print_json(
             valid_files,
@@ -2055,7 +1294,6 @@ fn main() -> Result<()> {
             &labels,
             &extra,
             sprt_payload.as_ref().map(|(_, j)| j.clone()),
-            by_startpos.as_ref(),
         )?;
     } else {
         print_text(
@@ -2067,21 +1305,10 @@ fn main() -> Result<()> {
             &h2h_penta,
             &labels,
             &extra,
-            sprt_payload.as_ref().map(|(_, output)| output),
         );
         if let Some((penta, json)) = sprt_payload.as_ref() {
             print_sprt_text_report(*penta, json);
         }
-    }
-
-    if !cli.json
-        && let Some(stats) = &by_startpos
-    {
-        stats.print_text();
-    }
-
-    if invalid && !cli.allow_partial {
-        bail!("不完全な入力です。部分集計だけを利用する場合は --allow-partial を指定してください");
     }
 
     Ok(())
@@ -2100,7 +1327,6 @@ fn print_text(
     h2h_penta: &BTreeMap<(String, String), Penta>,
     labels: &BTreeMap<String, String>,
     extra: &AggregatedExtraStats,
-    sprt: Option<&SprtJsonOutput>,
 ) {
     let pct = if total_all > 0 {
         total_done as f64 / total_all as f64 * 100.0
@@ -2157,137 +1383,69 @@ fn print_text(
     println!("直接対決");
     println!("{}", "=".repeat(75));
     for ((a, b), v) in head_to_head {
-        // SPRT 対象ペアは test を左に表示し、直後の SPRT レポートと視点を揃える。
-        // それ以外は従来どおり辞書順の left 視点を保つ。
-        let show_right_first = should_show_right_first(
-            a,
-            b,
-            sprt.map(|output| output.test.as_str()),
-            sprt.map(|output| output.base.as_str()),
-        );
+        let an = labels.get(a).map_or(a.as_str(), |s| s.as_str());
+        let bn = labels.get(b).map_or(b.as_str(), |s| s.as_str());
         let total = v.left_wins + v.right_wins + v.draws;
-        let (
-            primary,
-            secondary,
-            primary_wins,
-            secondary_wins,
-            primary_sente_games,
-            primary_sente_wins,
-            primary_gote_games,
-            primary_gote_wins,
-            primary_sente_total,
-            primary_gote_total,
-            nelo_sign,
-        ) = if show_right_first {
-            (
-                b,
-                a,
-                v.right_wins,
-                v.left_wins,
-                v.left_gote_games,
-                v.left_gote_games - v.left_gote_wins,
-                v.left_sente_games,
-                v.left_sente_games - v.left_sente_wins,
-                v.left_gote_total,
-                v.left_sente_total,
-                1.0,
-            )
-        } else {
-            (
-                a,
-                b,
-                v.left_wins,
-                v.right_wins,
-                v.left_sente_games,
-                v.left_sente_wins,
-                v.left_gote_games,
-                v.left_gote_wins,
-                v.left_sente_total,
-                v.left_gote_total,
-                -1.0,
-            )
-        };
-        let primary_name = labels.get(primary).map_or(primary.as_str(), |s| s.as_str());
-        let secondary_name = labels.get(secondary).map_or(secondary.as_str(), |s| s.as_str());
-        let primary_wr = if total > 0 {
-            primary_wins as f64 / total as f64 * 100.0
+        let wr_a = if total > 0 {
+            v.left_wins as f64 / total as f64 * 100.0
         } else {
             0.0
         };
 
-        let elo = elo_diff(primary_wins, secondary_wins, v.draws);
-        let ci = elo_ci95(primary_wins, secondary_wins, v.draws);
+        let elo = elo_diff(v.left_wins, v.right_wins, v.draws);
+        let ci = elo_ci95(v.left_wins, v.right_wins, v.draws);
 
-        // pentanomial nElo は正規化キーの right 視点で集計されている。
+        // pentanomial nElo（right=test 視点で集計されているため、left 視点に変換）
         let nelo_str = h2h_penta
             .get(&(a.clone(), b.clone()))
             .and_then(|p| p.normalized_elo())
-            .map(|(e, c)| format!(" | nElo:{:+.0} ±{:.0}", nelo_sign * e, c))
+            .map(|(e, c)| format!(" | nElo:{:+.0} ±{:.0}", -e, c))
             .unwrap_or_default();
 
-        // 符号の視点を明示する。
         let elo_str = match (elo, ci) {
-            (Some(e), Some(c)) => {
-                format!(" | Elo差:{:+.0} ±{:.0}{} ({primary_name}視点)", e, c, nelo_str)
-            }
-            _ if !nelo_str.is_empty() => format!("{nelo_str} ({primary_name}視点)"),
+            (Some(e), Some(c)) => format!(" | Elo差:{:+.0} ±{:.0}{}", e, c, nelo_str),
             _ => nelo_str,
         };
 
         println!(
             "  {:16} vs {:16} | {:3}局 | {}:{:3}勝 {}:{:3}勝 引分:{} | {}勝率:{:.1}%{}",
-            primary_name,
-            secondary_name,
-            v.done,
-            primary_name,
-            primary_wins,
-            secondary_name,
-            secondary_wins,
-            v.draws,
-            primary_name,
-            primary_wr,
-            elo_str
+            an, bn, v.done, an, v.left_wins, bn, v.right_wins, v.draws, an, wr_a, elo_str
         );
 
         // 先手/後手別勝率
-        if v.side_totals_unknown {
-            println!("    先後別集計:不明（先後情報のないsummaryを含む）");
-        } else if primary_sente_total > 0 || primary_gote_total > 0 {
-            let primary_sente = format_decisive_rate(
-                "先手",
-                primary_sente_wins,
-                primary_sente_games,
-                primary_sente_total,
-            );
-            let primary_gote = format_decisive_rate(
-                "後手",
-                primary_gote_wins,
-                primary_gote_games,
-                primary_gote_total,
-            );
-            // secondary の先手 = primary の後手局、secondary の後手 = primary の先手局
-            let secondary_sente_wins = primary_gote_games - primary_gote_wins;
-            let secondary_gote_wins = primary_sente_games - primary_sente_wins;
-            let secondary_sente = format_decisive_rate(
-                "先手",
-                secondary_sente_wins,
-                primary_gote_games,
-                primary_gote_total,
-            );
-            let secondary_gote = format_decisive_rate(
-                "後手",
-                secondary_gote_wins,
-                primary_sente_games,
-                primary_sente_total,
-            );
-            println!("    {primary_name} {primary_sente} {primary_gote}");
-            println!("    {secondary_name} {secondary_sente} {secondary_gote}");
+        if v.left_sente_games > 0 || v.left_gote_games > 0 {
+            let half = v.done / 2;
+            let half_up = half + v.done % 2;
+
+            let fmt_wr = |label: &str, wins: u32, decisive: u32, total_games: u32| -> String {
+                if decisive > 0 {
+                    format!(
+                        "{}:{:.1}%({}/{}局)",
+                        label,
+                        wins as f64 / decisive as f64 * 100.0,
+                        wins,
+                        total_games
+                    )
+                } else {
+                    format!("{}:-", label)
+                }
+            };
+
+            let a_sente = fmt_wr("先手", v.left_sente_wins, v.left_sente_games, half_up);
+            let a_gote = fmt_wr("後手", v.left_gote_wins, v.left_gote_games, half);
+            // right の先手 = left の後手局、right の後手 = left の先手局
+            let r_sente_decisive = v.left_gote_games;
+            let r_sente_wins = r_sente_decisive - v.left_gote_wins;
+            let r_gote_decisive = v.left_sente_games;
+            let r_gote_wins = r_gote_decisive - v.left_sente_wins;
+            let b_sente = fmt_wr("先手", r_sente_wins, r_sente_decisive, half);
+            let b_gote = fmt_wr("後手", r_gote_wins, r_gote_decisive, half_up);
+            println!("    {} {} {}", an, a_sente, a_gote);
+            println!("    {} {} {}", bn, b_sente, b_gote);
         }
     }
 
-    print_reasons(&extra.reasons);
-
-    if extra.completed_games > 0 || extra.retry.error_games > 0 {
+    if extra.completed_games > 0 {
         println!();
         println!("追加統計");
         println!("{}", "=".repeat(75));
@@ -2304,28 +1462,12 @@ fn print_text(
         };
         println!(
             "  平均手数: {:.1} plies ({}局)",
-            if extra.completed_games > 0 {
-                extra.total_plies as f64 / extra.completed_games as f64
-            } else {
-                0.0
-            },
+            extra.total_plies as f64 / extra.completed_games as f64,
             extra.completed_games
         );
         println!(
             "  先手勝率: {:.1}% ({}/{} 決着局), 後手勝率: {:.1}% ({}/{} 決着局), 引分: {}",
             black_wr, extra.black_wins, decisive, white_wr, extra.white_wins, decisive, extra.draws
-        );
-        println!(
-            "  error局: {}, errorペア: {}, 再試行ペア: {}, 枯渇ペア: {}{}",
-            extra.retry.error_games,
-            extra.retry.error_pairs,
-            extra.retry.retried_pairs,
-            extra.retry.exhausted_pairs,
-            if extra.retry.exhausted_pairs > 0 {
-                " (invalid)"
-            } else {
-                ""
-            },
         );
         let mut move_stats: Vec<_> = extra.engine_moves.iter().collect();
         move_stats.sort_by(|(id_a, _), (id_b, _)| {
@@ -2398,45 +1540,6 @@ fn print_text(
     }
 }
 
-const REASON_ORDER: [&str; 12] = [
-    "resign",
-    "win",
-    "sennichite",
-    "sennichite_perpetual_check",
-    "adjudication_resign",
-    "adjudication_win",
-    "adjudication_draw",
-    "max_moves",
-    "timeout",
-    "illegal_move",
-    "no_bestmove",
-    "error",
-];
-
-fn print_reasons(reasons: &BTreeMap<String, u32>) {
-    let total: u64 = reasons.values().map(|&count| u64::from(count)).sum();
-    if total == 0 {
-        return;
-    }
-    println!("\n終局理由（全 result 行: {total}、error 局・重複行を含む）");
-    let ordered = REASON_ORDER.into_iter().chain(
-        reasons
-            .keys()
-            .map(String::as_str)
-            .filter(|reason| !REASON_ORDER.contains(reason)),
-    );
-    for reason in ordered {
-        if let Some(&count) = reasons.get(reason).filter(|&&count| count > 0) {
-            println!("  {reason}: {count} ({:.2}%)", f64::from(count) / total as f64 * 100.0);
-        }
-    }
-    let max_moves = reasons.get("max_moves").copied().unwrap_or(0);
-    println!(
-        "  max_moves 到達率: {:.2}% ({max_moves}/{total})",
-        f64::from(max_moves) / total as f64 * 100.0
-    );
-}
-
 fn win_rate(wins: u32, losses: u32, draws: u32) -> f64 {
     let total = wins + losses + draws;
     if total == 0 {
@@ -2460,7 +1563,6 @@ fn print_json(
     labels: &BTreeMap<String, String>,
     extra: &AggregatedExtraStats,
     sprt: Option<SprtJsonOutput>,
-    by_startpos: Option<&StartposStats>,
 ) -> Result<()> {
     let pct = if total_all > 0 {
         total_done as f64 / total_all as f64 * 100.0
@@ -2580,7 +1682,6 @@ fn print_json(
     let decisive = extra.black_wins + extra.white_wins;
 
     let output = JsonOutput {
-        by_startpos: by_startpos.map(StartposStats::json),
         files: file_count,
         progress: Progress {
             done: total_done,
@@ -2591,7 +1692,6 @@ fn print_json(
         engines: json_engines,
         head_to_head: json_h2h,
         extra: JsonExtra {
-            reasons: extra.reasons.clone(),
             average_plies: if extra.completed_games > 0 {
                 extra.total_plies as f64 / extra.completed_games as f64
             } else {
@@ -2609,12 +1709,6 @@ fn print_json(
             },
             completed_games: extra.completed_games,
             draws: extra.draws,
-            error_games: extra.retry.error_games,
-            error_pairs: extra.retry.error_pairs,
-            retried_pairs: extra.retry.retried_pairs,
-            exhausted_pairs: extra.retry.exhausted_pairs,
-            invalid: extra.retry.exhausted_pairs > 0 || !extra.input_issues.is_empty(),
-            input_issues: extra.input_issues.clone(),
             engine_timing: json_engine_timing,
         },
         sprt,
@@ -2626,94 +1720,8 @@ fn print_json(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn sprt_nelo_bounds_accept_space_separated_negative_values() {
-        use clap::Parser;
-
-        for (nelo0, nelo1, expected0, expected1) in [
-            ("-10", "0", -10.0, 0.0),
-            ("-20", "-5", -20.0, -5.0),
-            ("-10.5", "-0.5", -10.5, -0.5),
-        ] {
-            let cli = super::Cli::try_parse_from([
-                "analyze_selfplay",
-                "log.jsonl",
-                "--sprt-nelo0",
-                nelo0,
-                "--sprt-nelo1",
-                nelo1,
-            ])
-            .unwrap();
-            assert_eq!(cli.sprt_nelo0, Some(expected0));
-            assert_eq!(cli.sprt_nelo1, Some(expected1));
-        }
-    }
-
-    #[test]
-    fn decisive_rate_labels_use_the_same_denominator() {
-        assert_eq!(
-            super::format_decisive_rate("先手", 1, 1, 2),
-            "先手決着局勝率:100.0%(1/1決着局、全2局)"
-        );
-        assert_eq!(
-            super::format_decisive_rate("後手", 0, 0, 2),
-            "後手決着局勝率:-（0決着局、全2局）"
-        );
-        assert_eq!(
-            super::format_decisive_rate("先手", 0, 0, 0),
-            "先手決着局勝率:-（0決着局、全0局）"
-        );
-    }
-
     use super::*;
     use std::io::Write as _;
-
-    #[test]
-    fn meta_accepts_settings_with_and_without_seed() {
-        let meta_json = |settings| {
-            format!(
-                r#"{{"settings":{settings},"engine_cmd":{{"path_black":"/b","path_white":"/w"}}}}"#
-            )
-        };
-
-        for settings in [r#"{"games":2}"#, r#"{"games":2,"seed":42}"#] {
-            let meta: MetaLog = serde_json::from_str(&meta_json(settings)).unwrap();
-            assert_eq!(meta.settings.games, 2);
-        }
-    }
-
-    #[test]
-    fn h2h_places_sprt_test_on_the_left() {
-        assert!(should_show_right_first("base", "test", Some("test"), Some("base")));
-        assert!(!should_show_right_first("test", "base", Some("test"), Some("base")));
-        assert!(!should_show_right_first("a", "b", Some("test"), Some("base")));
-        assert!(!should_show_right_first("base", "test", None, None));
-    }
-
-    #[test]
-    fn reverse_penta_swaps_win_and_loss_categories() {
-        let penta = Penta {
-            ll: 1,
-            dl: 2,
-            dd: 3,
-            wl: 4,
-            wd: 5,
-            ww: 6,
-        };
-        let reversed = reverse_penta(penta);
-        assert_eq!(
-            reversed,
-            Penta {
-                ll: 6,
-                dl: 5,
-                dd: 3,
-                wl: 4,
-                wd: 2,
-                ww: 1
-            }
-        );
-        assert_eq!(reverse_penta(reversed), penta);
-    }
 
     fn write_meta_jsonl(dir: &std::path::Path, name: &str, sprt_json: Option<&str>) -> String {
         let path = dir.join(name);
@@ -2749,28 +1757,6 @@ mod tests {
         assert_eq!(got.base_label, "v100");
         assert_eq!(got.test_label, "v101");
         assert_eq!(got.nelo1, 4.0);
-    }
-
-    /// CLI で片方のみ指定された場合も、一致しない SPRT meta は無視される
-    /// （infer_labels_from_meta のフィルタ規則と対称）。
-    #[test]
-    fn one_sided_cli_label_filters_unrelated_sprt_meta() {
-        let dir = tempfile::tempdir().unwrap();
-        let matching_sprt = "{\"base_label\":\"v100\",\"test_label\":\"v101\",\"nelo0\":0.0,\"nelo1\":4.0,\"alpha\":0.05,\"beta\":0.05}";
-        let unrelated_sprt = "{\"base_label\":\"v200\",\"test_label\":\"v201\",\"nelo0\":0.0,\"nelo1\":5.0,\"alpha\":0.01,\"beta\":0.01}";
-        let a = write_meta_jsonl(dir.path(), "a.jsonl", Some(matching_sprt));
-        let b = write_meta_jsonl(dir.path(), "b.jsonl", Some(unrelated_sprt));
-        let files: Vec<&str> = vec![a.as_str(), b.as_str()];
-
-        let res = collect_sprt_meta(&files, Some("v100"), None).unwrap();
-        let got = res.expect("matching meta should be picked up");
-        assert_eq!(got.base_label, "v100");
-        assert_eq!(got.test_label, "v101");
-
-        let res = collect_sprt_meta(&files, None, Some("v201")).unwrap();
-        let got = res.expect("matching meta should be picked up");
-        assert_eq!(got.base_label, "v200");
-        assert_eq!(got.test_label, "v201");
     }
 
     /// CLI ラベル未指定で異ラベルの meta が混在する場合は従来通り bail! する。
@@ -2854,285 +1840,6 @@ mod tests {
         assert!(err.to_string().contains("resultパースエラー"));
     }
 
-    fn write_retry_log(lines: &[&str]) -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("retry.jsonl");
-        let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(
-            file,
-            "{{\"type\":\"meta\",\"settings\":{{\"games\":2}},\
-             \"engine_cmd\":{{\"path_black\":\"/base\",\"path_white\":\"/test\",\
-             \"label_black\":\"base\",\"label_white\":\"test\"}}}}"
-        )
-        .unwrap();
-        for line in lines {
-            writeln!(file, "{line}").unwrap();
-        }
-        (dir, path.display().to_string())
-    }
-
-    #[test]
-    fn retry_generation_replaces_error_generation_for_direct_and_penta() {
-        let (_dir, path) = write_retry_log(&[
-            r#"{"type":"result","outcome":"white_win","winner":"test","plies":20,"pair_index":0,"pair_slot":0}"#,
-            r#"{"type":"result","outcome":"draw","plies":0,"pair_index":0,"pair_slot":1,"error":true}"#,
-            r#"{"type":"result","outcome":"white_win","winner":"test","plies":30,"pair_index":0,"pair_slot":0,"attempt":1}"#,
-            r#"{"type":"result","outcome":"black_win","winner":"test","plies":40,"pair_index":0,"pair_slot":1,"attempt":1}"#,
-        ]);
-
-        let parsed = parse_normal_file(&path, false).unwrap();
-        assert_eq!(parsed.done, 2);
-        assert_eq!(parsed.black_wins, 0);
-        assert_eq!(parsed.white_wins, 2);
-        assert_eq!(parsed.draws, 0);
-        assert_eq!(parsed.retry.error_games, 1);
-        assert_eq!(parsed.retry.error_pairs, 1);
-        assert_eq!(parsed.retry.retried_pairs, 1);
-        assert_eq!(parsed.retry.exhausted_pairs, 0);
-
-        let penta = collect_sprt_penta(&path, "base", "test").unwrap();
-        assert_eq!(
-            penta,
-            Penta {
-                ww: 1,
-                ..Penta::ZERO
-            },
-            "live SPRT と同じ世代入力は retry 世代の WW 1 ペアだけになる"
-        );
-    }
-
-    #[test]
-    fn reasons_count_all_results_without_changing_wld_or_penta() {
-        let (dir, path) = write_retry_log(&[
-            r#"{"type":"result","outcome":"draw","reason":"sennichite"}"#,
-            r#"{"type":"result","outcome":"white_win","winner":"test","reason":"sennichite_perpetual_check"}"#,
-            r#"{"type":"result","outcome":"draw","reason":"max_moves"}"#,
-            r#"{"type":"result","outcome":"draw","reason":"adjudication_draw"}"#,
-            r#"{"type":"result","outcome":"black_win","winner":"base","reason":"adjudication_resign"}"#,
-            r#"{"type":"result","outcome":"draw"}"#,
-            r#"{"type":"result","outcome":"draw","reason":"error: worker panic","error":true}"#,
-            r#"{"type":"result","outcome":"draw","reason":"error: engine exit","error":true}"#,
-            r#"{"type":"result","outcome":"draw","reason":"max_moves","pair_index":0,"pair_slot":0}"#,
-        ]);
-        let parsed = parse_normal_file(&path, false).unwrap();
-        assert_eq!((parsed.black_wins, parsed.white_wins, parsed.draws), (1, 1, 4));
-        assert_eq!(parsed.done, 6);
-        assert_eq!(
-            parsed.extra.reasons,
-            BTreeMap::from([
-                ("sennichite".to_string(), 1),
-                ("sennichite_perpetual_check".to_string(), 1),
-                ("max_moves".to_string(), 2),
-                ("adjudication_draw".to_string(), 1),
-                ("adjudication_resign".to_string(), 1),
-                ("unknown".to_string(), 1),
-                ("error".to_string(), 2),
-            ])
-        );
-        assert_eq!(
-            collect_sprt_penta(&path, "base", "test").unwrap(),
-            Penta {
-                wd: 1,
-                dd: 1,
-                dl: 1,
-                ..Penta::ZERO
-            }
-        );
-        dir.close().unwrap();
-    }
-
-    #[test]
-    fn direct_aggregation_keeps_first_result_for_duplicate_slot() {
-        let (_dir, path) = write_retry_log(&[
-            r#"{"type":"result","outcome":"black_win","winner":"base","plies":20,"pair_index":0,"pair_slot":0}"#,
-            r#"{"type":"result","outcome":"white_win","winner":"test","plies":30,"pair_index":0,"pair_slot":0}"#,
-            r#"{"type":"result","outcome":"white_win","winner":"base","plies":40,"pair_index":0,"pair_slot":1}"#,
-        ]);
-
-        let parsed = parse_normal_file(&path, false).unwrap();
-        assert_eq!(parsed.done, 2);
-        assert_eq!(parsed.black_wins, 2);
-        assert_eq!(parsed.white_wins, 0);
-    }
-
-    #[test]
-    fn attempt_defaults_to_zero_and_exhausted_pair_is_excluded() {
-        let legacy: ResultLog =
-            serde_json::from_str(r#"{"outcome":"draw","pair_index":7,"pair_slot":0}"#).unwrap();
-        assert_eq!(legacy.attempt, 0);
-
-        let (_dir, path) = write_retry_log(&[
-            r#"{"type":"result","outcome":"draw","pair_index":0,"pair_slot":0,"attempt":2,"error":true}"#,
-            r#"{"type":"result","outcome":"white_win","winner":"base","pair_index":0,"pair_slot":1,"attempt":2}"#,
-        ]);
-        let parsed = parse_normal_file(&path, false).unwrap();
-        assert_eq!(parsed.done, 0);
-        assert_eq!(parsed.retry.error_pairs, 1);
-        assert_eq!(parsed.retry.retried_pairs, 1);
-        assert_eq!(parsed.retry.exhausted_pairs, 1);
-        assert_eq!(collect_sprt_penta(&path, "base", "test").unwrap(), Penta::ZERO);
-    }
-
-    fn write_meta_jsonl_labels(
-        dir: &std::path::Path,
-        name: &str,
-        label_black: &str,
-        label_white: &str,
-        base_label: Option<&str>,
-    ) -> String {
-        let path = dir.join(name);
-        let mut f = std::fs::File::create(&path).unwrap();
-        let base_field = match base_label {
-            Some(s) => format!(",\"base_label\":\"{s}\""),
-            None => String::new(),
-        };
-        writeln!(
-            f,
-            "{{\"type\":\"meta\",\"timestamp\":\"t\",\"settings\":{{\"games\":2}},\
-             \"engine_cmd\":{{\"path_black\":\"/b\",\"path_white\":\"/w\",\
-             \"label_black\":\"{label_black}\",\"label_white\":\"{label_white}\",\
-             \"usi_options_black\":[],\"usi_options_white\":[]}}{base_field}}}"
-        )
-        .unwrap();
-        path.display().to_string()
-    }
-
-    /// meta の base_label 記録（tournament --base-label）があればそれを base とする。
-    #[test]
-    fn infer_uses_meta_base_label() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "cand", "anchor", Some("anchor"));
-        let files: Vec<&str> = vec![a.as_str()];
-        let inf = infer_labels_from_meta(&files, None, None).unwrap().unwrap();
-        assert_eq!(inf.base, "anchor");
-        assert_eq!(inf.test, "cand");
-        assert!(!inf.assumed);
-    }
-
-    /// CLI で片方のみ指定された場合、もう片方をペアの残りラベルで補完する。
-    /// CLI 指定は meta の base_label 記録より優先される。
-    #[test]
-    fn infer_completes_one_sided_cli_label() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "x", "y", Some("x"));
-        let files: Vec<&str> = vec![a.as_str()];
-
-        let inf = infer_labels_from_meta(&files, Some("y"), None).unwrap().unwrap();
-        assert_eq!(inf.base, "y");
-        assert_eq!(inf.test, "x");
-
-        let inf = infer_labels_from_meta(&files, None, Some("y")).unwrap().unwrap();
-        assert_eq!(inf.base, "x");
-        assert_eq!(inf.test, "y");
-        assert!(!inf.assumed);
-    }
-
-    /// 片方のラベルだけが "base" を含むなら、それを base と推定する。
-    #[test]
-    fn infer_base_name_heuristic() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "ftfact-100", "base-100", None);
-        let files: Vec<&str> = vec![a.as_str()];
-        let inf = infer_labels_from_meta(&files, None, None).unwrap().unwrap();
-        assert_eq!(inf.base, "base-100");
-        assert_eq!(inf.test, "ftfact-100");
-        assert!(!inf.assumed);
-    }
-
-    /// base_label 記録がラベル組に含まれない場合は無視して後続の推定にフォールバックする。
-    #[test]
-    fn infer_ignores_base_label_not_in_pair() {
-        let dir = tempfile::tempdir().unwrap();
-        let a =
-            write_meta_jsonl_labels(dir.path(), "a.jsonl", "ftfact-100", "base-100", Some("v999"));
-        let files: Vec<&str> = vec![a.as_str()];
-        let inf = infer_labels_from_meta(&files, None, None).unwrap().unwrap();
-        assert_eq!(inf.base, "base-100");
-        assert_eq!(inf.test, "ftfact-100");
-        assert!(!inf.assumed);
-    }
-
-    /// 役割を示す情報が皆無なら label_black=test の既定に落ち、assumed=true になる。
-    #[test]
-    fn infer_falls_back_to_label_black_as_test() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "v100", "v101", None);
-        let files: Vec<&str> = vec![a.as_str()];
-        let inf = infer_labels_from_meta(&files, None, None).unwrap().unwrap();
-        assert_eq!(inf.test, "v100");
-        assert_eq!(inf.base, "v101");
-        assert!(inf.assumed);
-    }
-
-    /// 両ラベルが "base" を含む場合はヒューリスティックを使わず既定に落ちる。
-    #[test]
-    fn infer_ambiguous_base_names_fall_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "base-a", "base-b", None);
-        let files: Vec<&str> = vec![a.as_str()];
-        let inf = infer_labels_from_meta(&files, None, None).unwrap().unwrap();
-        assert!(inf.assumed);
-    }
-
-    /// 同一ラベル組でもファイル間で base_label 記録が矛盾する場合は bail する
-    /// （入力順で base/test の符号が反転するのを防ぐ）。
-    #[test]
-    fn infer_conflicting_base_label_records_bail() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "cand", "anchor", Some("anchor"));
-        let b = write_meta_jsonl_labels(dir.path(), "b.jsonl", "cand", "anchor", Some("cand"));
-        let files: Vec<&str> = vec![a.as_str(), b.as_str()];
-        let err = infer_labels_from_meta(&files, None, None).unwrap_err();
-        assert!(err.to_string().contains("base_label"));
-    }
-
-    /// base_label 記録を持つファイルと持たないファイルの混在は矛盾ではなく、
-    /// 記録を持つ側から base を解決する。
-    #[test]
-    fn infer_merges_base_label_from_later_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "cand", "anchor", None);
-        let b = write_meta_jsonl_labels(dir.path(), "b.jsonl", "cand", "anchor", Some("anchor"));
-        let files: Vec<&str> = vec![a.as_str(), b.as_str()];
-        let inf = infer_labels_from_meta(&files, None, None).unwrap().unwrap();
-        assert_eq!(inf.base, "anchor");
-        assert_eq!(inf.test, "cand");
-        assert!(!inf.assumed);
-    }
-
-    /// 入力ファイル間でラベル組が一致しない場合は bail する。
-    #[test]
-    fn infer_conflicting_label_pairs_bails() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "x", "y", None);
-        let b = write_meta_jsonl_labels(dir.path(), "b.jsonl", "p", "q", None);
-        let files: Vec<&str> = vec![a.as_str(), b.as_str()];
-        let err = infer_labels_from_meta(&files, None, None).unwrap_err();
-        assert!(err.to_string().contains("ラベル組"));
-    }
-
-    /// CLI ラベル指定があれば、それを含まない別 run の meta は無視して bail しない。
-    #[test]
-    fn infer_cli_label_filters_unrelated_meta() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "x", "y", None);
-        let b = write_meta_jsonl_labels(dir.path(), "b.jsonl", "p", "q", None);
-        let files: Vec<&str> = vec![a.as_str(), b.as_str()];
-        let inf = infer_labels_from_meta(&files, Some("y"), None).unwrap().unwrap();
-        assert_eq!(inf.base, "y");
-        assert_eq!(inf.test, "x");
-    }
-
-    /// 同一ラベル同士（自己対局）は役割を割り当てられないため None を返す。
-    #[test]
-    fn infer_identical_labels_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_meta_jsonl_labels(dir.path(), "a.jsonl", "same", "same", None);
-        let files: Vec<&str> = vec![a.as_str()];
-        let res = infer_labels_from_meta(&files, None, None).unwrap();
-        assert!(res.is_none());
-    }
-
     /// 破損 JSON の先頭行は当該ファイルのみスキップし、他ファイルから収集できる。
     /// （警告の eprintln! 出力はテストでは捕捉していない）
     #[test]
@@ -3152,294 +1859,5 @@ mod tests {
         let res = collect_sprt_meta(&files, None, None).unwrap();
         let got = res.expect("good file should still provide meta");
         assert_eq!(got.base_label, "v100");
-    }
-    #[test]
-    fn by_startpos_prefers_result_position_and_preserves_names() {
-        use std::io::Write as _;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cycle.jsonl");
-        let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({"type":"meta", "settings":{"games":1}, "engine_cmd":{
-                "path_black":"base", "path_white":"test", "label_black":"base", "label_white":"test"
-            }})
-        )
-        .unwrap();
-        for slot in 0..2 {
-            writeln!(file, "{}", serde_json::json!({"type":"result", "game_id":slot,
-                "pair_index":0, "pair_slot":slot, "outcome":"draw", "plies":0,
-                "startpos_idx":0, "startpos":"position startpos moves 7g7f", "startpos_name":"opening"
-            })).unwrap();
-        }
-        drop(file);
-        std::fs::write(
-            dir.path().join("meta.json"),
-            serde_json::json!({
-                "start_positions":["position startpos"]
-            })
-            .to_string(),
-        )
-        .unwrap();
-        for with_meta in [true, false] {
-            if !with_meta {
-                std::fs::remove_file(dir.path().join("meta.json")).unwrap();
-            }
-            let stats = parse_normal_file(path.to_str().unwrap(), true)
-                .unwrap()
-                .extra
-                .by_startpos
-                .unwrap();
-            assert_eq!(stats.rows.len(), 1);
-            assert_eq!(stats.rows["position startpos moves 7g7f"].games, 2);
-            assert_eq!(stats.excluded_games, 0);
-            assert_eq!(stats.json()["rows"][0]["startpos_name"], "opening");
-            let mut merged = StartposStats::default();
-            merged.merge(stats);
-            assert_eq!(merged.json()["rows"][0]["startpos_name"], "opening");
-        }
-    }
-
-    #[test]
-    fn by_startpos_merges_runs_and_excludes_failed_attempts_and_legacy() {
-        let mut combined = StartposStats::default();
-        for reverse in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let positions = if reverse {
-                vec![
-                    "position startpos moves 7g7f",
-                    "position startpos moves 2g2f",
-                ]
-            } else {
-                vec![
-                    "position startpos moves 2g2f",
-                    "position startpos moves 7g7f",
-                ]
-            };
-            std::fs::write(
-                dir.path().join("meta.json"),
-                serde_json::json!({"start_positions": positions}).to_string(),
-            )
-            .unwrap();
-            for file_index in 0..2 {
-                let path = dir.path().join(format!("{file_index}.jsonl"));
-                let mut file = std::fs::File::create(&path).unwrap();
-                writeln!(file, "{}", serde_json::json!({"type":"meta","settings":{"games":8},"engine_cmd":{"path_black":"a","path_white":"b"}})).unwrap();
-                // error 世代は正常な相方も含めて除外。再試行だけを採用する。
-                for (id, pair, slot, attempt, error, outcome, plies, index) in [
-                    (0, 0, 0, 0, false, "black_win", 40, Some(0)),
-                    (1, 0, 1, 0, true, "draw", 40, Some(0)),
-                    (2, 0, 0, 1, false, "black_win", 40, Some(0)),
-                    (3, 0, 1, 1, false, "white_win", 20, Some(0)),
-                    (4, 1, 0, 0, false, "draw", 10, Some(1)),
-                    (5, 1, 1, 0, false, "draw", 9, Some(1)),
-                    (6, 2, 0, 0, false, "draw", 0, None),
-                    (7, 2, 1, 0, false, "draw", 0, Some(99)),
-                ] {
-                    for ply in 1..=plies {
-                        let usi = if file_index == 1 && ply == 20 {
-                            "2g2f"
-                        } else {
-                            "7g7f"
-                        };
-                        writeln!(file, "{}", serde_json::json!({"type":"move","game_id":id,"ply":ply,"side_to_move":"black","engine":"a","elapsed_ms":100,"think_limit_ms":100,"timed_out":false,"move_usi":usi})).unwrap();
-                    }
-                    let result = serde_json::json!({"type":"result","game_id":id,"pair_index":pair,"pair_slot":slot,"attempt":attempt,"error":error,"outcome":outcome,"plies":plies,"startpos_idx":index,"reason":"max_moves"});
-                    writeln!(file, "{result}").unwrap();
-                    // 同一スロットの重複も通常集計と同じく除外。
-                    if id == 2 {
-                        writeln!(file, "{result}").unwrap();
-                    }
-                }
-                drop(file);
-                let parsed = parse_normal_file(path.to_str().unwrap(), true).unwrap();
-                assert_eq!(parsed.done, 6);
-                combined.merge(parsed.extra.by_startpos.unwrap());
-            }
-        }
-        assert_eq!(combined.excluded_games, 8);
-        assert_eq!(
-            combined.rows.keys().cloned().collect::<Vec<_>>(),
-            vec![
-                "position startpos moves 2g2f",
-                "position startpos moves 7g7f"
-            ]
-        );
-        for row in combined.rows.values() {
-            assert_eq!((row.games, row.black_wins, row.white_wins, row.draws), (8, 2, 2, 4));
-            assert_eq!(row.reasons["max_moves"], 8);
-            assert_eq!(row.plies, 158);
-            assert_eq!(row.elapsed_ms, 15800);
-            assert_eq!(row.prefix_games, [6, 4, 2]);
-            assert_eq!(row.prefix_counts(), [1, 2, 2]);
-        }
-        let json = combined.json();
-        assert_eq!(json["rows"][0]["black_score_rate"], 0.5);
-        assert_eq!(json["rows"][0]["average_seconds"], 1.975);
-        assert_eq!(json["rows"][0]["average_plies"], 19.75);
-    }
-
-    #[test]
-    fn by_startpos_timeout_counts_elapsed_but_not_unapplied_move_at_boundaries() {
-        for boundary in [10, 20, 40] {
-            let mut lines = Vec::new();
-            // 同じ ply 数でも、時間切れ側の最終手は盤上に適用されていない。
-            for game_id in 0..2 {
-                for ply in 1..=boundary {
-                    lines.push(
-                        serde_json::json!({
-                            "type":"move", "game_id":game_id, "ply":ply,
-                            "side_to_move":"black", "engine":"base",
-                            "elapsed_ms":100, "think_limit_ms":100,
-                            "timed_out":game_id == 0 && ply == boundary, "move_usi":"7g7f"
-                        })
-                        .to_string(),
-                    );
-                }
-                lines.push(serde_json::json!({
-                    "type":"result", "game_id":game_id, "pair_index":0,
-                    "pair_slot":game_id, "outcome":"white_win", "plies":boundary,
-                    "startpos_idx":0, "reason":if game_id == 0 { "timeout" } else { "max_moves" }
-                }).to_string());
-            }
-            let (dir, path) =
-                write_retry_log(&lines.iter().map(String::as_str).collect::<Vec<_>>());
-            std::fs::write(
-                dir.path().join("meta.json"),
-                serde_json::json!({"start_positions":["position startpos"]}).to_string(),
-            )
-            .unwrap();
-            let stats = parse_normal_file(&path, true).unwrap().extra.by_startpos.unwrap();
-            let row = &stats.rows["position startpos"];
-            assert_eq!(row.games, 2);
-            assert_eq!(row.elapsed_ms, 2 * boundary * 100);
-            for (i, len) in [10, 20, 40].into_iter().enumerate() {
-                let expected = if len < boundary {
-                    2
-                } else {
-                    u64::from(len == boundary)
-                };
-                assert_eq!(row.prefix_games[i], expected);
-                assert_eq!(row.prefix_counts()[i], usize::from(len <= boundary));
-            }
-        }
-    }
-
-    #[test]
-    fn by_startpos_compact_prefixes_distinguish_moves_and_normalize_usi() {
-        // 各組は同じ盤上の手。組同士は成り・移動元・移動先・打つ駒・pass が異なる。
-        let variants = [
-            ["7c7b", "7c7bextra"],
-            ["7c7b+", "7c7b+extra"],
-            ["P*7b", "P*7bextra"],
-            ["S*7b", "S*7bextra"],
-            ["pass", "0000"],
-            ["6c7b", "6c7bextra"],
-            ["7c6b", "7c6bextra"],
-        ];
-        for changed_ply in [1, 10, 20, 40, 41] {
-            let mut lines = Vec::new();
-            for (game_id, usi) in variants.into_iter().flatten().enumerate() {
-                for ply in 1..=41 {
-                    lines.push(
-                        serde_json::json!({
-                            "type":"move", "game_id":game_id, "ply":ply,
-                            "side_to_move":"black", "engine":"base",
-                            "elapsed_ms":100, "think_limit_ms":100, "timed_out":false,
-                            "move_usi":if ply == changed_ply { usi } else { "7g7f" }
-                        })
-                        .to_string(),
-                    );
-                }
-                lines.push(
-                    serde_json::json!({
-                        "type":"result", "game_id":game_id, "pair_index":game_id / 2,
-                        "pair_slot":game_id % 2, "outcome":"draw", "plies":41,
-                        "startpos_idx":0, "reason":"max_moves"
-                    })
-                    .to_string(),
-                );
-            }
-            let (dir, path) =
-                write_retry_log(&lines.iter().map(String::as_str).collect::<Vec<_>>());
-            std::fs::write(
-                dir.path().join("meta.json"),
-                serde_json::json!({"start_positions":["position startpos"]}).to_string(),
-            )
-            .unwrap();
-            let stats = parse_normal_file(&path, true).unwrap().extra.by_startpos.unwrap();
-            let row = &stats.rows["position startpos"];
-            assert_eq!(row.prefix_games, [14; 3]);
-            assert_eq!(row.elapsed_ms, 14 * 41 * 100);
-            assert_eq!(
-                row.prefix_counts(),
-                [10, 20, 40].map(|len| if changed_ply <= len {
-                    variants.len()
-                } else {
-                    1
-                })
-            );
-            assert_eq!(
-                stats.json(),
-                parse_normal_file(&path, true).unwrap().extra.by_startpos.unwrap().json()
-            );
-        }
-    }
-
-    #[test]
-    fn by_startpos_missing_move_stops_contiguous_prefix() {
-        for missing_ply in [1, 10, 20, 40] {
-            let mut lines = Vec::new();
-            for game_id in 0..2 {
-                for ply in (1..=41).filter(|&ply| ply != missing_ply) {
-                    lines.push(
-                        serde_json::json!({
-                            "type":"move", "game_id":game_id, "ply":ply,
-                            "side_to_move":"black", "engine":"base",
-                            "elapsed_ms":100, "think_limit_ms":100, "timed_out":false,
-                            "move_usi":"pass"
-                        })
-                        .to_string(),
-                    );
-                }
-                lines.push(
-                    serde_json::json!({
-                        "type":"result", "game_id":game_id, "pair_index":0,
-                        "pair_slot":game_id, "outcome":"draw", "plies":41,
-                        "startpos_idx":0, "reason":"max_moves"
-                    })
-                    .to_string(),
-                );
-            }
-            let (dir, path) =
-                write_retry_log(&lines.iter().map(String::as_str).collect::<Vec<_>>());
-            std::fs::write(
-                dir.path().join("meta.json"),
-                serde_json::json!({"start_positions":["position startpos"]}).to_string(),
-            )
-            .unwrap();
-            let stats = parse_normal_file(&path, true).unwrap().extra.by_startpos.unwrap();
-            let row = &stats.rows["position startpos"];
-            assert_eq!(row.prefix_games, [10, 20, 40].map(|len| 2 * u64::from(len < missing_ply)));
-            assert_eq!(row.prefix_counts(), [10, 20, 40].map(|len| usize::from(len < missing_ply)));
-        }
-    }
-
-    #[test]
-    fn by_startpos_missing_or_broken_meta_counts_exclusions() {
-        let (dir, path) = write_retry_log(&[
-            r#"{"type":"result","outcome":"draw","startpos_idx":0}"#,
-            r#"{"type":"result","outcome":"draw","startpos_idx":0}"#,
-        ]);
-        for contents in [None, Some("{broken"), Some(r#"{"start_positions":[]}"#)] {
-            if let Some(contents) = contents {
-                std::fs::write(dir.path().join("meta.json"), contents).unwrap();
-            }
-            let stats = parse_normal_file(&path, true).unwrap().extra.by_startpos.unwrap();
-            assert_eq!(stats.excluded_games, 2);
-            assert!(stats.rows.is_empty());
-        }
-        assert!(parse_normal_file(&path, false).unwrap().extra.by_startpos.is_none());
     }
 }

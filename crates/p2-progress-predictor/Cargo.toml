@@ -1,0 +1,41 @@
+[package]
+name = "p2-progress-predictor"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# default は推論のみ (candle 依存なし、 Windows CUDA env issue を回避)
+default = []
+# 訓練と評価バイナリを有効化 (candle CPU)
+trainer = ["dep:candle-core", "dep:candle-nn", "dep:anyhow", "dep:clap"]
+# CPU only training (workspace-recommended for Windows)
+cpu = ["trainer"]
+# CUDA training (任意、 Linux のみ動作確認)
+cuda = ["trainer", "candle-core/cuda", "candle-nn/cuda"]
+
+[dependencies]
+rshogi-core = { version = "0.2", path = "../rshogi-core" }
+p2-search   = { path = "../p2-search" }
+
+# trainer 用 (optional、 feature ゲート)
+candle-core = { version = "0.8", default-features = false, optional = true }
+candle-nn   = { version = "0.8", default-features = false, optional = true }
+anyhow      = { workspace = true, optional = true }
+clap        = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bin]]
+name = "train_progress"
+path = "src/bin/train_progress.rs"
+required-features = ["trainer"]
+
+[[bin]]
+name = "eval_progress"
+path = "src/bin/eval_progress.rs"
+required-features = ["trainer"]
+
+[[bench]]
+name = "predict"
+harness = false

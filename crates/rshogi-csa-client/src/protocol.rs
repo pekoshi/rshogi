@@ -4,7 +4,6 @@
 //! CSA プロトコルを乗せる。送信側は `serialize_client_command` 経由で
 //! `ClientCommand` バリアントから 1 行を組み立てる。
 
-use std::borrow::Cow;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -18,65 +17,14 @@ use crate::event::Event;
 use crate::transport::{ConnectOpts, CsaTransport, TransportTarget};
 
 /// 先後共通または個別の時間設定
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct TimeConfig {
-    /// サーバーが通知する消費時間 T の単位（ミリ秒）。省略時は1秒。
-    pub time_unit_ms: i64,
     /// 持ち時間（ミリ秒）
     pub total_time_ms: i64,
     /// 秒読み（ミリ秒）
     pub byoyomi_ms: i64,
     /// フィッシャー increment（ミリ秒）
     pub increment_ms: i64,
-}
-
-impl Default for TimeConfig {
-    fn default() -> Self {
-        Self {
-            time_unit_ms: 1000,
-            total_time_ms: 0,
-            byoyomi_ms: 0,
-            increment_ms: 0,
-        }
-    }
-}
-
-// 受信中の単位数と確定済みのミリ秒を混在させない。
-#[derive(Default)]
-struct RawTimeConfig {
-    unit_ms: Option<i64>,
-    total: Option<i64>,
-    byoyomi: Option<i64>,
-    increment: Option<i64>,
-}
-
-impl RawTimeConfig {
-    fn resolve(self, base: &TimeConfig) -> Result<TimeConfig> {
-        let unit = self.unit_ms.unwrap_or(base.time_unit_ms);
-        let convert = |value: Option<i64>, fallback| match value {
-            Some(value) => value
-                .checked_mul(unit)
-                .ok_or_else(|| anyhow::anyhow!("時間設定がミリ秒の上限を超えています")),
-            None => Ok(fallback),
-        };
-        Ok(TimeConfig {
-            time_unit_ms: unit,
-            total_time_ms: convert(self.total, base.total_time_ms)?,
-            byoyomi_ms: convert(self.byoyomi, base.byoyomi_ms)?,
-            increment_ms: convert(self.increment, base.increment_ms)?,
-        })
-    }
-}
-
-/// 対局成立の応答。拒否された場合は同じ接続で次の対局を待つ。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StartResponse {
-    /// 対局開始。サーバーから通知された確定対局 ID。
-    Started(String),
-    /// 対局不成立。
-    Rejected,
-    /// 待機中に呼び出し元が停止を要求した。
-    Cancelled,
 }
 
 /// CSAサーバーから受信した対局情報
@@ -102,11 +50,6 @@ pub struct GameSummary {
     /// `Some(token)` の場合、WS 切断時に `LOGIN <id> <pw> reconnect:<game_id>+<token>`
     /// で同一対局へ復帰できる (Workers の `RECONNECT_GRACE_SECONDS` 以内)。
     pub reconnect_token: Option<String>,
-    /// サーバーが広告した `%KACHI` 判定の入玉ルール。`Entering_King_Rule:` 拡張行
-    /// (USI トークン、本リポサーバー) を優先し、無ければ CSA 標準の
-    /// `Declaration:Jishogi 1.1` (27 点法、wdoor 等) から導出する。どちらも
-    /// 無ければ `None` (サーバーのルール不明。エンジン設定は変更しない)。
-    pub entering_king_rule: Option<rshogi_core::types::EnteringKingRule>,
 }
 
 /// 再接続成立時にサーバから送られる `BEGIN Reconnect_State` ブロックの
@@ -120,8 +63,6 @@ pub struct ReconnectState {
     pub current_turn: Option<Color>,
     pub black_remaining_ms: i64,
     pub white_remaining_ms: i64,
-    /// 現手番の残り予算と受信時刻。旧サーバーでは `None`。
-    pub turn_clock: Option<(rshogi_csa_server::protocol::reconnect::ReconnectClock, Instant)>,
 }
 
 /// サーバーから受信した指し手
@@ -129,7 +70,7 @@ pub struct ReconnectState {
 pub struct ServerMove {
     /// CSA形式の指し手 (例: "+7776FU")
     pub mv: String,
-    /// 消費時間（Time_Unit 単位）。フィールド名は既存 API との互換用。
+    /// 消費時間（秒）
     pub time_sec: u32,
 }
 
@@ -149,6 +90,8 @@ pub struct CsaConnection {
     /// 下層 transport（TCP / WebSocket）。
     transport: CsaTransport,
     last_activity_time: Instant,
+    /// パスワードマスク用
+    password: String,
     /// 直前に受信した終局理由行（#TIME_UP 等）
     pub pending_end_reason: Option<String>,
 }
@@ -160,7 +103,6 @@ impl CsaConnection {
             &TransportTarget::from_host_port(host, port)?,
             &ConnectOpts {
                 tcp_keepalive,
-                unacked_timeout: None,
                 ws_origin: None,
             },
         )
@@ -174,12 +116,14 @@ impl CsaConnection {
         Ok(Self {
             transport,
             last_activity_time: Instant::now(),
+            password: String::new(),
             pending_end_reason: None,
         })
     }
 
     /// ログイン
     pub fn login(&mut self, id: &str, password: &str) -> Result<()> {
+        self.password = password.to_string();
         let cmd = serialize_client_command(&ClientCommand::Login {
             name: PlayerName::new(id),
             password: Secret::new(password),
@@ -212,6 +156,7 @@ impl CsaConnection {
         token: &str,
     ) -> Result<()> {
         use rshogi_csa_server::protocol::command::ReconnectRequest;
+        self.password = password.to_string();
         let cmd = serialize_client_command(&ClientCommand::Login {
             name: PlayerName::new(id),
             password: Secret::new(password),
@@ -258,9 +203,6 @@ impl CsaConnection {
         loop {
             let line = self.recv_line_blocking(Duration::from_secs(30))?;
             if line == "END Reconnect_State" {
-                if state.turn_clock.is_some() && state.current_turn.is_none() {
-                    bail!("再接続時計の手番が不正");
-                }
                 return Ok(state);
             }
             if let Some(val) = line.strip_prefix("Current_Turn:") {
@@ -274,37 +216,15 @@ impl CsaConnection {
             } else if let Some(val) = line.strip_prefix("White_Time_Remaining_Ms:") {
                 state.white_remaining_ms = val.trim().parse().unwrap_or(0);
             }
-            if let Some(clock) =
-                rshogi_csa_server::protocol::reconnect::ReconnectClock::parse_line(&line)?
-            {
-                if state.turn_clock.is_some() {
-                    bail!("再接続時計の重複行");
-                }
-                state.turn_clock = Some((clock, Instant::now()));
-            }
             // `Last_Move:` を含む他の拡張行は黙って破棄する (前方互換)。
         }
     }
 
     /// Game_Summary を受信して解析する
     pub fn recv_game_summary(&mut self, keepalive_interval_sec: u64) -> Result<GameSummary> {
-        self.recv_game_summary_while(keepalive_interval_sec, || true)?
-            .ok_or_else(|| anyhow::anyhow!("対局待機が停止されました"))
-    }
-
-    /// keep-alive と停止確認を行いながら次の対局情報を待つ。
-    /// `should_continue` が false を返すと `Ok(None)` で終了する。
-    pub fn recv_game_summary_while(
-        &mut self,
-        keepalive_interval_sec: u64,
-        mut should_continue: impl FnMut() -> bool,
-    ) -> Result<Option<GameSummary>> {
         log::info!("[CSA] 対局待機中...");
         // "BEGIN Game_Summary" を待つ（keep-alive 送信しながら）
         loop {
-            if !should_continue() {
-                return Ok(None);
-            }
             match self.recv_line_nonblocking() {
                 Ok(Some(line)) if line == "BEGIN Game_Summary" => break,
                 Ok(Some(_)) => {} // 他の行は無視
@@ -322,31 +242,21 @@ impl CsaConnection {
         let mut position_lines = Vec::new();
         let mut in_position = false;
         let mut reconnect_token: Option<String> = None;
-        let mut entering_king_rule: Option<rshogi_core::types::EnteringKingRule> = None;
-        let mut declaration_jishogi = false;
 
         // 時間設定: 共通 / 先手別 / 後手別の3レイヤー
-        // 数値は単位数のまま保持し、全項目を受信した後で換算する。
-        // Time_Unit が Total_Time より後でも同じ結果になる。
-        let mut common_time = RawTimeConfig::default();
-        let mut black_time: Option<RawTimeConfig> = None;
-        let mut white_time: Option<RawTimeConfig> = None;
+        // Time_Unit のデフォルトは秒 (1000ms)
+        // header_time_unit_ms: ヘッダレベルの Time_Unit（ブロック外・共通）
+        // block_time_unit_ms: 現在の Time ブロック内の Time_Unit
+        let mut header_time_unit_ms: i64 = 1000;
+        let mut block_time_unit_ms: i64 = 1000;
+        let mut common_time = TimeConfig::default();
+        let mut black_time: Option<TimeConfig> = None;
+        let mut white_time: Option<TimeConfig> = None;
         // 現在パース中の Time ブロックの対象 (None=共通, Some(Black/White)=個別)
         let mut time_target: Option<Option<Color>> = None;
 
-        let mut last_summary_line = Instant::now();
         loop {
-            if !should_continue() {
-                return Ok(None);
-            }
-            let Some(line) = self.recv_line_nonblocking()? else {
-                if last_summary_line.elapsed() >= Duration::from_secs(30) {
-                    bail!("Game_Summary 本文の受信がタイムアウトしました");
-                }
-                self.maybe_send_keepalive(keepalive_interval_sec)?;
-                continue;
-            };
-            last_summary_line = Instant::now();
+            let line = self.recv_line_blocking(Duration::from_secs(30))?;
             if line == "END Game_Summary" {
                 break;
             }
@@ -359,16 +269,19 @@ impl CsaConnection {
                 continue;
             }
             if line == "BEGIN Time" {
+                block_time_unit_ms = header_time_unit_ms;
                 time_target = Some(None); // 共通
                 continue;
             }
             if line == "BEGIN Time+" {
-                black_time = Some(RawTimeConfig::default());
+                block_time_unit_ms = header_time_unit_ms;
+                black_time = Some(common_time.clone());
                 time_target = Some(Some(Color::Black));
                 continue;
             }
             if line == "BEGIN Time-" {
-                white_time = Some(RawTimeConfig::default());
+                block_time_unit_ms = header_time_unit_ms;
+                white_time = Some(common_time.clone());
                 time_target = Some(Some(Color::White));
                 continue;
             }
@@ -389,13 +302,16 @@ impl CsaConnection {
                     Some(Color::White) => white_time.as_mut().unwrap(),
                 };
                 if let Some(val) = line.strip_prefix("Time_Unit:") {
-                    tc.unit_ms = Some(parse_time_unit(val.trim())?);
+                    block_time_unit_ms = parse_time_unit(val.trim());
                 } else if let Some(val) = line.strip_prefix("Total_Time:") {
-                    tc.total = Some(parse_time_value(val)?);
+                    let v: i64 = val.trim().parse().unwrap_or(0);
+                    tc.total_time_ms = v * block_time_unit_ms;
                 } else if let Some(val) = line.strip_prefix("Byoyomi:") {
-                    tc.byoyomi = Some(parse_time_value(val)?);
+                    let v: i64 = val.trim().parse().unwrap_or(0);
+                    tc.byoyomi_ms = v * block_time_unit_ms;
                 } else if let Some(val) = line.strip_prefix("Increment:") {
-                    tc.increment = Some(parse_time_value(val)?);
+                    let v: i64 = val.trim().parse().unwrap_or(0);
+                    tc.increment_ms = v * block_time_unit_ms;
                 }
                 continue;
             }
@@ -414,21 +330,16 @@ impl CsaConnection {
                     Color::White
                 };
             } else if let Some(val) = line.strip_prefix("Time_Unit:") {
-                common_time.unit_ms = Some(parse_time_unit(val.trim())?);
+                header_time_unit_ms = parse_time_unit(val.trim());
             } else if let Some(val) = line.strip_prefix("Total_Time:") {
-                common_time.total = Some(parse_time_value(val)?);
+                let v: i64 = val.trim().parse().unwrap_or(0);
+                common_time.total_time_ms = v * header_time_unit_ms;
             } else if let Some(val) = line.strip_prefix("Byoyomi:") {
-                common_time.byoyomi = Some(parse_time_value(val)?);
+                let v: i64 = val.trim().parse().unwrap_or(0);
+                common_time.byoyomi_ms = v * header_time_unit_ms;
             } else if let Some(val) = line.strip_prefix("Increment:") {
-                common_time.increment = Some(parse_time_value(val)?);
-            } else if let Some(val) = line.strip_prefix("Entering_King_Rule:") {
-                let val = val.trim();
-                entering_king_rule = rshogi_core::types::EnteringKingRule::from_usi(val);
-                if entering_king_rule.is_none() {
-                    log::warn!("[CSA] 未知の Entering_King_Rule '{val}' を無視します");
-                }
-            } else if let Some(val) = line.strip_prefix("Declaration:") {
-                declaration_jishogi = val.trim() == "Jishogi 1.1";
+                let v: i64 = val.trim().parse().unwrap_or(0);
+                common_time.increment_ms = v * header_time_unit_ms;
             } else if let Some(val) = line.strip_prefix("Reconnect_Token:") {
                 // 自色用 token は `END Game_Summary` 直前に 1 行だけ届く拡張行。
                 // 相手色 token は届かない（サーバ側 `build_for(my_color)` で除外）。
@@ -436,10 +347,9 @@ impl CsaConnection {
             }
         }
 
-        // 共通設定を確定してから、先後別の指定項目だけを上書きする。
-        let common_time = common_time.resolve(&TimeConfig::default())?;
-        let final_black_time = black_time.unwrap_or_default().resolve(&common_time)?;
-        let final_white_time = white_time.unwrap_or_default().resolve(&common_time)?;
+        // 先後別設定がなければ共通設定をコピー
+        let final_black_time = black_time.unwrap_or_else(|| common_time.clone());
+        let final_white_time = white_time.unwrap_or(common_time);
 
         // Position ブロックをパース
         let pos_text = position_lines.join("\n");
@@ -452,12 +362,6 @@ impl CsaConnection {
             })
             .collect();
 
-        // 拡張行が無いサーバー (wdoor 等) では CSA 標準 `Declaration:Jishogi 1.1`
-        // (= 27 点法) から導出する。
-        if entering_king_rule.is_none() && declaration_jishogi {
-            entering_king_rule = Some(rshogi_core::types::EnteringKingRule::Point27);
-        }
-
         let summary = GameSummary {
             game_id,
             my_color,
@@ -468,7 +372,6 @@ impl CsaConnection {
             black_time: final_black_time,
             white_time: final_white_time,
             reconnect_token,
-            entering_king_rule,
         };
         log::info!(
             "[CSA] 対局情報受信: {} ({}手目から) {}vs{} 先手:{}ms+{}ms+{}ms 後手:{}ms+{}ms+{}ms",
@@ -483,50 +386,24 @@ impl CsaConnection {
             summary.white_time.byoyomi_ms,
             summary.white_time.increment_ms,
         );
-        Ok(Some(summary))
+        Ok(summary)
     }
 
-    /// AGREE を送信して START / REJECT を待つ。待機時間に上限は設けない。
-    /// keep-alive と停止確認を継続し、REJECT は接続エラーと区別する。
-    pub fn agree_and_wait_start(
-        &mut self,
-        game_id: &str,
-        keepalive_interval_sec: u64,
-        mut should_continue: impl FnMut() -> bool,
-    ) -> Result<StartResponse> {
-        if !should_continue() {
-            return Ok(StartResponse::Cancelled);
-        }
+    /// AGREE を送信して START を待つ
+    pub fn agree_and_wait_start(&mut self, game_id: &str) -> Result<()> {
         let cmd = serialize_client_command(&ClientCommand::Agree {
-            game_id: if game_id.is_empty() {
-                None
-            } else {
-                Some(GameId::new(game_id))
-            },
+            game_id: Some(GameId::new(game_id)),
         });
         self.send_line(&cmd)?;
         loop {
-            if !should_continue() {
-                return Ok(StartResponse::Cancelled);
+            let line = self.recv_line_blocking(Duration::from_secs(60))?;
+            if line.starts_with("START:") {
+                log::info!("[CSA] 対局開始: {}", line);
+                return Ok(());
             }
-            if let Some(line) = self.recv_line_nonblocking()? {
-                if let Some(id) = line.strip_prefix("START:") {
-                    if !game_id.is_empty() && id.trim() != game_id {
-                        bail!("START の対局IDが一致しません: {line}");
-                    }
-                    log::info!("[CSA] 対局開始: {line}");
-                    return Ok(StartResponse::Started(id.trim().to_owned()));
-                }
-                if let Some(id) = line.strip_prefix("REJECT:") {
-                    let id = id.split(" by ").next().unwrap_or_default().trim();
-                    if !game_id.is_empty() && id != game_id {
-                        bail!("REJECT の対局IDが一致しません: {line}");
-                    }
-                    log::info!("[CSA] 対局不成立: {line}");
-                    return Ok(StartResponse::Rejected);
-                }
+            if line.starts_with("REJECT:") {
+                bail!("対局が拒否されました: {line}");
             }
-            self.maybe_send_keepalive(keepalive_interval_sec)?;
         }
     }
 
@@ -619,36 +496,6 @@ impl CsaConnection {
         self.recv_line_blocking(timeout)
     }
 
-    /// `LOBBY_PONG` と停止確認を続けながら、ロビーの次の応答行を待つ。
-    /// `keepalive_interval_sec` が 0 なら自発送信は無効。`LOBBY_PING` には常に応答する。
-    /// 待機時間に上限は設けず、停止時は `Ok(None)`。受信スレッド開始後は使用できない。
-    pub fn recv_lobby_line_while(
-        &mut self,
-        keepalive_interval_sec: u64,
-        mut should_continue: impl FnMut() -> bool,
-    ) -> Result<Option<String>> {
-        let mut last_pong_time = Instant::now();
-        loop {
-            if !should_continue() {
-                return Ok(None);
-            }
-            if keepalive_interval_sec > 0
-                && last_pong_time.elapsed() >= Duration::from_secs(keepalive_interval_sec)
-            {
-                self.send_raw_line("LOBBY_PONG")?;
-                last_pong_time = Instant::now();
-            }
-            if let Some(line) = self.recv_line_nonblocking()? {
-                if line == "LOBBY_PING" {
-                    self.send_raw_line("LOBBY_PONG")?;
-                    last_pong_time = Instant::now();
-                    continue;
-                }
-                return Ok(Some(line));
-            }
-        }
-    }
-
     /// keep-alive 空行を送信（必要な場合）
     pub fn maybe_send_keepalive(&mut self, interval_sec: u64) -> Result<()> {
         if interval_sec == 0 {
@@ -662,7 +509,12 @@ impl CsaConnection {
     }
 
     fn send_line(&mut self, line: &str) -> Result<()> {
-        log::debug!("[CSA] > {}", redact_login(line));
+        if !self.password.is_empty() && line.contains(&self.password) {
+            let masked = line.replace(&self.password, "*****");
+            log::debug!("[CSA] > {masked}");
+        } else {
+            log::debug!("[CSA] > {line}");
+        }
         self.transport.write_line(line)?;
         self.last_activity_time = Instant::now();
         Ok(())
@@ -689,17 +541,6 @@ impl CsaConnection {
     }
 }
 
-fn redact_login(line: &str) -> Cow<'_, str> {
-    let mut parts = line.split_whitespace();
-    match parts.next() {
-        Some(command @ ("LOGIN" | "LOGIN_LOBBY")) => {
-            let id = parts.next().unwrap_or_default();
-            Cow::Owned(format!("{command} {id} *****"))
-        }
-        _ => Cow::Borrowed(line),
-    }
-}
-
 /// サーバーから受信したイベント
 pub enum RecvEvent {
     Move(ServerMove),
@@ -719,30 +560,14 @@ pub(crate) fn parse_server_move(line: &str) -> (String, u32) {
     }
 }
 
-fn parse_time_value(value: &str) -> Result<i64> {
-    let number = value.trim().parse::<i64>()?;
-    if number < 0 {
-        bail!("不正な時間値: {value}");
-    }
-    Ok(number)
-}
-
-fn parse_time_unit(v: &str) -> Result<i64> {
-    let (number, scale) = if let Some(n) = v.strip_suffix("msec") {
-        (n, 1)
-    } else if let Some(n) = v.strip_suffix("sec") {
-        (n, 1000)
-    } else if let Some(n) = v.strip_suffix("min") {
-        (n, 60_000)
+fn parse_time_unit(v: &str) -> i64 {
+    if v.contains("msec") || v.contains("ms") {
+        1
+    } else if v.contains("min") {
+        60000
     } else {
-        bail!("不正な Time_Unit: {v}");
-    };
-    let unit = number
-        .parse::<i64>()?
-        .checked_mul(scale)
-        .filter(|unit| *unit > 0)
-        .ok_or_else(|| anyhow::anyhow!("不正な Time_Unit: {v}"))?;
-    Ok(unit)
+        1000
+    }
 }
 
 /// 最終結果行のみ Some を返す。中間行（#TIME_UP, #ILLEGAL_MOVE 等）は None。
@@ -768,190 +593,4 @@ pub(crate) fn parse_game_result(line: &str) -> Option<GameResult> {
 /// 通してしまうため、`LOGIN:` プレフィックスと末尾の ` OK` をセットで要求する。
 fn is_login_ok(response: &str) -> bool {
     response.starts_with("LOGIN:") && response.ends_with(" OK")
-}
-
-/// CSA サーバから返された `LOGIN:incorrect rate_limited retry_after=<sec>` /
-/// `LOGIN_LOBBY:incorrect rate_limited retry_after=<sec>` の `<sec>` を抽出する。
-///
-/// 本 helper は `bail!` などで `anyhow::Error` の表示文字列に変換された後も呼べる
-/// よう、入力は任意の `&str` を受け付け、`retry_after=` トークンに続く非空白の数値
-/// 列を greedy に parse する。トークンが含まれていない / 数値として parse できない
-/// 場合は `None` を返し、呼び出し側は既存の指数バックオフのみで retry する。
-///
-/// # 例
-///
-/// ```
-/// use rshogi_csa_client::protocol::extract_retry_after_sec;
-///
-/// assert_eq!(
-///     extract_retry_after_sec("LOGIN_LOBBY 拒否: incorrect rate_limited retry_after=10"),
-///     Some(10)
-/// );
-/// assert_eq!(
-///     extract_retry_after_sec("ログイン失敗: LOGIN:incorrect rate_limited retry_after=5"),
-///     Some(5)
-/// );
-/// assert_eq!(extract_retry_after_sec("LOGIN:incorrect unknown_game_name"), None);
-/// ```
-pub fn extract_retry_after_sec(err_msg: &str) -> Option<u64> {
-    err_msg.split("retry_after=").nth(1)?.split_whitespace().next()?.parse().ok()
-}
-
-/// 連続対局ループで `Err` を受けたときに採用する次 sleep 時間を決める。
-/// server の `rate_limited retry_after=<sec>` (extract_retry_after_sec で抽出) を
-/// honoring し、既存の指数バックオフ (`retry_delay`) と比べて長い方を採用する。
-///
-/// retry_after を強制 max しない理由: 単発の `retry_after=1` 等で penalty 累積中の
-/// バックオフを巻き戻すと retry storm を再開してしまう。「server が要求する最小
-/// 待機」と「client が決めた指数バックオフ」の両方を満たす最短時間として `max` を取る。
-///
-/// `err_msg` に `retry_after=` トークンが含まれない / 数値 parse 失敗時は
-/// `retry_delay` をそのまま返す。
-pub fn compute_effective_retry_delay(err_msg: &str, retry_delay: Duration) -> Duration {
-    match extract_retry_after_sec(err_msg) {
-        Some(sec) => Duration::from_secs(sec).max(retry_delay),
-        None => retry_delay,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn login_logging_hides_password_and_reconnect_token() {
-        for line in [
-            "LOGIN alice secret",
-            "LOGIN alice secret reconnect:game+token",
-            "LOGIN\talice\tsecret x1",
-            "LOGIN_LOBBY alice+casual+black secret",
-        ] {
-            let redacted = redact_login(line);
-            assert!(!redacted.contains("secret"));
-            assert!(!redacted.contains("token"));
-            assert!(redacted.ends_with(" *****"));
-        }
-        assert_eq!(redact_login("+7776FU"), "+7776FU");
-        assert_eq!(redact_login("LOGOUT_LOBBY"), "LOGOUT_LOBBY");
-    }
-
-    #[test]
-    fn lobby_wait_observes_stop_while_server_is_silent() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut conn =
-            CsaConnection::connect("127.0.0.1", listener.local_addr().unwrap().port(), false)
-                .unwrap();
-        let (_server, _) = listener.accept().unwrap();
-        let mut checks = 0;
-        let started = Instant::now();
-        let line = conn
-            .recv_lobby_line_while(0, || {
-                checks += 1;
-                checks < 2
-            })
-            .unwrap();
-        assert!(line.is_none());
-        assert_eq!(checks, 2);
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn lobby_wait_keeps_queue_alive_until_match() {
-        use std::io::{BufRead, BufReader, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut conn =
-            CsaConnection::connect("127.0.0.1", listener.local_addr().unwrap().port(), false)
-                .unwrap();
-        let (server, _) = listener.accept().unwrap();
-        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let server = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server);
-            let mut keepalive = String::new();
-            reader.read_line(&mut keepalive).unwrap();
-            assert_eq!(keepalive, "LOBBY_PONG\n");
-            reader.get_mut().write_all(b"MATCHED room black\n").unwrap();
-        });
-        assert_eq!(
-            conn.recv_lobby_line_while(1, || true).unwrap().as_deref(),
-            Some("MATCHED room black")
-        );
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn lobby_wait_answers_ping_when_periodic_keepalive_is_disabled() {
-        use std::io::{BufRead, BufReader, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut conn =
-            CsaConnection::connect("127.0.0.1", listener.local_addr().unwrap().port(), false)
-                .unwrap();
-        let (mut server, _) = listener.accept().unwrap();
-        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        server.write_all(b"LOBBY_PING\n").unwrap();
-        let server = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server);
-            let mut pong = String::new();
-            reader.read_line(&mut pong).unwrap();
-            assert_eq!(pong, "LOBBY_PONG\n");
-            reader.get_mut().write_all(b"MATCHED room black\n").unwrap();
-        });
-        assert_eq!(
-            conn.recv_lobby_line_while(0, || true).unwrap().as_deref(),
-            Some("MATCHED room black")
-        );
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn time_unit_requires_positive_supported_unit_and_preserves_multiplier() {
-        for (text, ms) in [
-            ("1sec", 1000),
-            ("2sec", 2000),
-            ("1min", 60000),
-            ("10msec", 10),
-        ] {
-            assert_eq!(parse_time_unit(text).unwrap(), ms);
-        }
-        for text in ["0sec", "-1min", "garbage", "1ms", "9223372036854775807min"] {
-            assert!(parse_time_unit(text).is_err(), "{text}");
-        }
-        assert!(parse_time_value("-1").is_err());
-        assert!(
-            RawTimeConfig {
-                total: Some(i64::MAX),
-                ..RawTimeConfig::default()
-            }
-            .resolve(&TimeConfig::default())
-            .is_err()
-        );
-    }
-
-    // ───────────────────────────────────────────────
-    // `compute_effective_retry_delay` の挙動を pin する。retry_after は
-    // 「server が要求する最小待機」、retry_delay は「client の指数バックオフ」で、
-    // 両方を満たす最短時間として max を取る契約 (#682)。
-    // ───────────────────────────────────────────────
-
-    #[test]
-    fn retry_after_parsing_and_backoff() {
-        for (message, parsed, delay) in [
-            ("[Lobby] LOGIN_LOBBY 拒否: incorrect rate_limited retry_after=10", Some(10), 10),
-            ("ログイン失敗: LOGIN:incorrect rate_limited retry_after=5", Some(5), 8),
-            ("LOGIN:incorrect unknown_game_name", None, 8),
-            ("", None, 8),
-            ("retry_after=NaN", None, 8),
-            ("retry_after=30 source=lobby", Some(30), 30),
-            ("retry_after=7 retry_after=99", Some(7), 8),
-            ("retry_after=0", Some(0), 8),
-        ] {
-            assert_eq!(extract_retry_after_sec(message), parsed, "{message}");
-            assert_eq!(
-                compute_effective_retry_delay(message, Duration::from_secs(8)),
-                Duration::from_secs(delay),
-                "{message}"
-            );
-        }
-    }
 }

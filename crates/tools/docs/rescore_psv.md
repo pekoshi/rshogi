@@ -1,601 +1,370 @@
 # rescore_psv — PSV 評価値の再スコアリング + ポリシー展開
 
-LayerStacks の bucket mode（`progresskpabsq16` を含む）と進行度係数は [routing 対応表](nnue-routing.md) を参照してください。
+PSV（PackedSfenValue）ファイルの評価値を ONNX モデルで再スコアリングするツール。
+GPU 推論による高速処理に対応。
 
-PSV（PackedSfenValue）ファイルの評価値（score）を付け替えるツール。全モードが
-ストリーミングで動作し、**ピークメモリは入力件数に依存しない**ため、数十億局面の
-ファイルもそのまま処理できる。
+`--expand-output-dir` を指定すると、**同一の ONNX 推論結果から value と policy を
+両方取り出して、rescore と局面展開を 1 パスで実行** できる（`expand_psv_from_policy`
+相当の処理を統合）。
 
-| モード | 評価器 | 用途 |
-|---|---|---|
-| **ONNX 直接推論（推奨）** | dlshogi 系 / AobaZero 系 ONNX モデル | GPU による大量リスコア。TensorRT FP16 で最速 |
-| 内部 NNUE（静的 / qsearch） | `--nnue` で指定した NNUE | CPU のみで完結する軽量リスコア |
-| 内部 NNUE + 本探索 | `--search-depth` | 探索スコアでのラベル付け |
-| 外部 USI エンジン | `--engine` | rshogi に載らない評価器（DL 系 USI エンジン等） |
+## 前提条件
 
-主要ユースケースは **dlshogi 系 ONNX モデル + TensorRT FP16** での一括リスコア。
-以下のクイックスタートがその導線になっている。
+- NVIDIA GPU + CUDA Toolkit（12.x 以上）
+- ONNX Runtime 1.24.2 GPU 版
+- cuDNN 9
+- TensorRT 10（`--onnx-tensorrt` 使用時のみ、オプション）
 
-PSV 出力では探索木標本のマーカー（padding の bit 1）を引き継ぐ。
-`move16` を保持する場合は padding 全体を保持し、最善手の出力・葉局面への置換・
-ポリシー展開で `move16` を書き換える場合は bit 1 だけを残し、dual-label の bit 0 をクリアする。
-マーカーが消えた既存の出力を作り直す場合は、元の PSV と新しい出力先を指定する。
+## セットアップ
 
-## クイックスタート（推奨: dlshogi ONNX + TensorRT FP16）
+### 1. ONNX Runtime GPU 版
 
-### 1. 環境変数
+[ONNX Runtime Releases](https://github.com/microsoft/onnxruntime/releases) から
+`onnxruntime-linux-x64-gpu-1.24.2.tgz`（Linux）または
+`onnxruntime-win-x64-gpu-1.24.2.zip`（Windows）をダウンロード。
 
-初回はライブラリの導入が必要（後述「セットアップ」参照）。導入済みなら以下の
-2 変数が通っていることを確認する:
+```bash
+wget https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-gpu-1.24.2.tgz
+tar xzf onnxruntime-linux-x64-gpu-1.24.2.tgz -C ~/lib/
+```
+
+> ort 2.0.0-rc.12（Release Candidate）は ONNX Runtime 1.24.2 向け。バージョンを合わせること。
+> ort の安定版リリース後はバージョン対応表を要確認。
+
+### 2. cuDNN 9
+
+ONNX Runtime GPU 版は cuDNN 9 に依存する。
+
+```bash
+wget https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.8.0.87_cuda12-archive.tar.xz
+tar xf cudnn-linux-x86_64-9.8.0.87_cuda12-archive.tar.xz -C ~/lib/
+```
+
+### 3. TensorRT（オプション、`--onnx-tensorrt` 使用時のみ）
+
+TensorRT EP を使うと FP16 推論により約 2.5 倍高速化される。
+
+```bash
+wget https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.11.0/tars/TensorRT-10.11.0.33.Linux.x86_64-gnu.cuda-12.9.tar.gz
+tar xzf TensorRT-10.11.0.33.Linux.x86_64-gnu.cuda-12.9.tar.gz -C ~/lib/
+```
+
+> ORT 1.24.2 は `libnvinfer.so.10` を要求するため TensorRT 10.x が必要。
+
+### 4. 環境変数
+
+以下を `.bashrc` 等に追加する。
 
 ```bash
 export ORT_DYLIB_PATH=~/lib/onnxruntime-linux-x64-gpu-1.24.2/lib/libonnxruntime.so
 export LD_LIBRARY_PATH=~/lib/TensorRT-10.11.0.33/lib:~/lib/cudnn-linux-x86_64-9.8.0.87_cuda12-archive/lib:~/lib/onnxruntime-linux-x64-gpu-1.24.2/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 ```
 
-### 2. 実行
+TensorRT を使わない場合は `LD_LIBRARY_PATH` から TensorRT のパスを省略可。
+
+| 環境変数 | 役割 |
+|---|---|
+| `ORT_DYLIB_PATH` | ONNX Runtime ライブラリ本体のパス（必須） |
+| `LD_LIBRARY_PATH` | TensorRT・cuDNN・CUDA 等の依存ライブラリの検索パス |
+
+**Windows の場合**: `LD_LIBRARY_PATH` の代わりにシステムの `PATH` を使う。
+
+```powershell
+$env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime-win-x64-gpu-1.24.2\lib\onnxruntime.dll"
+$env:PATH = "C:\path\to\TensorRT\lib;C:\path\to\onnxruntime-win-x64-gpu-1.24.2\lib;C:\path\to\cudnn\bin;" + $env:PATH
+```
+
+## 使い方
+
+### ビルド
+
+モデル形式に応じた feature フラグを指定する。
+
+| feature | 対象モデル |
+|---|---|
+| `aobazero-onnx` | AobaZero 系 ONNX モデル |
+| `dlshogi-onnx` | 標準 dlshogi 系 ONNX モデル（DL水匠等） |
 
 ```bash
-cargo build --release -p tools --bin rescore_psv   # default build でそのまま使える
+cargo build --release -p tools --features aobazero-onnx --bin rescore_psv
+# または
+cargo build --release -p tools --features dlshogi-onnx --bin rescore_psv
+```
 
-target/release/rescore_psv \
-  --input "data/shard_*.bin" \
-  --output-dir rescored/ \
+### 実行例
+
+```bash
+# AobaZero ONNX モデル（GPU）
+cargo run --release -p tools --features aobazero-onnx --bin rescore_psv -- \
+  --input data/train.psv \
+  --output-dir data/rescored/ \
+  --onnx-model model.onnx \
+  --onnx-batch-size 1024 \
+  --onnx-gpu-id 0 \
+  --onnx-eval-scale 600 \
+  --threads 12
+
+# 標準 dlshogi ONNX モデル（GPU）
+cargo run --release -p tools --features dlshogi-onnx --bin rescore_psv -- \
+  --input data/train.psv \
+  --output-dir data/rescored/ \
   --dlshogi-onnx-model DL_suisho.onnx \
+  --onnx-batch-size 1024 \
+  --onnx-gpu-id 0 \
+  --onnx-eval-scale 600 \
+  --threads 12
+
+# TensorRT + FP16（約 2.5 倍高速、初回はエンジンコンパイルに時間がかかる）
+cargo run --release -p tools --features dlshogi-onnx --bin rescore_psv -- \
+  --input data/train.psv \
+  --output-dir data/rescored/ \
+  --dlshogi-onnx-model DL_suisho.onnx \
+  --onnx-batch-size 1024 \
+  --onnx-gpu-id 0 \
   --onnx-tensorrt \
-  --onnx-tensorrt-cache trt_cache/ \
+  --onnx-tensorrt-cache /tmp/trt_cache \
+  --onnx-eval-scale 600 \
+  --threads 12
+
+# CPU 推論
+cargo run --release -p tools --features aobazero-onnx --bin rescore_psv -- \
+  --input data/train.psv \
+  --output-dir data/rescored/ \
+  --onnx-model model.onnx \
+  --onnx-gpu-id=-1 \
+  --threads 12
+
+# rescore + ポリシー展開を 1 パスで実行（--expand-output-dir）
+# 同一推論で value → rescore 出力、policy → 子局面出力
+cargo run --release -p tools --features dlshogi-onnx --bin rescore_psv -- \
+  --input data/train.psv \
+  --output-dir data/rescored/ \
+  --expand-output-dir data/expanded/ \
+  --expand-threshold 10.0 \
+  --dlshogi-onnx-model DL_suisho.onnx \
+  --onnx-batch-size 1024 \
+  --onnx-gpu-id 0 \
+  --onnx-tensorrt \
+  --onnx-tensorrt-cache /tmp/trt_cache \
   --onnx-eval-scale 600
 ```
 
-- `--onnx-tensorrt`: FP16 推論で FP32（CUDA EP）比 約 2.5〜2.8 倍高速。評価値は
-  FP32 比で平均 12cp 程度ずれる（やや高めに出る傾向）。厳密に FP32 が必要な場合
-  のみ外す（そのとき `--onnx-tensorrt` なしの CUDA EP が最速。TensorRT の FP32
-  モードは CUDA EP より遅い）。
-- `--onnx-tensorrt-cache`: **実質必須**。初回にその GPU 向けエンジンをビルドして
-  保存し（数十秒〜数分）、2 回目以降は再利用する。未指定だと毎回ビルドし直す。
-  キャッシュは GPU アーキ固有で、GPU を変えたら自動で再ビルドされる。最後の端数
-  バッチも `--onnx-batch-size` 行に埋めて推論するので、入力ファイルの件数によって
-  エンジンを作り直すことはない（`--onnx-batch-size` を変えた最初の実行では、キャッシュの
-  入力形の範囲を広げるために 1 回作り直す）。
-  **キャッシュはモデルの重みを見ない**（モデルのファイル名と、グラフの入出力・ノードの
-  名前などで引き当てる）。モデルごとに別のディレクトリを指定し、モデルを置き換えたら
-  `*.engine` と `*.profile` を消す（そのキャッシュを使う実行が止まっているときに）。残すと、
-  重みだけが違うモデルでは古いモデルから作ったエンジンで推論する。
-- `--onnx-eval-scale 600`: 勝率→cp 変換スケール。dlshogi 系の標準値。
-- 長時間ジョブは `nohup` / `tmux` で流しっぱなしにする（非 TTY では自動で
-  grep しやすいログ行形式になる）。
-
-### 3. 進捗の読み方
-
-```
-全体 38%  3.84M/10.0M  (shard 2/4)  8.3k/s  残り 12:40  完了 06/22 14:43
-└ shard_003  52% ███████████░░░░░░░░░  523.5k/1.00M
-```
-
-`完了`（ログ行では `ETA`）は残り時間ではなく完了予定の**時刻**（`MM/DD HH:MM`）。
-入力に破損レコード等があるとその分 100% に届かないことがあるが、rescore 出力
-（有効レコードのみ）には影響しない（終了時の `Note:` 行で件数を確認できる）。
-
-### 4. 中断と再開
-
-- shard ごとに完了マーカー `rescored/<入力名>.done` が書かれる。**中断したら同じ
-  コマンドを再実行するだけ**で、完了済み shard は skip され、未完了 shard から
-  再開する。
-- モデルや `--onnx-eval-scale` 等の設定を変えて再実行すると、マーカー不一致を
-  検知して該当 shard を自動で最初から再生成する。
-- `Ctrl-C` での中断は安全（処理途中のファイルを完了扱いにしない。部分出力は
-  出力対象のレコードを入力順に先頭から並べたものになる）。
-
-詳細は「再開（resume）の仕組み」参照。
-
-## セットアップ（初回のみ）
-
-前提: NVIDIA GPU + CUDA Toolkit 12.x（本手順の ONNX Runtime / cuDNN / TensorRT は
-いずれも CUDA 12 系ビルド）、ONNX Runtime 1.24.2 GPU 版、cuDNN 9、TensorRT 10
-（`--onnx-tensorrt` 使用時のみ）。バージョンは揃えること:
-
-| コンポーネント | バージョン | 備考 |
-|---|---|---|
-| ONNX Runtime GPU | 1.24.2 | ort crate 2.0.0-rc.12 対応版。CUDA 12 ビルドを使う |
-| cuDNN | 9.x (9.8.0.87) | ORT GPU 版の依存 |
-| TensorRT | 10.x (10.11.0.33) | ORT 1.24.2 は `libnvinfer.so.10` を要求 |
-
-> ort crate は 2.0.0-rc.12（Release Candidate）。ort の安定版リリース後は
-> バージョン対応表を要確認。
-
-```bash
-wget https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-gpu-1.24.2.tgz
-tar xzf onnxruntime-linux-x64-gpu-1.24.2.tgz -C ~/lib/
-wget https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.8.0.87_cuda12-archive.tar.xz
-tar xf cudnn-linux-x86_64-9.8.0.87_cuda12-archive.tar.xz -C ~/lib/
-wget https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.11.0/tars/TensorRT-10.11.0.33.Linux.x86_64-gnu.cuda-12.9.tar.gz
-tar xzf TensorRT-10.11.0.33.Linux.x86_64-gnu.cuda-12.9.tar.gz -C ~/lib/
-```
-
-環境変数（クイックスタート参照）を `.bashrc` 等に追加する。`ORT_DYLIB_PATH` は
-ONNX Runtime を実行時に dlopen するために必須（未設定はエラーになる）。
-`LD_LIBRARY_PATH` は TensorRT・cuDNN・CUDA 等の依存ライブラリの検索パスで、
-TensorRT を使わない場合は TensorRT のパスを省略できる。GPU モードでは起動時に
-CUDA が利用可能かチェックし、CPU への暗黙フォールバックを防止する。
-
-ONNX モデルを読むツール（rescore_psv、expand_psv_from_policy、book_rescore、label_bench_dl、
-policy_rollout_psv、yardstick_label）は、最初の session を作る前に ONNX Runtime の
-テレメトリを無効にする。Microsoft が配布する Windows 版は既定でテレメトリ（モデルの
-メタデータや推論回数など）を送るため。無効にできなかった場合はモデルを読まずにエラーで止まる。
-これは ONNX Runtime 以外の通信が無いことを保証するものではない。
-
-### Windows / 特定 GPU の補足
-
-- Windows は同一バージョンの Windows 版を導入し、`LD_LIBRARY_PATH` の代わりに
-  `PATH` へ追加する（`$env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime.dll"` /
-  `$env:PATH = "C:\path\to\TensorRT\lib;...;" + $env:PATH`）。直リンク:
-  [ONNX Runtime](https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-gpu-1.24.2.zip)（CUDA 12 ビルド。`cuda13` 版ではない）/
-  [cuDNN 9](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.8.0.87_cuda12-archive.zip)/
-  [TensorRT 10.11](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.11.0/zip/TensorRT-10.11.0.33.Windows.win10.cuda-12.9.zip)
-- RTX 5090 / Blackwell (sm_120) はこの構成でそのまま動作する（キャッシュ生成物例:
-  `<cache dir>/TensorrtExecutionProvider_..._fp16_sm120.engine`）。
-- 外部データ形式の ONNX（本体 〜150KB + `.onnx.data` 数十 MB のモデル）は両ファイル
-  を同一ディレクトリに置く（ORT が本体からの相対パスで外部ウェイトを読むため）。
-
-## ビルド
-
-dlshogi 系 ONNX（`--dlshogi-onnx-model`）は default feature。AobaZero 系
-（`--onnx-model`）を使う場合のみ `aobazero-onnx` を追加する。
-
-| feature | 対象モデル | default |
-|---|---|---|
-| `dlshogi-onnx` | 標準 dlshogi 系 ONNX（DL水匠等、features2=57ch） | ✅ |
-| `aobazero-onnx` | AobaZero 系 ONNX（カスタム特徴量） | — |
-
-```bash
-cargo build --release -p tools --bin rescore_psv
-cargo build --release -p tools --features aobazero-onnx --bin rescore_psv  # AobaZero も使う場合
-```
-
-ort は load-dynamic のためビルド時に libonnxruntime は不要（実行時に dlopen する）。
-
-### 単一構成の build
-
-既定の `nnue-arch` は汎用実装と 1536x16x32・1536x16x64・2304x16x64、5 種の FT の静的実装を含み、
-対応する拡張なしの LayerStacks を静的に読む。PSQT・Threat・effect bucket・
-`ls_bucket=` 指定、別の寸法、prepacked、architecture override は汎用実装を使う。
-別の寸法は `--features layerstacks-<寸法>` の追加でも静的に読める。
-NativeBackend の読み込みログに `NNUE LayerStack implementation=static|dynamic` を出す。
-
-1 つの構成の NNUE だけでリスコアするなら、その構成の静的な実装だけを入れた build がさらに速い。
-単一構成の build では、既定にない寸法や PSQT・Threat つきの net も静的に読める。
-rshogi-core の NNUE の評価・探索を直接呼ぶほかのツール (`gensfen` の NativeBackend、`rescore_hcpe`、
-`yardstick_label`、`label_bench_positions`、`preprocess_psv`) も `--bin` を替えて同じ指定で build できる。
-`--no-default-features` で ONNX のモードも外れるので、ONNX も使う build には `dlshogi-onnx` を足す。
-
-`--no-default-features` を付けて、その構成の feature だけを指定する。各軸の slot は 1 つずつ選ぶ。
-`--target-dir` を分けると、既定の build と並べて置ける。
-
-| 構成 | feature |
-|---|---|
-| HalfKX (HalfKP / HalfKA 系) | `rshogi-core/halfkx-arch,rshogi-core/halfkx-activation-<crelu\|screlu\|pairwise>,ft-<FT>` |
-| LayerStacks | `rshogi-core/layerstack-arch,layerstacks-<寸法>,ft-<FT>`、拡張があれば `nnue-psqt` / `nnue-threat` を足す |
-
-`<FT>` は `halfkp` / `halfka_split` / `halfka_merged` / `halfka_hm_split` / `halfka_hm_merged`、
-`<寸法>` は [NNUE 対応表](../../../docs/nnue-supported-architectures.md#layerstacks)の L1 構成
-(`1536x16x32` など)。LayerStacks の `layerstack-arch` は寸法と FT の slot が無いと build エラーになる。
-build に含まれない構成の NNUE は読み込み時にエラーになる。
-
-```bash
-# HalfKP 256x2-32-32 CReLU（水匠5 など）
-cargo build --release -p tools --bin rescore_psv --target-dir target/rescore-halfkp \
-  --no-default-features \
-  --features rshogi-core/halfkx-arch,rshogi-core/halfkx-activation-crelu,ft-halfkp
-# LayerStacks HalfKA_hm 1536x16x32、拡張なし
-cargo build --release -p tools --bin rescore_psv --target-dir target/rescore-ls1536 \
-  --no-default-features \
-  --features rshogi-core/layerstack-arch,layerstacks-1536x16x32,ft-halfka_hm_merged
-```
-
-上の 2 つの build では、水匠5 と progresskpabs の LayerStacks の net を深さ 9 の探索でリスコアした出力が、
-既定の build と byte 単位で一致した。`gensfen` も同じ feature の build で、
-progresskpabs の LayerStacks 1536x16x32 の net と同じ seed の対局から、既定の build と同じ教師局面を出した
-(並列の対局では出力の順が変わるので、局面の集合で比べた)。ほかの構成で同じ値になることは試験していないので、
-教師を作る前に少数の局面で既定の build と出力を比べる。
-
-HalfKX は rshogi-core の preset edition (`rshogi-core/edition-halfkp-crelu` など、
-`cargo xtask list-editions` で一覧) を指定しても同じ build になる。LayerStacks の preset のうち
-寸法が 1536 / 2304 / 3072 系のものは `nnue-progress-diff` を含み、progresskpabs の bucket を
-f32 の差分更新で求める。全駒から計算する既定の build とは丸めが違うので、progresskpabs の net では
-bucket の境界付近の局面で評価値が変わる。既定の build と同じ値が要る教師のリスコアでは、これらの preset を使わない。
-
-静的 LayerStacks を直接読む診断ツール (`bench_nnue_eval` 等) も同じ構成で build するときは、
-LayerStacks の行の `rshogi-core/layerstack-arch` を tools の `layerstack-arch` に替える。
-preset に足すときは、tools の `layerstack-arch` と、preset と同じ寸法・FT の slot を tools の feature
-(`layerstacks-<寸法>` / `ft-<FT>`、`rshogi-core/` を付けない) で指定する。
-## オプションリファレンス
-
-### 共通
+### 主要オプション
 
 | オプション | デフォルト | 説明 |
 |---|---|---|
-| `--input` | （必須） | 入力 PSV。glob / 複数指定可 |
-| `--output-dir` | （必須） | 出力ディレクトリ（入力ファイル名で出力） |
-| `--out-scores` | false | dlshogi ONNX または NNUE 静的評価の score のみを `<入力名>.scores.i16` に出力（後述） |
-| `--threads` | 0（論理コア数） | 並列処理スレッド数 |
-| `--limit` | 0（無制限） | 各入力ファイルで処理するレコード数上限（`--out-scores` と併用不可） |
-| `--score-clip` | 10000 | スコアを ± この値にクリップ |
-| `--skip-in-check` | false | 王手局面を出力から除外 |
-| `--delete-input` | false | 各ファイル処理完了後に入力を削除（ディスク節約、`--out-scores` と併用不可） |
-| `--verbose` | false | 詳細出力 |
+| `--input` | （必須） | 入力 PSV ファイル（カンマ区切りで複数可） |
+| `--output-dir` | （必須） | 出力ディレクトリ |
+| `--onnx-model` | — | AobaZero ONNX モデルパス（`aobazero-onnx` feature 時） |
+| `--dlshogi-onnx-model` | — | dlshogi ONNX モデルパス（`dlshogi-onnx` feature 時） |
+| `--onnx-batch-size` | 256 | 推論バッチサイズ |
+| `--onnx-gpu-id` | 0 | GPU ID（`-1` で CPU 推論） |
+| `--onnx-tensorrt` | false | TensorRT EP を使用（FP16 推論） |
+| `--onnx-tensorrt-cache` | — | TensorRT エンジンキャッシュの保存先 |
+| `--onnx-eval-scale` | 600.0 | 勝率→cp 変換スケール（有限値・正値必須） |
+| `--skip-in-check` | false | 王手親局面の rescore 出力を抑制（後述） |
+| `--threads` | 1 | 処理スレッド数（rayon による特徴量構築の並列化） |
 
-### ONNX モード
+### ポリシー展開オプション（`--expand-output-dir` 指定時）
 
 | オプション | デフォルト | 説明 |
 |---|---|---|
-| `--dlshogi-onnx-model` | — | dlshogi 系 ONNX モデルパス |
-| `--onnx-model` | — | AobaZero 系 ONNX モデルパス（`aobazero-onnx` feature） |
-| `--onnx-batch-size` | 1024 | 推論バッチサイズ（チューニング指針参照） |
-| `--onnx-gpu-id` | 0 | GPU 番号。`0,1` のようにカンマ区切りで複数の GPU を使う（レシピ「複数 GPU で推論する」参照）。`-1` で CPU 推論（他の番号と併用不可） |
-| `--onnx-sessions` | 2 | GPU 1 つあたりの推論の多重化数（1〜4、CPU 推論では常に 1）。VRAM は増える（チューニング指針参照） |
-| `--onnx-tensorrt` | false | TensorRT EP（FP16）を使用 |
-| `--onnx-tensorrt-cache` | — | TensorRT エンジンキャッシュ保存先（実質必須） |
-| `--onnx-eval-scale` | 600.0 | 勝率→cp 変換スケール（正の有限値） |
-| `--onnx-draw-ply` | 0（調整なし） | AobaZero モデル用の引き分け手数 |
-| `--expand-output-dir` | — | policy 展開の出力先（レシピ参照） |
-| `--expand-threshold` | 10.0 | 展開する softmax 確率閾値 %（`(0, 100]`） |
-| `--expand-skip-parent-in-check` | false | 親局面が王手なら expand をスキップ（rescore 側は `--skip-in-check` で別制御） |
+| `--expand-output-dir` | — | 展開された子局面の出力ディレクトリ。**指定時のみ expand 有効。ONNX モード必須** |
+| `--expand-threshold` | 10.0 | 合法手 softmax 確率がこの値（%）を超えた手を子局面として出力。`(0.0, 100.0]` の有限値 |
+| `--expand-skip-parent-in-check` | false | 親が王手なら expand をスキップ（`--skip-in-check` と独立） |
 | `--expand-skip-child-in-check` | false | 展開した子局面が王手なら expand 出力をスキップ |
-| `--ort-profile` | — | ORT profiling 出力先ディレクトリ（1 本目のセッションの `session.run()` の内訳を、実行全体で JSON 1 つに出力。開発用。ORT は記録を 100 万件で打ち切り、エラーで終わった実行では JSON を書かない） |
-| `--qsearch-leaf-label` | false | ラベルのみ葉評価にする（`--nnue` 併用必須、レシピ参照） |
-| `--qsearch-leaf-replacement-output` | — | 葉置換 arm の同時出力先（レシピ参照） |
 
-### 内部 NNUE / 探索 / 外部エンジンモード
+出力ファイル名は入力ファイル名と同じ。`--output-dir` と `--expand-output-dir` は
+別ディレクトリを指定する必要がある（同一指定は起動時エラー）。
 
-| オプション | デフォルト | 説明 |
-|---|---|---|
-| `--nnue` | — | NNUE モデル（ONNX / `--engine` 未使用時に必須） |
-| `--use-qsearch` | false | 静的評価の代わりに qsearch 評価を使用 |
-| `--search-depth` | — | 指定深さの alpha-beta 探索スコアを使用（`--use-qsearch` と排他） |
-| `--emit-bestmove` | false | `--search-depth` の探索結果の最善手を実 YaneuraOu PSV 形式 (A) で move16 に出力 |
-| `--hash-mb` | 64 | スレッドごとの置換表サイズ MB（`--search-depth` 時）。置換表は 256 局面の塊ごとに消す（後述「探索モードの並列化」） |
-| `--max-nodes` / `--max-time` | 0（無制限） | 1 局面あたりの探索ノード / ミリ秒上限（`--search-depth` 時のみ有効）。探索爆発ガード。上限で反復が途中で止まったときは、最後に完了した反復の評価値を書く |
-| `--max-ply` | 16 | qsearch の最大深さ |
-| `--apply-qsearch-leaf` | false | 局面を qsearch 葉に置換して出力 |
-| `--source-fv-scale` / `--target-fv-scale` | 24 / 24 | FV_SCALE 変換（通常は変換不要） |
-| `--allow-routing-buckets-mismatch` | false | `--ls-progress-buckets` と格納 bucket 数の不一致を警告付きで許可（旧世代 net 専用、本文参照） |
-| `--engine` | — | 外部 USI エンジンパス。内部 NNUE の代わりに評価 |
-| `--engine-nodes` | 1 | エンジンの `go nodes` 値（0 で `go depth 1`） |
-| `--engine-threads` | 1 | 並列エンジンプロセス数（DL 系は VRAM に応じ 2〜4） |
-| `--usi-option` | — | `Name=Value` 形式、複数可（例: `DNN_Model=model.onnx`） |
-| `--engine-timeout` | 600 | エンジン応答タイムアウト秒（TensorRT 初回ビルド対策で長め） |
+### `--skip-in-check` の挙動
 
-### チューニング指針
+王手局面を rescore 出力から除外するフラグ。**ONNX モードでは 2026-04 以降、
+挙動が変更されている**:
 
-- `--onnx-batch-size`: GPU 推論では既定 1024 のままでよい。実測（RTX 3080 Ti /
-  RTX 5090、DL水匠 + TensorRT FP16、1M 局面）では 512〜2048 はスループットが
-  ほぼフラットで、256 以下だけ明確に遅い（3080 Ti で −3%、5090 で −10〜15%。
-  `--onnx-sessions 1` だと差はさらに開く）。「VRAM の許す限り大きく」しても
-  単調には速くならず、メモリを余分に食うだけの領域がある（参考: 3080 Ti /
-  sessions=2 の VRAM peak は batch 1024 で約 1.5GiB、2048 で約 1.7GiB）。
-  最適点は GPU / モデル / EP でずれるため、大規模 rescore の前に数十万局面の
-  サンプルで 512/1024/2048 を振って pos/s を比べるのが確実。この計測条件では
-  出力がバッチサイズ / セッション数に依らず sha256 一致することを確認済み
-  （一般保証ではないので、厳密な再現性が要る場合は同一設定で流し切る）。
-  ホスト RAM 側も特徴量バッファがバッチサイズ × セッション数に比例して増える。
-  バッファは 2 × 全セッション数（GPU の数 × `--onnx-sessions`）slot 確保され、1 slot = batch × 1 局面の特徴量サイズ
-  （dlshogi 系は 9,639 f32 ≈ 38 KiB）なので、既定 1024 × sessions 2 では概算
-  約 150 MiB。CPU 推論（`--onnx-gpu-id -1`）や省メモリ環境では 256/512 も
-  含めて計測して選ぶ。
-- `--threads`: 特徴量構築（CPU 前処理）の並列数。GPU 推論とオーバーラップされる
-  ため、重いモデルではデフォルトで足りる。軽量モデル + 高速 GPU で前処理が律速
-  になる場合のみ増やす。
-- `--onnx-sessions`: 上記実測（2 GPU / DL水匠）では既定 2 が最適（sessions=1
-  比 +13〜36% @3080 Ti、+3〜10% @5090）。多重化がバッチ間の GPU アイドルを
-  埋めるため、バッチサイズへの感度も下がる。GPU が電力上限に達している環境
-  では 3 以上に増やしても伸びない。
+- 旧挙動: 推論バッチに入れる前にドロップ（推論もスキップ）
+- 新挙動: **推論は実行し、rescore の書き出しだけ抑制**（expand 機能と独立動作させるため）
 
-## ユースケース別レシピ
+出力 PSV のバイト列は変わらない。推論コストは王手親局面の割合分わずかに増加する
+（教師データ中の王手局面は通常 1 桁 %）。
+`--expand-skip-parent-in-check` と `--expand-skip-child-in-check` で expand 側の
+王手フィルタを独立に制御できる。
 
-### 大規模 shard の段階処理（glob + レジューム）
+### ポリシー展開（`--expand-output-dir`）について
 
-数十〜数百 shard を逐次処理し、中断・設定変更があっても再開できる。クイック
-スタートのコマンドがそのままこの形（`--input "data/shard_*.bin"`）。
-`nohup` / `tmux` で流しっぱなしにしておき、GPU 温度で止めた後の再開や、モデル
-差し替え時の一括再スコアに使える（TensorRT では、モデルを差し替えたらエンジンキャッシュも
-消す。クイックスタートの `--onnx-tensorrt-cache` の説明を参照）。
+`--expand-output-dir` を指定すると、同じ ONNX 推論の policy 出力を使って
+合法手の softmax 確率を計算し、閾値を超えた手の子局面を PSV として書き出す。
+`expand_psv_from_policy` を別パスで走らせるのと同等の結果を、**推論 1 パス**で
+得られる。
 
-ONNX モードでは、セッション（TensorRT ではモデルの解析とエンジンの読み込み）と入力
-バッファを最初に処理するファイルで作り、残りのファイルで使い回す。小さいファイルが
-多いときは、ファイルごとに `rescore_psv` を起動するより 1 回の実行にまとめて渡す方が
-速い。数百個のパスを並べると Windows のコマンドラインの長さの上限（32,767 文字）を
-超えうるので、glob で渡す（引用符で囲んで shell に展開させない）。実行中にモデル
-ファイルが置き換わるとエラーで止まる（処理中だったファイルは `Ctrl-C` で打ち切った場合も含めて出力を空にし、次の実行で
-作り直す。TensorRT では再実行の前にエンジンキャッシュを消す）。ただし処理の終わりに
-モデルのファイルが無い（消してから置き直す途中など）と、出力を空にできずに止まる。その
-ときは処理中だったファイルの出力を消してから再実行する。置き換えの判定は
-モデルの本体ファイルのパス・サイズ・mtime で行う（完了マーカーも同じ）ので、外部
-データ（`.onnx.data`）だけを置き換えた場合は検出しない。
+子局面 PSV の `score` / `move16` / `game_result` は 0 で初期化される。子局面に
+スコアを付与したい場合は、出力した expand 結果を改めて `rescore_psv` に通す
+（そのときは `--expand-output-dir` なしで value rescore のみ）。
 
-### 複数 GPU で推論する（`--onnx-gpu-id 0,1`）
+### 完了マーカー（`<rescore_output>.done`）
 
-```bash
-rescore_psv --input "data/shard_*.bin" --output-dir rescored/ \
-  --dlshogi-onnx-model model.onnx --onnx-gpu-id 0,1 \
-  --onnx-tensorrt --onnx-tensorrt-cache trt_cache/
-```
+ONNX モードでは、各入力ファイルの処理完了時に rescore 出力の隣に
+`<ファイル名>.done` という sidecar テキストを atomic rename で書き出す。
+次回同じ入力に対して実行すると:
 
-- GPU ごとに `--onnx-sessions` 本のセッションを作る（上の例は既定 2 で計 4 本）。バッチは
-  空いたセッションが次を取るので、速さの違う GPU を混ぜても遅い方の速さに揃うわけではない。
-  ただし出力はバッチの通し番号の順に書くので、遅い GPU が処理中のバッチより後の結果は書けずに
-  バッファ（セッション数の 2 倍のバッチ）に溜まる。速さがおよそ 3 倍以上違う GPU を混ぜると、
-  バッファが埋まって速い GPU が待つ。番号を 1 つだけ指定したときは、その GPU だけで推論する。
-- 複数 GPU の動作は、GPU が 1 つの機械で同じ番号を重ねる指定（下の `0,0`）でだけ確かめている。
-  GPU 0 以外のデバイスや、複数の GPU を積んだ機械での実行は確かめていない。
-- 同じ番号を重ねて書ける（`--onnx-gpu-id 0,0` は GPU 0 に 2 × `--onnx-sessions` 本）。GPU が
-  1 つの機械で、複数 GPU の配り方を試すのに使える。
-- 出力の順序: GPU の数・割り当てによらず、GPU 1 つのときと同じ（バッチの通し番号の順に書く）。
-- 推論の値: 複数 GPU で GPU 1 つのときと値が一致するかは確かめていない（一般保証ではない）。
-  バッチの割り当ては実行ごとに変わるので、GPU ごとに推論の値がずれれば、同じ入力でも実行の
-  たびに出力がずれうる。特に機種の違う GPU を混ぜると、TensorRT のエンジンや CUDA の
-  カーネルが GPU ごとに違うため、最下位 bit が変わりうる。値の再現性が要るなら GPU 1 つで流す。
-- 完了マーカーは GPU の構成（`--onnx-gpu-id`・`--onnx-sessions`）を記録しない。構成を変えて
-  再実行しても完了済みの出力はそのまま再利用し、途中の出力は続きから書く。新しい構成で
-  作り直したいときは、出力と `<出力名>.done`（`--out-scores` では `<出力名>.in-progress` も）を消してから実行する。
-- TensorRT のエンジンキャッシュは、全 GPU で 1 つの `--onnx-tensorrt-cache` を共有してよい。
-  ONNX Runtime の TensorRT EP はキャッシュのファイル名に GPU の compute capability を付ける
-  （`..._fp16_sm86.engine` など）ので、世代の違う GPU は別のファイルになる。compute capability が
-  同じ GPU は同じファイルを使い、最初に推論した GPU で作ったエンジンを他の GPU も読む（各
-  `--onnx-gpu-id` の項目の 1 本目のセッションが、指定した順に 1 本ずつ最初のバッチを推論するので、
-  キャッシュの書き込みは競合しない。エンジンが無いときは、各 GPU の 1 本目のエンジン作りが順に走るので、作り終わるまでの時間は GPU の数だけ延びる）。compute capability が同じでも機種が違う GPU（メモリの
-  量が違うなど）では、TensorRT は他の機種で作ったエンジンを推奨しておらず、読めないこともある。
-  その場合は GPU ごとに別の実行に分け、それぞれ別のキャッシュディレクトリを渡す。
-- GPU を増やすと、特徴量を作る CPU 側（`--threads`）が次に律速になりうる。GPU 使用率が上がらない
-  ときは `RESCORE_PHASE_TIMING=1` で `build` の割合を見る。
-- `--ort-profile` は全体の 1 本目のセッション（最初の GPU）だけを記録する。
+- **marker の設定 fingerprint が現在の CLI と完全一致 + 出力サイズが記録と一致** → ファイル skip
+- **fingerprint 不一致（モデル差し替え・`--onnx-eval-scale` 変更・expand 設定変更など）** →
+  rescore/expand 両出力を truncate して再生成
+- **marker が無い（従来互換）+ expand 無効** → 既存のレコード数ベース resume にフォールバック
+- **marker が無い + expand 有効** → 両出力を truncate して最初から処理
 
-### score sidecar 出力（`--out-scores`）
+fingerprint に含まれる項目:
 
-```bash
-rescore_psv --input "data/*.psv" --output-dir scores/ \
-  --dlshogi-onnx-model model.onnx --out-scores
-```
+- モデルパス（canonicalize 済み）、モデルサイズ、モデル mtime（ns）
+- 入力パス、入力サイズ、入力 mtime（ns）
+- `process_count`（`--limit` 適用後）
+- `--skip-in-check`、`--score-clip`、`--onnx-eval-scale`（`f32::to_bits()` の hex で保存）
+- AobaZero モデル時のみ `--onnx-draw-ply`
+- expand 有効時: `--expand-threshold`（to_bits hex）、`--expand-skip-parent-in-check`、
+  `--expand-skip-child-in-check`、`--expand-output-dir` の canonicalize 済みパス
 
-```bash
-# NNUE 静的評価でも同じ sidecar を出力できる（LayerStacks は routing 3 オプション併用）
-rescore_psv --input "data/*.psv" --output-dir scores/ \
-  --nnue ls.bin --ls-bucket-mode progresskpabs --ls-progress-buckets 9 \
-  --ls-progress-coeff progress.bin --out-scores
-```
+`Ctrl-C` で中断した場合は marker を書き出さない（中途半端に処理したファイルを
+完了扱いにしない）。プロセス kill / panic には atomic rename + `sync_all()` で
+対応。電源断・カーネルパニックは非目標。
 
-フル PSV の代わりに `<入力ファイル名>.scores.i16` を生成する。record `i` の score は
-offset `i * 2` にある little-endian i16 で、ファイルサイズは厳密に
-`base PSV の全 records × 2` byte となる。通常のフル PSV
-出力と同じ推論・符号変換・clip を通り、
-通常出力の offset 32..34 を行順に抽出したものと bit 一致する。
+#### パスに使える文字の制約
 
-このモードは `--dlshogi-onnx-model` の直接推論、または `--nnue` の静的評価
-（qsearch なし）で使える。qsearch、search、外部
-engine、AobaZero ONNX、leaf label/replacement、expand、入力を削除する `--delete-input`、
-処理件数を制限する `--limit`（0 より大きい値）、および行を減らす `--skip-in-check` とは
-併用できない。入力は 40 byte の倍数でなければ
-即時エラーになる。run 開始時に `<入力名>.scores.i16.in-progress` を作り、
-入力・モデル・ラベル条件の fingerprint を記録する（NNUE 静的評価では ONNX モデルの
-代わりに NNUE の path/size/mtime と routing 設定 `--ls-bucket-mode` /
-`--ls-progress-buckets` / `--ls-progress-coeff`（path + sha256）、
-`--source-fv-scale` / `--target-fv-scale` を追跡する）。中断後はこの marker が現在の
-設定と一致し、既存 sidecar が 2 byte の倍数であるときだけ、サイズを 2 で割った record
-位置から追記再開する。一致時に奇数 byte なら即時エラーになる。marker が無い、壊れている、
-または fingerprint が異なる場合は、既存サイズにかかわらず sidecar を truncate して最初から生成する。
-完了時は全 record 数との厳密一致を再検証して `.done` marker を書き、in-progress marker を
-削除する。decode / 局面構築エラーを含むバッチは書き出し前に停止するため、既存 sidecar の
-prefix は常に base PSV と行対応する。
+マーカーは単純な `key=value\n` テキスト形式で保存される。round-trip を保証する
+ため、**model / input / expand_output_dir のパスに以下の文字を含めると起動時
+エラーで弾かれる**:
 
-### 王手局面を教師データから除外する
+- `=` (key/value セパレータと衝突、例: `v1.0=alpha/model.onnx`)
+- `\n` / `\r` (レコードセパレータと衝突)
+- 非 UTF-8 バイト列（Windows では実質発生しない、Linux の古い / 非 UTF-8 FS 由来）
+
+エラーが出た場合はパスをリネームして回避する。これらの文字を path に含める
+ユースケースは稀なので通常は気にする必要はない。
+
+### パス安全チェック（ONNX モード）
+
+ONNX モードでは以下を起動時 / ファイルごとに検証し、データ破壊を防止する:
+
+- `--output-dir` と `--expand-output-dir` が同一ディレクトリ → エラー
+- 入力ファイル = 予定出力パス（未作成でも parent canonicalize で検出）→ エラー
+- 既存出力が symlink → エラー（symlink 越しの truncate で入力を破壊しないため）
+- Unix のみ: 既存出力が入力と同じ inode（hardlink）→ エラー
+- marker 不一致で旧 expand artifact を削除する前に、旧 artifact が現在の入力と
+  同一実体でないことを検証 → 同一なら削除せずエラー（段階的パイプライン対策）
+
+### `--threads` について
+
+特徴量構築（CPU 処理）を rayon で並列化するスレッド数。
+**本ツールのボトルネックは CPU→GPU のデータ転送（全処理時間の 96%、nsys 計測）であり、
+CPU 側の特徴量構築を並列化しても全体時間は短縮されない**。デフォルトの `--threads 1` で問題ない。
+
+### 計測例（DL_suisho.onnx, BS=1024, RTX 2070 Super）
+
+| 構成 | --threads 4 | --threads 1 | 差 |
+|---|---|---|---|
+| CUDA FP32 (90,724 records) | 31.7 s | 33.4 s | 5%（計測ノイズ範囲） |
+| TensorRT FP16 (90,724 records) | 11.6 s | 11.4 s | -2% |
+| TensorRT FP16 (1,051,780 records, 温度管理付き) | 97.2 s | 96.9 s | 0.3% |
+
+> 注: GPU のサーマルスロットリングが計測に大きく影響するため、
+> 連続計測時は GPU 温度を 60℃ 以下に冷却してから実行すること。
+
+## ユースケース別の使い分け
+
+DL 系 ONNX モード（`--dlshogi-onnx-model` / `--onnx-model`）での代表的な
+運用パターン。各フラグは独立に組み合わせ可能。
+
+### 1. 王手局面を教師データから除外する
+
+王手親局面は評価が不安定になりやすい（詰み・詰めろ・王手放置などが混在）ため、
+学習ノイズを減らしたい場合に使う:
 
 ```bash
 rescore_psv --input "data/*.bin" --output-dir rescored/ \
-  --dlshogi-onnx-model model.onnx --skip-in-check
+  --dlshogi-onnx-model model.onnx \
+  --skip-in-check
 ```
 
-王手親局面は評価が不安定になりやすい（詰み・詰めろ・王手放置が混在）ため、
-学習ノイズを減らしたい場合に使う。ONNX モードでは推論自体は実行し書き出しだけを
-抑制するので、expand 機能とは独立に働く（推論コストは王手親局面の割合分だけ僅かに
-増える。教師データ中の王手局面は通常 1 桁 %）。
+rescore 出力から王手親レコードが除外される（推論は実行され、書き出しだけ抑制）。
+出力サイズは「入力 - 王手局面数」。
 
-### ポリシー展開（`--expand-output-dir`）
+### 2. 親と子の王手フィルタを別々に制御する（expand 併用）
 
-同一の ONNX 推論から value と policy を両方取り出し、rescore と子局面展開を
-1 パスで実行する:
+expand 側と rescore 側で独立に王手除外を制御したい場合:
 
 ```bash
+# 例 A: rescore には王手親も含める、expand 側は王手親から展開しない
 rescore_psv --input data.bin --output-dir rescored/ \
   --expand-output-dir expanded/ \
   --dlshogi-onnx-model model.onnx \
+  --expand-skip-parent-in-check
+
+# 例 B: 展開した子局面が王手状態になるものを除外（"王手に追い込んだ手" を学習対象から外す）
+rescore_psv --input data.bin --output-dir rescored/ \
+  --expand-output-dir expanded/ \
+  --dlshogi-onnx-model model.onnx \
+  --expand-skip-child-in-check
+```
+
+`--skip-in-check` / `--expand-skip-parent-in-check` / `--expand-skip-child-in-check`
+の 3 フラグは独立。全部同時 ON で「王手が関係する局面を全排除」にもできる。
+
+### 3. 大規模 shard を段階的に処理する（glob + レジューム）
+
+数十〜数百 shard を逐次処理し、中断・設定変更があっても再開できる:
+
+```bash
+rescore_psv --input "data/shard_*.bin" --output-dir rescored/ \
+  --expand-output-dir expanded/ \
+  --dlshogi-onnx-model model.onnx \
+  --onnx-tensorrt --onnx-tensorrt-cache /tmp/trt_cache \
   --expand-threshold 10.0
 ```
 
-- 合法手の softmax 確率が `--expand-threshold`（%、`(0, 100]`）を超えた手の
-  子局面を PSV として書き出す。子局面の `score` / `move16` / `game_result` は 0
-  初期化されるので、スコアが必要なら展開結果を改めて `rescore_psv` に通す。
-- `--expand-skip-parent-in-check` / `--expand-skip-child-in-check` で expand 側の
-  王手フィルタを `--skip-in-check`（rescore 側）と独立に制御できる。
-- 出力ファイル名は入力ファイル名と同じ。`--output-dir` と `--expand-output-dir` は
-  別ディレクトリ必須（起動時エラー）。
-- 多段パイプライン（展開結果をさらに展開）も可能。各段で入力・出力・expand 先を
-  すべて別ディレクトリにする。誤設定（旧段の出力 = 次段の入力の同一実体など）は
-  起動時に検出してエラーになる。
+各 shard 完了時に `rescored/shard_XXX.bin.done` マーカーが書き出される。
+次回実行時の挙動:
 
-### 葉ラベル / 葉置換（`--qsearch-leaf-label`）
+- 設定変更なし + 全 shard 完了済み → 全 skip
+- 一部 shard のみ完了 → 未完了 shard だけ処理（完了分はマーカーで skip）
+- `--onnx-eval-scale` やモデルを変更 → marker 不一致で対象 shard を自動再生成
 
-DL 系の静的評価でラベル付けする際、PV 末端（静かな局面）の評価を教師ラベルに
-したい場合に使う。局面は root のまま保持し、ラベルだけを qsearch 葉の ONNX 評価
-にする:
+`nohup` / `tmux` で流しっぱなしにしておき、GPU 温度で止めた後の再開や、
+モデル差し替え時の一括再スコアに使える。
+
+### 4. 段階的パイプライン（多段 expand + rescore）
+
+policy で得た子局面をさらに展開、のようにカバレッジを段階的に広げる:
 
 ```bash
-rescore_psv --input "data/*.bin" --output-dir rescored_leaflabel/ \
-  --dlshogi-onnx-model model.onnx \
-  --nnue suisho5.bin \
-  --qsearch-leaf-label
+# ステップ 1: 元データを rescore + 1 次展開
+rescore_psv --input "data/*.bin" --output-dir rescored/ \
+  --expand-output-dir expanded1/ \
+  --dlshogi-onnx-model model.onnx
+
+# ステップ 2: 1 次展開の子局面を入力にして、さらに rescore + 2 次展開
+rescore_psv --input "expanded1/*.bin" --output-dir rescored_expanded1/ \
+  --expand-output-dir expanded2/ \
+  --dlshogi-onnx-model model.onnx
 ```
 
-- `--nnue`（葉探索用）と `--dlshogi-onnx-model`（葉ラベル用）の両方が必須。
-  dlshogi モデル専用（AobaZero は特徴量が手数 game_ply を含み、葉へ進めても root の
-  game_ply が混入するため非対応）。`--apply-qsearch-leaf` / expand と併用不可。
-- 葉で手番が反転した場合は root 手番視点へ符号反転する。王手 root は葉探索せず
-  原局面のまま評価する。
-- `--qsearch-leaf-replacement-output <dir>` を併用すると、同一 1 パスで
-  **葉局面に置換した**レコード（leaf-REPLACEMENT arm）も別ディレクトリに書き出せる。
-  葉探索を行った局面では 2 工程（`--apply-qsearch-leaf` → DL rescore）と bit 一致し、再計算を半減できる。
-  `--output-dir` とは別ディレクトリ必須。レコード仕様の詳細は
-  [internals](rescore_psv-internals.md) 参照。
+**運用上の注意**:
 
-### 内部 NNUE / 探索 / 外部エンジンでリスコアする
+- 各段で `--output-dir` と `--expand-output-dir` は **別ディレクトリ**を指定
+- 入力ディレクトリ（例 `expanded1/`）と新しい `--expand-output-dir`（例
+  `expanded2/`）も **別ディレクトリ**を指定
+- 旧段の expand 出力が次段の入力と同じファイル実体になる誤設定は起動時に検出
+  してエラー（安全装置、PR #463 で追加）
 
-```bash
-# 静的 NNUE 評価（CPU のみ、最軽量）
-rescore_psv --input data.bin --output-dir rescored/ --nnue nn.bin
+## 動作確認
 
-# LayerStacks progresskpabs（routing は必ず学習時と同じ値を明示。
-# 格納 bucket 数と不一致の指定はエラー。旧世代の格納 9 / routing 8 net だけ
-# --allow-routing-buckets-mismatch で通す）
-rescore_psv --input data.bin --output-dir rescored/ --nnue ls.bin \
-  --ls-bucket-mode progresskpabs --ls-progress-buckets 9 \
-  --ls-progress-coeff progress.bin
+正常時の出力:
 
-# qsearch 評価
-rescore_psv --input data.bin --output-dir rescored/ --nnue nn.bin --use-qsearch
-
-# depth 指定探索（探索スコアでラベル付け）
-rescore_psv --input data.bin --output-dir rescored/ --nnue nn.bin \
-  --search-depth 8 --max-nodes 1000000 --threads 16
-
-# 外部 USI エンジン（DL 系エンジン等）
-rescore_psv --input data.bin --output-dir rescored/ \
-  --engine /path/to/usi_engine --engine-nodes 100000 --engine-threads 2 \
-  --usi-option "DNN_Model=model.onnx"
 ```
-
-`--search-depth` のメモリは、スレッドごとに置換表（`--hash-mb`）と、履歴・評価キャッシュ
-などの固定分 約 160 MB を使う。置換表の合計（`--hash-mb` × スレッド数）が 4 GB を超えると
-起動時に警告が出る。外部エンジンはプロセスが死んだ場合、担当分の
-未評価レコードを生存エンジンに再割り当てして継続する（全滅時はエラー終了し、
-`--delete-input` でも入力を保全する）。
-
-LayerStacks NNUE では `--ls-bucket-mode` が必須です。`progresskpabs` はさらに
-`--ls-progress-buckets` と `--ls-progress-coeff` が必須で、格納 bucket 数を routing 数へ
-暗黙採用しません。`kingrank9` は progress 用の2オプションを指定せず、格納9 bucket のモデルだけを受理します。
-
-`--ls-progress-buckets` が NNUE ファイルの格納 bucket 数と異なる場合はエラーになります
-（誤った routing 数は全行を無警告で誤評価にするため）。格納 bucket 数より少ない routing で
-学習された旧世代 net（例: 格納 9 / routing 8）を意図的に評価する場合のみ
-`--allow-routing-buckets-mismatch` を付けると警告付きで通過します。
-
-## 再開（resume）の仕組み
-
-- **ONNX モード**: 入力ファイルごとに完了マーカー `<出力名>.done` を書く。
-  再実行時、マーカーの設定 fingerprint（モデル・入力・主要フラグ）が現在の CLI と
-  一致し出力サイズも一致すれば skip、不一致なら該当ファイルの全出力を truncate
-  して自動再生成する。`Ctrl-C` 中断時は `.done` を書かない。
-- **ONNX の全 PSV 出力の中断再開**: 完了マーカーがない場合は、同じ入力と設定で再実行する。
-  入力を先頭から読み、デコードできないレコードや `--skip-in-check` で除外する局面を飛ばしながら、
-  既存出力を対応する入力レコードと照合する。局面や padding が一致しない場合は追記せずに
-  エラーで停止するので、新しい `--output-dir` を指定する。
-  展開出力・葉置換出力・`--qsearch-leaf-label` を有効にした場合はファイルの先頭から再生成する。
-  同じ出力パスへの複数プロセスからの同時書き込みは非対応。
-- **`--out-scores` の中断再開**: `<出力名>.in-progress` に `.done` と同じ形式の
-  fingerprint を保持する。入力 path/size/mtime、モデル path/size/mtime、全入力件数、
-  `--onnx-eval-scale`、`--score-clip`、`--onnx-tensorrt` など fingerprint が追跡する
-  条件が一致する場合だけ既存 prefix へ追記する。不一致・marker 欠落時は truncate して
-  再生成する。run 中に入力またはモデルの metadata が変化した場合も `.done` を書かず、
-  次回実行時に再生成する。出力 sidecar
-  自身の mtime は fingerprint に含めないため、追記による mtime 更新は resume を妨げない。
-  `Ctrl-C` 中断時は in-progress marker を残し、正常完了時だけ `.done` へ昇格する。
-  同じ出力 sidecar への複数プロセスからの同時書き込みは非対応。
-- **NNUE 静的評価 + `--out-scores`**: ONNX の `--out-scores` と同じ
-  `.in-progress` / `.done` marker 方式で中断再開・skip 判定を行う。fingerprint は
-  入力 path/size/mtime、NNUE path/size/mtime、全入力件数、`--score-clip`、
-  routing（`--ls-bucket-mode` / `--ls-progress-buckets` / `--ls-progress-coeff` の
-  path + sha256）、`--source-fv-scale` / `--target-fv-scale` を追跡する。
-- **NNUE / 探索 / 外部エンジンモード**: マーカーは使わず、出力レコード数が入力
-  レコード数以上のファイルを skip する（ファイル粒度。中途半端なファイルは最初
-  から再処理）。
-- fingerprint の全項目やマーカーのパス文字制約（`=` / 改行 / 非 UTF-8 を含む
-  パスは起動時エラー）は [internals](rescore_psv-internals.md) 参照。
-
-## メモリと決定性
-
-- 全モードでピークメモリは入力件数に非依存（NNUE / 探索 / 外部エンジンは
-  100 万件チャンク、ONNX はバッチ単位の固定 slot パイプライン）。
-- **ONNX モード**: 出力は `--onnx-sessions` / `--threads` に依存せず bit 一致（GPU 1 つでの確認。
-  複数 GPU での値の一致は未確認で、機種の違う GPU を混ぜると最下位 bit が変わりうる。
-  レシピ「複数 GPU で推論する」参照）。1 回の
-  実行に渡すファイルの分け方にも依存しない（CPU EP と、DL水匠・ONNX Runtime 1.24.2・
-  TensorRT 10.16 FP16・RTX 3080 Ti の CUDA / TensorRT EP で確認）。TensorRT は
-  同一エンジンキャッシュ（warm）での実行が bit 再現の基準（cold の初回ビルドや、エンジンを
-  作り直した後では最下位 bit が変わりうる）。
-- **`--search-depth`**: 出力は `--threads` に依存せず bit 一致する（探索状態を 256 局面の塊
-  ごとに初期化するため。後述「探索モードの並列化」）。`--hash-mb`・深さ・`--max-nodes` を
-  変えると出力も変わる。`--max-time` は時間で打ち切るため再現しない。
-- **`--engine`**: 同一設定での再実行は bit 一致するが、エンジンプロセス数を変えると
-  局面割り当てが変わり出力スコアも変わる（エンジン内部状態が担当局面列を通して
-  持ち越されるため）。再現性が必要ならエンジンプロセス数（`--engine-threads`）を明示的に
-  固定すること。外部エンジン自体が決定的であること（内部スレッド数 1 等）も条件。
-
-## 探索モードの並列化
-
-`--search-depth` は入力を 256 局面ずつの塊に切り、空いたスレッドへ順に配る。結果は入力順に
-並べ直して書く。重さのばらつきが大きい局面（入玉局面の深い探索など）でも、遅いスレッドを
-待って他のスレッドが止まることがない。
-
-- 各スレッドは塊の先頭で置換表・履歴・探索スタックを初期化し、塊の中では持ち越す。
-  局面ごとに初期化しないのは、履歴の表だけで約 100 MB あり、局面ごとに消すと探索と同程度の
-  時間がかかるため。
-- 配布済みで書き出していない局面は最大 100 万件で、ピークメモリは入力件数に依存しない。
-  1 局面だけ極端に重くても、他のスレッドはこの件数まで先へ進める。
-- 中断（Ctrl-C）時は、入力の連続した先頭部分だけを書いて終わる。
-
-## 終了動作（ONNX モード）
-
-ONNX モードの正常終了は、全出力（rescore 出力・`.done` マーカー）を flush した後、
-通常のプロセス teardown を踏まずに即時終了する（`_exit`）。ONNX Runtime
-（TensorRT EP）をロードしたプロセスは exit 時のライブラリデストラクタ連鎖が
-glibc ヒープを壊し、全処理の正常完了後に `corrupted double-linked list` abort
-（exit code 134）を間欠的に起こすため、その回避。出力は即時終了前に書き終わって
-おり欠けない。エラー終了は従来経路のため稀に exit 134 で落ちることがあるが、
-その場合も stderr のエラーメッセージが一次情報。
-
-## 出力パスの保護
-
-処理開始前に、展開済みの全入力と、指定された NNUE・進行度係数・ONNX モデル本体・外部 engine を、
-PSV / score sidecar / expand / replacement 出力および使用する .done・.in-progress・各 .tmp と照合します。
-旧 marker が削除対象として記録した expand / replacement パスも検査します。
-same path、symlink 出力、hardlink（Windows を含む）、同一実体への大小文字 alias を拒否します。
-後続ファイルの出力が先行入力と衝突する場合も、既存出力を変更する前に停止します。
-Windows では正規化した予定パスの Unicode 小文字化→大文字化が一致する出力を、未作成でも起動時に保守的に拒否します。
-case-sensitive directory でもこの命名制限が適用されます。Unicode として表現できない Windows 出力パスは拒否します。
-この文字変換は Windows のファイルシステム固有の case table と完全一致する保証はなく、実在ファイルは handle 同一性も検査します。
-同じ入力を別表記で指定する場合も、出力先が重複すれば拒否します。
-
-外部 engine の DNN_Model と、名前が File / Dir / Path / Coeff で終わる明示 USI option は資源として扱います
-（名前の判定は大文字小文字を区別しません）。相対パスは engine の作業ディレクトリ（指定した engine パスの親）を基準にします。
-USI option の名前・値の前後空白は送信と保護検査の両方で除去します。
-全 USI option の名前・値に独立したトークン name / value が含まれる場合は、大文字小文字を問わず起動前に拒否します。
-これらは engine の setoption 解釈で名前・値の境界を切り替える予約語であり、資源 option に見えない名前も検査対象です。path/value.nnue のようにパスの一部である場合は許可します。
-認識した資源 option（BookDir を含む）の名前・値に連続空白、タブ、改行などが残る場合は、engine による空白正規化で参照先が変わるため起動前に拒否します。
-内部の空白は単一の半角スペースだけを許可し、通常のスペースを含むパスは保護対象です。空値・無効値を除外する前、重複 option を集約する前に検査します。
-空値・`<empty>`・`<auto>`・存在しない USI 資源は列挙しません（NNUE など専用 CLI 引数の存在検査は省略しません）。
-BookFile=no_book は定跡なしとして扱い、有効な BookFile は BookDir（未指定・空なら book）からの相対パスとして解決します。
-BookDir 自体の全走査は行わず、指定された BookFile を保護します。それ以外の directory 資源はファイルを再帰列挙します。
-option 名の大小文字を区別する engine と区別しない engine の双方に対応するため、表記が異なる BookDir 候補は統合せず、
-各候補から解決した BookFile をすべて保護します。完全一致の BookDir が未指定または空なら既定の book も候補に含めます。
-SPSAParamsFile も各表記の明示ファイルを保持し、完全一致の非自動指定がない場合、
-または大小文字違いを含む候補に自動・空指定がある場合は、隣接する spsa.params も保護します。
-複数候補を保守的に保護するため、実際に engine が採用しない候補との衝突も拒否する場合があります。
-SPSAParamsFile が未指定・空・`<auto>`・`<empty>` で engine 実体の隣に spsa.params が存在する場合も保護します。 engine 実体の隣に `engine_options.txt` (エンジンが option を固定するファイル) があると、保護が実際の設定を表さないのでエラーで止まります。
-これ以外の vendor 固有 option や engine 内部の既定モデルは推測しません。
-
-書込み用 file は切り詰めずに開き、資源・他出力との handle 同一性を再確認してから、従来の truncate / append / resume 判断に従います。
-存在しない marker を事前検査だけで作成しません。比較用 handle は順次開閉し、同時 open 数は入力ファイル数に比例して増えません。
---delete-input で削除した入力は、その後の検査対象から除きます。他プロセスが保護対象を削除して検査不能になった場合は、安全側に停止します。
-
-この保護は並行置換の排他ロックや処理開始後の rollback を保証しません。拒否時に新規の空出力が残る場合があります。
-ONNX external tensor、ORT が生成する profile JSON、TensorRT cache は列挙・保護対象外です。これらの資源・出力は別の場所に配置してください。
+ORT_DYLIB_PATH: /home/user/lib/.../libonnxruntime.so
+Loading AobaZero ONNX model: model.onnx
+Using CUDA GPU 0
+CUDA execution provider: available
+AobaZero ONNX model loaded. Batch size: 1024
+[00:00:05] ████████████████████ 6693/6693 (1234 rec/s) Processing...
+```
 
 ## トラブルシューティング
 
@@ -603,30 +372,39 @@ ONNX external tensor、ORT が生成する profile JSON、TensorRT cache は列�
 |---|---|---|
 | `ORT_DYLIB_PATH environment variable is not set` | 環境変数未設定 | `ORT_DYLIB_PATH` に `libonnxruntime.so` のパスを設定 |
 | `ORT_DYLIB_PATH is set to '...' but the file does not exist` | パスが間違っている | ファイルパスを確認 |
-| `ONNX Runtime environment was configured before telemetry could be disabled` | テレメトリを無効にする前に ONNX Runtime の環境が作られた（ツールの不具合） | issue で報告する |
 | `CUDAExecutionProvider is NOT available` | CPU 版ランタイムを使っている | GPU 版ランタイムをダウンロードして `ORT_DYLIB_PATH` を修正 |
 | `libcudnn.so.9: cannot open shared object file` | cuDNN が見つからない | cuDNN 9 をインストールし `LD_LIBRARY_PATH` に追加 |
 | `CUDA EP registration failed` | CUDA/cuDNN のバージョン不一致等 | CUDA Toolkit・cuDNN のバージョンを確認 |
 | `TensorRTExecutionProvider is NOT available` | TensorRT が見つからない | `libnvinfer.so.10` を `LD_LIBRARY_PATH` に追加 |
 | `--onnx-tensorrt requires a GPU` | TensorRT と CPU モードの併用 | `--onnx-gpu-id` を 0 以上に設定 |
-| `Got invalid dimensions for input: input2` 等 | モデルの特徴量形式が不一致 | dlshogi 標準（57ch）は `--dlshogi-onnx-model`、AobaZero は `--onnx-model` を使う |
-| `--expand-output-dir requires ONNX mode` | NNUE/USI モードで expand 指定 | ONNX モードを使う |
+| `--expand-output-dir requires ONNX mode` | NNUE/USI モードで expand 指定 | ONNX モード（`--onnx-model` / `--dlshogi-onnx-model`）を使う |
 | `--expand-threshold must be a finite value in (0.0, 100.0]` | 範囲外 / NaN / inf | 有限値かつ `0 < v <= 100` を指定 |
 | `--onnx-eval-scale must be a positive finite value` | 0 以下 / NaN / inf | 正の有限値（通常 600.0）を指定 |
-| `... must point to different directories` | 出力系ディレクトリの同一指定 | 別ディレクトリを指定 |
-| `--qsearch-leaf-replacement-output requires --qsearch-leaf-label` | replacement のみ指定 | `--qsearch-leaf-label` を併用 |
-| `Output path is a symlink` | 既存出力が symlink（リンク先を問わず truncate を拒否） | symlink を削除するか別ディレクトリを使う |
-| `Output path resolves to input file` | 出力が入力または明示資源の同一実体（hardlink を含む） | 別ディレクトリを指定 |
-| `Output paths resolve to the same file` | 本体・marker・旧 cleanup 対象の出力先が重複 | 衝突する出力先や旧 marker の参照先を確認 |
-| `... path contains '='` / `non-UTF-8 characters` | マーカー非対応のパス文字 | パスをリネーム（`v1.0=alpha` → `v1.0-alpha` 等） |
-| `All engine processes have failed` | 外部エンジンが全プロセス死亡 | エンジンのログ / `--usi-option` / `--engine-timeout` を確認 |
+| `--output-dir and --expand-output-dir must point to different directories` | 同一ディレクトリ指定 | 別ディレクトリを指定 |
+| `Output path is a symlink (refusing to truncate a symlink)` | 出力予定パスが symlink | symlink を削除するか別ディレクトリを使う |
+| `Output path is a hardlink to the input file` | 出力予定が入力の hardlink（Unix） | 別ディレクトリを指定 |
+| `Stale expand artifact ... resolves to the current input file` | 旧 expand 出力と現在 input が同一（段階的パイプライン） | 入力を移動するか `--expand-output-dir` を変更 |
+| `... path contains '=' which is not supported by the completion marker` | モデル/入力/expand 出力パスに `=` が含まれる | パスをリネーム（`v1.0=alpha` → `v1.0-alpha` など） |
+| `... path contains non-UTF-8 characters` | パスに非 UTF-8 バイト列 | パスを UTF-8 に揃える |
 
-## 関連
+## 技術的背景
 
-- [rescore_hcpe](rescore_hcpe.md) — hcpe 教師の eval 付け替え（NNUE 固定 depth）
-- [psv_to_hcpe3](psv_to_hcpe3.md) — PSV → dlshogi 学習用 hcpe3 / hcpe 変換
-- [rescore_psv-internals.md](rescore_psv-internals.md) — 内部実装（供給パイプライン、
-  完了マーカー仕様、パス安全チェック等）
-- [psv-utils](https://github.com/KazApps/psv-utils) — 同等機能の Python ツール
+本ツールは ONNX Runtime をバイナリに同梱せず、実行時に外部ライブラリとして読み込む。
+このため `ORT_DYLIB_PATH` でライブラリの場所を明示的に指定する必要がある。
 
-起動時の bucket 数・係数の組合せと入力エラー時の扱いは、[native routing の設定条件](nnue-routing.md#起動時の設定条件)を参照してください。
+- `ORT_DYLIB_PATH` 未設定時はエラーを返す（未設定のまま実行するとハングするため）
+- GPU モードでは起動時に CUDA が利用可能かチェックし、CPU への暗黙フォールバックを防止する
+- `--onnx-tensorrt` で TensorRT ExecutionProvider (FP16) を使用可能
+- TensorRT は常に FP16 で推論する。FP32 モード（`--onnx-tensorrt` なし）と比較して約 2.8 倍高速化されるが、
+  評価値に平均 12cp 程度の差が出る（FP16 の方が系統的にやや高く出る傾向）
+- TensorRT FP32 は計測の結果 CUDA EP より遅いため（カーネル最適化の効果よりセッション初期化コストが大きい）、
+  FP32 で推論する場合は `--onnx-tensorrt` を指定せず CUDA EP を使うこと
+- TensorRT は初回実行時にモデルを GPU 固有にコンパイルする（数十秒〜数分）。
+  `--onnx-tensorrt-cache` でキャッシュを保存すると 2 回目以降は高速起動する
+- このツールのボトルネックは CPU→GPU のデータ転送（全処理時間の 96%、nsys 計測）であり、
+  FP16 による高速化は主に転送量の半減と Tensor Core 活用に起因する
+- `--threads` による特徴量構築の並列化は、ボトルネックが CPU→GPU 転送（96%）に
+  あるため原理的に全体時間への影響がない。計測でもいずれの構成 (CUDA FP32 / TensorRT FP16、
+  90k / 1.05M records) で有意な差は観測されなかった
+- 参考: 同等の Python ツール [psv-utils](https://github.com/KazApps/psv-utils) と比較して、
+  本ツールは CUDA EP / TensorRT EP どちらでも約 6〜9% 速い（1,051,780 records, 温度管理付き計測）

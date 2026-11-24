@@ -1,170 +1,78 @@
-# rshogi tools
+# tools
 
-将棋エンジンの対局評価、教師データの生成・加工、性能計測、定跡整備のツール群です。
+将棋エンジン開発用ツール群
 
-| やりたいこと | 入口 |
-|---|---|
-| 台帳の上位二手の差から片側の一本道の区間を探す（走査上限あり） | [book_mine master one-way](docs/book_mine.md#master-one-way-台帳から一本道の区間を探す) |
-| 教師データを作る・加工する | [gensfen](docs/gensfen.md) / [データ処理の選び方](docs/pack_tools.md) |
-| 棋譜を引き継いで1局指す | [tournament](docs/tournament.md#棋譜を引き継いで1局指す) |
-| エンジンを対局で比較する | [tournament](docs/tournament.md) → [analyze_selfplay](docs/analyze_selfplay.md) |
-| 探索結果の一致を検証する（`--strict` で nodes・score・PV・bestmove、未完了・欠損を判定） | [compare_nodes](docs/compare_nodes.md) |
-| 探索速度を測る | [benchmark](docs/benchmark.md) / [search_only_ab](docs/search_only_ab.md) |
-| 探索定数を SPSA で調整する (複数の機械の worker に対局を任せる `--remote-worker`、run-dir の写しの照合 `--verify-resume` も) | [spsa](docs/spsa.md) / [運用手順](docs/spsa_runbook.md) |
-| 自己対局 (先後交換ペア、`--unpaired` で単局も可) の定跡出口と、勝たなかった側が途中で有利になった局面 (`--chance-cp`) を件数と少数の ID 見本で集計し、木のキューの行と既存の木への不足手順の更新行を作る | [book_mine tree seeds](docs/book_mine.md#tree-seeds-自己対局から次に読む根を作る) |
-| 台帳を共有して木を並列に読む (worker の探索スレッド数は `--threads` で指定可・`opts.extend` で段の上限の先を1位から延長し、`opts.extend_rounds` の回数まで FORCE で伸ばし直し可・`opts.settle_rounds` で伝播後の線だけを追加読み可（settle 開始後は先読みを停止）・すべての読み条件を元の設定のまま共有し、木ごとに `opts.multipv` / `opts.nodes` と `require_condition` を指定可・実行中の台帳の一括追記（検査のメモリ上限つき、不正行と後続の値の衝突を集計して除外し、既存の同値行にも先読みの印を引き継ぐ。`--imported-journal` で取り込んだ行をエンジンが読んだ行と別のファイルに書ける）・読みがまだ無い要求局面の書き出し (`--pending-secs`)・計算量に上限のある任意の先読み・読みかけの局面の途中の上位の手で子を先に読む `--speculate-at`・その先読みを優先度の高い木で先に配る `--speculate-priority`・停止統計つき) | [book_mine tree serve](docs/book_mine.md#常駐) |
-| 別の台帳の読みを取り込む (複数の台帳を 1 回で、`--offsets` で前回の続きから、`--exclude-readings` で指定した読みを除いて) | [book_mine tree import-journal](docs/book_mine.md#別の台帳の読みの取り込み) |
-| 複数台の残り・締めまでの読める量と未着手の木の価値・重複を点検し、未完了の木の再採点 (`--rerank-table` / `--rerank-out`、受付行の `group` の木を最小の priority にそろえる、`--add` の新しい木も同じ物差しで採点して `<prefix>_rerank-add.jsonl` に出す、対象の own ごとの walk 表が必須、元データは段ごとに最大 16 回逐次読み、更新行は hold・計画の出力と併用不可、`--rerank-tiers` で id・区分・今の priority の段の表を当てて priority と group を決める、名前を変えて移した写し (同じ根・同じ own) のある木の hold は外さない)・NOT_READY の続きの候補 (`--not-ready-out` / `--not-ready-table`、直前に送った id は `--not-ready-sent` で除外、計画と続きに同じ id が出る併用は出力前にエラー)・受付を送る行で置き換えた (NOT_READY の続きも含む) 木ごとの累積の帯 (`--band-per-tree`)・group ごとに締めまでに読み切る見込みの表 (`--group-table`)・hold 候補と移動・新規追加・手順足し込みの計画 (`<prefix>_plan.tsv` と台別 JSONL、台に入るかは priority の帯の量で判定、移し先は台全体の比 `--move-max-ratio` と帯の読み終わり時間 `--move-band-factor` (既定で有効) で上限を付け、進みの記録の無い台は受付の木を未着手として数える、帯ごとの読み終わり時間 `<prefix>_bands.tsv`、急ぎの帯の偏りを均す `--balance-priority`/`--balance-hours`) を出す (移動元の台へ送った足し込みを木と一緒に移す。重みが確定する own の止まりだけを reach-low にする) | [book_mine tree queue-review](docs/book_mine.md#tree-queue-review-台ごとの残りと未着手の木を点検する) |
-| 外部の定跡の木を借りて自分の読みで値を付ける (main は元データ全体で伝播し直した値で選び、nodes も合流後の最善手に揃える。未完了局面へ戻る出口の読みも登録を保留) | [book_mine borrow](docs/book_mine.md#borrow-大きい定跡の木を借りる) |
-| 木の読みを台帳と照合し、合流を含む値の由来を付けて元データに登録する (serve の稼働中も可、読みの条件が混ざる木は `cond` を手ごとに書く、局面を除外する `--skip-keys <FILE>`、反転キーの合流で止まる木ごとに独立に除く局面を探し (`--auto-skip-flip-jobs <N>`、既定 4)、残った問題 (木の組み合わせで止まる分) は全部の木の局面から並列に絞り (通らないときだけ木の組と局面の ddmin)、足す `--auto-skip-flip <OUT>`、curated の局面の main も替える `--replace-curated`、木の中で先を読んだ手 (`--bench-expanded`)、1 回の読みの手と先を確かめられない手 (`--bench-single`) を差が `--alt-gap` 以上でも bench で残す指定、成れる角・飛・歩の不成は main・alt から record にし木の手からも外す、`--single-enqueue-out` の行に `--walk-table` の辿りの重み・下限 `--single-min-weight`・重みの帯ごとの priority `--single-priority-band`) | [book_mine tree register](docs/book_mine.md#定跡の元データへの登録) |
-| 読み終わった木の出力先を根の下から集め、登録済み・未完了・id の接頭辞・段 0 だけ・外した読みそのもの (key・nodes・sec が全部一致) を含む木・登録済みの木や先の候補と内容が同じ写しを判定つきの表に出し、残りを `tree register` に渡す一覧にする | [book_mine tree inventory](docs/book_mine.md#tree-inventory-登録していない読み終わった木の一覧) |
-| 完了した木の延長線と伝播後の最善手の違い、実戦手からの最善手順を調べる | [book_mine tree lines](docs/book_mine.md#tree-lines-延長線と実戦手の打ち切り理由) |
-| 複数のserveの進み・1 engine と全 worker の NPS・NOT_READYの終了件数・世代別の深さ・先後別に重複を除いたDONE実績による残り・idleまでの時間を表示する | [book_mine tree status](docs/book_mine.md#tree-status-複数の台の進みと-idle-までの時間) |
-| 定跡の 13 列の元データ・読み条件・値の由来・schema の語彙・合法手と、main・alt に成れる角・飛・歩の不成が無いことを検査する | [book_mine master validate](docs/book_mine.md#master-validate-元データの全件検査) |
-| 元データに行を追加・置換する（curated の全列置換も対象） | [book_mine master add](docs/book_mine.md#master-add-元データへの行の追加と置換) |
-| 序盤の main の替わりを継続手数で hold / replace に分け、指定キーを優先して保留する (`--continuation`・`--hold-keys`・`--deep-opp-freq`・`--deep-min-games`)。hold の継続が足りない枝の途切れた局面の一覧 (`--cuts-out`) と、そこを根にした木のキューの行 (`--cuts-enqueue-out`、既存キューによる除外 `--cuts-exclude-queue`) | [book_mine master hold-early](docs/book_mine.md#master-hold-early-序盤の-main-の替わりを保留に戻す) |
-| 読みのログから整数評価値の追加候補と報告を作る | [book_mine master add-reads](docs/book_mine.md#master-add-reads-読みから追加候補を作る) |
-| 元データから定跡・プリセット・条件と探索深さの注釈を書き出す（取り込みを含む tree 台帳から探索深さを照合し、失敗時は既存出力を復元） | [book_mine master export](docs/book_mine.md#master-export-定跡プリセット注釈の書き出し) |
-| 注目の線から元データと DONE の木を合わせ、伝播値つきの定跡をビュアー用に作る | [book_mine master line-db](docs/book_mine.md#master-line-db-注目の線を辿る定跡) |
-| 2 つの定跡の局面と手の差分を表示する | [book_mine master diff](docs/book_mine.md#master-diff-2-つの定跡の差分) |
-| 書き出した定跡とプリセットを検査する | [book_mine master check](docs/book_mine.md#master-check-書き出した定跡とプリセットの検査) |
-| 伝播の切れ目の局面を重み順に並べ、既存の木との重複を除いたキューにする `--bridge-enqueue-out` と、main の置換と、旧 main・curated を保護した悪い alt の bench（控え）への降格・値が `--bad-eval` より大きく基準との差が `--demote-line` (既定 100) 未満の控えの復帰（`--apply`・`--replace-curated`・`--demote-alts`・`--revive-bench`。降格・復帰は `--demote-line 100`、点検・main 置換は `--line 40`。`--opp-records` で相手の record も、`--opp-bench` で相手の bench も伝播に使い、反転した局面へは辺を張らない。成れる角・飛・歩の不成は main・alt から record にし、控えからも戻さない。`--single-enqueue-out` の行に `--walk-table` の辿りの重み・下限 `--single-min-weight`・重みの帯ごとの priority `--single-priority-band`） | [book_mine master audit](docs/book_mine.md#master-audit-定跡の元データの点検) |
-| 自分は main、相手は強い対局の頻度か大きい定跡の手で指すとして辿り、自分が読み始める局面と重みを出す (`--opp-records` で強い対局が止まりの局面とその 10・20 手前に着いた局数・得点・勝敗の列) | [book_mine master walk](docs/book_mine.md#master-walk-自分が読み始める局面と重み) |
-| 自前の main と外部定跡の最善・指定点差以内の手をぶつけ、定跡切れ・値の出所・外部定跡の続き・強い対局の局数と得点を一覧にする | [book_mine master compare](docs/book_mine.md#master-compare-自前の定跡と外部定跡の突き合わせ) |
-| 対局の抜け・受付の被覆を調べ、抜けをつなぐ木や実戦の線を両側で舗装する木を局ごとの優先度つきで出す | [book_mine master game-gaps](docs/book_mine.md#master-game-gaps-対局の手順と元データの抜け) |
-| 負けた局の崩れと伝播後の実戦手の値を照合し、崩れまでの抜けをつなぐ木を出す | [book_mine master game-pave](docs/book_mine.md#master-game-pave-負けた局の崩れまでを定跡につなぐ) |
-| 初期局面から先手と後手の main を交互に直接キーで辿り、定跡が切れる局面 (局面なし・反転キーでだけある・main なし・循環) と理由、そこを根にした own=bw の木の行を出す | [book_mine master main-line](docs/book_mine.md#master-main-line-main-対-main-で定跡が切れる所) |
-| walk の止まりと伝播の切れ目・定跡に戻る手の表を合わせ、出口を有望・塞ぎたい・浅い・値の出所が弱いに分けた表と Markdown の報告を出し、good 以外の出口を木の計画にする (元データの行が無い未決着の末端まで続く場合はそこを根にする。根の移動時は出口と続きの先の受付を照合。局面の番号は全部の節で「何手目」= その局面で次に指す手の番号、先手番は奇数・後手番は偶数。表は局面の手番 `turn` と `move_number` の列を持ち、偶奇が合わなければエラー。手順照合と各出口の処置は `path`・`enqueue` 列に表示) | [book_mine master exit-report](docs/book_mine.md#master-exit-report-版ごとの出口の報告) |
-| 戦型の候補ごとに、RAMU の手番の決めた局面で main の代わりに決めた手を指して辿り、出口の値・確度・強い対局の実績・危ない局面を通る重み・分岐の後の相手の手を比べる表と Markdown の報告を出す (報告の局面の番号は「何手目」= その局面で次に指す手の番号) | [book_mine master opening-report](docs/book_mine.md#master-opening-report-戦型の候補を比べる表) |
-| walk と同じ辿りで RAMU の手番の局面の main の伝播の値と外部定跡の値を比べ、食い違う局面の表と Markdown の報告、定跡が切れた所を根にした木のキューの行を出す (受付の木の照合つき) | [book_mine master opp-book-diff](docs/book_mine.md#master-opp-book-diff-外部定跡と食い違う局面) |
-| 自分は main、相手は main・alt を指して辿れる出口を層ごとの外部ソート・到達済みキーのマージで分類し、既存の木との重複を除いてキューにする | [book_mine master exits](docs/book_mine.md#master-exits-元データを辿って出口を列挙する) |
-| Threat の幅を縮め、速度試験用 net を作る | [resize_nnue_threat](docs/resize_nnue_threat.md) |
-| LayerStacks の FT と L1 の列を並べ替える | [permute_nnue_ft](docs/permute_nnue_ft.md) |
-| その他のツールを探す | [目的別の全ツール一覧](docs/tools-reference.md) |
+## ツール一覧
 
-`master audit --deep-plies N`（N は 1 以上）は、両方の手の先で元データの main が N 手以上続けば線未満も対象にします。直接のキーが無いときは反転キーでも続きを辿ります。
-`master audit` と `tree register` の `--switch-rule propagated` は線を使わず、main と 1 位の値がどちらも手の先の局面から来ていれば差が 1 でも main を替え、片方が 1 回の読みなら替えずに、その手を伸ばす木の行を `--single-enqueue-out` に出します (`--exclude-queue` で既に積んだ木を除く)。
-`master cycles` と `master rejoin` は `--direct-lookup` で、対局で定跡を直接のキーだけで引く (先後反転した局面の項目を引かない) 前提で値を伝播し、反転キーで合流した局面では止まりません。確かめなかった局面の数を標準エラーに、一覧を `--direct-lookup-table <PATH>` に出します。
+### 対局・データ生成
 
-`master audit` と `master rejoin` の重み (`--opp-freq`) は `--opp-book <PATH>` で、局数が足りない局面と局数の少ない手に行く分を大きい定跡の手で辿ります (`master walk --opp-book` と同じ割り振り)。
-`master audit` と `master hold-early` は `--deep-opp-freq <PATH>` で頻度定跡を渡すと、相手の main に加えて `--deep-min-games <N>` (既定 3) 局以上の応手をすべて辿り、最短の継続手数で判定します。頻度定跡は読み込み時に下限未満の手を除外します。audit では `--deep-plies` が必要で、`--deep-min-games` の明示指定には頻度定跡が必要です。
+| ツール | 説明 |
+|--------|------|
+| `tournament` | 複数エンジンの round-robin 並列トーナメント、SPRT 検定 |
+| `analyze_selfplay` | tournament 出力の集計・Elo/nElo 算出・SPRT post-hoc 判定 |
+| `engine_selfplay` | USIエンジン同士の自己対局、学習データ（PackedSfenValue）生成 |
+| `floodgate_pipeline` | Floodgate棋譜のダウンロード・変換 |
 
-控え（bench）の復帰は `tree register`（控え自身の source 保護を適用）と `master audit --revive-bench` で行い、`borrow value` では復帰させません。書き出しでは record と同じく DB に -30000 で残し、プリセットから除きます。
+### 学習データ処理
 
-## ビルドと実行
+| ツール | 説明 |
+|--------|------|
+| `shuffle_psv` | PSV ファイルのシャッフル |
+| `split_psv` | PSV ファイルを局面数または容量で分割 |
+| `merge_psv` | 複数の PSV ファイルを順序どおり結合 |
+| `rescore_psv` | 局面の再評価（探索スコア付与） |
+| `preprocess_psv` | PSV ファイルの前処理（qsearch leaf置換等） |
+| `validate_psv` | PSV ファイルの不正局面検出・除去 |
+| `psv_to_jsonl` | PSV 形式 → JSONL 変換（デバッグ・確認用） |
+| `fix_scores` | スコアの補正 |
+| `psv_dedup` / `psv_dedup_bloom` / `psv_dedup_partition` | PSV 局面の重複除去（3 方式。使い分けは [pack_tools.md](docs/pack_tools.md#重複除去ツールの選び方)） |
 
-リポジトリのルートで実行します。必要な Rust 環境は [ビルド手順](../../docs/build.md) を参照してください。
-以下は Bash / Git Bash で実行する例です。Windows native のエンジンの実行ファイルには `.exe` を付けます。
+### ベンチマーク・分析
 
-```bash
-cargo build --release -p tools --bin shuffle_psv
-cargo run --release -p tools --bin shuffle_psv -- --help
-```
+| ツール | 説明 |
+|--------|------|
+| `benchmark` | エンジン性能ベンチマーク |
+| `compare_eval_nnue` | NNUE評価値の比較 |
 
-通常は必要なバイナリだけを `--bin` で選びます。`kifu_player` と `dlshogi-onnx` は
-既定で有効です。TUI・ONNX 依存を外す場合は
-`--no-default-features --features nnue-arch` をビルド引数に追加します。
-`prepack_nnue` は追加の `--features prepacked-nnue` が必要です。
-既定の `nnue-arch` は汎用実装と 1536x16x32・1536x16x64・2304x16x64、5 種の FT の静的実装を含み、
-対応する拡張なしの LayerStacks を静的に読みます。PSQT・Threat・effect bucket・
-`ls_bucket=` 指定、別の寸法、prepacked、architecture override は汎用実装を使います。
-別の寸法は `--features layerstacks-<寸法>` の追加でも静的に読めます。
-gensfen と rescore_psv の NativeBackend は読み込みログに
-`NNUE LayerStack implementation=static|dynamic` を出力します。
-1 つの NNUE 構成だけを入れた速い build (`rescore_psv`・`gensfen` など、rshogi-core の NNUE の評価・探索を直接呼ぶツール) は
-[rescore_psv の単一構成の build](docs/rescore_psv.md#単一構成の-build) を参照してください。
-静的 LayerStacks を直接読む診断ツール (`bench_nnue_eval` / `eval_sfens` / `nnue_saturation` /
-`verify_nnue_accumulator`) には、tools の `layerstack-arch` feature (`nnue-arch` に含まれる) が必要です。
-診断するモデルに合わせて寸法を指定します。1024×16×64 には `layerstacks-1024x16x64` を使います。
+### NNUE 学習
 
-[`eval_sfens`](docs/eval_sfens.md)、[`nnue_saturation`](docs/nnue_saturation.md)、
-[`bench_nnue_eval`](docs/bench_nnue_eval.md) は、ネットに `ls_bucket=` がある場合に
-その routing を自動選択します。LayerStacks は最大 64 bucket（PSQT 付きは最大 32）、`ls_bucket=` は最大 3 軸です。
-`eval_sfens` は既定の `--bucket-mode progresskpabs` を明示した場合もヘッダの spec を使います。
+NNUE モデルの学習には [bullet-shogi](https://github.com/SH11235/bullet-shogi/tree/shogi-support) を使用しています。
+教師データは上記の PSV ツール群で生成・前処理し、bullet-shogi で学習を行います。
 
 ## クイックスタート
 
-教師データ・NNUE モデル・進行度係数は repo 外の共有 root に置き、
-環境変数 `SHOGI_DATA` に設定してください。以下の入力ファイルはあらかじめ用意します。
-出力は実行ごとに別名にすると前回の結果を保持できます。
-
-### 教師データの生成とシャッフル
+### 自己対局で学習データ生成
 
 ```bash
-# model.bin は使用する評価関数に置き換える。
-RUN="$SHOGI_DATA/teachers/generated-$(date +%Y%m%d_%H%M%S)"
-cargo run --release -p tools --bin gensfen -- \
-  --eval-file "$SHOGI_DATA/nnue/model.bin" \
-  --games 100 --nodes 80000 --threads 1 --hash-mb 256 \
-  --out-dir "$RUN"
-
-cargo run --release -p tools --bin shuffle_psv -- \
-  --input "$RUN/gensfen.psv" --output "$RUN/shuffled.psv" \
-  --seed 42 --chunk-size 1000000
+cargo run -p tools --release --bin engine_selfplay -- \
+  --games 100 --byoyomi 1000
+# → runs/selfplay/<timestamp>-selfplay.psv
 ```
 
-`gensfen` は終了時に局面数を表示し、指定先へ PSV と結果 JSONL を保存します。
-`search-tree-sample` feature では、探索木内の局面を別の PSV に採取することもできます。
-採取した局面はマーカーを保持したまま再評価・展開できます。
-[rescore_psv](docs/rescore_psv.md) は ONNX の全 PSV への追記再開時に既存出力を照合します。
-[expand_psv_from_policy](docs/expand_psv_from_policy.md) は展開先の局面にも親のマーカーを引き継ぎます。
-LayerStacks の routing・進行度係数が必要なモデルは
-[起動時の設定条件](docs/nnue-routing.md#起動時の設定条件)に従って指定してください。
-`shuffle_psv` のチャンク指定は全件のメモリ保持を避けるためです。メモリ・一時ディスク容量と
-中断時の扱いは [shuffle_psv](docs/shuffle_psv.md)、生成の drain・再開は
-[gensfen](docs/gensfen.md) を参照してください。学習自体は外部トレーナーで行います。
-[bullet-shogi](https://github.com/SH11235/bullet-shogi/tree/shogi-support) を使う場合の学習手順は、そちらの文書を参照してください。
-
-### 2 エンジンの対局と集計
-
-評価関数などの初期設定が済んだ USI エンジンを用意します。
-同じバイナリでモデルを比較する例は [tournament](docs/tournament.md) を参照してください。
+### 学習データのシャッフル
 
 ```bash
-RUN="runs/selfplay/$(date +%Y%m%d_%H%M%S)-compare"
-cargo run --release -p tools --bin tournament -- \
-  --engine /path/to/candidate --engine-label candidate \
-  --engine /path/to/base --engine-label base \
-  --games 10 --byoyomi 1000 --threads 1 --hash-mb 256 \
-  --concurrency 2 --seed 42 --out-dir "$RUN"
-
-cargo run --release -p tools --bin analyze_selfplay -- "$RUN"
+cargo run -p tools --release --bin shuffle_psv -- \
+  --input data.psv --output shuffled.psv
 ```
 
-`--games 10` は各方向 10 局なので、この例は先後を交換して計 20 局です。
-開始局面集を使う比較では `--startpos-file` を追加します。
-Fischer 時計の NPS による補正（`--nps-scaling`）と Linux の NUMA 固定（`--cpu-affinity numa`）は
-[tournament の時計補正と CPU 割り当て](docs/tournament.md#機械の速さによる時計の補正---nps-scaling)を参照してください。
-engine ごとの相手手番思考は `--ponder 0:true 1:false` で指定できます。
-的中時は PV の先頭と bestmove の一致を確認して評価値を採用し、厳密な主 PV は個別に検査します。
-詳しくは [ponder の設定と CPU 割り当て](docs/tournament.md#相手手番の思考ponder)を参照してください。
-中断・動的な局数変更・SPRT は [tournament](docs/tournament.md)、
-不完全入力の扱いは [analyze_selfplay](docs/analyze_selfplay.md) を参照してください。
-
-### 探索の動作確認
+### ベンチマーク実行
 
 ```bash
-cargo run --release -p tools --bin benchmark -- \
-  --internal --usi-option MaterialLevel=1 \
-  --limit-type nodes --limit 10000 --tt-mb 16 --eval-hash-mb 16
+cargo run -p tools --release --bin benchmark -- --internal
 ```
 
-駒得評価で短く探索し、コンソールに NPS、`benchmark_results/` に JSON を保存します。
-NNUE を使った性能比較では `--nnue-file` と必要な routing を明示し、
-[benchmark](docs/benchmark.md) または [search_only_ab](docs/search_only_ab.md) の条件を揃えて計測します。
+## ドキュメント
 
-## 共通の注意と関連資料
+各ツールの詳細は `docs/` を参照：
 
-- 各 CLI の全オプションは `cargo run --release -p tools --bin <名前> -- --help` で確認できます。
-- 共通の入力ファイル収集は、読めないディレクトリを黙って除外せずエラーを返します。
-- 入出力の保護・上書き・再開の契約はツールごとに異なります。各 doc の出力に関する説明を確認してください。
-- [prep_hcpe](docs/prep_hcpe.md) はメモリ予算に応じて shuffle 方式を切り替え、開始時に使用量の見積もりを表示します。
-- [HCPE の 38 byte 形式と padding](docs/hcpe-format.md)、[LayerStacks routing と進行度係数](docs/nnue-routing.md)。
-- CSA client のログは単局集計です。未決の対局は勝敗集計・教師抽出から除外し、SPRT の対象にしません。
-  詳細は [解析](docs/analyze_selfplay.md) と [KIF 変換](docs/jsonl_to_kif.md) を参照してください。
-- Floodgate の HTTPS 取得は OS の証明書ストアを使います。最小 Linux コンテナには `ca-certificates` を用意してください。
-  暗号 provider は `ring` で、ビルドには C コンパイラが必要です（CMake / NASM は不要）。
-- [コマンド例集](examples/README.md)、[教師データの追加パイプライン](docs/training_data_pipeline.md)。
-- CSA 接続クライアントは別 crate です。[csa_client の手順](../rshogi-csa-client/examples/README.md)を参照してください。
+- [tournament](docs/tournament.md) - 並列トーナメント・SPRT 検定
+- [engine_selfplay](docs/engine_selfplay.md) - 自己対局ツールの詳細
+- [benchmark](docs/benchmark.md) - ベンチマークツールの詳細
+- [pack_tools](docs/pack_tools.md) - 学習データ処理ツール群
 
-`master rejoin` は `--opp-records --opp-bench --bridge-replies` で点検と同じ相手の手と伝播を使えます。`master exit-report` の切れ目は、walk の RAMU の側が局面の手番と一致する組だけで重みと目標を判定します。目標に届く木の出口は、元データの一本道を辿って有望と未決着に分けます。
+各ツールのオプション一覧は `--help` で確認できます。
+
+## 使用例
+
+より多くのコマンド例は [examples/README.md](examples/README.md) を参照。

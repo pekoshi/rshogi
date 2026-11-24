@@ -62,9 +62,8 @@
 //!     = 216,720
 //! ```
 //!
-//! Profile 1 (same-class) は 192,640、profile 2 (same-class-major-pawn) は 173,568、
-//! profile 3 (step-attacker) は 33,408 (= 36 × (72+112+328+416)、attacker が
-//! 歩桂銀金のみ)、profile 10 (cross-side) は 96,320。詳細は [`super::threat_exclusion`] を参照。
+//! Profile 1 (same-class) は 192,640、profile 2 (same-class-major-pawn) は 173,568。
+//! 詳細は [`super::threat_exclusion`] を参照。
 //!
 //! # index 構造
 //!
@@ -74,7 +73,8 @@
 //!
 //! threat_index =
 //!     pair_base[attacker_side][attacker_class][attacked_side][attacked_class]
-//!   + attack_offset[attack_pattern][from_sq_n][to_sq_n]
+//!   + from_offset[attack_pattern][from_sq_n]
+//!   + attack_order[attack_pattern][from_sq_n][to_sq_n]
 //! ```
 //!
 //! ## 用語
@@ -94,12 +94,12 @@
 //!   (5 種 × 2 色 = 10 エントリ)
 //!
 //! 方向性駒は攻撃方向が駒色に依存する。perspective 基準正規化後の駒色
-//! (`oriented_color`) を attack LUT のキーに含める
+//! (`oriented_color`) を attack LUT のキーに含める Stockfish FullThreats 準拠の
 //! 設計を採用している。THREAT_DIMENSIONS は影響を受けず、index 空間は同一。
 //!
-//! ## 正規化
+//! ## 正規化 (Stockfish FullThreats 準拠)
 //!
-//! HalfKaHmMerged と同じ perspective 基準で正規化する:
+//! HalfKA_hm と同じ perspective 基準で正規化する:
 //!
 //! ```text
 //! 1. Perspective 基準正規化:
@@ -113,7 +113,7 @@
 //! - from_sq と to_sq の両方に同じ perspective 変換を適用 (相対位置が保存される)
 //! - 駒色は perspective で swap: `oriented_color = attacker_color ^ perspective`
 //! - orient 後のマスと oriented_color を使って色別 attack LUT を引く
-//! - HalfKaHmMerged と Threat で正規化基準を統一
+//! - HalfKA_hm と Threat で正規化基準を統一
 //!
 //! ## pair_base テーブル
 //!
@@ -125,15 +125,15 @@
 //! - profile による除外 pair は sentinel `EXCLUDED_PAIR_BASE` を持ち、
 //!   累積和計算時にスキップされる ([`super::threat_exclusion`] 参照)
 //!
-//! ## attack_offset テーブル
+//! ## from_offset / attack_order テーブル
 //!
-//! 各 attack pattern について、空盤面上の利きを攻撃元・攻撃先の Square raw 値の昇順で
-//! 並べたときの 0-indexed 番号を格納する。攻撃元より前のマスの攻撃数と、その攻撃元での
-//! 攻撃先の順位を加えた値になる。空盤面で利きがない組は `u16::MAX` で表す。
+//! - `from_offset[attack_pattern][sq]` = sq=0 から sq-1 までの各マスの攻撃数の累積和
+//! - `attack_order[attack_pattern][from_sq][to_sq]` = 空盤面上で from_sq の駒が
+//!   攻撃できる全マスを **Square raw 値の昇順** で 0-indexed 番号付けした時の to_sq の番号
 //!
 //! **重要 — 静的テーブルと実盤面の使い分け**:
 //!
-//! - **index テーブル生成 (`attack_offset`) は空盤面上の利き** を使う。
+//! - **index テーブル生成 (`from_offset`, `attack_order`) は空盤面上の利き** を使う。
 //!   実盤面の occupied は無視し、静的テーブルとして事前計算可能にする
 //! - **active な threat pair の列挙** には実盤面の occupied を使う。
 //!   `attackers_to_occ(sq, occupied)` で実際に発生している threat を取り出す
@@ -141,32 +141,23 @@
 //! スライダー駒 (Lance, Bishop, Rook, Horse, Dragon) では index と active 列挙で
 //! 異なる利きを参照する点に注意。
 
-#[cfg(all(feature = "nnue-threat", any(test, feature = "layerstack-arch")))]
-use crate::bitboard::{
-    BISHOP_STEP, ROOK_STEP, between_bb_aligned, direct_of, king_effect, lance_step_effect,
-    ray_effect,
-};
 use crate::bitboard::{
     Bitboard, bishop_effect, dragon_effect, gold_effect, horse_effect, knight_effect, lance_effect,
     pawn_effect, rook_effect, silver_effect,
 };
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 use crate::position::Position;
-#[cfg(all(feature = "nnue-threat", any(test, feature = "layerstack-arch")))]
-use crate::types::Piece;
 use crate::types::{Color, PieceType, Square};
 
 use super::accumulator::DirtyPiece;
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 use super::accumulator::IndexList;
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 use super::bona_piece::BonaPiece;
-#[cfg(feature = "nnue-threat")]
-use super::bona_piece_halfka_hm_merged::is_hm_mirror;
-use super::bona_piece_halfka_hm_merged::{E_KING, F_KING};
-#[cfg(feature = "nnue-threat")]
-use super::stats::{count_threat_diff, count_threat_full};
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
+use super::bona_piece_halfka_hm::is_hm_mirror;
+use super::bona_piece_halfka_hm::{E_KING, F_KING};
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 use super::threat_exclusion;
 
 use std::sync::LazyLock;
@@ -180,15 +171,14 @@ use std::sync::LazyLock;
 /// Profile 0 (full): 216,720
 /// Profile 1 (same-class): 192,640
 /// Profile 2 (same-class-major-pawn): 173,568
-/// Profile 10 (cross-side): 96,320
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 pub const THREAT_DIMENSIONS: usize = PAIR_DATA.1;
 
 /// ThreatClass の数（King 除外）
 pub const NUM_THREAT_CLASSES: usize = 9;
 
 /// changed threat features の最大数（差分更新用）
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 pub const MAX_CHANGED_THREAT_FEATURES: usize = 192;
 
 // =============================================================================
@@ -217,7 +207,7 @@ pub const MAX_CHANGED_THREAT_FEATURES: usize = 192;
 /// # 戻り値
 /// - true: refresh (full rebuild) が必要
 /// - false: append_changed_threat_indices で差分更新可能
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 pub fn needs_threat_refresh(
     dirty_piece: &DirtyPiece,
     curr_king_sq: Square,
@@ -343,18 +333,18 @@ pub(crate) const ATTACKS_PER_COLOR: [usize; NUM_THREAT_CLASSES] = [
 
 /// pair_base[attacker_side][attacker_class][attacked_side][attacked_class]
 /// flat index: as * 162 + ac * 18 + ds * 9 + dc
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 const NUM_PAIRS: usize = 2 * NUM_THREAT_CLASSES * 2 * NUM_THREAT_CLASSES; // 324
 
 /// 除外された pair の sentinel 値
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 const EXCLUDED_PAIR_BASE: usize = usize::MAX;
 
 /// pair_base テーブルと THREAT_DIMENSIONS を構築
 ///
 /// 除外された pair は `EXCLUDED_PAIR_BASE` (sentinel) が格納され、
 /// 累積和からスキップされる。戻り値の .1 が THREAT_DIMENSIONS。
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 const fn build_pair_base() -> ([usize; NUM_PAIRS], usize) {
     let mut table = [0usize; NUM_PAIRS];
     let mut cumulative = 0usize;
@@ -385,29 +375,17 @@ const fn build_pair_base() -> ([usize; NUM_PAIRS], usize) {
 }
 
 /// pair_base テーブルと THREAT_DIMENSIONS (compile-time 計算)
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 const PAIR_DATA: ([usize; NUM_PAIRS], usize) = build_pair_base();
 
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 static PAIR_BASE: [usize; NUM_PAIRS] = PAIR_DATA.0;
 
-// 除外のない profile ではホットパスの sentinel 判定をコンパイル時に除く。
-#[cfg(feature = "nnue-threat")]
-const HAS_EXCLUDED_PAIRS: bool = {
-    let mut i = 0;
-    let mut has_excluded = false;
-    while i < NUM_PAIRS {
-        if PAIR_DATA.0[i] == EXCLUDED_PAIR_BASE {
-            has_excluded = true;
-            break;
-        }
-        i += 1;
-    }
-    has_excluded
-};
-
-/// 照合用の pair_base 計算。除外された pair は None を返す。
-#[cfg(all(test, feature = "nnue-threat"))]
+/// pair_base を取得。除外された pair は None を返す。
+///
+/// Profile 0 (除外なし) では `EXCLUDED_PAIR_BASE` が存在しないため、
+/// `cfg!()` でチェック自体をコンパイル時に除去し、Option の unwrap 分岐を LLVM に消させる。
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 #[inline]
 fn pair_base(
     attacker_side: usize,
@@ -420,8 +398,6 @@ fn pair_base(
     if cfg!(any(
         feature = "threat-profile-same-class",
         feature = "threat-profile-same-class-major-pawn",
-        feature = "threat-profile-step-attacker",
-        feature = "threat-profile-cross-side",
     )) && base == EXCLUDED_PAIR_BASE
     {
         None
@@ -431,7 +407,7 @@ fn pair_base(
 }
 
 // =============================================================================
-// attack_offset テーブル（色別 LUT）
+// from_offset テーブル + attack_order（色別 LUT、Stockfish 準拠）
 // =============================================================================
 
 /// 方向性駒かどうか
@@ -478,7 +454,6 @@ fn attacks_count(class: ThreatClass, sq: Square) -> usize {
 }
 
 /// from_offset[class][sq] = sq=0..sq-1 の攻撃数累積和
-#[cfg(test)]
 fn compute_from_offset_colored(class: ThreatClass, color: Color) -> [usize; 81] {
     let mut offsets = [0usize; 81];
     let mut cumulative = 0usize;
@@ -497,7 +472,6 @@ fn compute_from_offset_colored(class: ThreatClass, color: Color) -> [usize; 81] 
 const NUM_ATTACK_PATTERNS: usize = 14;
 
 /// FromOffsetTable の LazyLock キャッシュ
-#[cfg(all(test, feature = "nnue-threat"))]
 static FROM_OFFSET_TABLE: LazyLock<FromOffsetTable> = LazyLock::new(FromOffsetTable::new);
 
 fn attack_pattern_id(class: ThreatClass, oriented_color: Color) -> usize {
@@ -509,12 +483,10 @@ fn attack_pattern_id(class: ThreatClass, oriented_color: Color) -> usize {
 }
 
 /// 全 attack pattern の from_offset テーブル
-#[cfg(all(test, feature = "nnue-threat"))]
 struct FromOffsetTable {
     data: [[usize; 81]; NUM_ATTACK_PATTERNS],
 }
 
-#[cfg(all(test, feature = "nnue-threat"))]
 impl FromOffsetTable {
     fn new() -> Self {
         let mut data = [[0usize; 81]; NUM_ATTACK_PATTERNS];
@@ -538,7 +510,7 @@ impl FromOffsetTable {
 
 /// attack_order: from_sq の攻撃先を raw 昇順で列挙したときの to_sq の順位（色別）
 ///
-/// テスト用。
+/// テスト用。ホットパスでは `AttackOrderTable` の LUT を使用する。
 #[cfg(test)]
 fn compute_attack_order_colored(
     class: ThreatClass,
@@ -566,15 +538,18 @@ fn compute_attack_order_colored(
     );
 }
 
-/// 空盤面の利きに対する pattern 内のオフセット。利きがない組は `INVALID`。
+/// attack_order の事前計算 LUT
 ///
-/// サイズ: 14 × 81 × 81 × 2 = 183,708 bytes ≈ 179 KiB
-struct AttackOffsetTable {
-    data: [[[u16; 81]; 81]; NUM_ATTACK_PATTERNS],
+/// `data[attack_pattern][from_sq][to_sq]` = 空盤面上で from_sq の駒が to_sq を攻撃する際の
+/// 0-indexed 順位。攻撃しない (from, to) ペアは `INVALID` (u8::MAX)。
+///
+/// サイズ: 14 × 81 × 81 = 91,854 bytes ≈ 90 KiB
+struct AttackOrderTable {
+    data: [[[u8; 81]; 81]; NUM_ATTACK_PATTERNS],
 }
 
-impl AttackOffsetTable {
-    const INVALID: u16 = u16::MAX;
+impl AttackOrderTable {
+    const INVALID: u8 = u8::MAX;
 
     fn new() -> Self {
         let mut data = [[[Self::INVALID; 81]; 81]; NUM_ATTACK_PATTERNS];
@@ -589,64 +564,38 @@ impl AttackOffsetTable {
         Self { data }
     }
 
-    fn fill_pattern(table: &mut [[u16; 81]; 81], class: ThreatClass, color: Color) {
-        // 1 pattern は最大でも 81 × 81 組なので u16::MAX には届かない。
-        let mut offset = 0u16;
-        for (from_raw, row) in table.iter_mut().enumerate() {
-            let from_sq = Square::from_u8(from_raw as u8).unwrap();
-            let mut attacks = attacks_bb_colored(class, color, from_sq);
-            while !attacks.is_empty() {
-                row[attacks.pop().index()] = offset;
-                offset += 1;
+    fn fill_pattern(table: &mut [[u8; 81]; 81], class: ThreatClass, color: Color) {
+        for from_raw in 0..81u8 {
+            let from_sq = Square::from_u8(from_raw).unwrap();
+            let bb = attacks_bb_colored(class, color, from_sq);
+            let mut order: u8 = 0;
+            let mut iter = bb;
+            while !iter.is_empty() {
+                let to_sq = iter.pop();
+                table[from_raw as usize][to_sq.raw() as usize] = order;
+                order += 1;
             }
         }
     }
 
     #[inline]
-    fn get(&self, pattern: usize, from_sq: Square, to_sq: Square) -> u16 {
-        self.data[pattern][from_sq.index()][to_sq.index()]
+    fn get(&self, pattern: usize, from_sq: Square, to_sq: Square) -> u8 {
+        self.data[pattern][from_sq.raw() as usize][to_sq.raw() as usize]
     }
 }
 
-static ATTACK_OFFSET_TABLE: LazyLock<AttackOffsetTable> = LazyLock::new(AttackOffsetTable::new);
+/// AttackOrderTable の LazyLock キャッシュ
+static ATTACK_ORDER_TABLE: LazyLock<AttackOrderTable> = LazyLock::new(AttackOrderTable::new);
+
+// =============================================================================
+// Threat index 計算ヘルパ
+// =============================================================================
 
 // =============================================================================
 // Threat index 計算
 // =============================================================================
 
-/// full-symdedup profile: この edge が canonical-dead か（emit 時に落とす対象）。
-///
-/// 逆向き edge (`attacked_class @ to_sq, target_color` が `from_sq` を攻撃) がこの
-/// edge の active な全局面で必ず active な「相互含意」edge のうち、視点非依存の
-/// canonical 規則で落とす側だけを true とする。判定は raw 座標・実色で行い、両
-/// perspective で同一 edge を落とすので STM/NSTM 対称性は保たれる。
-///
-/// necessarily-mutual は「逆向き駒が空盤面で `from_sq` に届くか」= index 算出用
-/// `ATTACK_OFFSET_TABLE` の逆引き（O(1)、active edge は from→to 区間が空なので実盤面
-/// 到達と一致）。
-///
-/// tie-break は perspective swap と HM (Half-Mirror) file 反転のどちらでも不変な量で
-/// なければならない（正規化後の index を両視点で突き合わせるため）。`ThreatClass`
-/// discriminant の大小はミラー・回転・視点反転いずれにも不変なので、class が違う pair
-/// は大きい class を attacker とする側を残し小さい側 (`ac < dc`) を dead にする。同
-/// class pair は raw マス番号でしか順序付けできず、raw file 順は HM ミラーで反転する
-/// （ミラー等価な 2 局面で残す側が逆転し正規化 index 空間の HM 等価性・dead 保証が
-/// 壊れる）ため dedup せず両側を emit する。
-#[cfg(feature = "nnue-threat")]
-#[inline]
-fn is_canonical_dead(
-    attacker_class: ThreatClass,
-    from_sq: Square,
-    attacked_class: ThreatClass,
-    target_color: Color,
-    to_sq: Square,
-) -> bool {
-    let rev_pattern = attack_pattern_id(attacked_class, target_color);
-    let mutual = ATTACK_OFFSET_TABLE.get(rev_pattern, to_sq, from_sq) != AttackOffsetTable::INVALID;
-    mutual && (attacker_class as u8) < (attacked_class as u8)
-}
-
-/// 照合用の Threat index 計算（perspective 基準 + 色別 LUT）
+/// Threat index を計算する（Stockfish 準拠: perspective 基準 + 色別 LUT）
 ///
 /// 除外された pair の場合は `None` を返す。
 ///
@@ -659,9 +608,9 @@ fn is_canonical_dead(
 /// - `from_sq_n`: 正規化後の攻撃駒のマス
 /// - `to_sq_n`: 正規化後の被攻撃駒のマス
 /// - `from_offset_table`: 事前計算された from_offset テーブル
-#[cfg(all(test, feature = "nnue-threat"))]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 #[inline]
-fn threat_index_reference(
+fn threat_index(
     attacker_side: usize,
     attacker_class: ThreatClass,
     oriented_color: Color,
@@ -674,106 +623,33 @@ fn threat_index_reference(
     let base = pair_base(attacker_side, attacker_class, attacked_side, attacked_class)?;
     let pattern = attack_pattern_id(attacker_class, oriented_color);
     let from_off = from_offset_table.get(pattern, from_sq_n);
-    let attack_ord =
-        compute_attack_order_colored(attacker_class, oriented_color, from_sq_n, to_sq_n);
-    Some(base + from_off + attack_ord)
+    let attack_ord = ATTACK_ORDER_TABLE.get(pattern, from_sq_n, to_sq_n);
+    debug_assert_ne!(
+        attack_ord,
+        AttackOrderTable::INVALID,
+        "attack_order: to_sq {} is not attacked by pattern {pattern} at {}",
+        to_sq_n.raw(),
+        from_sq_n.raw()
+    );
+    Some(base + from_off + attack_ord as usize)
 }
 
 // =============================================================================
 // マス正規化
 // =============================================================================
 
-/// マスを perspective 基準 + HM mirror で正規化
+/// マスを perspective 基準 + HM mirror で正規化（Stockfish 準拠）
 ///
-/// HalfKaHmMerged と同じ perspective 基準。
+/// HalfKA_hm と同じ perspective 基準。
 /// 方向性駒の利き方向の整合は、色別 attack LUT で解決する。
-#[cfg(all(test, feature = "nnue-threat"))]
 #[inline]
-fn normalize_sq_reference(sq: Square, perspective: Color, hm_mirror: bool) -> Square {
+pub(crate) fn normalize_sq(sq: Square, perspective: Color, hm_mirror: bool) -> Square {
     let sq_n = if perspective == Color::Black {
         sq
     } else {
         sq.inverse()
     };
     if hm_mirror { sq_n.mirror() } else { sq_n }
-}
-
-#[cfg(feature = "nnue-threat")]
-static NORMALIZED_SQUARES: [[[Square; 81]; 2]; 2] = {
-    let mut table = [[[Square::SQ_11; 81]; 2]; 2];
-    let mut raw = 0;
-    while raw < 81 {
-        let sq = Square::from_u8(raw as u8).unwrap();
-        table[Color::Black.index()][0][raw] = sq;
-        table[Color::Black.index()][1][raw] = sq.mirror();
-        table[Color::White.index()][0][raw] = sq.inverse();
-        table[Color::White.index()][1][raw] = sq.inverse().mirror();
-        raw += 1;
-    }
-    table
-};
-
-#[cfg(feature = "nnue-threat")]
-struct ThreatIndexContext {
-    perspective: Color,
-    normalized: &'static [Square; 81],
-    attack_offsets: &'static AttackOffsetTable,
-}
-
-#[cfg(feature = "nnue-threat")]
-impl ThreatIndexContext {
-    #[inline]
-    fn new(perspective: Color, hm: bool) -> Self {
-        Self {
-            perspective,
-            normalized: &NORMALIZED_SQUARES[perspective.index()][usize::from(hm)],
-            attack_offsets: &ATTACK_OFFSET_TABLE,
-        }
-    }
-
-    #[inline]
-    fn source(&self, color: Color, class: ThreatClass, from: Square) -> ThreatSource {
-        let attacker_side = usize::from(color != self.perspective);
-        let oriented_color = if color == self.perspective {
-            Color::Black
-        } else {
-            Color::White
-        };
-        let pattern = attack_pattern_id(class, oriented_color);
-        let from = self.normalized[from.index()];
-        let pair_row = attacker_side * NUM_THREAT_CLASSES + class as usize;
-        ThreatSource {
-            perspective: self.perspective,
-            normalized: self.normalized,
-            pair_bases: &PAIR_BASE.as_chunks::<{ 2 * NUM_THREAT_CLASSES }>().0[pair_row],
-            attack_offsets: &self.attack_offsets.data[pattern][from.index()],
-        }
-    }
-}
-
-#[cfg(feature = "nnue-threat")]
-#[derive(Clone, Copy)]
-struct ThreatSource {
-    perspective: Color,
-    normalized: &'static [Square; 81],
-    pair_bases: &'static [usize; 2 * NUM_THREAT_CLASSES],
-    attack_offsets: &'static [u16; 81],
-}
-
-#[cfg(feature = "nnue-threat")]
-impl ThreatSource {
-    #[inline]
-    fn index(&self, target_color: Color, target_class: ThreatClass, to: Square) -> Option<usize> {
-        let attacked_side = usize::from(target_color != self.perspective);
-        let base = self.pair_bases[attacked_side * NUM_THREAT_CLASSES + target_class as usize];
-        if HAS_EXCLUDED_PAIRS && base == EXCLUDED_PAIR_BASE {
-            return None;
-        }
-
-        let offset = self.attack_offsets[self.normalized[to.index()].index()];
-        debug_assert_ne!(offset, AttackOffsetTable::INVALID);
-        Some(base + usize::from(offset))
-    }
 }
 
 // =============================================================================
@@ -783,7 +659,7 @@ impl ThreatSource {
 /// 現局面の全 threat pair を列挙し、indices に追加する（テスト用）。
 ///
 /// ホットパスでは `for_each_active_threat_index` を使用する。
-#[cfg(all(test, feature = "nnue-threat"))]
+#[cfg(all(test, any(feature = "nnue-threat", feature = "nnue-scalar-threat")))]
 pub fn append_active_threat_indices(
     pos: &Position,
     perspective: Color,
@@ -828,14 +704,9 @@ pub fn append_active_threat_indices(
 
                 let attacked_side = if target_color == friend_color { 0 } else { 1 };
 
-                #[cfg(feature = "threat-profile-full-symdedup")]
-                if is_canonical_dead(attacker_class, from_sq, attacked_class, target_color, to_sq) {
-                    continue;
-                }
-
-                // Perspective 基準で正規化
-                let from_sq_n = normalize_sq_reference(from_sq, perspective, hm);
-                let to_sq_n = normalize_sq_reference(to_sq, perspective, hm);
+                // Perspective 基準で正規化（Stockfish 準拠）
+                let from_sq_n = normalize_sq(from_sq, perspective, hm);
+                let to_sq_n = normalize_sq(to_sq, perspective, hm);
 
                 // oriented_color: perspective swap 後の attacker 色
                 // perspective=Black なら attacker_color そのまま
@@ -846,7 +717,7 @@ pub fn append_active_threat_indices(
                     !attacker_color
                 };
 
-                let Some(idx) = threat_index_reference(
+                let Some(idx) = threat_index(
                     attacker_side,
                     attacker_class,
                     oriented_color,
@@ -871,7 +742,7 @@ pub fn append_active_threat_indices(
 }
 
 /// 駒種・色・マス・occupied から実盤面上の攻撃先 Bitboard を取得
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 fn attacks_from_piece(pt: PieceType, color: Color, sq: Square, occupied: Bitboard) -> Bitboard {
     match pt {
         PieceType::Pawn => pawn_effect(color, sq),
@@ -895,7 +766,7 @@ fn attacks_from_piece(pt: PieceType, color: Color, sq: Square, occupied: Bitboar
 ///
 /// このグループの attack_bb は `occupied` 引数を無視するため、
 /// before/after で盤面が変わっても同一結果を返せる。
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 #[inline]
 fn is_occupied_independent_threat(pt: PieceType) -> bool {
     matches!(
@@ -918,7 +789,7 @@ fn is_occupied_independent_threat(pt: PieceType) -> bool {
 /// 現局面の全 threat pair を列挙し、コールバック `f` に index を渡す。
 ///
 /// `append_active_threat_indices` と同一ロジックだが、Vec 不要でホットパスで使用可能。
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 #[inline]
 pub fn for_each_active_threat_index<F: FnMut(usize)>(
     pos: &Position,
@@ -926,13 +797,14 @@ pub fn for_each_active_threat_index<F: FnMut(usize)>(
     king_sq: Square,
     mut f: F,
 ) {
-    count_threat_full!();
     let hm = is_hm_mirror(king_sq, perspective);
     let occupied = pos.occupied();
-    let context = ThreatIndexContext::new(perspective, hm);
+    let from_offset_table = &*FROM_OFFSET_TABLE;
     let friend_color = perspective;
 
     for &attacker_color in &[friend_color, !friend_color] {
+        let attacker_side = if attacker_color == friend_color { 0 } else { 1 };
+
         let mut attacker_bb = pos.pieces_c(attacker_color);
         while !attacker_bb.is_empty() {
             let from_sq = attacker_bb.pop();
@@ -945,10 +817,6 @@ pub fn for_each_active_threat_index<F: FnMut(usize)>(
 
             let attack_bb = attacks_from_piece(pt, attacker_color, from_sq, occupied);
             let mut targets = attack_bb & occupied;
-            if targets.is_empty() {
-                continue;
-            }
-            let source = context.source(attacker_color, attacker_class, from_sq);
             while !targets.is_empty() {
                 let to_sq = targets.pop();
                 let target_pc = pos.piece_on(to_sq);
@@ -959,90 +827,29 @@ pub fn for_each_active_threat_index<F: FnMut(usize)>(
                 };
 
                 let target_color = target_pc.color();
+                let attacked_side = if target_color == friend_color { 0 } else { 1 };
+                let from_sq_n = normalize_sq(from_sq, perspective, hm);
+                let to_sq_n = normalize_sq(to_sq, perspective, hm);
+                let oriented_color = if perspective == Color::Black {
+                    attacker_color
+                } else {
+                    !attacker_color
+                };
 
-                if cfg!(feature = "threat-profile-full-symdedup")
-                    && is_canonical_dead(
-                        attacker_class,
-                        from_sq,
-                        attacked_class,
-                        target_color,
-                        to_sq,
-                    )
-                {
-                    continue;
-                }
-
-                let Some(idx) = source.index(target_color, attacked_class, to_sq) else {
-                    continue;
+                let Some(idx) = threat_index(
+                    attacker_side,
+                    attacker_class,
+                    oriented_color,
+                    attacked_side,
+                    attacked_class,
+                    from_sq_n,
+                    to_sq_n,
+                    from_offset_table,
+                ) else {
+                    continue; // excluded pair
                 };
                 debug_assert!(idx < THREAT_DIMENSIONS);
                 f(idx);
-            }
-        }
-    }
-}
-
-/// 物理的な threat pair を一度列挙し、両視点の index を渡す。
-#[cfg(feature = "nnue-threat")]
-#[inline]
-pub fn for_each_active_threat_index_both<F: FnMut(Color, usize)>(pos: &Position, mut f: F) {
-    count_threat_full!();
-    count_threat_full!();
-    let contexts = [Color::Black, Color::White]
-        .map(|p| ThreatIndexContext::new(p, is_hm_mirror(pos.king_square(p), p)));
-    let occupied = pos.occupied();
-
-    for attacker_color in [Color::Black, Color::White] {
-        let mut attacker_bb = pos.pieces_c(attacker_color);
-        while !attacker_bb.is_empty() {
-            let from_sq = attacker_bb.pop();
-            let pc = pos.piece_on(from_sq);
-            let pt = pc.piece_type();
-
-            let Some(attacker_class) = ThreatClass::from_piece_type(pt) else {
-                continue;
-            };
-
-            let attack_bb = attacks_from_piece(pt, attacker_color, from_sq, occupied);
-            let mut targets = attack_bb & occupied;
-            if targets.is_empty() {
-                continue;
-            }
-            let sources = contexts
-                .each_ref()
-                .map(|ctx| ctx.source(attacker_color, attacker_class, from_sq));
-            while !targets.is_empty() {
-                let to_sq = targets.pop();
-                let target_pc = pos.piece_on(to_sq);
-                let target_pt = target_pc.piece_type();
-
-                let Some(attacked_class) = ThreatClass::from_piece_type(target_pt) else {
-                    continue;
-                };
-
-                let target_color = target_pc.color();
-
-                if cfg!(feature = "threat-profile-full-symdedup")
-                    && is_canonical_dead(
-                        attacker_class,
-                        from_sq,
-                        attacked_class,
-                        target_color,
-                        to_sq,
-                    )
-                {
-                    continue;
-                }
-
-                for perspective in [Color::Black, Color::White] {
-                    let Some(idx) =
-                        sources[perspective.index()].index(target_color, attacked_class, to_sq)
-                    else {
-                        continue;
-                    };
-                    debug_assert!(idx < THREAT_DIMENSIONS);
-                    f(perspective, idx);
-                }
             }
         }
     }
@@ -1054,10 +861,10 @@ pub fn for_each_active_threat_index_both<F: FnMut(Color, usize)>(pos: &Position,
 
 /// BonaPiece (fb perspective) から盤上駒のマスを抽出する。
 /// 手駒・ZERO は None。King も含む（占有ビット再構成用）。
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 pub(crate) fn decode_board_square_fb(bp: BonaPiece) -> Option<Square> {
     use super::bona_piece::{FE_END, FE_HAND_END};
-    use super::bona_piece_halfka_hm_merged::{E_KING, F_KING};
+    use super::bona_piece_halfka_hm::{E_KING, F_KING};
 
     let v = bp.value() as usize;
     if v == 0 {
@@ -1081,7 +888,7 @@ pub(crate) fn decode_board_square_fb(bp: BonaPiece) -> Option<Square> {
 
 /// BonaPiece (fb perspective) から Threat 駒情報をデコードする。
 /// King・手駒・ZERO は None。
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 pub(crate) fn decode_board_threat_info_fb(
     bp: BonaPiece,
 ) -> Option<(Color, ThreatClass, PieceType, Square)> {
@@ -1143,288 +950,12 @@ pub(crate) fn decode_board_threat_info_fb(
     Some((color, class, pt, sq))
 }
 
-/// 現局面から未評価の手を逆順に戻し、触れた升の駒だけを上書きする。
-#[cfg(all(feature = "nnue-threat", any(test, feature = "layerstack-arch")))]
-pub(crate) struct ThreatAncestor<'a> {
-    pos: &'a Position,
-    pieces: [Piece; 81],
-    touched: Bitboard,
-    occupied: Bitboard,
-    kings: [Square; 2],
-}
-
-#[cfg(all(feature = "nnue-threat", any(test, feature = "layerstack-arch")))]
-impl<'a> ThreatAncestor<'a> {
-    pub(crate) fn new(pos: &'a Position) -> Self {
-        Self {
-            pos,
-            pieces: [Piece::NONE; 81],
-            touched: Bitboard::EMPTY,
-            occupied: pos.occupied(),
-            kings: [pos.king_square(Color::Black), pos.king_square(Color::White)],
-        }
-    }
-
-    pub(crate) fn undo(&mut self, dirty: &DirtyPiece) {
-        for cp in &dirty.changed_piece[..dirty.dirty_num as usize] {
-            if let Some(sq) = decode_board_square_fb(cp.new_piece.fb) {
-                self.pieces[sq.index()] = Piece::NONE;
-                self.touched.set(sq);
-                self.occupied.clear(sq);
-            }
-        }
-        // 捕獲先は old/new で重複するため、消去と復元を分離する。
-        for cp in &dirty.changed_piece[..dirty.dirty_num as usize] {
-            if let Some(sq) = decode_board_square_fb(cp.old_piece.fb) {
-                let pc =
-                    if let Some((color, _, pt, _)) = decode_board_threat_info_fb(cp.old_piece.fb) {
-                        Piece::new(color, pt)
-                    } else {
-                        let color = if cp.old_piece.fb.value() as usize >= E_KING {
-                            Color::White
-                        } else {
-                            Color::Black
-                        };
-                        self.kings[color.index()] = sq;
-                        Piece::new(color, PieceType::King)
-                    };
-                self.pieces[sq.index()] = pc;
-                self.touched.set(sq);
-                self.occupied.set(sq);
-            }
-        }
-    }
-
-    pub(crate) fn same_mirror(&self, perspective: Color) -> bool {
-        is_hm_mirror(self.kings[perspective.index()], perspective)
-            == is_hm_mirror(self.pos.king_square(perspective), perspective)
-    }
-
-    fn changed_squares(&self) -> Bitboard {
-        let mut touched = self.touched;
-        let mut changed = Bitboard::EMPTY;
-        while !touched.is_empty() {
-            let sq = touched.pop();
-            if self.pieces[sq.index()] != canonical_piece(self.pos.piece_on(sq)) {
-                changed.set(sq);
-            }
-        }
-        changed
-    }
-}
-
-#[cfg(all(feature = "nnue-threat", any(test, feature = "layerstack-arch")))]
-fn canonical_piece(pc: Piece) -> Piece {
-    if pc.is_none() {
-        return pc;
-    }
-    match pc.piece_type() {
-        PieceType::ProPawn | PieceType::ProLance | PieceType::ProKnight | PieceType::ProSilver => {
-            Piece::new(pc.color(), PieceType::Gold)
-        }
-        _ => pc,
-    }
-}
-
-#[cfg(all(feature = "nnue-threat", any(test, feature = "layerstack-arch")))]
-fn threat_short_attackers(pos: &Position, sq: Square) -> Bitboard {
-    let pawns = pos.pieces_pt(PieceType::Pawn);
-    let knights = pos.pieces_pt(PieceType::Knight);
-    let silvers = pos.pieces_pt(PieceType::Silver);
-    let golds = pos.golds();
-    let majors = (ROOK_STEP[sq.index()] & pos.pieces_pt(PieceType::Horse))
-        | (BISHOP_STEP[sq.index()] & pos.pieces_pt(PieceType::Dragon));
-    let steps = |color: Color| {
-        ((pawn_effect(!color, sq) & pawns)
-            | (knight_effect(!color, sq) & knights)
-            | (silver_effect(!color, sq) & silvers)
-            | (gold_effect(!color, sq) & golds))
-            & pos.pieces_c(color)
-    };
-    steps(Color::Black) | steps(Color::White) | (king_effect(sq) & majors)
-}
-
-#[cfg(all(feature = "nnue-threat", any(test, feature = "layerstack-arch")))]
-#[inline]
-fn append_threat_edge(
-    from: Square,
-    ac: ThreatClass,
-    to: Square,
-    target: Piece,
-    sources: impl FnOnce() -> [ThreatSource; 2],
-    output: &mut [IndexList<MAX_CHANGED_THREAT_FEATURES>; 2],
-) -> bool {
-    let Some(dc) = ThreatClass::from_piece_type(target.piece_type()) else {
-        return true;
-    };
-    let target_color = target.color();
-    if cfg!(feature = "threat-profile-full-symdedup")
-        && is_canonical_dead(ac, from, dc, target_color, to)
-    {
-        return true;
-    }
-    for (source, output) in sources().into_iter().zip(output) {
-        let Some(index) = source.index(target_color, dc, to) else {
-            continue;
-        };
-        if output.len() == MAX_CHANGED_THREAT_FEATURES || !output.push(index) {
-            return false;
-        }
-    }
-    true
-}
-
-/// 祖先と現局面の物理差分を一度列挙し、両視点の index に変換する。
-#[cfg(all(feature = "nnue-threat", any(test, feature = "layerstack-arch")))]
-pub(crate) fn append_threat_endpoint_diff(
-    before: &ThreatAncestor<'_>,
-    removed: &mut [IndexList<MAX_CHANGED_THREAT_FEATURES>; 2],
-    added: &mut [IndexList<MAX_CHANGED_THREAT_FEATURES>; 2],
-) -> bool {
-    let changed = before.changed_squares();
-    if changed.is_empty() {
-        return true;
-    }
-    count_threat_diff!();
-    let pos = before.pos;
-    let old_occ = before.occupied;
-    let new_occ = pos.occupied();
-    let occupied = old_occ | new_occ;
-    let occupancy_changed = old_occ ^ new_occ;
-    let unchanged = new_occ & !changed;
-    let contexts = [Color::Black, Color::White]
-        .map(|p| ThreatIndexContext::new(p, is_hm_mirror(pos.king_square(p), p)));
-    let sources_for =
-        |from, color, class| contexts.each_ref().map(|ctx| ctx.source(color, class, from));
-    let mut visited = Bitboard::EMPTY;
-    let mut squares = changed;
-    while !squares.is_empty() {
-        let sq = squares.pop();
-        let old_pc = before.pieces[sq.index()];
-        let new_pc = pos.piece_on(sq);
-        let bishop_sources = BISHOP_STEP[sq.index()] & unchanged & pos.bishop_horse();
-        let rook_sources = ROOK_STEP[sq.index()]
-            & unchanged
-            & (pos.rook_dragon()
-                | (lance_step_effect(Color::White, sq)
-                    & pos.pieces(Color::Black, PieceType::Lance))
-                | (lance_step_effect(Color::Black, sq)
-                    & pos.pieces(Color::White, PieceType::Lance)));
-        let sliders = bishop_sources | rook_sources;
-        let is_threat_piece = |pc: Piece| !pc.is_none() && pc.piece_type() != PieceType::King;
-        let short_attackers = if is_threat_piece(old_pc) || is_threat_piece(new_pc) {
-            threat_short_attackers(pos, sq) & unchanged
-        } else {
-            Bitboard::EMPTY
-        };
-
-        let mut nearest = Bitboard::EMPTY;
-        if bishop_sources.is_not_empty() {
-            nearest |= bishop_effect(sq, occupied) & occupied;
-        }
-        if rook_sources.is_not_empty() {
-            nearest |= rook_effect(sq, occupied) & occupied;
-        }
-        // 両端にいる最初の駒より奥の占有差分は、この升への利きに影響しない。
-        let common = nearest & !occupancy_changed;
-        let mut old_nearest = common;
-        let mut new_nearest = common;
-        let mut differing = nearest & occupancy_changed;
-        while !differing.is_empty() {
-            let blocker = differing.pop();
-            let dir = direct_of(sq, blocker).unwrap();
-            if old_occ.contains(blocker) {
-                old_nearest.set(blocker);
-                new_nearest |= ray_effect(dir, sq, new_occ) & new_occ;
-            } else {
-                new_nearest.set(blocker);
-                old_nearest |= ray_effect(dir, sq, old_occ) & old_occ;
-            }
-        }
-
-        for (pc, occ, nearest, is_before, output) in [
-            (old_pc, old_occ, old_nearest, true, &mut *removed),
-            (new_pc, new_occ, new_nearest, false, &mut *added),
-        ] {
-            let sliding_attackers = nearest & sliders;
-            if pc.is_none() {
-                // この端点で空いている升を挟む辺は、反対側の端点では必ず遮られる。
-                let mut sources = sliding_attackers;
-                while !sources.is_empty() {
-                    let from = sources.pop();
-                    let dir = direct_of(from, sq).unwrap();
-                    let targets = ray_effect(dir, sq, Bitboard::EMPTY) & nearest & unchanged;
-                    let Some(to) = targets.lsb() else {
-                        continue;
-                    };
-                    if visited.is_not_empty()
-                        && (visited & between_bb_aligned(from, to)).is_not_empty()
-                    {
-                        continue;
-                    }
-                    let source = pos.piece_on(from);
-                    let class = ThreatClass::from_piece_type(source.piece_type()).unwrap();
-                    if !append_threat_edge(
-                        from,
-                        class,
-                        to,
-                        pos.piece_on(to),
-                        || sources_for(from, source.color(), class),
-                        output,
-                    ) {
-                        return false;
-                    }
-                }
-            } else if let Some(class) = ThreatClass::from_piece_type(pc.piece_type()) {
-                let color = pc.color();
-                let mut targets = attacks_from_piece(pc.piece_type(), color, sq, occ) & occ;
-                if targets.is_not_empty() {
-                    let sources = sources_for(sq, color, class);
-                    while !targets.is_empty() {
-                        let to = targets.pop();
-                        let target = if is_before && changed.contains(to) {
-                            before.pieces[to.index()]
-                        } else {
-                            pos.piece_on(to)
-                        };
-                        if !append_threat_edge(sq, class, to, target, || sources, output) {
-                            return false;
-                        }
-                    }
-                }
-                // 変化升を始点とする辺は、その升から出る辺の列挙に任せる。
-                let mut sources = short_attackers | sliding_attackers;
-                while !sources.is_empty() {
-                    let from = sources.pop();
-                    let source = pos.piece_on(from);
-                    let class = ThreatClass::from_piece_type(source.piece_type()).unwrap();
-                    if !append_threat_edge(
-                        from,
-                        class,
-                        sq,
-                        pc,
-                        || sources_for(from, source.color(), class),
-                        output,
-                    ) {
-                        return false;
-                    }
-                }
-            }
-        }
-        // 同じ辺を複数の空き升から見つけたときは、最初の升だけで列挙する。
-        if occupancy_changed.contains(sq) {
-            visited.set(sq);
-        }
-    }
-    true
-}
-
 // =============================================================================
 // append_changed_indices（Threat 差分生成）
 // =============================================================================
 
 /// 差分更新の dirty piece エントリ（before 状態の駒情報）
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 struct ThreatEntry {
     sq: Square,
     color: Color,
@@ -1436,7 +967,7 @@ struct ThreatEntry {
 ///
 /// source squares (典型 10-30) × targets per source (典型 2-8) の上限。
 /// debug build で実測し、オーバーフローが無いことを確認する。
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 const MAX_INTERMEDIATE_THREATS: usize = 512;
 
 /// DirtyPiece から Threat 特徴量の差分（removed / added）を計算する。
@@ -1455,7 +986,7 @@ const MAX_INTERMEDIATE_THREATS: usize = 512;
 ///    moved/captured 駒は changed_bb に含まれるため実害なし。）
 /// 3. 各 source square の before/after threat pair を列挙
 /// 4. ソート + マージで set difference → removed / added
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 pub fn append_changed_threat_indices(
     pos: &Position,
     dirty_piece: &DirtyPiece,
@@ -1467,10 +998,10 @@ pub fn append_changed_threat_indices(
     if dirty_piece.dirty_num == 0 {
         return true;
     }
-    count_threat_diff!();
 
     let hm = is_hm_mirror(king_sq, perspective);
-    let context = ThreatIndexContext::new(perspective, hm);
+    let from_offset_table = &*FROM_OFFSET_TABLE;
+    let friend_color = perspective;
     let after_occ = pos.occupied();
 
     // ---------------------------------------------------------------
@@ -1584,10 +1115,16 @@ pub fn append_changed_threat_indices(
                 // from_piece_type は必ず Some。
                 let class = ThreatClass::from_piece_type(pt).expect("leaper class");
                 let color = pc.color();
-                let source = context.source(color, class, sq_s);
+                let attacker_side = if color == friend_color { 0 } else { 1 };
+                let oriented_color = if perspective == Color::Black {
+                    color
+                } else {
+                    !color
+                };
                 // occupied 非依存なので EMPTY を渡す
                 let attack_bb = attacks_from_piece(pt, color, sq_s, Bitboard::EMPTY);
                 let candidate_targets = attack_bb & changed_bb;
+                let from_sq_n = normalize_sq(sq_s, perspective, hm);
 
                 // --- Before 側: candidate ∩ before_occ ---
                 let mut bt = candidate_targets & before_occ;
@@ -1601,12 +1138,18 @@ pub fn append_changed_threat_indices(
                         new_count,
                         pos,
                     ) {
-                        if cfg!(feature = "threat-profile-full-symdedup")
-                            && is_canonical_dead(class, sq_s, t.class, t.color, to_sq)
-                        {
-                            continue;
-                        }
-                        if let Some(idx) = source.index(t.color, t.class, to_sq) {
+                        let attacked_side = if t.color == friend_color { 0 } else { 1 };
+                        let to_sq_n = normalize_sq(to_sq, perspective, hm);
+                        if let Some(idx) = threat_index(
+                            attacker_side,
+                            class,
+                            oriented_color,
+                            attacked_side,
+                            t.class,
+                            from_sq_n,
+                            to_sq_n,
+                            from_offset_table,
+                        ) {
                             if before_len >= MAX_INTERMEDIATE_THREATS {
                                 overflow = true;
                                 break;
@@ -1631,12 +1174,18 @@ pub fn append_changed_threat_indices(
                     let target_pt = target_pc.piece_type();
                     if let Some(target_class) = ThreatClass::from_piece_type(target_pt) {
                         let target_color = target_pc.color();
-                        if cfg!(feature = "threat-profile-full-symdedup")
-                            && is_canonical_dead(class, sq_s, target_class, target_color, to_sq)
-                        {
-                            continue;
-                        }
-                        if let Some(idx) = source.index(target_color, target_class, to_sq) {
+                        let attacked_side = if target_color == friend_color { 0 } else { 1 };
+                        let to_sq_n = normalize_sq(to_sq, perspective, hm);
+                        if let Some(idx) = threat_index(
+                            attacker_side,
+                            class,
+                            oriented_color,
+                            attacked_side,
+                            target_class,
+                            from_sq_n,
+                            to_sq_n,
+                            from_offset_table,
+                        ) {
                             if after_len >= MAX_INTERMEDIATE_THREATS {
                                 overflow = true;
                                 break;
@@ -1659,7 +1208,12 @@ pub fn append_changed_threat_indices(
         if let Some(info) =
             lookup_piece_before(sq_s, &old_entries, old_count, &new_entries, new_count, pos)
         {
-            let source = context.source(info.color, info.class, sq_s);
+            let attacker_side = if info.color == friend_color { 0 } else { 1 };
+            let oriented_color = if perspective == Color::Black {
+                info.color
+            } else {
+                !info.color
+            };
             let attacks = attacks_from_piece(info.pt, info.color, sq_s, before_occ);
             let mut targets = attacks & before_occ;
             while !targets.is_empty() {
@@ -1672,12 +1226,19 @@ pub fn append_changed_threat_indices(
                     new_count,
                     pos,
                 ) {
-                    if cfg!(feature = "threat-profile-full-symdedup")
-                        && is_canonical_dead(info.class, sq_s, t.class, t.color, to_sq)
-                    {
-                        continue;
-                    }
-                    if let Some(idx) = source.index(t.color, t.class, to_sq) {
+                    let attacked_side = if t.color == friend_color { 0 } else { 1 };
+                    let from_sq_n = normalize_sq(sq_s, perspective, hm);
+                    let to_sq_n = normalize_sq(to_sq, perspective, hm);
+                    if let Some(idx) = threat_index(
+                        attacker_side,
+                        info.class,
+                        oriented_color,
+                        attacked_side,
+                        t.class,
+                        from_sq_n,
+                        to_sq_n,
+                        from_offset_table,
+                    ) {
                         if before_len >= MAX_INTERMEDIATE_THREATS {
                             overflow = true;
                             break;
@@ -1698,7 +1259,12 @@ pub fn append_changed_threat_indices(
             let pt = pc.piece_type();
             if let Some(class) = ThreatClass::from_piece_type(pt) {
                 let color = pc.color();
-                let source = context.source(color, class, sq_s);
+                let attacker_side = if color == friend_color { 0 } else { 1 };
+                let oriented_color = if perspective == Color::Black {
+                    color
+                } else {
+                    !color
+                };
                 let attacks = attacks_from_piece(pt, color, sq_s, after_occ);
                 let mut targets = attacks & after_occ;
                 while !targets.is_empty() {
@@ -1710,12 +1276,19 @@ pub fn append_changed_threat_indices(
                     let target_pt = target_pc.piece_type();
                     if let Some(target_class) = ThreatClass::from_piece_type(target_pt) {
                         let target_color = target_pc.color();
-                        if cfg!(feature = "threat-profile-full-symdedup")
-                            && is_canonical_dead(class, sq_s, target_class, target_color, to_sq)
-                        {
-                            continue;
-                        }
-                        if let Some(idx) = source.index(target_color, target_class, to_sq) {
+                        let attacked_side = if target_color == friend_color { 0 } else { 1 };
+                        let from_sq_n = normalize_sq(sq_s, perspective, hm);
+                        let to_sq_n = normalize_sq(to_sq, perspective, hm);
+                        if let Some(idx) = threat_index(
+                            attacker_side,
+                            class,
+                            oriented_color,
+                            attacked_side,
+                            target_class,
+                            from_sq_n,
+                            to_sq_n,
+                            from_offset_table,
+                        ) {
                             if after_len >= MAX_INTERMEDIATE_THREATS {
                                 overflow = true;
                                 break;
@@ -1787,14 +1360,14 @@ pub fn append_changed_threat_indices(
 /// 1. old_entries に sq がある → before 状態の駒情報（捕獲された駒等）
 /// 2. new_entries に sq がある → before 状態では空（駒が移動してきた場所）
 /// 3. いずれでもない → current Position から取得（変化していない駒）
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 struct PieceInfoBefore {
     color: Color,
     class: ThreatClass,
     pt: PieceType,
 }
 
-#[cfg(feature = "nnue-threat")]
+#[cfg(any(feature = "nnue-threat", feature = "nnue-scalar-threat"))]
 #[inline]
 fn lookup_piece_before(
     sq: Square,
@@ -1841,62 +1414,9 @@ fn lookup_piece_before(
 // テスト
 // =============================================================================
 
-#[cfg(all(test, feature = "nnue-threat"))]
-pub(super) fn for_each_full_refresh_test_position(mut f: impl FnMut(&Position)) {
-    use crate::movegen::{MoveList, generate_legal};
-    let mut sfens = vec![
-        "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1".to_owned(),
-        "+Bn1g2s1l/2skg2r1/ppppp1n1p/5bpp1/5p1P1/2P6/PP1PP1P1P/1SK2S1R1/LN1G1G1NL w Lp 24"
-            .to_owned(),
-        "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1".to_owned(),
-        "4k4/9/9/9/9/9/9/4K4/9 b RBGSNLP 1".to_owned(),
-    ];
-    for black in ["K8", "8K"] {
-        for white in ["k8", "8k"] {
-            for turn in ["b", "w"] {
-                sfens.push(format!(
-                    "{white}/9/2+s1+p4/3G1P3/4p4/3+n1+N3/9/9/{black} {turn} RBSNLPg 1"
-                ));
-            }
-        }
-    }
-    for sfen in sfens {
-        let mut pos = Position::new();
-        pos.set_sfen(&sfen).unwrap();
-        f(&pos);
-        let mut moves = MoveList::new();
-        generate_legal(&pos, &mut moves);
-        for &mv in &moves {
-            pos.do_move(mv, pos.gives_check(mv));
-            f(&pos);
-            pos.undo_move(mv);
-        }
-    }
-}
-
-#[cfg(all(test, feature = "nnue-threat"))]
+#[cfg(all(test, any(feature = "nnue-threat", feature = "nnue-scalar-threat")))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shared_full_refresh_indices_match_per_perspective() {
-        for_each_full_refresh_test_position(|pos| {
-            let mut actual: [Vec<usize>; 2] = std::array::from_fn(|_| Vec::new());
-            for_each_active_threat_index_both(pos, |p, index| actual[p.index()].push(index));
-            for perspective in [Color::Black, Color::White] {
-                let mut expected = Vec::new();
-                for_each_active_threat_index(
-                    pos,
-                    perspective,
-                    pos.king_square(perspective),
-                    |index| expected.push(index),
-                );
-                expected.sort_unstable();
-                actual[perspective.index()].sort_unstable();
-                assert_eq!(actual[perspective.index()], expected, "{perspective:?}");
-            }
-        });
-    }
 
     #[test]
     fn test_threat_class_from_piece_type() {
@@ -1933,8 +1453,6 @@ mod tests {
         #[cfg(not(any(
             feature = "threat-profile-same-class",
             feature = "threat-profile-same-class-major-pawn",
-            feature = "threat-profile-step-attacker",
-            feature = "threat-profile-cross-side",
         )))]
         assert_eq!(THREAT_DIMENSIONS, 216_720, "profile 0 (full)");
 
@@ -1943,12 +1461,6 @@ mod tests {
 
         #[cfg(feature = "threat-profile-same-class-major-pawn")]
         assert_eq!(THREAT_DIMENSIONS, 173_568, "profile 2 (same-class-major-pawn)");
-
-        #[cfg(feature = "threat-profile-step-attacker")]
-        assert_eq!(THREAT_DIMENSIONS, 33_408, "profile 3 (step-attacker)");
-
-        #[cfg(feature = "threat-profile-cross-side")]
-        assert_eq!(THREAT_DIMENSIONS, 96_320, "profile 10 (cross-side)");
     }
 
     #[test]
@@ -2080,71 +1592,43 @@ mod tests {
     }
 
     #[test]
-    fn test_threat_index_matches_reference_exhaustively() {
-        let mut non_excluded_count = 0;
-        let mut excluded_count = 0;
-        let squares = (0..81).map(|raw| Square::from_u8(raw).unwrap());
-        for perspective in [Color::Black, Color::White] {
-            for hm in [false, true] {
-                let ctx = ThreatIndexContext::new(perspective, hm);
-                for sq in squares.clone() {
-                    assert_eq!(
-                        ctx.normalized[sq.index()],
-                        normalize_sq_reference(sq, perspective, hm)
-                    );
-                }
-                for color in [Color::Black, Color::White] {
-                    let attacker_side = usize::from(color != perspective);
-                    let oriented_color = if perspective == Color::Black {
-                        color
-                    } else {
-                        !color
-                    };
-                    for class in ALL_THREAT_CLASSES {
-                        for from in squares.clone() {
-                            let source = ctx.source(color, class, from);
-                            let from_n = normalize_sq_reference(from, perspective, hm);
-                            let attacks = attacks_bb_colored(class, oriented_color, from_n);
-                            let pattern = attack_pattern_id(class, oriented_color);
-                            let from_offset = FROM_OFFSET_TABLE.get(pattern, from_n);
-                            for to in squares.clone() {
-                                let to_n = normalize_sq_reference(to, perspective, hm);
-                                let offset = source.attack_offsets[to_n.index()];
-                                if !attacks.contains(to_n) {
-                                    assert_eq!(offset, AttackOffsetTable::INVALID);
-                                    continue;
-                                }
-                                let order = compute_attack_order_colored(
-                                    class,
-                                    oriented_color,
-                                    from_n,
-                                    to_n,
-                                );
-                                assert_eq!(usize::from(offset), from_offset + order);
-                                for target_color in [Color::Black, Color::White] {
-                                    let target_side = usize::from(target_color != perspective);
-                                    for target_class in ALL_THREAT_CLASSES {
-                                        let expected = threat_index_reference(
-                                            attacker_side,
-                                            class,
-                                            oriented_color,
-                                            target_side,
-                                            target_class,
-                                            from_n,
-                                            to_n,
-                                            &FROM_OFFSET_TABLE,
+    fn test_threat_index_range() {
+        let from_offset_table = FromOffsetTable::new();
+        // 全クラスの全マスの全攻撃先について、non-excluded pair の index が範囲内であることを確認
+        // 先手基準 (oriented_color=Black) と後手基準 (oriented_color=White) の両方をテスト
+        let mut non_excluded_count = 0u64;
+        let mut excluded_count = 0u64;
+        for &class in &ALL_THREAT_CLASSES {
+            for &oriented_color in &[Color::Black, Color::White] {
+                for sq_raw in 0..81u8 {
+                    let sq = Square::from_u8(sq_raw).unwrap();
+                    let bb = attacks_bb_colored(class, oriented_color, sq);
+                    let mut iter = bb;
+                    while !iter.is_empty() {
+                        let to = iter.pop();
+                        for as_ in 0..2 {
+                            for ds in 0..2 {
+                                for &dc_class in &ALL_THREAT_CLASSES {
+                                    let idx = threat_index(
+                                        as_,
+                                        class,
+                                        oriented_color,
+                                        ds,
+                                        dc_class,
+                                        sq,
+                                        to,
+                                        &from_offset_table,
+                                    );
+                                    if let Some(idx) = idx {
+                                        assert!(
+                                            idx < THREAT_DIMENSIONS,
+                                            "index {idx} out of range for class={class:?} color={oriented_color:?} sq={} to={}",
+                                            sq.raw(),
+                                            to.raw()
                                         );
-                                        let actual = source.index(target_color, target_class, to);
-                                        assert_eq!(
-                                            actual, expected,
-                                            "{perspective:?} {hm} {color:?} {class:?} {from:?} -> {target_color:?} {target_class:?} {to:?}"
-                                        );
-                                        if let Some(index) = actual {
-                                            assert!(index < THREAT_DIMENSIONS);
-                                            non_excluded_count += 1;
-                                        } else {
-                                            excluded_count += 1;
-                                        }
+                                        non_excluded_count += 1;
+                                    } else {
+                                        excluded_count += 1;
                                     }
                                 }
                             }
@@ -2154,12 +1638,8 @@ mod tests {
             }
         }
         assert!(non_excluded_count > 0, "should have some non-excluded pairs");
-        // profile 0 と full-symdedup (id 4) は pair 除外なし (index 空間が同一) なので
-        // index 計算段階の excluded は 0。full-symdedup の active 間引きは列挙時の
-        // canonical-dead drop が担い、index 算出には現れない。他 profile は pair 除外あり。
-        if threat_exclusion::THREAT_PROFILE_ID == 0
-            || cfg!(feature = "threat-profile-full-symdedup")
-        {
+        // Profile 0 では除外なし、他の profile では除外あり
+        if threat_exclusion::THREAT_PROFILE_ID == 0 {
             assert_eq!(excluded_count, 0);
         } else {
             assert!(
@@ -2185,19 +1665,9 @@ mod tests {
         let mut indices_w = Vec::new();
         append_active_threat_indices(&pos, Color::White, king_sq_w, &mut indices_w);
 
-        // 初期局面は両軍が接触しておらず敵駒への利きが無い。cross-side (敵味方跨ぎの
-        // 異種のみ) では同 side の利きが全除外され threat が 0 になる。それ以外の profile は
-        // 同 side の利きが残るため最低限含まれる。
-        #[cfg(feature = "threat-profile-cross-side")]
-        {
-            assert!(indices_b.is_empty(), "cross-side startpos should have no threats");
-            assert!(indices_w.is_empty(), "cross-side startpos should have no threats");
-        }
-        #[cfg(not(feature = "threat-profile-cross-side"))]
-        {
-            assert!(!indices_b.is_empty(), "Black perspective should have threats");
-            assert!(!indices_w.is_empty(), "White perspective should have threats");
-        }
+        // 初期局面では threat pair が最低限含まれることを確認
+        assert!(!indices_b.is_empty(), "Black perspective should have threats");
+        assert!(!indices_w.is_empty(), "White perspective should have threats");
 
         // 全 index が範囲内
         for &idx in &indices_b {
@@ -2215,9 +1685,6 @@ mod tests {
     #[cfg(not(any(
         feature = "threat-profile-same-class",
         feature = "threat-profile-same-class-major-pawn",
-        feature = "threat-profile-step-attacker",
-        feature = "threat-profile-full-symdedup",
-        feature = "threat-profile-cross-side",
     )))]
     fn test_canonical_startpos_threat_indices() {
         let mut pos = Position::new();
@@ -2249,86 +1716,11 @@ mod tests {
         assert_eq!(indices_w, expected, "White perspective canonical mismatch (symmetric pos)");
     }
 
-    /// full-symdedup (profile 4) の startpos canonical。tatara
-    /// (`shogi-features` `ThreatIndexer::new(ThreatProfile::FullSymDedup)`) で生成した
-    /// 同 startpos の sorted index と一致することを固定し、tatara ↔ rshogi の index
-    /// layout 一致を機械的に保証する。full の 34 値から canonical-dead な対称 edge 2 個
-    /// (11047 / 122160) を落とした 32 値。
-    #[test]
-    #[cfg(feature = "threat-profile-full-symdedup")]
-    fn test_canonical_startpos_threat_indices_symdedup() {
-        let mut pos = Position::new();
-        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
-            .expect("Failed to parse startpos");
-
-        let king_sq_b = pos.king_square(Color::Black);
-        let mut indices_b = Vec::new();
-        append_active_threat_indices(&pos, Color::Black, king_sq_b, &mut indices_b);
-        indices_b.sort();
-
-        let king_sq_w = pos.king_square(Color::White);
-        let mut indices_w = Vec::new();
-        append_active_threat_indices(&pos, Color::White, king_sq_w, &mut indices_w);
-        indices_w.sort();
-
-        // tatara `ThreatProfile::FullSymDedup` で生成。両 repo 同時更新のこと。
-        #[rustfmt::skip]
-        let expected: &[usize] = &[
-            1330, 1618, 7147, 7148, 7231, 7232, 11213, 16475, 16578, 23268,
-            23270, 24087, 25717, 37487, 40080, 43974, 112573, 112861, 116503,
-            116504, 116587, 116588, 122650, 128533, 128636, 138321, 138323,
-            139136, 140770, 158280, 160871, 164753,
-        ];
-
-        assert_eq!(indices_b, expected, "Black perspective symdedup canonical mismatch");
-        assert_eq!(
-            indices_w, expected,
-            "White perspective symdedup canonical mismatch (symmetric pos)"
-        );
-    }
-
-    /// step-attacker (profile 3) の startpos canonical。tatara
-    /// (`shogi-features` `ThreatIndexer::new(ThreatProfile::StepAttacker)`) で生成した
-    /// 同 startpos の sorted index と一致することを固定し、tatara ↔ rshogi の index
-    /// layout 一致を機械的に保証する (bullet-shogi に step-attacker が無く bullet golden が
-    /// 取れないため)。slider attacker を除外するので full の 34 値から step 駒由来の 16 値に減る。
-    #[test]
-    #[cfg(feature = "threat-profile-step-attacker")]
-    fn test_canonical_startpos_threat_indices_step_attacker() {
-        let mut pos = Position::new();
-        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
-            .expect("Failed to parse startpos");
-
-        let king_sq_b = pos.king_square(Color::Black);
-        let mut indices_b = Vec::new();
-        append_active_threat_indices(&pos, Color::Black, king_sq_b, &mut indices_b);
-        indices_b.sort();
-
-        let king_sq_w = pos.king_square(Color::White);
-        let mut indices_w = Vec::new();
-        append_active_threat_indices(&pos, Color::White, king_sq_w, &mut indices_w);
-        indices_w.sort();
-
-        // tatara `ThreatProfile::StepAttacker` で生成。両 repo 同時更新のこと。
-        #[rustfmt::skip]
-        let expected: &[usize] = &[
-            1315, 1316, 1399, 1400, 5215, 5381, 10643, 10746,
-            19015, 19016, 19099, 19100, 24672, 25162, 31045, 31148,
-        ];
-
-        assert_eq!(indices_b, expected, "Black perspective step-attacker canonical mismatch");
-        assert_eq!(
-            indices_w, expected,
-            "White perspective step-attacker canonical mismatch (symmetric pos)"
-        );
-    }
-
     // =========================================================================
     // 差分更新テスト
     // =========================================================================
 
     use super::super::accumulator::IndexList;
-    use crate::movegen::{MoveList, generate_legal};
     use crate::types::Move;
 
     /// 差分更新の結果が full refresh と一致することを検証するヘルパー。
@@ -2411,243 +1803,30 @@ mod tests {
         }
     }
 
+    /// 初手 7六歩（通常手）の差分更新テスト
     #[test]
-    fn endpoint_diff_matches_active_features() {
-        let sfens = [
-            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
-            "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",
-            "l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w RGgsn5p 1",
-            "4k4/9/9/9/9/9/9/4K4/9 b RBGSNLP 1",
-        ];
-        for sfen in sfens {
-            let mut pos = Position::new();
-            pos.set_sfen(sfen).unwrap();
-            let before = std::array::from_fn::<_, 81, _>(|i| {
-                canonical_piece(pos.piece_on(Square::from_u8(i as u8).unwrap()))
-            });
-            let before_occ = pos.occupied();
-            let before_kings = [pos.king_square(Color::Black), pos.king_square(Color::White)];
-            let active: [Vec<usize>; 2] = std::array::from_fn(|p| {
-                let perspective = if p == 0 { Color::Black } else { Color::White };
-                let mut indices = Vec::new();
-                append_active_threat_indices(
-                    &pos,
-                    perspective,
-                    pos.king_square(perspective),
-                    &mut indices,
-                );
-                indices
-            });
-            let mut list = MoveList::new();
-            generate_legal(&pos, &mut list);
-            for &mv in &list {
-                let dirty = pos.do_move(mv, pos.gives_check(mv));
-                let mut restored = ThreatAncestor::new(&pos);
-                restored.undo(&dirty);
-                let changed = restored.changed_squares();
-                for (i, &pc) in before.iter().enumerate() {
-                    let sq = Square::from_u8(i as u8).unwrap();
-                    assert_eq!(changed.contains(sq), pc != canonical_piece(pos.piece_on(sq)));
-                    if changed.contains(sq) {
-                        assert_eq!(restored.pieces[i], pc);
-                    }
-                }
-                assert_eq!(restored.occupied, before_occ);
-                assert_eq!(restored.kings, before_kings);
-                let mut removed = std::array::from_fn(|_| IndexList::new());
-                let mut added = std::array::from_fn(|_| IndexList::new());
-                assert!(append_threat_endpoint_diff(&restored, &mut removed, &mut added));
-                for perspective in [Color::Black, Color::White] {
-                    if !restored.same_mirror(perspective) {
-                        continue;
-                    }
-                    let p = perspective.index();
-                    let mut actual = active[p].clone();
-                    for index in removed[p].iter() {
-                        let at = actual.iter().position(|&x| x == index).unwrap();
-                        actual.remove(at);
-                    }
-                    actual.extend(added[p].iter());
-                    actual.sort_unstable();
-                    let mut expected = Vec::new();
-                    append_active_threat_indices(
-                        &pos,
-                        perspective,
-                        pos.king_square(perspective),
-                        &mut expected,
-                    );
-                    expected.sort_unstable();
-                    assert_eq!(actual, expected, "{sfen} {mv:?} {perspective:?}");
-                }
-                if !removed[0].is_empty() || !added[0].is_empty() {
-                    let mut full_removed = std::array::from_fn(|_| IndexList::new());
-                    let mut full_added = std::array::from_fn(|_| IndexList::new());
-                    for output in full_removed.iter_mut().chain(full_added.iter_mut()) {
-                        for _ in 0..MAX_CHANGED_THREAT_FEATURES {
-                            assert!(output.push(0));
-                        }
-                    }
-                    assert!(!append_threat_endpoint_diff(
-                        &restored,
-                        &mut full_removed,
-                        &mut full_added
-                    ));
-                }
-                pos.undo_move(mv);
-            }
-        }
-    }
-
-    fn assert_endpoint_diff_matches_full(old: &Position, ancestor: &ThreatAncestor<'_>) {
-        use std::collections::BTreeMap;
-
-        let current = ancestor.pos;
-        let mut removed = std::array::from_fn(|_| IndexList::new());
-        let mut added = std::array::from_fn(|_| IndexList::new());
-        assert!(append_threat_endpoint_diff(ancestor, &mut removed, &mut added));
-        for perspective in [Color::Black, Color::White] {
-            // 端点差分と同じ座標で比較するため、両端に現局面の HM を使う。
-            let king = current.king_square(perspective);
-            let mut counts = BTreeMap::<usize, i32>::new();
-            for (pos, sign) in [(old, -1), (current, 1)] {
-                let mut active = Vec::new();
-                append_active_threat_indices(pos, perspective, king, &mut active);
-                for index in active {
-                    *counts.entry(index).or_default() += sign;
-                }
-            }
-            for (output, sign) in [(&removed, -1), (&added, 1)] {
-                let expected: Vec<_> = counts
-                    .iter()
-                    .flat_map(|(&index, &count)| {
-                        std::iter::repeat_n(index, (count * sign).max(0) as usize)
-                    })
-                    .collect();
-                let mut actual: Vec<_> = output[perspective.index()].iter().collect();
-                actual.sort_unstable();
-                assert_eq!(
-                    actual,
-                    expected,
-                    "{perspective:?}, sign={sign}, {} -> {}",
-                    old.to_sfen(),
-                    current.to_sfen()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn endpoint_diff_matches_feature_multisets_on_random_paths() {
-        use crate::movegen::generate_legal_all;
-        use rand::{Rng, SeedableRng};
-        use rand_xoshiro::Xoshiro256PlusPlus;
-
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x6258_a15d);
-        let (mut capture, mut promotion, mut drop, mut king_move, mut restored) =
-            (false, false, false, false, false);
-        for sfen in [
-            crate::position::SFEN_HIRATE,
-            "+Bn1g2s1l/2skg2r1/ppppp1n1p/5bpp1/5p1P1/2P6/PP1PP1P1P/1SK2S1R1/LN1G1G1NL w Lp 24",
-            "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",
-            "l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w RGgsn5p 1",
-        ] {
-            let mut pos = Position::new();
-            pos.set_sfen(sfen).unwrap();
-            let mut old = Position::new();
-            let mut path = Vec::new();
-            for _ in 0..96 {
-                let mut list = MoveList::new();
-                generate_legal_all(&pos, &mut list);
-                if list.is_empty() {
-                    break;
-                }
-                let mv = list[rng.random_range(0..list.len())];
-                capture |= !pos.piece_on(mv.to()).is_none();
-                promotion |= mv.is_promotion();
-                drop |= mv.is_drop();
-                king_move |=
-                    !mv.is_drop() && pos.piece_on(mv.from()).piece_type() == PieceType::King;
-                let previous = pos.to_sfen();
-                path.push((previous, pos.do_move(mv, pos.gives_check(mv))));
-
-                for distance in [2, 3, 4, 6, 12, 24] {
-                    let Some(start) = path.len().checked_sub(distance) else {
-                        continue;
-                    };
-                    old.set_sfen(&path[start].0).unwrap();
-                    let mut ancestor = ThreatAncestor::new(&pos);
-                    for (_, dirty) in path[start..].iter().rev() {
-                        ancestor.undo(dirty);
-                    }
-                    restored |= (ancestor.touched & !ancestor.changed_squares()).is_not_empty();
-                    assert_endpoint_diff_matches_full(&old, &ancestor);
-                }
-            }
-        }
-        assert!(capture && promotion && drop && king_move && restored);
-    }
-
-    #[test]
-    fn endpoint_diff_emits_one_slider_edge_through_multiple_vacated_squares() {
-        let sfen = "4k4/9/9/9/R1S1S1p2/9/9/9/4K4 b - 1";
-        let mut old = Position::new();
-        old.set_sfen(sfen).unwrap();
+    fn test_changed_indices_pawn_push() {
         let mut pos = Position::new();
-        pos.set_sfen(sfen).unwrap();
-        let dirty = ["7e6d", "5a4a", "5e4d"].map(|text| {
-            let mv = pos.to_move(Move::from_usi(text).unwrap()).unwrap();
-            assert!(pos.is_legal(mv));
-            pos.do_move(mv, pos.gives_check(mv))
-        });
-        let mut ancestor = ThreatAncestor::new(&pos);
-        for entry in dirty.iter().rev() {
-            ancestor.undo(entry);
-        }
-        assert_endpoint_diff_matches_full(&old, &ancestor);
+        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
+            .expect("startpos");
+        let m = Move::from_usi("7g7f").expect("7g7f");
+        verify_incremental(&mut pos, m);
     }
 
+    /// 角道を開けた後の角交換（取る手）の差分更新テスト
     #[test]
-    fn endpoint_diff_removes_one_slider_edge_when_multiple_squares_are_filled() {
-        // 上の局面を逆にたどり、飛車の利きが空いた升を 2 つ通る辺が消える側を確かめる
+    fn test_changed_indices_capture() {
         let mut pos = Position::new();
-        pos.set_sfen("4k4/9/9/9/R1S1S1p2/9/9/9/4K4 b - 1").unwrap();
-        for text in ["7e6d", "5a4a", "5e4d"] {
-            let mv = pos.to_move(Move::from_usi(text).unwrap()).unwrap();
-            pos.do_move(mv, pos.gives_check(mv));
+        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
+            .expect("startpos");
+        // 7六歩 → 3四歩 → 8八角から2二角成（角交換）
+        for mv_str in &["7g7f", "3c3d"] {
+            let m = Move::from_usi(mv_str).unwrap();
+            let gc = pos.gives_check(m);
+            pos.do_move(m, gc);
         }
-        let mut old = Position::new();
-        old.set_sfen(&pos.to_sfen()).unwrap();
-        let dirty = ["4a5a", "6d7e", "5a4a", "4d5e"].map(|text| {
-            let mv = pos.to_move(Move::from_usi(text).unwrap()).unwrap();
-            assert!(pos.is_legal(mv));
-            pos.do_move(mv, pos.gives_check(mv))
-        });
-        let mut ancestor = ThreatAncestor::new(&pos);
-        for entry in dirty.iter().rev() {
-            ancestor.undo(entry);
-        }
-        assert_endpoint_diff_matches_full(&old, &ancestor);
-    }
-
-    #[test]
-    fn endpoint_diff_skips_squares_restored_by_later_moves() {
-        let mut pos = Position::new();
-        pos.set_sfen(crate::position::SFEN_HIRATE).unwrap();
-        let dirty = ["5i5h", "5a5b", "5h5i", "5b5a"].map(|text| {
-            let mv = pos.to_move(Move::from_usi(text).unwrap()).unwrap();
-            assert!(pos.is_legal(mv));
-            pos.do_move(mv, pos.gives_check(mv))
-        });
-        let mut ancestor = ThreatAncestor::new(&pos);
-        for entry in dirty.iter().rev() {
-            ancestor.undo(entry);
-        }
-        assert!(!ancestor.touched.is_empty());
-        assert!(ancestor.changed_squares().is_empty());
-        let mut removed = std::array::from_fn(|_| IndexList::new());
-        let mut added = std::array::from_fn(|_| IndexList::new());
-        assert!(append_threat_endpoint_diff(&ancestor, &mut removed, &mut added));
-        assert!(removed.iter().chain(&added).all(IndexList::is_empty));
+        let m = Move::from_usi("8h2b+").expect("8h2b+");
+        verify_incremental(&mut pos, m);
     }
 
     /// 駒打ち（手駒から打つ手）の差分更新テスト
@@ -2694,39 +1873,11 @@ mod tests {
         }
     }
 
-    /// 複数局面の全合法手で差分更新(append_changed)を full refresh と照合する網羅テスト。
-    /// slider の blocker 変化(取り/成り/開き線/大駒打ち)を広くカバーするため、成駒・手駒(大駒含む)・
-    /// 密集局面を入れる。
-    #[test]
-    fn test_changed_indices_all_legal_moves() {
-        let sfens = [
-            // 平手初形
-            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
-            // 成駒(+B)・開き線のある中盤
-            "+Bn1g2s1l/2skg2r1/ppppp1n1p/5bpp1/5p1P1/2P6/PP1PP1P1P/1SK2S1R1/LN1G1G1NL w Lp 24",
-            // 両者が角を手駒に持つ複雑な中盤(大駒打ちが blocker 変化を生む)
-            "l4S2l/4g1gs1/5p1p1/pr2N1pkp/4Gn3/PP3PPPP/2GPP4/1K7/L3r+s2L w BS2N5Pb 1",
-            // 飛を手駒に持つ密集局面(飛打ち + 取り/成りが多い)
-            "l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w RGgsn5p 1",
-        ];
-        for sfen in sfens {
-            let mut pos = Position::new();
-            pos.set_sfen(sfen).expect("valid sfen");
-            let mut list = MoveList::new();
-            generate_legal(&pos, &mut list);
-            assert!(!list.is_empty(), "no legal moves for {sfen}");
-            for &m in &list {
-                // verify_incremental は内部で undo_move するため pos は不変。各手を独立検証。
-                verify_incremental(&mut pos, m);
-            }
-        }
-    }
-
     /// BonaPiece デコードのテスト
     #[test]
     fn test_decode_board_square_fb() {
         use super::super::bona_piece::{E_PAWN, F_PAWN};
-        use super::super::bona_piece_halfka_hm_merged::{E_KING, F_KING};
+        use super::super::bona_piece_halfka_hm::{E_KING, F_KING};
 
         // ZERO → None
         assert!(decode_board_square_fb(BonaPiece::ZERO).is_none());
@@ -2755,7 +1906,7 @@ mod tests {
     #[test]
     fn test_decode_board_threat_info_fb() {
         use super::super::bona_piece::{E_HORSE, E_ROOK, F_HORSE, F_PAWN, F_ROOK};
-        use super::super::bona_piece_halfka_hm_merged::F_KING;
+        use super::super::bona_piece_halfka_hm::F_KING;
 
         // F_PAWN + 40: Black Pawn at sq=40
         let bp = BonaPiece::new(F_PAWN + 40);
@@ -2823,6 +1974,38 @@ mod tests {
         verify_incremental(&mut pos, m);
     }
 
+    /// 取り成り手の差分更新テスト
+    #[test]
+    fn test_changed_indices_promotion_with_capture() {
+        let mut pos = Position::new();
+        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
+            .expect("startpos");
+        // 角交換: 7六歩 → 3四歩 → 2二角成（成り + 取り）
+        for mv_str in &["7g7f", "3c3d"] {
+            let m = Move::from_usi(mv_str).unwrap();
+            let gc = pos.gives_check(m);
+            pos.do_move(m, gc);
+        }
+        // 8八角 → 2二角成 = 成りかつ取り
+        let m = Move::from_usi("8h2b+").expect("8h2b+");
+        verify_incremental(&mut pos, m);
+    }
+
+    /// 後手番の指し手に対する差分更新テスト
+    #[test]
+    fn test_changed_indices_white_to_move() {
+        let mut pos = Position::new();
+        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
+            .expect("startpos");
+        // 先手 7六歩
+        let m = Move::from_usi("7g7f").unwrap();
+        let gc = pos.gives_check(m);
+        pos.do_move(m, gc);
+        // 後手 3四歩
+        let m = Move::from_usi("3c3d").expect("3c3d");
+        verify_incremental(&mut pos, m);
+    }
+
     /// 開き利き（スライダーの blocker が外れるケース）の差分更新テスト
     ///
     /// 飛車の前に歩がいて、歩が横に動くと飛車の利きが通る局面。
@@ -2857,13 +2040,44 @@ mod tests {
         }
     }
 
+    /// AttackOrderTable と compute_attack_order_colored の一致テスト
+    #[test]
+    fn test_attack_order_table_matches_compute() {
+        let table = &*ATTACK_ORDER_TABLE;
+        for &class in &ALL_THREAT_CLASSES {
+            for &color in &[Color::Black, Color::White] {
+                if !is_directional(class) && color == Color::White {
+                    continue; // 非方向性駒は Black パターンのみ
+                }
+                let pattern = attack_pattern_id(class, color);
+                for from_raw in 0..81u8 {
+                    let from_sq = Square::from_u8(from_raw).unwrap();
+                    let bb = attacks_bb_colored(class, color, from_sq);
+                    let mut iter = bb;
+                    while !iter.is_empty() {
+                        let to_sq = iter.pop();
+                        let expected = compute_attack_order_colored(class, color, from_sq, to_sq);
+                        let got = table.get(pattern, from_sq, to_sq);
+                        assert_eq!(
+                            got,
+                            expected as u8,
+                            "Mismatch: {class:?} {color:?} from={} to={}",
+                            from_raw,
+                            to_sq.raw()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // =========================================================================
     // needs_threat_refresh テスト (Phase 0: HM mirror ベースの refresh 判定)
     // =========================================================================
 
     use super::super::accumulator::{ChangedBonaPiece, DirtyPiece};
     use super::super::bona_piece::ExtBonaPiece;
-    use super::super::bona_piece_halfka_hm_merged::{E_KING, F_KING};
+    use super::super::bona_piece_halfka_hm::{E_KING, F_KING};
 
     /// DirtyPiece を king move で組み立てるヘルパー
     fn make_king_move_dirty(king_color: Color, from_sq: Square, to_sq: Square) -> DirtyPiece {

@@ -1,10 +1,11 @@
-use crate::movegen::{MoveList, generate_legal_all_with_pass, to_legal_move_by_rules};
+use crate::eval::material::compute_material_value;
+use crate::movegen::{MoveList, generate_legal_with_pass};
 use crate::types::json::{
     BoardStateJson, CellJson, HandJson, HandsJson, PieceJson, ReplayResultJson,
 };
 use crate::types::{Color, File, Hand, Move, Piece, PieceType, Rank, Square};
 
-use super::{MAX_GAME_PLY, Position, SFEN_HIRATE};
+use super::{Position, SFEN_HIRATE};
 
 impl Position {
     /// 平手初期局面をJSON形式で取得する。
@@ -40,8 +41,7 @@ impl Position {
         }
     }
 
-    /// JSON形式から局面を復元する。玉は各色 0〜1 枚 (玉の無い側がある局面も受け付ける)。
-    /// 手数 (`ply`) は省略時 1 で、0..=[`MAX_GAME_PLY`] だけを受け付ける。
+    /// JSON形式から局面を復元する。
     pub fn from_board_state_json(json: &BoardStateJson) -> Result<Self, String> {
         if json.cells.len() != 9 {
             return Err(format!("cells must have 9 rows, but got {}", json.cells.len()));
@@ -49,11 +49,7 @@ impl Position {
 
         let mut position = Position::new();
         position.side_to_move = turn_to_color(&json.turn)?;
-        let ply = json.ply.unwrap_or(1);
-        if !(0..=MAX_GAME_PLY).contains(&ply) {
-            return Err(format!("ply must be in 0..={MAX_GAME_PLY}, but got {ply}"));
-        }
-        position.game_ply = ply;
+        position.game_ply = json.ply.unwrap_or(1);
 
         let mut black_king = None;
         let mut white_king = None;
@@ -64,7 +60,7 @@ impl Position {
             }
 
             for cell in row {
-                let square = Square::from_usi_strict(&cell.square)
+                let square = Square::from_usi(&cell.square)
                     .ok_or_else(|| format!("invalid square: {}", cell.square))?;
 
                 if let Some(piece_json) = &cell.piece {
@@ -73,15 +69,9 @@ impl Position {
                         return Err(format!("duplicated piece on square {}", cell.square));
                     }
                     if piece.piece_type() == PieceType::King {
-                        let king = match piece.color() {
-                            Color::Black => &mut black_king,
-                            Color::White => &mut white_king,
-                        };
-                        if king.replace(square).is_some() {
-                            return Err(format!(
-                                "{} has more than one king in board state",
-                                color_to_owner(piece.color())
-                            ));
+                        match piece.color() {
+                            Color::Black => black_king = Some(square),
+                            Color::White => white_king = Some(square),
                         }
                     }
                     position.put_piece(piece, square);
@@ -89,19 +79,23 @@ impl Position {
             }
         }
 
-        // 玉の無い側の king_square は既定の升のまま (`set_sfen` と同じ)
-        if let Some(square) = black_king {
-            position.king_square[Color::Black.index()] = square;
-        }
-        if let Some(square) = white_king {
-            position.king_square[Color::White.index()] = square;
-        }
+        position.king_square[Color::Black.index()] =
+            black_king.ok_or_else(|| "sente king is missing in board state".to_string())?;
+        position.king_square[Color::White.index()] =
+            white_king.ok_or_else(|| "gote king is missing in board state".to_string())?;
 
         position.hand[Color::Black.index()] = hand_from_json(&json.hands.sente)?;
         position.hand[Color::White.index()] = hand_from_json(&json.hands.gote)?;
 
-        position.finalize_after_population().map_err(|e| e.to_string())?;
-        position.clear_checkers_without_king();
+        position.compute_hash();
+        position.update_blockers_and_pinners();
+        position.update_check_squares();
+        position.recompute_board_effects();
+
+        let them = !position.side_to_move;
+        position.state_mut().checkers =
+            position.attackers_to_c(position.king_square[position.side_to_move.index()], them);
+        position.state_mut().material_value = compute_material_value(&position);
 
         Ok(position)
     }
@@ -117,10 +111,7 @@ impl Position {
         Ok(pos.to_board_state_json())
     }
 
-    /// 棋譜を厳密に適用し、不正手で停止する。合法な不成も省略せず受理する。
-    ///
-    /// 玉の無い側がある局面も受け付ける (合法手は
-    /// [`crate::movegen::generate_legal_allowing_missing_kings`] と同じ)。
+    /// 棋譜を厳密に適用し、不正手で停止する。
     ///
     /// # Arguments
     /// * `sfen` - 開始局面のSFEN
@@ -142,38 +133,24 @@ impl Position {
         if let Some((black, white)) = pass_rights {
             position.enable_pass_rights(black, white);
         }
-        let mut missing_king = false;
-        for color in [Color::Black, Color::White] {
-            match position.pieces(color, PieceType::King).count() {
-                0 => missing_king = true,
-                1 => {}
-                _ => return Err(format!("{} has more than one king", color_to_owner(color))),
-            }
-        }
-        position.clear_checkers_without_king();
 
         let mut applied: Vec<String> = Vec::with_capacity(moves.len());
         let mut error: Option<String> = None;
 
         for mv in moves {
-            let parsed =
-                Move::from_usi_strict(mv).ok_or_else(|| format!("failed to parse move: {mv}"))?;
+            let parsed = Move::from_usi(mv).ok_or_else(|| format!("failed to parse move: {mv}"))?;
             let parsed_raw = parsed.raw();
 
-            let is_legal = if missing_king {
-                // 1 手ずつ総当たりの規則で確かめる (全合法手を作るより軽い)
-                to_legal_move_by_rules(&mut position, parsed).is_some()
-            } else {
-                let mut list = MoveList::new();
-                generate_legal_all_with_pass(&position, &mut list);
-                list.iter().any(|candidate| candidate.raw() == parsed_raw)
-            };
+            let mut list = MoveList::new();
+            generate_legal_with_pass(&position, &mut list);
+            let is_legal = list.iter().any(|candidate| candidate.raw() == parsed_raw);
             if !is_legal {
                 error = Some(format!("illegal move: {mv}"));
                 break;
             }
 
-            position.do_move_allowing_missing_kings(parsed);
+            let gives_check = position.gives_check(parsed);
+            position.do_move(parsed, gives_check);
             applied.push(parsed.to_usi());
         }
 
@@ -334,126 +311,6 @@ const fn hand_max(pt: PieceType) -> u32 {
 mod tests {
     use super::*;
 
-    fn assert_same_position(actual: &Position, expected: &Position, compare_board_effects: bool) {
-        assert_eq!(actual.to_sfen(), expected.to_sfen());
-        assert_eq!(actual.key(), expected.key());
-        assert_eq!(actual.state().pawn_key, expected.state().pawn_key);
-        assert_eq!(actual.state().minor_piece_key, expected.state().minor_piece_key);
-        assert_eq!(actual.state().non_pawn_key, expected.state().non_pawn_key);
-        assert_eq!(actual.state().checkers, expected.state().checkers);
-        assert_eq!(actual.state().blockers_for_king, expected.state().blockers_for_king);
-        assert_eq!(actual.state().pinners, expected.state().pinners);
-        assert_eq!(actual.state().check_squares, expected.state().check_squares);
-        assert_eq!(actual.state().material_value, expected.state().material_value);
-        assert_eq!(actual.piece_list().piece_list_fb(), expected.piece_list().piece_list_fb());
-        assert_eq!(actual.piece_list().piece_list_fw(), expected.piece_list().piece_list_fw());
-        for i in 0..Square::NUM {
-            let sq = Square::from_u8(i as u8).unwrap();
-            if actual.piece_on(sq).is_some() {
-                assert_eq!(
-                    actual.piece_list().piece_no_of_board(sq),
-                    expected.piece_list().piece_no_of_board(sq)
-                );
-            }
-            if compare_board_effects {
-                for color in [Color::Black, Color::White] {
-                    assert_eq!(actual.board_effect(color, sq), expected.board_effect(color, sq));
-                }
-            }
-        }
-        for color in [Color::Black, Color::White] {
-            for pt in PieceType::HAND_PIECES {
-                for n in 1..=actual.hand(color).count(pt) {
-                    let bp = crate::nnue::ExtBonaPiece::from_hand(color, pt, n as u8);
-                    assert_eq!(
-                        actual.piece_list().piece_no_of_hand(bp.fb),
-                        expected.piece_list().piece_no_of_hand(bp.fb)
-                    );
-                }
-            }
-        }
-        assert_eq!(legal_moves(actual), legal_moves(expected));
-    }
-
-    fn legal_moves(pos: &Position) -> Vec<String> {
-        let mut list = MoveList::new();
-        crate::movegen::generate_legal_all(pos, &mut list);
-        let mut moves: Vec<_> = list.iter().map(|mv| mv.to_usi()).collect();
-        moves.sort();
-        moves
-    }
-
-    #[test]
-    fn test_json_restores_complete_position() {
-        // 評価設定をロックし、halfkx-arch では NNUE の初期化状態によらず
-        // do_move/undo_move で利きが差分更新されるよう material Lv9 を有効にする。
-        let guard = crate::eval::material::test_support::lock_material();
-        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv9);
-        let update_board_effects = Position::should_update_board_effects();
-        #[cfg(any(
-            feature = "halfkx-arch",
-            feature = "nnue-effect-bucket",
-            feature = "nnue-runtime-dimensions"
-        ))]
-        assert!(update_board_effects);
-
-        for sfen in [
-            SFEN_HIRATE,
-            "8l/1l+R2P3/p2pBG1pp/kps1p4/Nn1P2G2/P1P1P2PP/1PS6/1KSG3+r1/LN2+p3L w Sbgn3p 124",
-            "4k4/9/9/9/9/9/9/9/4K4 b 2R2B4G4S4N4L18P 37",
-            "4r4/9/9/9/4K4/9/9/9/4k4 b - 1",
-        ] {
-            let mut expected = Position::new();
-            expected.set_sfen(sfen).unwrap();
-            let mut actual =
-                Position::from_board_state_json(&expected.to_board_state_json()).unwrap();
-            // 構築直後の利きは全構成で再計算済み。
-            assert_same_position(&actual, &expected, true);
-
-            let board =
-                std::array::from_fn(|i| expected.piece_on(Square::from_u8(i as u8).unwrap()));
-            let mut parts = Position::new();
-            parts.set_from_parts(&board, &expected.hand, expected.side_to_move()).unwrap();
-            parts.game_ply = expected.game_ply();
-            assert_same_position(&actual, &parts, true);
-
-            for usi in legal_moves(&expected) {
-                let mv = expected.to_move(Move::from_usi(&usi).unwrap()).unwrap();
-                actual.do_move(mv, actual.gives_check(mv));
-                expected.do_move(mv, expected.gives_check(mv));
-                assert_same_position(&actual, &expected, update_board_effects);
-                actual.undo_move(mv);
-                expected.undo_move(mv);
-                assert_same_position(&actual, &parts, update_board_effects);
-            }
-        }
-        drop(guard);
-    }
-
-    #[test]
-    fn test_json_rejects_total_piece_inventory_overflow() {
-        for (sfen, extra) in [
-            (SFEN_HIRATE, PieceType::Pawn),
-            ("4k4/9/9/9/4+b4/9/9/9/4K4 b B 1", PieceType::Bishop),
-            ("4k4/9/9/9/9/9/9/9/4K4 b Rr 1", PieceType::Rook),
-        ] {
-            let mut source = Position::new();
-            source.set_sfen(sfen).unwrap();
-            source.hand[Color::Black.index()] = source.hand(Color::Black).add(extra);
-            let json_error =
-                Position::from_board_state_json(&source.to_board_state_json()).err().unwrap();
-            let mut restored = Position::new();
-            let sfen_error = restored.set_sfen(&source.to_sfen()).unwrap_err();
-            let board = std::array::from_fn(|i| source.piece_on(Square::from_u8(i as u8).unwrap()));
-            let parts_error = restored
-                .set_from_parts(&board, &source.hand, source.side_to_move())
-                .unwrap_err();
-            assert_eq!(json_error, sfen_error.to_string());
-            assert_eq!(sfen_error, parts_error);
-            assert!(json_error.contains("Too many"));
-        }
-    }
-
     #[test]
     fn test_initial_board_json() {
         let board = Position::initial_board_json();
@@ -476,54 +333,6 @@ mod tests {
     }
 
     #[test]
-    fn test_json_ply_range() {
-        let mut board = Position::initial_board_json();
-        for ply in [None, Some(0), Some(MAX_GAME_PLY)] {
-            board.ply = ply;
-            let pos = Position::from_board_state_json(&board).unwrap();
-            assert_eq!(pos.game_ply(), ply.unwrap_or(1));
-        }
-        for ply in [-1, MAX_GAME_PLY + 1, i32::MAX, i32::MIN] {
-            board.ply = Some(ply);
-            assert!(Position::from_board_state_json(&board).is_err());
-        }
-    }
-
-    #[test]
-    fn test_strict_replay_rejects_trailing_characters() {
-        for token in [
-            "7g7fgarbage",
-            "7g7f+garbage",
-            "7g7fx",
-            "7g7f++",
-            "P*5e+",
-            "P*5egarbage",
-            "7g7f ",
-            "7g7f歩",
-        ] {
-            let error =
-                Position::replay_moves_strict("startpos", &[token.into()], None).unwrap_err();
-            assert_eq!(error, format!("failed to parse move: {token}"));
-        }
-        let moves = ["7g7f".into(), "3c3dgarbage".into()];
-        assert_eq!(
-            Position::replay_moves_strict("startpos", &moves, None).unwrap_err(),
-            "failed to parse move: 3c3dgarbage"
-        );
-    }
-
-    #[test]
-    fn test_json_board_rejects_trailing_square_characters() {
-        for square in ["1aextra", "1a+", "1a ", "1a歩"] {
-            let mut board = Position::initial_board_json();
-            board.cells[0][0].square = square.into();
-            assert_eq!(
-                Position::from_board_state_json(&board).err(),
-                Some(format!("invalid square: {square}"))
-            );
-        }
-    }
-    #[test]
     fn test_sfen_roundtrip() {
         let sfen = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
         let json = Position::parse_sfen_to_json(sfen).unwrap();
@@ -532,80 +341,6 @@ mod tests {
         assert_eq!(pos.to_sfen(), sfen);
     }
 
-    #[test]
-    fn test_strict_replay_accepts_non_promotions_for_both_sides() {
-        for (sfen, usi, piece) in [
-            ("k8/9/9/4P4/9/9/9/9/8K b - 1", "5d5c", "P"),
-            ("k8/9/9/4L4/9/9/9/9/8K b - 1", "5d5b", "L"),
-            ("k8/9/9/4B4/9/9/9/9/8K b - 1", "5d4c", "B"),
-            ("k8/9/9/4R4/9/9/9/9/8K b - 1", "5d5c", "R"),
-            ("k8/9/9/9/9/4p4/9/9/8K w - 1", "5f5g", "P"),
-            ("k8/9/9/9/9/4l4/9/9/8K w - 1", "5f5h", "L"),
-            ("k8/9/9/9/9/4b4/9/9/8K w - 1", "5f6g", "B"),
-            ("k8/9/9/9/9/4r4/9/9/8K w - 1", "5f5g", "R"),
-        ] {
-            for rights in [None, Some((1, 1))] {
-                let result = Position::replay_moves_strict(sfen, &[usi.into()], rights).unwrap();
-                assert_eq!(result.error, None, "{sfen}: {usi}");
-                assert_eq!(result.applied, [usi]);
-                assert_eq!(result.last_ply, 0);
-                let cell = result
-                    .board
-                    .cells
-                    .iter()
-                    .flatten()
-                    .find(|cell| cell.square == usi[2..4])
-                    .unwrap();
-                let actual = cell.piece.as_ref().unwrap();
-                assert_eq!(actual.piece_type, piece);
-                assert_ne!(actual.promoted, Some(true));
-            }
-        }
-    }
-
-    #[test]
-    fn test_strict_replay_rejects_dead_piece_non_promotions() {
-        for (sfen, usi) in [
-            ("k8/4P4/9/9/9/9/9/9/8K b - 1", "5b5a"),
-            ("k8/4L4/9/9/9/9/9/9/8K b - 1", "5b5a"),
-            ("k8/9/4N4/9/9/9/9/9/8K b - 1", "5c4a"),
-            ("k8/9/9/4N4/9/9/9/9/8K b - 1", "5d4b"),
-            ("k8/9/9/9/9/9/9/4p4/8K w - 1", "5h5i"),
-            ("k8/9/9/9/9/9/9/4l4/8K w - 1", "5h5i"),
-            ("k8/9/9/9/9/9/4n4/9/8K w - 1", "5g6i"),
-            ("k8/9/9/9/9/4n4/9/9/8K w - 1", "5f6h"),
-        ] {
-            for rights in [None, Some((1, 1))] {
-                let result = Position::replay_moves_strict(sfen, &[usi.into()], rights).unwrap();
-                assert_eq!(result.error, Some(format!("illegal move: {usi}")));
-                assert!(result.applied.is_empty());
-                assert_eq!(result.last_ply, -1);
-                assert_eq!(result.board, Position::parse_sfen_to_json(sfen).unwrap());
-                let promotion = format!("{usi}+");
-                let promoted =
-                    Position::replay_moves_strict(sfen, std::slice::from_ref(&promotion), rights)
-                        .unwrap();
-                assert_eq!(promoted.error, None, "{sfen}: {promotion}");
-                assert_eq!(promoted.applied, [promotion]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_strict_replay_in_check_rejects_pass_and_accepts_non_promoting_evasion() {
-        // 角で王手している飛車を取る不成は合法。王手放置やパスは不可。
-        let sfen = "k8/9/4r4/3B5/9/9/9/9/4K4 b - 1";
-        for rights in [None, Some((1, 1))] {
-            for usi in ["pass", "6d7c"] {
-                let result = Position::replay_moves_strict(sfen, &[usi.into()], rights).unwrap();
-                assert_eq!(result.error, Some(format!("illegal move: {usi}")));
-                assert!(result.applied.is_empty());
-            }
-            let result = Position::replay_moves_strict(sfen, &["6d5c".into()], rights).unwrap();
-            assert_eq!(result.error, None);
-            assert_eq!(result.applied, ["6d5c"]);
-        }
-    }
     #[test]
     fn test_replay_moves_strict_accepts_usi_without_piece_info() {
         let moves = vec!["7g7f".to_string()];
@@ -660,59 +395,5 @@ mod tests {
         );
         assert!(result.error.is_some());
         assert!(result.error.unwrap().contains("illegal move"));
-    }
-
-    #[test]
-    fn test_replay_moves_strict_without_attacker_king() {
-        // 受け方の玉 2一 の利きが、玉の無い攻め方の既定の升 1一 に届く局面
-        let sfen = "7k1/9/9/9/9/9/9/9/9 b G 1";
-        let moves = ["G*2b".to_string()];
-        let result = Position::replay_moves_strict(sfen, &moves, None).unwrap();
-        assert_eq!(result.error, None);
-        assert_eq!(result.applied, moves);
-        // 受け方の玉は、利きの無い金を取れて、利きのある升へは逃げられない
-        let moves = ["G*3b".to_string(), "2a3b".to_string()];
-        let result = Position::replay_moves_strict(sfen, &moves, None).unwrap();
-        assert_eq!(result.error, None);
-        let moves = ["G*2b".to_string(), "2a1b".to_string(), "2b2a".to_string()];
-        let result = Position::replay_moves_strict(sfen, &moves, None).unwrap();
-        assert_eq!(result.error, Some("illegal move: 2a1b".to_string()));
-        assert_eq!(result.applied, ["G*2b"]);
-    }
-
-    #[test]
-    fn test_replay_moves_strict_with_pass_without_attacker_king() {
-        let sfen = "7k1/9/9/9/9/9/9/9/9 b G 1";
-        let moves = ["pass".to_string(), "2a3a".to_string(), "G*3b".to_string()];
-        let result = Position::replay_moves_strict(sfen, &moves, Some((1, 1))).unwrap();
-        assert_eq!(result.error, None);
-        assert_eq!(result.applied, moves);
-        let result = Position::replay_moves_strict(sfen, &moves, None).unwrap();
-        assert_eq!(result.error, Some("illegal move: pass".to_string()));
-    }
-
-    #[test]
-    fn test_replay_moves_strict_rejects_two_kings_of_one_side() {
-        let result = Position::replay_moves_strict("9/9/9/9/9/9/9/9/K7K b - 1", &[], None);
-        assert_eq!(result.unwrap_err(), "sente has more than one king");
-    }
-
-    #[test]
-    fn test_json_accepts_missing_king_and_rejects_two_kings() {
-        let mut expected = Position::new();
-        // 受け方の玉 2一 の利きが、玉の無い先手の既定の升 1一 に届く
-        expected.set_sfen("7k1/9/9/9/9/9/9/9/9 b G 1").unwrap();
-        let json = expected.to_board_state_json();
-        let restored = Position::from_board_state_json(&json).unwrap();
-        assert_eq!(restored.to_sfen(), expected.to_sfen());
-        assert!(!restored.in_check());
-
-        let mut two_kings = json.clone();
-        let gote_king = json.cells[0].iter().find_map(|cell| cell.piece.clone());
-        two_kings.cells[8][0].piece = gote_king;
-        assert_eq!(
-            Position::from_board_state_json(&two_kings).err().as_deref(),
-            Some("gote has more than one king in board state")
-        );
     }
 }

@@ -7,8 +7,8 @@
 //! | 名前 | 数式 | 出力次元比 | 用途 |
 //! |------|------|-----------|------|
 //! | CReLU | `clamp(x, 0, QA)` | 1:1 | 従来互換 |
-//! | PairwiseCReLU | `clamp(a, 0, QA) * clamp(b, 0, QA) >> shift` | 2:1 | ペアごとの積 |
-//! | SCReLU | `clamp(x, 0, QA)²` | 1:1 | bullet-shogi SCReLU モデル用 |
+//! | PairwiseCReLU | `clamp(a, 0, QA) * clamp(b, 0, QA) >> shift` | 2:1 | Stockfish方式 |
+//! | SCReLU | `clamp(x, 0, QA)²` | 1:1 | bullet-shogi互換 |
 //!
 //! # アーキテクチャ文字列との対応
 //!
@@ -29,10 +29,6 @@ use super::constants::WEIGHT_SCALE_BITS;
 /// 各活性化関数は出力次元の変換比率（`OUTPUT_DIM_DIVISOR`）を定義し、
 /// L1層の入力次元を決定する。
 pub trait FtActivation: Clone + Copy + Default + Send + Sync + 'static {
-    /// FT 出力は qa <= 127 のとき、中間層出力は qa に関係なく 0..=127 に収まるか。
-    /// 独自実装は既定で全 u8 範囲の積和を使用する。
-    const SEVEN_BIT_WHEN_QA127: bool = false;
-
     /// 出力次元の除数
     ///
     /// L1層入力次元 = FT出力次元 * 2 / OUTPUT_DIM_DIVISOR
@@ -47,10 +43,6 @@ pub trait FtActivation: Clone + Copy + Default + Send + Sync + 'static {
     /// - `input`: FeatureTransformer出力（i16）
     /// - `output`: 活性化後の出力（u8）
     /// - `qa`: クリッピング閾値（通常127または255）
-    ///
-    /// # Panics
-    /// 組込み実装は出力長が `input.len() / OUTPUT_DIM_DIVISOR` と異なる場合に panic する。
-    /// PairwiseCReLU の入力長は、両視点を均等に分割できる4の倍数でなければならない。
     fn activate_i16_to_u8(input: &[i16], output: &mut [u8], qa: i16);
 
     /// i32入力からu8出力への活性化関数適用（中間層用）
@@ -60,9 +52,6 @@ pub trait FtActivation: Clone + Copy + Default + Send + Sync + 'static {
     /// # 引数
     /// - `input`: AffineTransform出力（i32）
     /// - `output`: 活性化後の出力（u8）
-    ///
-    /// # Panics
-    /// 組込み実装は入力と出力の長さが異なる場合に panic する。
     fn activate_i32_to_u8(input: &[i32], output: &mut [u8]);
 
     /// アーキテクチャ文字列のサフィックス
@@ -87,19 +76,17 @@ pub trait FtActivation: Clone + Copy + Default + Send + Sync + 'static {
 pub struct CReLU;
 
 impl FtActivation for CReLU {
-    const SEVEN_BIT_WHEN_QA127: bool = true;
-
     const OUTPUT_DIM_DIVISOR: usize = 1;
 
     #[inline]
     fn activate_i16_to_u8(input: &[i16], output: &mut [u8], qa: i16) {
-        assert_eq!(input.len(), output.len());
+        debug_assert_eq!(input.len(), output.len());
         crelu_i16_to_u8(input, output, qa);
     }
 
     #[inline]
     fn activate_i32_to_u8(input: &[i32], output: &mut [u8]) {
-        assert_eq!(input.len(), output.len());
+        debug_assert_eq!(input.len(), output.len());
         crelu_i32_to_u8(input, output);
     }
 
@@ -392,28 +379,25 @@ fn crelu_i32_to_u8(input: &[i32], output: &mut [u8]) {
 ///
 /// `y[j] = clamp(a, 0, QA) * clamp(b, 0, QA) >> shift`
 ///
-/// 入力の前半と後半をペアにして乗算し、
+/// Stockfishで使用される方式。入力の前半と後半をペアにして乗算し、
 /// 出力次元を半分にする。
 #[derive(Clone, Copy, Default)]
 pub struct PairwiseCReLU;
 
 impl FtActivation for PairwiseCReLU {
-    const SEVEN_BIT_WHEN_QA127: bool = true;
-
     const OUTPUT_DIM_DIVISOR: usize = 2;
 
     #[inline]
     fn activate_i16_to_u8(input: &[i16], output: &mut [u8], qa: i16) {
-        assert!(input.len().is_multiple_of(4));
-        assert_eq!(input.len() / 2, output.len());
+        debug_assert_eq!(input.len(), output.len() * 2);
         pairwise_crelu_i16_to_u8(input, output, qa);
     }
 
     #[inline]
     fn activate_i32_to_u8(input: &[i32], output: &mut [u8]) {
-        // 中間層では通常のCReLUを使用
+        // 中間層では通常のCReLUを使用（bullet-shogiと同じ）
         // Pairwiseは最初のFT層のみに適用
-        assert_eq!(input.len(), output.len());
+        debug_assert_eq!(input.len(), output.len());
         crelu_i32_to_u8(input, output);
     }
 
@@ -468,7 +452,9 @@ fn pairwise_crelu_i16_to_u8(input: &[i16], output: &mut [u8], qa: i16) {
     //   必要なシフト量: log2(16129/127) ≈ 7.00 → shift=7
     //   実際の出力: (127*127)>>7 = 126 (許容範囲)
     //
-    // shift=8（QA=255時、出力[0,254]）は実験で棋力が下がったため採用しない。
+    // Stockfish/Reckless互換: この値は実測で最適化されており、
+    // shift=8（QA=255時、出力[0,254]）は実験で棋力が低下したため採用せず
+    //
     // SIMD シフト命令は定数が必要なため、分岐して処理
     if qa >= 255 {
         // STM perspective: input[0..l1] → output[0..quarter]
@@ -1109,25 +1095,23 @@ fn pairwise_crelu_i32_to_u8(input: &[i32], output: &mut [u8]) {
 ///
 /// `y = clamp(x, 0, QA)²`
 ///
-/// bullet-shogi SCReLU モデル用の活性化関数。
+/// bullet-shogiで使用される活性化関数。
 /// クリッピング後に二乗することで、より強い非線形性を持つ。
 #[derive(Clone, Copy, Default)]
 pub struct SCReLU;
 
 impl FtActivation for SCReLU {
-    const SEVEN_BIT_WHEN_QA127: bool = true;
-
     const OUTPUT_DIM_DIVISOR: usize = 1;
 
     #[inline]
     fn activate_i16_to_u8(input: &[i16], output: &mut [u8], qa: i16) {
-        assert_eq!(input.len(), output.len());
+        debug_assert_eq!(input.len(), output.len());
         screlu_i16_to_u8(input, output, qa);
     }
 
     #[inline]
     fn activate_i32_to_u8(input: &[i32], output: &mut [u8]) {
-        assert_eq!(input.len(), output.len());
+        debug_assert_eq!(input.len(), output.len());
         screlu_i32_to_u8(input, output);
     }
 
@@ -1289,17 +1273,7 @@ fn screlu_i16_to_u8_inner<const QA: i32, const SHIFT: i32>(input: &[i16], output
                     };
 
                     // クランプ
-                    #[cfg(target_feature = "sse4.1")]
                     let clamped = _mm_min_epi32(_mm_max_epi32(v, zero), max_clamp);
-                    #[cfg(not(target_feature = "sse4.1"))]
-                    let clamped = {
-                        let positive = _mm_and_si128(v, _mm_cmpgt_epi32(v, zero));
-                        let over = _mm_cmpgt_epi32(positive, max_clamp);
-                        _mm_or_si128(
-                            _mm_and_si128(over, max_clamp),
-                            _mm_andnot_si128(over, positive),
-                        )
-                    };
 
                     // 二乗
                     #[cfg(target_feature = "sse4.1")]
@@ -1321,13 +1295,7 @@ fn screlu_i16_to_u8_inner<const QA: i32, const SHIFT: i32>(input: &[i16], output
 
                     // シフトしてクランプ
                     let shifted = _mm_srai_epi32(squared, SHIFT);
-                    #[cfg(target_feature = "sse4.1")]
                     let result = _mm_min_epi32(shifted, max_out);
-                    #[cfg(not(target_feature = "sse4.1"))]
-                    let result = {
-                        let over = _mm_cmpgt_epi32(shifted, max_out);
-                        _mm_or_si128(_mm_and_si128(over, max_out), _mm_andnot_si128(over, shifted))
-                    };
 
                     // i32 → i16 → u8 にパック
                     let packed16 = _mm_packs_epi32(result, result);
@@ -1490,73 +1458,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn activations_reject_short_output_before_writing() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        fn check<A: FtActivation>() {
-            let mut output = [0xa5; 1];
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| A::activate_i16_to_u8(
-                    &[1; 32],
-                    &mut output,
-                    127
-                )))
-                .is_err()
-            );
-            assert_eq!(output, [0xa5]);
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| A::activate_i32_to_u8(&[1; 32], &mut output)))
-                    .is_err()
-            );
-            assert_eq!(output, [0xa5]);
-        }
-
-        check::<CReLU>();
-        check::<SCReLU>();
-        check::<PairwiseCReLU>();
-    }
-
-    #[test]
-    #[should_panic]
-    fn pairwise_rejects_unequal_perspective_halves() {
-        PairwiseCReLU::activate_i16_to_u8(&[1; 6], &mut [0; 3], 127);
-    }
-
-    #[test]
-    fn screlu_i16_matches_scalar_at_simd_boundaries() {
-        let input: [i16; 67] = std::array::from_fn(|i| {
-            [-128, -1, 0, 1, 63, 126, 127, 128, 254, 255, i16::MAX][i % 11]
-        });
-        for qa in [127, 255] {
-            let mut output = [0; 67];
-            SCReLU::activate_i16_to_u8(&input, &mut output, qa);
-            for (&value, actual) in input.iter().zip(output) {
-                let clamped = i32::from(value).clamp(0, i32::from(qa));
-                let shift = if qa == 255 { 9 } else { 7 };
-                assert_eq!(actual, ((clamped * clamped) >> shift).min(127) as u8);
-            }
-        }
-    }
-
-    #[test]
     fn test_detect_activation_from_arch() {
-        assert_eq!(detect_activation_from_arch("Features=HalfKaHmMerged[73305->512x2]"), "CReLU");
+        assert_eq!(detect_activation_from_arch("Features=HalfKA_hm[73305->512x2]"), "CReLU");
         assert_eq!(
-            detect_activation_from_arch("Features=HalfKaHmMerged[73305->512x2]-SCReLU"),
+            detect_activation_from_arch("Features=HalfKA_hm[73305->512x2]-SCReLU"),
             "SCReLU"
         );
         assert_eq!(
-            detect_activation_from_arch("Features=HalfKaHmMerged[73305->512/2x2]-Pairwise"),
+            detect_activation_from_arch("Features=HalfKA_hm[73305->512/2x2]-Pairwise"),
             "PairwiseCReLU"
         );
         // "PairwiseCReLU" の識別子は "-Pairwise" なので nnue-pytorch の "-PairwiseCReLU" も拾える
         assert_eq!(
-            detect_activation_from_arch("Features=HalfKaHmMerged[73305->512/2x2]-PairwiseCReLU"),
+            detect_activation_from_arch("Features=HalfKA_hm[73305->512/2x2]-PairwiseCReLU"),
             "PairwiseCReLU"
         );
         // "-SCReLU-Pairwise" は未対応なので誤って SCReLU や Pairwise と判定しない
         assert_eq!(
-            detect_activation_from_arch("Features=HalfKaHmMerged[73305->512/2x2]-SCReLU-Pairwise"),
+            detect_activation_from_arch("Features=HalfKA_hm[73305->512/2x2]-SCReLU-Pairwise"),
             "SCReLU-Pairwise"
         );
     }
@@ -1564,7 +1483,7 @@ mod tests {
     #[test]
     fn test_detect_activation_nested_screlu() {
         // bucket 無し SCReLU: `(SqrClippedReLU[` トークンのみ、`(ClippedReLU[` は無い
-        let arch = "Features=HalfKaHmMerged(Friend)[73305->1024x2],Network=AffineTransform\
+        let arch = "Features=HalfKA_hm(Friend)[73305->1024x2],Network=AffineTransform\
                     [1<-64](SqrClippedReLU[64](AffineTransform[64<-8](SqrClippedReLU[8](\
                     AffineTransformSparseInput[8<-2048](InputSlice[2048(0:2048)]))))),fv_scale=14";
         assert_eq!(detect_activation_from_arch(arch), "SCReLU");
@@ -1573,7 +1492,7 @@ mod tests {
     #[test]
     fn test_detect_activation_nested_crelu() {
         // bucket 無し CReLU: `(ClippedReLU[` トークンのみ
-        let arch = "Features=HalfKaHmMerged(Friend)[73305->1024x2],Network=AffineTransform\
+        let arch = "Features=HalfKA_hm(Friend)[73305->1024x2],Network=AffineTransform\
                     [1<-64](ClippedReLU[64](AffineTransform[64<-8](ClippedReLU[8](\
                     AffineTransformSparseInput[8<-2048](InputSlice[2048(0:2048)]))))),fv_scale=14";
         assert_eq!(detect_activation_from_arch(arch), "CReLU");
@@ -1583,7 +1502,7 @@ mod tests {
     fn test_detect_activation_nested_layerstacks_mixed() {
         // LayerStacks (bucketed) は SqrClippedReLU と ClippedReLU が混在 →
         // CReLU を返す（LayerStacks 経路では戻り値は使われないため既存挙動を保持）
-        let arch = "Features=HalfKaHmMerged(Friend)[73305->1536x2],Network=AffineTransform\
+        let arch = "Features=HalfKA_hm(Friend)[73305->1536x2],Network=AffineTransform\
                     [1<-32](ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](\
                     AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28";
         assert_eq!(detect_activation_from_arch(arch), "CReLU");
@@ -1683,9 +1602,16 @@ mod tests {
 
     #[test]
     fn test_detect_activation() {
-        assert_eq!(detect_activation_from_arch("HalfKaHmMerged^512x2-8-96"), "CReLU");
-        assert_eq!(detect_activation_from_arch("HalfKaHmMerged^512x2-8-96-SCReLU"), "SCReLU");
+        assert_eq!(detect_activation_from_arch("HalfKA_hm^512x2-8-96"), "CReLU");
+        assert_eq!(detect_activation_from_arch("HalfKA_hm^512x2-8-96-SCReLU"), "SCReLU");
         assert_eq!(detect_activation_from_arch("HalfKP256x2-32-32-PairwiseCReLU"), "PairwiseCReLU");
+    }
+
+    #[test]
+    fn test_output_dim_divisor() {
+        assert_eq!(CReLU::OUTPUT_DIM_DIVISOR, 1);
+        assert_eq!(PairwiseCReLU::OUTPUT_DIM_DIVISOR, 2);
+        assert_eq!(SCReLU::OUTPUT_DIM_DIVISOR, 1);
     }
 
     #[test]

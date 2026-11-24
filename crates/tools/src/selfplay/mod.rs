@@ -1,9 +1,6 @@
-pub mod adjudication;
 pub mod backend;
-pub mod cpu_affinity;
 pub mod engine;
 pub mod game;
-pub mod nps_bench;
 pub mod position;
 pub mod time_control;
 pub mod types;
@@ -15,16 +12,11 @@ pub use backend::{
 pub use engine::{EngineConfig, EngineProcess};
 pub use game::{GameConfig, GameResult, MoveEvent, run_game};
 pub use position::{
-    ParsedPosition, build_position, describe_position, ensure_start_positions_within_max_moves,
-    load_start_positions, parse_position_line, parse_sfen_only, plies_before_start,
+    ParsedPosition, build_position, describe_position, load_start_positions, parse_position_line,
+    parse_sfen_only,
 };
 pub use time_control::TimeControl;
 pub use types::{
     EvalLog, GameOutcome, InfoCallback, InfoSnapshot, SearchOutcome, SearchRequest, TimeArgs,
     duration_to_millis, side_label,
 };
-
-pub use adjudication::{DrawRule, ResignRule};
-
-/// tournament が出力する動的制御の変更履歴ファイル名。
-pub const CONTROL_HISTORY_FILE_NAME: &str = "control_history.jsonl";

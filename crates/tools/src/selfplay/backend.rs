@@ -8,10 +8,10 @@ use std::time::Instant;
 
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search, SearchInfo};
-use rshogi_core::types::{Bound, Color, Move};
+use rshogi_core::types::{Color, Move};
 
 use super::engine::EngineProcess;
-use super::types::{EvalLog, InfoSnapshot, ScoreBound, SearchRequest, TimeArgs};
+use super::types::{EvalLog, InfoSnapshot, SearchRequest, TimeArgs};
 
 // =============================================================================
 // 共通型
@@ -84,9 +84,8 @@ pub struct SearchParams {
 pub trait SearchBackend {
     /// 新しい対局の準備
     ///
-    /// NativeBackend は true で TT・EvalHash・履歴を保持し、false ですべてクリアする。
-    /// USI backend は true で isready、false で usinewgame + isready を送る。
-    /// キャッシュ保持は接続先に依存し、rshogi は isready でも TT・EvalHash をクリアする。
+    /// `keep_tt` が true の場合は置換表を保持する。
+    /// false の場合は置換表と履歴をクリアする。
     fn prepare_game(&mut self, keep_tt: bool) -> Result<()>;
 
     /// 探索を実行して結果を返す
@@ -105,34 +104,6 @@ pub struct NativeBackend {
 }
 
 impl NativeBackend {
-    /// 探索木の標本採取を設定する。
-    #[cfg(feature = "search-tree-sample")]
-    pub fn set_tree_sample(
-        &mut self,
-        config: Option<rshogi_core::search::TreeSampleConfig>,
-        seed: u64,
-    ) {
-        self.engine.set_tree_sample(config, seed);
-    }
-
-    /// 対局ごとの標本採取 seed を設定する。
-    #[cfg(feature = "search-tree-sample")]
-    pub fn reseed_tree_sample(&mut self, seed: u64) {
-        self.engine.reseed_tree_sample(seed);
-    }
-
-    /// 採取済み標本を取り出す。
-    #[cfg(feature = "search-tree-sample")]
-    pub fn drain_tree_samples(&mut self, out: &mut Vec<rshogi_core::search::TreeSample>) {
-        self.engine.drain_tree_samples(out);
-    }
-
-    /// 標本採取の累計を返す。
-    #[cfg(feature = "search-tree-sample")]
-    pub fn tree_sample_stats(&self) -> rshogi_core::search::TreeSampleStats {
-        self.engine.tree_sample_stats()
-    }
-
     /// 新しい NativeBackend を作成
     pub fn new(tt_size_mb: usize, eval_hash_size_mb: usize) -> Self {
         Self {
@@ -144,12 +115,11 @@ impl NativeBackend {
 impl SearchBackend for NativeBackend {
     fn prepare_game(&mut self, keep_tt: bool) -> Result<()> {
         if keep_tt {
-            // TT・EvalHash・履歴を保持（USI backend の保持動作は接続先に依存）
+            // TT・履歴ともに保持（USI の sync_ready() と同等）
         } else {
-            // TT・EvalHash・探索状態をクリア（rshogi USI の usinewgame と同等）
+            // TT・履歴ともにクリア（USI の usinewgame と同等）
             self.engine.clear_tt();
-            self.engine.clear_eval_hash();
-            self.engine.clear_for_new_game();
+            self.engine.clear_histories();
         }
         Ok(())
     }
@@ -226,13 +196,6 @@ impl SearchBackend for NativeBackend {
         let best_move_usi = best_move.map(|m| m.to_usi());
 
         let eval = Some(EvalLog {
-            // Native backendは単一SearchResultから構築するため、USI原文は存在しない。
-            last_exact_primary: None,
-            score_bound: match result.bound {
-                Bound::Lower => Some(ScoreBound::Lowerbound),
-                Bound::Upper => Some(ScoreBound::Upperbound),
-                Bound::Exact | Bound::None => None,
-            },
             score_cp: if result.score.is_mate_score() {
                 None
             } else {
@@ -244,7 +207,6 @@ impl SearchBackend for NativeBackend {
             } else {
                 None
             },
-            score_mate_sign: None,
             depth: Some(result.depth as u32),
             seldepth: None,
             nodes: Some(result.nodes),
@@ -312,9 +274,8 @@ impl SearchBackend for UsiBackend {
         };
 
         let req = SearchRequest {
-            limit_only_timeout_ms: None,
+            position_cmd: None, // 2026-10-07: backend は単発探索なので履歴なし (従来動作)
             sfen: &params.sfen,
-            moves: "",
             time_args: params.time_args,
             think_limit_ms: params.think_limit_ms,
             timeout_margin_ms: params.timeout_margin_ms,

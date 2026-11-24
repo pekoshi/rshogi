@@ -8,14 +8,14 @@
 
 use crate::nnue::DirtyPiece;
 use crate::position::Position;
-use crate::types::{Bound, DEPTH_QS, Depth, Move, Value};
+use crate::types::{Bound, Depth, Move, Value};
 
 use super::alpha_beta::{
     FutilityParams, SearchContext, SearchState, Step14Context, Step14Outcome, TTContext,
 };
 use super::qsearch::qsearch;
 use super::search_helpers::{
-    clear_cont_history_for_null, cont_history_keys, do_move_and_push, nnue_pop, nnue_push,
+    clear_cont_history_for_null, cont_history_tables, do_move_and_push, nnue_pop, nnue_push,
     set_cont_history_for_move,
 };
 use super::stats::{inc_stat, inc_stat_by_depth};
@@ -24,25 +24,38 @@ use super::tt_sanity::{TtWriteTrace, helper_tt_write_enabled_for_depth, maybe_tr
 use super::types::{NodeType, value_to_tt};
 use super::{LimitsType, MovePicker, TimeManagement};
 
+#[inline]
+fn div_i32_by_32_toward_zero(x: i32) -> i32 {
+    (x + ((x >> 31) & 31)) >> 5
+}
+
 /// Futility pruning
-///
-/// bool 群をレジスタ上で扱えるよう、呼び出し元に展開する。
-#[inline(always)]
+#[inline]
 pub(super) fn try_futility_pruning(
     params: FutilityParams,
     tune_params: &super::SearchTuneParams,
 ) -> Option<Value> {
     if !params.tt_pv
         && !params.in_check
-        && params.depth < 14
+        && params.depth < tune_params.reverse_futility_max_depth
         && params.static_eval != Value::NONE
         && params.static_eval >= params.beta
         && !params.beta.is_loss()
         && !params.static_eval.is_win()
         && (!params.tt_move_exists || params.tt_capture)
     {
-        let futility_mult = tune_params.futility_margin_base
-            - tune_params.futility_margin_tt_bonus * (!params.tt_hit) as i32;
+        // PATCH-2026-05-31-RANK5-START
+        // SF 7bd32a5: depth 1..ramp で futility_margin_low → futility_margin_base
+        // を線形補間。ramp 以降は base が適用される。 base 値は SPSA で tune 済の
+        // 既存値を維持しつつ、shallow depth では枝刈りを緩める。
+        let ramp = tune_params.futility_margin_ramp_depth.max(1);
+        let low = tune_params.futility_margin_low;
+        let base = tune_params.futility_margin_base;
+        let d = params.depth.min(ramp);
+        let interpolated_base = low + (base - low) * d / ramp;
+        let futility_mult =
+            interpolated_base - tune_params.futility_margin_tt_bonus * (!params.tt_hit) as i32;
+        // PATCH-2026-05-31-RANK5-END
         let futility_margin = Value::new(
             futility_mult * params.depth
                 - (params.improving as i32) * futility_mult * tune_params.futility_improving_scale
@@ -119,7 +132,7 @@ pub(super) fn step14_pruning(
                 }
             }
         } else if !step_ctx.follow_pv || !step_ctx.pv_node {
-            // Quiet moves — followPV かつ PV ノードの場合は pruning をスキップ
+            // Quiet moves — followPV かつ PV ノードの場合は pruning をスキップ（Stockfish 準拠）
             // ※ スキップ時は continuation history pruning / futility pruning / SEE pruning の
             //    全 3 チェックを通過する
             let moved_piece = step_ctx.mv.moved_piece_after();
@@ -130,8 +143,7 @@ pub(super) fn step14_pruning(
             let (main_hist, pawn_hist) = {
                 let h = unsafe { ctx.history.as_ref_unchecked() };
                 let mh = h.main_history.get(step_ctx.mover, step_ctx.mv) as i32;
-                let ph =
-                    ctx.shared.pawn_history(step_ctx.pawn_history_index, moved_piece, to_sq) as i32;
+                let ph = h.pawn_history.get(step_ctx.pawn_history_index, moved_piece, to_sq) as i32;
                 (mh, ph)
             };
 
@@ -154,9 +166,13 @@ pub(super) fn step14_pruning(
             }
 
             // mainHistoryは pruning判定後に追加
+            let main_hist_term = tune.main_hist_pruning_add_num * main_hist;
             let hist_score = cont_history
-                + tune.main_hist_pruning_add_num * main_hist
-                    / tune.main_hist_pruning_add_den.max(1);
+                + if tune.main_hist_pruning_add_den == 32 {
+                    div_i32_by_32_toward_zero(main_hist_term)
+                } else {
+                    main_hist_term / tune.main_hist_pruning_add_den.max(1)
+                };
 
             // lmrDepth調整 (枝刈りされなかった場合のみ実行)
             let lmr_depth = lmr_depth + hist_score / tune.lmr_depth_history_div.max(1);
@@ -335,9 +351,9 @@ where
         let r = ctx.tune_params.nmp_reduction_base
             + depth / ctx.tune_params.nmp_reduction_depth_div.max(1);
 
-        #[cfg(not(feature = "search-pass-rules"))]
+        #[cfg(feature = "search-no-pass-rules")]
         let use_pass = false;
-        #[cfg(feature = "search-pass-rules")]
+        #[cfg(not(feature = "search-no-pass-rules"))]
         let use_pass = pos.is_pass_rights_enabled() && pos.can_pass();
 
         if use_pass {
@@ -375,52 +391,20 @@ where
         }
 
         if null_value >= beta && !null_value.is_win() {
-            if st.nmp_min_ply != 0 || depth < ctx.tune_params.nmp_verification_depth_threshold {
-                inc_stat!(st, nmp_cutoff);
-                inc_stat_by_depth!(st, nmp_cutoff_by_depth, depth);
-                return (Some(null_value), improving);
-            }
-
-            st.nmp_min_ply = ply
-                + ctx.tune_params.nmp_min_ply_update_num * (depth - r)
-                    / ctx.tune_params.nmp_min_ply_update_den.max(1);
-
-            // NMP verification search は同一 ply の depth-liveness 追跡フィールドを
-            // 浅い depth で上書きするため、外側の move path に戻る際に復元する。
-            // また verification 自体を実手 child と誤認させない (偽の非減少 edge
-            // カウントや verification depth への clamp を防ぐ)。マークは一回性なので、
-            // verification が qsearch へ直行して liveness 更新に到達しない depth では
-            // 立てない (残留すると次の実手 child が誤って追跡から外れる)。
-            let outer_depth_liveness = st.depth_liveness_snapshot(ply);
-            if depth - r > DEPTH_QS {
-                st.depth_liveness_mark_verification_root();
-            }
-            let v = search_node(
-                st,
-                ctx,
-                pos,
-                depth - r,
-                beta - Value::new(1),
-                beta,
-                ply,
-                false,
-                limits,
-                time_manager,
-            );
-            st.depth_liveness_restore(ply, outer_depth_liveness);
-
-            st.nmp_min_ply = 0;
-
-            if v >= beta {
-                inc_stat!(st, nmp_cutoff);
-                inc_stat_by_depth!(st, nmp_cutoff_by_depth, depth);
-                return (Some(null_value), improving);
-            }
+            // PATCH-2026-05-31-RANK4-START
+            // YO c117c9c: NMP verification search を将棋では常に skip する。
+            // verification search の意義 = null move が指せると優位な特殊局面
+            // (zugzwang 等) の誤枝刈りを防ぐことだが、将棋ではほぼ発生しないため
+            // YO は丸ごと bypass している。state は touch せず、即 cutoff を返す。
+            inc_stat!(st, nmp_cutoff);
+            inc_stat_by_depth!(st, nmp_cutoff_by_depth, depth);
+            return (Some(null_value), improving);
+            // PATCH-2026-05-31-RANK4-END
         }
     }
 
     // Step10直前の improving 再計算は VALUE_NONE を含めて評価する。
-    // 王手中は improving を更新しない。
+    // in-check ノードは YO ではこの経路に入らないため、現実装では !in_check のみ維持する。
     if !in_check {
         improving |= static_eval >= beta;
     }
@@ -494,7 +478,7 @@ where
 
     inc_stat!(st, probcut_attempted);
 
-    let cont_tables = cont_history_keys(st, ply);
+    let cont_tables = cont_history_tables(st, ctx, ply);
     let mut mp = MovePicker::new_probcut(
         pos,
         tt_ctx.mv,
@@ -511,7 +495,7 @@ where
         let mv = {
             // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない
             let h = unsafe { ctx.history.as_ref_unchecked() };
-            mp.next_move(pos, h, ctx.shared)
+            mp.next_move(pos, h)
         };
         if mv == Move::NONE {
             break;
@@ -529,7 +513,7 @@ where
         let cont_hist_to = mv.to();
 
         st.stack[ply as usize].current_move = mv;
-        do_move_and_push(st, pos, mv, gives_check, ctx.tt, ctx.eval_hash);
+        do_move_and_push(st, pos, mv, gives_check, ctx.tt);
         set_cont_history_for_move(
             st,
             ctx,
@@ -550,7 +534,7 @@ where
             time_manager,
         );
 
-        if !st.abort && value >= prob_beta && probcut_depth > 0 {
+        if value >= prob_beta && probcut_depth > 0 {
             st.set_child_follow_pv(ply, mv);
             value = -search_node(
                 st,
@@ -568,11 +552,6 @@ where
         nnue_pop(st);
         pos.undo_move(mv);
 
-        // 未完了の子の番兵値を cutoff 判定や TT 保存に使わない。
-        if st.abort {
-            return Some(Value::ZERO);
-        }
-
         if value >= prob_beta {
             inc_stat!(st, probcut_cutoff);
             let stored_depth = (probcut_depth + 1).max(1);
@@ -581,18 +560,7 @@ where
                 && helper_tt_write_enabled_for_depth(ctx.thread_id, Bound::Lower, stored_depth);
             #[cfg(not(feature = "tt-trace"))]
             let allow_write = ctx.allow_tt_write;
-            if allow_write
-                && tt_ctx.writer.write(
-                    tt_ctx.key,
-                    value_to_tt(value, ply),
-                    st.stack[ply as usize].tt_pv,
-                    Bound::Lower,
-                    stored_depth,
-                    mv,
-                    unadjusted_static_eval,
-                    ctx.tt.generation(),
-                )
-            {
+            if allow_write {
                 #[cfg(feature = "tt-trace")]
                 maybe_trace_tt_write(TtWriteTrace {
                     stage: "probcut_store",
@@ -611,6 +579,16 @@ where
                         Move::NONE
                     },
                 });
+                tt_ctx.result.write(
+                    tt_ctx.key,
+                    value_to_tt(value, ply),
+                    st.stack[ply as usize].tt_pv,
+                    Bound::Lower,
+                    stored_depth,
+                    mv,
+                    unadjusted_static_eval,
+                    ctx.tt.generation(),
+                );
                 inc_stat_by_depth!(st, tt_write_by_depth, stored_depth);
             }
 

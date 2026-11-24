@@ -1,56 +1,19 @@
 //! USIエンジン管理（ponder対応）
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::event::Event;
 use crate::protocol::parse_game_result;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// stderr ring buffer の最大行数 (engine 死亡時の診断 message 用)。
-const STDERR_TAIL_MAX_LINES: usize = 64;
-
-/// stderr 1 行あたりの byte 上限。超過分は破棄して次の `\n` で改行扱い。
-const STDERR_LINE_MAX_BYTES: usize = 4096;
-
-/// `engine_exited_error()` が stderr reader thread の EOF 観測完了を待つ最大時間。
-const STDERR_DRAIN_WAIT: Duration = Duration::from_millis(200);
-const STDERR_DRAIN_POLL: Duration = Duration::from_millis(50);
-
-/// `quit()` (graceful path) で stderr reader thread の join を待つ最大時間。
-const STDERR_JOIN_WAIT_GRACEFUL: Duration = Duration::from_millis(500);
-
-/// `Drop` (fast path) で stderr reader thread の join を待つ最大時間。
-const STDERR_JOIN_WAIT_DROP: Duration = Duration::from_millis(100);
-
-/// [`UsiEngine::spawn`] の起動オプション。
-///
-/// `bool` 引数 (ponder / stderr_passthrough) の意味取り違えを防ぐため、起動時に
-/// 個別意味を持つ flag は本 struct に集約する。`Default` impl は意図的に提供しない:
-/// 全 call site が値を明示することで「どの flag が ON か」を呼び出し位置で読めるようにする
-/// (TOML/CLI から渡された値をそのまま透過するのが既存運用)。
-pub struct SpawnOptions {
-    /// USI engine に ponder (相手手番中思考) を許可するか。CSA `--ponder` / TOML
-    /// `game.ponder` から伝搬される。
-    pub ponder: bool,
-    /// USI handshake (`usi` → `usiok` → `isready` → `readyok`) を待つ最大時間。
-    /// CSA TOML `engine.startup_timeout_sec` から伝搬される。
-    pub startup_timeout: Duration,
-    /// engine stderr を csa_client log に多重化するか。true のとき stderr reader
-    /// thread は ring buffer に push するのに加えて各行を `log::info!("[engine stderr] ...")`
-    /// に転送する。debug / 初期セットアップ用で、通常稼働時は false。
-    pub stderr_passthrough: bool,
-}
 
 /// USIエンジンプロセス
 pub struct UsiEngine {
@@ -60,25 +23,6 @@ pub struct UsiEngine {
     pub engine_name: String,
     opt_names: HashSet<String>,
     quit_sent: bool,
-    /// engine binary の path。`engine_name` は handshake 後しか入らないため、
-    /// 死亡時の error message には path も並記して debugging を支援する。
-    /// spawn は対局開始時 1 回しか呼ばれず、`PathBuf` の heap allocation は
-    /// ホットパスにないので許容範囲。
-    engine_path: PathBuf,
-    /// engine の stderr 末尾 64 行 ring buffer。各行 4096 bytes cap。
-    /// engine 死亡時の error message に末尾を付けて原因 debugging を支援する。
-    /// reader thread は best-effort: poison/UTF-8/IO error は loop 終了で吸収。
-    stderr_tail: Arc<Mutex<VecDeque<String>>>,
-    /// stderr reader thread が EOF/IO error 観測後 true をセット。
-    /// `engine_exited_error()` は snapshot 前に短時間 (200ms) この flag を
-    /// best-effort で待つ。実際の tail 可視性は snapshot 時の `Mutex::lock()`
-    /// が Acquire 同期点として機能することで保証される (Acquire load は
-    /// 早期 break 用 signal で、可視性 chain は Mutex 経由)。
-    stderr_done: Arc<AtomicBool>,
-    /// stderr reader thread の handle。`quit()` (graceful) と `Drop` (fast)
-    /// で bounded join + detach fallback。`engine_exited_error()` は handle を
-    /// take しない (副作用なし、cleanup ownership は quit/Drop に集約)。
-    stderr_reader_handle: Option<thread::JoinHandle<()>>,
 }
 
 /// bestmove の解析結果
@@ -90,8 +34,8 @@ pub struct BestMoveResult {
 
 /// 探索の終了理由
 pub enum SearchOutcome {
-    /// エンジンが bestmove を返した。第 2 引数は同じ主の info 行の score・PV と付随情報。
-    /// 採用できる行がなければ空の [`SearchInfo`]。
+    /// エンジンが bestmove を返した。第 2 引数は終了時点の累積 [`SearchInfo`]
+    /// (final score, final pv, final depth 等)。
     BestMove(BestMoveResult, SearchInfo),
 
     /// 探索中に server から終局通知 (or disconnect) を受信して中断した。
@@ -132,34 +76,23 @@ pub type InfoCallback<'a> = dyn FnMut(&SearchInfo, &str) + 'a;
 /// 利用例:
 ///
 /// ```ignore
-/// use rshogi_csa_client::{
-///     run_game_session_with_events, SpawnOptions, UsiEngine, UsiEngineDriver,
-/// };
+/// use rshogi_csa_client::{run_game_session_with_events, UsiEngine, UsiEngineDriver};
 ///
 /// // 1. 具象 `UsiEngine` をそのまま渡す
-/// let opts = SpawnOptions { ponder, startup_timeout: timeout, stderr_passthrough: false };
-/// let mut engine = UsiEngine::spawn(&path, &options, opts)?;
+/// let mut engine = UsiEngine::spawn(&path, &options, ponder, timeout)?;
 /// run_game_session_with_events(&config, &mut conn, &mut engine, shutdown, &mut sink)?;
 ///
 /// // 2. dyn dispatch で複数 engine 実装を切り替える
-/// let opts = SpawnOptions { ponder, startup_timeout: timeout, stderr_passthrough: false };
 /// let mut engine: Box<dyn UsiEngineDriver> = if use_builtin {
 ///     Box::new(BuiltinEngine::new(...))
 /// } else {
-///     Box::new(UsiEngine::spawn(&path, &options, opts)?)
+///     Box::new(UsiEngine::spawn(&path, &options, ponder, timeout)?)
 /// };
 /// run_game_session_with_events(&config, &mut conn, &mut *engine, shutdown, &mut sink)?;
 /// ```
 pub trait UsiEngineDriver {
     /// USI `usinewgame` 相当を実装する。対局開始前に 1 度呼ばれる。
     fn new_game(&mut self) -> Result<()>;
-
-    /// USI `setoption name <name> value <value>` を送信する。
-    ///
-    /// session はサーバーが Game_Summary で広告した入玉ルールをエンジンへ伝える
-    /// ために [`UsiEngineDriver::new_game`] の直前に呼ぶ。同期は後続 `new_game`
-    /// (usinewgame + isready) の readyok 待ちに委ねてよい。
-    fn set_option(&mut self, name: &str, value: &str) -> Result<()>;
 
     /// `position` + `go` を送信し、bestmove または server interrupt まで block する。
     ///
@@ -173,7 +106,6 @@ pub trait UsiEngineDriver {
     ///    行を検出した場合は engine に `stop` を送り、bestmove を drain してから
     ///    `Ok(SearchOutcome::ServerInterrupt(server_lines))` を返す
     /// 6. [`Event::ServerDisconnected`] を受信した場合も同様に終局として扱う
-    /// 7. 戻り値の評価情報は score・PV がそろった主の info 行に限定し、不完全な後続行で破棄する
     ///
     /// 実装は探索中、`shutdown` を `try_recv` / timeout poll 等で blocking しない形で観測
     /// すること (例: 200ms 以下の poll interval、または engine 応答ストリームと multiplex)。
@@ -228,10 +160,6 @@ impl UsiEngineDriver for UsiEngine {
         UsiEngine::new_game(self)
     }
 
-    fn set_option(&mut self, name: &str, value: &str) -> Result<()> {
-        self.send(&format!("setoption name {name} value {value}"))
-    }
-
     fn go_with_info(
         &mut self,
         position_cmd: &str,
@@ -265,7 +193,11 @@ impl UsiEngineDriver for UsiEngine {
     }
 }
 
-/// 探索途中は各項目の最終観測値、bestmove の戻り値は同じ主の info 行の評価情報。
+/// info 行から抽出した探索情報
+///
+/// `depth` / `score_cp` / `score_mate` / `pv` は CSA Floodgate 拡張コメント生成に使われる。
+/// `seldepth` / `nodes` / `time_ms` / `nps` は JSONL 出力モード（analyze_selfplay 互換）の
+/// `move.eval` フィールドへの転写用。`info` 行から最後に観測した値を保持する。
 #[derive(Clone, Debug, Default)]
 pub struct SearchInfo {
     pub depth: Option<u32>,
@@ -278,54 +210,23 @@ pub struct SearchInfo {
     pub pv: Vec<String>,
 }
 
-impl SearchInfo {
-    /// 読み筋の先頭が確定した指し手と一致するなら `true`。
-    pub fn matches_bestmove(&self, bestmove: &str) -> bool {
-        self.pv.first().is_some_and(|mv| mv == bestmove)
-    }
-
-    /// cp または mate の値を持つなら `true`。
-    pub fn has_score(&self) -> bool {
-        self.score_cp.is_some() || self.score_mate.is_some()
-    }
-}
-
 impl UsiEngine {
-    /// USIエンジンを起動し、初期化する。
-    ///
-    /// `opts` は [`SpawnOptions`] を参照: ponder 可否 / handshake timeout /
-    /// stderr passthrough を集約する。bool 2 個 (ponder と stderr_passthrough) を
-    /// 位置引数で並べると call site で意味が逆転して気付きにくいため struct で渡す。
+    /// USIエンジンを起動し、初期化する
     pub fn spawn(
         path: &Path,
         options: &HashMap<String, toml::Value>,
-        opts: SpawnOptions,
+        ponder: bool,
+        timeout: Duration,
     ) -> Result<Self> {
-        let SpawnOptions {
-            ponder,
-            startup_timeout: timeout,
-            stderr_passthrough,
-        } = opts;
         let mut cmd = Command::new(path);
-        // 子プロセスを独立したプロセスグループで起動。
-        // `Drop` / `quit()` 内 timeout 後に `killpg(pgid, SIGKILL)` で
-        // process group ごと kill するための前段。pgid == child.id() となる。
+        // 子プロセスを独立したプロセスグループで起動
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY:
-            // - `pre_exec` クロージャは fork 後 exec 前の片側スレッド context で
-            //   実行され、`libc::setpgid` は async-signal-safe (POSIX.1-2017 に
-            //   定義された signal-safe API) なので allocation / lock を呼ばない。
-            // - `setpgid(0, 0)` は呼び出し元プロセスを leader とする新規 PG を
-            //   作るのみ。失敗時は -1 を返すので `last_os_error()` を `Err` で返し、
-            //   spawn 自体を失敗させて以降の killpg が「孫が同じ PG に居ない」状態
-            //   で SIGKILL を撒く事故を防ぐ。
+            // SAFETY: setpgid は async-signal-safe
             unsafe {
                 cmd.pre_exec(|| {
-                    if libc::setpgid(0, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                    libc::setpgid(0, 0);
                     Ok(())
                 });
             }
@@ -333,13 +234,12 @@ impl UsiEngine {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| anyhow!("エンジン起動失敗 {}: {e}", path.display()))?;
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -355,49 +255,6 @@ impl UsiEngine {
             }
         });
 
-        // stderr ring buffer。EOF/IO error までは best-effort で末尾 64 行を
-        // 保持し、engine 死亡時に診断 error message へ転写する。
-        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_MAX_LINES)));
-        let stderr_done = Arc::new(AtomicBool::new(false));
-        let stderr_tail_writer = Arc::clone(&stderr_tail);
-        let stderr_done_writer = Arc::clone(&stderr_done);
-        let stderr_reader_handle = std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut buf: Vec<u8> = Vec::with_capacity(STDERR_LINE_MAX_BYTES);
-            loop {
-                buf.clear();
-                match read_line_capped(&mut reader, &mut buf, STDERR_LINE_MAX_BYTES) {
-                    Ok(ReadLineOutcome::Eof) => break,
-                    Ok(ReadLineOutcome::Line) => {
-                        // 空行 (buf.len() == 0 の `Line`) もここに含まれる。EOF と空行を取り違えて
-                        // reader thread を早期終了させると以降の stderr が失われ、
-                        // pipe が詰まって engine 側が write で block するリスクがある
-                        // ため、空行は通常行と同じく ring buffer に push する
-                        // (PR #596 review で指摘された bug への対応)。
-                        let raw = String::from_utf8_lossy(&buf).into_owned();
-                        let line = raw.trim_end_matches('\r').to_owned();
-                        // passthrough 時は ring push と並行して log::info! で
-                        // csa_client log に多重化する。lock 取得前に行うのは
-                        // log macro 側の latency を mutex critical section に
-                        // 持ち込まないため (best-effort 経路、順序保証不要)。
-                        if stderr_passthrough {
-                            log::info!("[engine stderr] {line}");
-                        }
-                        let mut tail = match stderr_tail_writer.lock() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
-                        if tail.len() >= STDERR_TAIL_MAX_LINES {
-                            tail.pop_front();
-                        }
-                        tail.push_back(line);
-                    }
-                    Err(_) => break,
-                }
-            }
-            stderr_done_writer.store(true, Ordering::Release);
-        });
-
         let mut engine = Self {
             child,
             writer: BufWriter::new(stdin),
@@ -405,10 +262,6 @@ impl UsiEngine {
             engine_name: String::new(),
             opt_names: HashSet::new(),
             quit_sent: false,
-            engine_path: path.to_path_buf(),
-            stderr_tail,
-            stderr_done,
-            stderr_reader_handle: Some(stderr_reader_handle),
         };
         engine.initialize(options, ponder, timeout)?;
         Ok(engine)
@@ -435,48 +288,7 @@ impl UsiEngine {
             }
         }
 
-        self.send_options(options, ponder)?;
-        self.send("isready")?;
-        loop {
-            if self.recv(timeout)? == "readyok" {
-                break;
-            }
-        }
-
-        log::info!(
-            "[USI] エンジン準備完了: {}",
-            if self.engine_name.is_empty() {
-                "(unknown)"
-            } else {
-                &self.engine_name
-            }
-        );
-        Ok(())
-    }
-
-    /// 対局の合間に指定したオプションを送り、`isready` / `readyok` で準備完了を待つ。
-    /// `ponder` が有効なら、起動時と同じく対応する Ponder オプションを優先する。
-    pub fn update_options(
-        &mut self,
-        options: &HashMap<String, toml::Value>,
-        ponder: bool,
-        timeout: Duration,
-    ) -> Result<()> {
-        self.send_options(options, ponder)?;
-        self.send("isready")?;
-        let started = Instant::now();
-        loop {
-            let remaining = timeout
-                .checked_sub(started.elapsed())
-                .context("エンジン準備完了の待機がタイムアウトしました")?;
-            if self.recv(remaining)? == "readyok" {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn send_options(&mut self, options: &HashMap<String, toml::Value>, ponder: bool) -> Result<()> {
+        // USI オプション設定
         for (key, value) in options {
             let val_str = match value {
                 toml::Value::Integer(n) => n.to_string(),
@@ -497,6 +309,22 @@ impl UsiEngine {
             }
         }
 
+        // isready → readyok
+        self.send("isready")?;
+        loop {
+            let line = self.recv(timeout)?;
+            if line == "readyok" {
+                break;
+            }
+        }
+        log::info!(
+            "[USI] エンジン準備完了: {}",
+            if self.engine_name.is_empty() {
+                "(unknown)"
+            } else {
+                &self.engine_name
+            }
+        );
         Ok(())
     }
 
@@ -522,7 +350,6 @@ impl UsiEngine {
         shutdown: &AtomicBool,
         server_rx: &Receiver<Event>,
     ) -> Result<SearchOutcome> {
-        self.drain_pending_engine_lines("go");
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         self.wait_bestmove(shutdown, server_rx, None)
@@ -539,7 +366,6 @@ impl UsiEngine {
         server_rx: &Receiver<Event>,
         info_callback: &mut InfoCallback<'_>,
     ) -> Result<SearchOutcome> {
-        self.drain_pending_engine_lines("go_with_info");
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         self.wait_bestmove(shutdown, server_rx, Some(info_callback))
@@ -547,7 +373,6 @@ impl UsiEngine {
 
     /// ponder 探索を開始（bestmove を待たない）
     pub fn go_ponder(&mut self, position_cmd: &str, go_cmd: &str) -> Result<()> {
-        self.drain_pending_engine_lines("go_ponder");
         self.send(position_cmd)?;
         self.send(go_cmd)?;
         Ok(())
@@ -607,28 +432,6 @@ impl UsiEngine {
         }
     }
 
-    /// 探索開始前に、前の探索が残した pending 出力をチャネルから読み捨てる。
-    ///
-    /// isready/readyok による同期バリアは使わない: isready は「対局準備」であり、
-    /// TT クリア等の重い初期化を伴うことがある。毎手送ると置換表を持ち越せない。
-    /// 代わりに「エンジンは info → bestmove の順に単一スレッドで書き、bestmove が
-    /// その go の最終出力」という不変条件に依拠する: 呼び出し元は直前の探索の
-    /// bestmove を消費済みなので、それ以前の行はチャネル到着済みで try_recv で
-    /// 全て捨てられる (bestmove 後に出力するエンジンはこの前提の対象外)。
-    fn drain_pending_engine_lines(&mut self, context: &str) {
-        while let Ok(line) = self.rx.try_recv() {
-            Self::log_discarded_pending_line(context, &line);
-        }
-    }
-
-    fn log_discarded_pending_line(context: &str, line: &str) {
-        if line.starts_with("bestmove") {
-            log::warn!("[USI] discard pending bestmove before {context}: {line}");
-        } else {
-            log::debug!("[USI] discard pending line before {context}: {line}");
-        }
-    }
-
     /// gameover を送信
     pub fn gameover(&mut self, result: &str) -> Result<()> {
         self.send(&format!("gameover {result}"))
@@ -636,46 +439,21 @@ impl UsiEngine {
 
     /// quit を送信してプロセスを終了（タイムアウト付き）
     pub fn quit(&mut self) {
-        if self.quit_sent {
-            return;
-        }
-        let send_result = self.send("quit");
-        if send_result.is_ok() {
-            // 3 秒待ってまだ終了しなければ kill
+        if !self.quit_sent {
+            let _ = self.send("quit");
+            // 3秒待ってまだ終了しなければ kill
             for _ in 0..30 {
                 if let Ok(Some(_)) = self.child.try_wait() {
-                    break;
+                    self.quit_sent = true;
+                    return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-        }
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
             log::warn!("[USI] quit タイムアウト、kill します");
-            kill_engine_process_tree(&mut self.child);
+            let _ = self.child.kill();
             let _ = self.child.wait();
+            self.quit_sent = true;
         }
-        // stderr handle bounded join (graceful path のみ実施)。
-        //
-        // direct child が `quit` で正常終了しても、engine が fork した孫が
-        // stderr fd を継承していると reader thread は EOF を観測できず join が
-        // timeout する (#618)。timeout 後は process group ごと SIGKILL で
-        // 孫の stderr fd を強制 close し、reader thread を確実に終了させる。
-        // child は既に終了済みでも、`killpg` は同じ pgid に属する live な孫
-        // にだけ届くため副作用は無い。
-        if let Some(handle) = self.stderr_reader_handle.take()
-            && let Err(unfinished) = join_handle_bounded(handle, STDERR_JOIN_WAIT_GRACEFUL)
-        {
-            log::warn!(
-                "[USI] stderr reader join timeout (graceful)、孫プロセスへ killpg を発行します (#618)"
-            );
-            kill_engine_process_tree(&mut self.child);
-            // direct child は既に reaping 済みでも try_wait/wait は idempotent。
-            // killpg 後 reader thread が EOF で抜けるまでもう一度 short join。
-            if let Err(unfinished) = join_handle_bounded(unfinished, STDERR_JOIN_WAIT_DROP) {
-                drop(unfinished);
-            }
-        }
-        self.quit_sent = true;
     }
 
     fn wait_bestmove(
@@ -690,7 +468,6 @@ impl UsiEngine {
         const POST_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
         let mut info = SearchInfo::default();
-        let mut move_info = SearchInfo::default();
         let mut stop_sent = false;
         let start = Instant::now();
         let mut stop_sent_at: Option<Instant> = None;
@@ -698,12 +475,6 @@ impl UsiEngine {
         let mut server_lines: Vec<String> = Vec::new();
 
         loop {
-            if !stop_sent && shutdown.load(Ordering::SeqCst) {
-                log::info!("[USI] shutdown 要求により stop 送信");
-                self.send("stop")?;
-                stop_sent = true;
-                stop_sent_at = Some(Instant::now());
-            }
             // 全体タイムアウト
             let elapsed = start.elapsed();
             if let Some(st) = stop_sent_at {
@@ -746,7 +517,6 @@ impl UsiEngine {
                     log::trace!("[USI] < {line}");
                     if line.starts_with("info") {
                         update_search_info(&mut info, &line);
-                        update_move_info(&mut move_info, &line);
                         if let Some(cb) = info_callback.as_deref_mut() {
                             cb(&info, &line);
                         }
@@ -770,13 +540,20 @@ impl UsiEngine {
                                 bestmove,
                                 ponder_move,
                             },
-                            move_info,
+                            info,
                         ));
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    if !stop_sent && shutdown.load(Ordering::SeqCst) {
+                        log::info!("[USI] shutdown 要求により stop 送信");
+                        self.send("stop")?;
+                        stop_sent = true;
+                        stop_sent_at = Some(Instant::now());
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(self.engine_exited_error());
+                    bail!("エンジンプロセスが終了しました");
                 }
             }
         }
@@ -784,39 +561,13 @@ impl UsiEngine {
 
     pub(crate) fn send(&mut self, cmd: &str) -> Result<()> {
         log::debug!("[USI] > {cmd}");
-        let result = self
-            .writer
-            .write_all(cmd.as_bytes())
-            .and_then(|_| self.writer.write_all(b"\n"))
-            .and_then(|_| self.writer.flush());
-        match result {
-            Ok(()) => Ok(()),
-            Err(io_err)
-                if matches!(
-                    io_err.kind(),
-                    std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                // BrokenPipe = engine 死亡確定の強い signal (Linux primary scope)。
-                // Windows の subprocess stdin 死亡は `ConnectionAborted` /
-                // `ConnectionReset` で報告されるため、`matches!` arm に追加して
-                // Windows でも engine 死亡確定経路として扱う。Linux で
-                // `ConnectionAborted/Reset` が stdin pipe に来ることはない
-                // (発生したら同じく fatal 扱いで safe) ので、`cfg(target_os)`
-                // gate は不要。
-                Err(self.engine_exited_error())
-            }
-            Err(io_err) => {
-                // 上記 fatal kind 以外は engine 生存中の transient error。
-                // `anyhow::Context::context` で source を保持しつつ伝搬。
-                Err(io_err).context("エンジン I/O エラー")
-            }
-        }
+        self.writer.write_all(cmd.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
+        Ok(())
     }
 
-    fn recv(&mut self, timeout: Duration) -> Result<String> {
+    fn recv(&self, timeout: Duration) -> Result<String> {
         match self.rx.recv_timeout(timeout) {
             Ok(line) => {
                 log::trace!("[USI] < {line}");
@@ -825,54 +576,9 @@ impl UsiEngine {
             Err(RecvTimeoutError::Timeout) => {
                 bail!("エンジン応答タイムアウト");
             }
-            Err(RecvTimeoutError::Disconnected) => Err(self.engine_exited_error()),
-        }
-    }
-
-    /// engine 死亡確定経路 (BrokenPipe / Disconnected) から呼ばれる、
-    /// stderr 末尾と exit status を含む診断 error の組み立て。
-    ///
-    /// 副作用なし: `child` の reaping は `try_wait` の std cache 経由のみ、
-    /// `stderr_reader_handle` の take や `quit_sent` のセットは行わない。
-    /// 同一 session で複数回呼ばれても idempotent。cleanup ownership は
-    /// `quit()` (graceful) と `Drop` (fast) に集約する。
-    fn engine_exited_error(&mut self) -> anyhow::Error {
-        // (1) stderr reader の EOF 観測完了を best-effort で 200ms 待つ。
-        //     実際の tail 可視性は snapshot 時の `Mutex::lock()` で確保される
-        //     (Acquire 同期点)。本 wait は reader が最後の行を push し終えるのを
-        //     待つ目的のみ。fatal communication error 経路 (recv Disconnected /
-        //     send BrokenPipe / wait_bestmove Disconnected) から呼ばれる契約
-        //     なので、try_wait の結果に関係なく常に wait する。
-        let poll_iters = (STDERR_DRAIN_WAIT.as_millis() / STDERR_DRAIN_POLL.as_millis()).max(1);
-        for _ in 0..poll_iters {
-            if self.stderr_done.load(Ordering::Acquire) {
-                break;
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("エンジンプロセスが終了しました");
             }
-            std::thread::sleep(STDERR_DRAIN_POLL);
-        }
-        // (2) try_wait で exit_status 取得 (副作用なし、reaping は std が cache する)
-        let exit_status = match self.child.try_wait() {
-            Ok(Some(status)) => Some(format!("{status}")),
-            _ => None,
-        };
-        // (3) tail snapshot (poison-resistant)
-        let tail: Vec<String> = self
-            .stderr_tail
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .cloned()
-            .collect();
-        // (4) error message 構築
-        let path = self.engine_path.display();
-        let prefix = match exit_status {
-            Some(s) => format!("エンジンプロセスが終了しました (path={path}, exit={s})"),
-            None => format!("エンジンプロセスが終了しました (path={path}, status=unknown)"),
-        };
-        if tail.is_empty() {
-            anyhow!("{prefix}; エンジン stderr は空")
-        } else {
-            anyhow!("{prefix}; エンジン stderr 末尾 {} 行:\n{}", tail.len(), tail.join("\n"))
         }
     }
 
@@ -880,76 +586,18 @@ impl UsiEngine {
     pub fn drain(&self) {
         while self.rx.try_recv().is_ok() {}
     }
-
-    /// テスト専用: engine subprocess の raw pid を返す。`pre_exec(setpgid(0,0))`
-    /// により pgid と同値となる。`/proc/<pid>/stat` から孫の pgid 一致を検証する
-    /// regression test (#618) からのみ使用する。
-    #[doc(hidden)]
-    pub fn child_pid_for_test(&self) -> u32 {
-        self.child.id()
-    }
 }
 
 impl Drop for UsiEngine {
     fn drop(&mut self) {
-        // 既存 fast path を維持: send("quit") + sleep 100ms + killpg + wait。
-        // engine 死亡確定 (BrokenPipe) の場合 send 経由で `engine_exited_error()`
-        // が走り 200ms wait を払うが、Drop 全体の遅延は最大 ~400ms に bounded。
-        // panic-on-drop / test runner 経路で 3.5 秒+ の遅延を回避する設計。
-        //
-        // `kill_engine_process_tree` は unix では `killpg(pgid, SIGKILL)` を発行し、
-        // engine が fork した孫プロセス (stderr fd 継承パターン) にも SIGKILL を
-        // 届ける。kernel が孫の stderr fd を強制 close することで、stderr reader
-        // thread が EOF で抜け、leak を防ぐ (#618)。reap は direct child のみ
-        // `self.child.wait()` で行う (孫は init が reap)。
         if !self.quit_sent {
             let _ = self.send("quit");
+            // 少し待ってからプロセスを kill
             std::thread::sleep(Duration::from_millis(100));
-            kill_engine_process_tree(&mut self.child);
+            let _ = self.child.kill();
             let _ = self.child.wait();
         }
-        // stderr handle が残っていれば best-effort で cleanup (bounded join 100ms、
-        // 超過なら detach)
-        if let Some(handle) = self.stderr_reader_handle.take()
-            && let Err(unfinished) = join_handle_bounded(handle, STDERR_JOIN_WAIT_DROP)
-        {
-            drop(unfinished);
-        }
     }
-}
-
-/// engine 死亡確定時に `Child` および孫プロセスへ kill signal を送る共通 helper。
-///
-/// Unix では `pre_exec(setpgid(0,0))` で子プロセスを独立 process group に
-/// 置いているため、`killpg(pgid, SIGKILL)` を発行することで engine が fork
-/// した孫プロセスにも一括で SIGKILL が届く。孫が継承した stderr fd は kernel
-/// が強制 close するので、parent の stderr reader thread は EOF で終了する
-/// (PR #596 review で議論された stderr reader leak の根因対策)。
-///
-/// 注意: `wait()` で reap できるのは direct child のみ。孫プロセスは grand-
-/// parent (init / systemd) が reap する。本 helper は kill だけを担当し、
-/// reap は呼び出し側が `child.wait()` で direct child について行う前提。
-///
-/// `killpg` 失敗時 (例: child の id が i32 範囲外、または既に process group
-/// が空になっている) は `child.kill()` に fallback し、最低限の直系 child
-/// kill を保証する。
-///
-/// 非 Unix プラットフォームでは process group の概念がないため `child.kill()`
-/// に直接委譲する (Windows の Job Object 化は別 issue 扱い)。
-fn kill_engine_process_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        // `child.id()` は raw pid (u32)。`setpgid(0,0)` 後は pgid と同値。
-        // i32 範囲外なら killpg は発行できないので fallback に回す。
-        if let Ok(pid_raw) = i32::try_from(child.id()) {
-            let pgid = nix::unistd::Pid::from_raw(pid_raw);
-            if nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL).is_ok() {
-                return;
-            }
-            // killpg 失敗 (ESRCH 等) → child 単独 kill に fallback。
-        }
-    }
-    let _ = child.kill();
 }
 
 /// `option name <NAME> type ...` からオプション名を抽出
@@ -961,28 +609,6 @@ fn parse_option_name(rest: &str) -> Option<String> {
         Some(rest[..pos].trim().to_string())
     } else {
         Some(rest.trim().to_string())
-    }
-}
-
-fn update_move_info(info: &mut SearchInfo, line: &str) {
-    // string 以降は自由文なので、評価値や multipv に見える語句も制御項目として読まない。
-    if line.split_whitespace().take_while(|t| *t != "pv").any(|t| t == "string") {
-        return;
-    }
-    let has_pv = line.split_whitespace().take_while(|t| *t != "string").any(|t| t == "pv");
-    let fields: Vec<_> =
-        line.split_whitespace().take_while(|t| *t != "pv" && *t != "string").collect();
-    // 副候補の評価値は bestmove 用の主候補を更新・破棄する根拠にならない。
-    if fields.windows(2).any(|pair| pair[0] == "multipv" && pair[1] != "1") {
-        return;
-    }
-    let mut row = SearchInfo::default();
-    update_search_info(&mut row, line);
-    if row.has_score() && !row.pv.is_empty() {
-        *info = row;
-    } else if row.has_score() || !row.pv.is_empty() || fields.contains(&"score") || has_pv {
-        // 不完全な主の行が来たら、別の行の値と読み筋を対応付けない。
-        *info = SearchInfo::default();
     }
 }
 
@@ -1048,127 +674,6 @@ fn update_search_info(info: &mut SearchInfo, line: &str) {
                 in_pv = true;
             }
             _ => {}
-        }
-    }
-}
-
-/// `read_line_capped` の戻り値。EOF と「空行の delimiter 読み取り」を
-/// 区別するために使う。
-///
-/// ## 背景
-///
-/// 戻り値を単に byte 数 (`usize`) にしてしまうと、空行 `"\n"` を読んだとき
-/// (`buf.len() == 0`) と EOF (`buf.len() == 0`) が区別できず、呼び出し側で
-/// 空行を EOF として誤認して reader thread を早期終了させる bug を生む
-/// (PR #596 codex review で指摘)。`buf` への push は呼び出し側で観測できる
-/// ため、`Line` バリアントは byte 数を持たず純粋に「区切りを 1 行読んだ」
-/// signal として機能させる。
-enum ReadLineOutcome {
-    /// 1 行読み取り完了 (空行を含む)。実 byte 数は呼び出し側が `buf.len()`
-    /// で観測する。
-    Line,
-    /// EOF (これ以上 reader からは読めない)。reader thread を終了させる
-    /// signal として使う。
-    Eof,
-}
-
-/// stderr stream から `\n` 区切りで 1 行読み込む。
-///
-/// `max_bytes` を超えた分は読み飛ばし (discard) し、次の `\n` で 1 行として
-/// return する (4 KB 超の長い 1 行は truncate されて残りは破棄、複数行に分割
-/// しない)。LF 区切りのみ。CR 単独 (古い Mac 形式) は同一行扱い。CRLF の `\r`
-/// は戻り値の buf に残るため、ring buffer 投入直前に `trim_end_matches('\r')`
-/// で除去すること。
-///
-/// 戻り値は [`ReadLineOutcome`] で EOF と空行を区別する。EOF の場合は
-/// `ReadLineOutcome::Eof` を返し、呼び出し側はこれを受けて reader loop を
-/// 終了する。1 行読み取り (空行を含む) の場合は `ReadLineOutcome::Line` を
-/// 返し、実 byte 数は呼び出し側が `buf.len()` で観測する (delimiter `\n` を
-/// 含まず、`max_bytes` 超過分も含まない)。
-fn read_line_capped<R: BufRead>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-    max_bytes: usize,
-) -> std::io::Result<ReadLineOutcome> {
-    let mut byte = [0u8; 1];
-    let mut got_byte = false;
-    loop {
-        match reader.read(&mut byte) {
-            Ok(0) => {
-                // EOF: 何も読まずに EOF なら Eof、何か読んだ後 EOF なら最終行扱い
-                if got_byte {
-                    return Ok(ReadLineOutcome::Line);
-                }
-                return Ok(ReadLineOutcome::Eof);
-            }
-            Ok(_) => {
-                got_byte = true;
-                if byte[0] == b'\n' {
-                    return Ok(ReadLineOutcome::Line);
-                }
-                if buf.len() < max_bytes {
-                    buf.push(byte[0]);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// `JoinHandle` を最大 `deadline` まで待機して join を試みる。timeout 時は
-/// `Err(handle)` を返し caller が `drop()` で detach する。
-fn join_handle_bounded(
-    handle: thread::JoinHandle<()>,
-    deadline: Duration,
-) -> std::result::Result<(), thread::JoinHandle<()>> {
-    let start = std::time::Instant::now();
-    while start.elapsed() < deadline {
-        if handle.is_finished() {
-            let _ = handle.join();
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Err(handle)
-}
-
-#[cfg(test)]
-mod move_info_tests {
-    use super::*;
-
-    #[test]
-    fn incomplete_primary_rows_never_mix_score_and_pv() {
-        for partial in [
-            "info pv 2g2f",
-            "info pv 2g2f score cp 93",
-            "info score cp 93",
-            "info pv",
-        ] {
-            let mut info = SearchInfo::default();
-            update_move_info(&mut info, "info depth 8 nodes 100 score cp 81 pv 8c8d");
-            update_move_info(&mut info, partial);
-            assert!(!info.has_score(), "{partial}");
-            assert!(info.pv.is_empty(), "{partial}");
-        }
-    }
-
-    #[test]
-    fn secondary_rows_do_not_replace_primary_and_metadata_stays_in_row() {
-        for primary in [
-            "info depth 8 score cp 93 pv 2g2f 8c8d",
-            "info multipv 1 depth 8 score cp 93 pv 2g2f 8c8d",
-        ] {
-            let mut info = SearchInfo::default();
-            update_move_info(&mut info, "info nodes 999 time 50 score cp 81 pv 8c8d");
-            update_move_info(&mut info, primary);
-            update_move_info(&mut info, "info multipv 2 depth 9 score cp 10 pv 7g7f");
-            update_move_info(&mut info, "info depth 10 nodes 2000");
-            assert_eq!(info.score_cp, Some(93));
-            assert_eq!(info.pv, ["2g2f", "8c8d"]);
-            assert_eq!(info.depth, Some(8));
-            assert_eq!(info.nodes, None);
-            assert_eq!(info.time_ms, None);
         }
     }
 }

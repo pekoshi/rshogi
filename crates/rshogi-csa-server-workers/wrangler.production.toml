@@ -11,12 +11,6 @@
 
 name = "rshogi-csa-server-workers"
 main = "build/worker/shim.mjs"
-# Custom Domain binding。DNS record (AAAA 100:: proxied) は iac repo (Pulumi) が正典
-routes = [{ pattern = "rshogi-csa-server.sh11235.com", custom_domain = true }]
-# workers.dev 直 URL / preview URL は zone (sh11235.com) の WAF・Rate Limiting を
-# 経由しないため公開しない。到達経路は Custom Domain (proxied) のみに限定する
-workers_dev = false
-preview_urls = false
 # 2026-04-21 時点の最新 compatibility flag 日付に追従する。
 # 主要 opt-in 機能:
 # - `web_socket_auto_reply_to_close` (2026-04-07): WS が close フレームに自動応答
@@ -26,29 +20,6 @@ preview_urls = false
 # Cloudflare 公式ガイダンス: 新規プロジェクトは current date を設定。bump は新フラグ
 # が出ても自動追従しないため、運用判断で本 PR のような明示更新で進める方針。
 compatibility_date = "2026-04-21"
-
-# `logpush = true` は本 Worker のログを `workers_trace_events` dataset に流す
-# (Cloudflare Logpush が consume できる) ようにする。LogpushJob 側 (Pulumi declare、
-# `infra/pulumi/index.ts`) と本フラグの両方が揃って初めて R2 archive にログが
-# 落ちる。詳細は `docs/csa-server/observability.md` §1 / §3 を参照。
-# [#625 Phase B / PR #698]
-#
-# 2026-05-10 検証で判明: Workers Free plan は `logpush` フラグ自体が deploy gate
-# で reject される (`A request to the Cloudflare API .../workers/scripts/...
-# failed. You do not have access to use Logpush. [code: 10023]` で deploy が
-# error 終了する)。**「Free plan で no-op」は誤りで、deploy 自体が落ちるため
-# Free plan ではコメントアウト必須**。Paid plan 移行時に下行のコメントを外して
-# 有効化する (`docs/csa-server/observability.md` §3.2 / §7.3 参照)。
-# logpush = true
-
-# ログ集計の欠落を抑えるため、invocation のサンプリング率を 1.0 にする。
-# 保持期間・プラットフォーム側の制限は docs/csa-server/observability.md を参照。
-[observability]
-enabled = true
-
-[observability.logs]
-enabled = true
-head_sampling_rate = 1.0
 
 # CI 環境では事前に `cargo install -q worker-build@^0.8 --locked` がインストール済みの
 # 前提（`.github/workflows/deploy-workers.yml` の独立 step `Install worker-build` で
@@ -66,20 +37,10 @@ name = "GAME_ROOM"
 class_name = "GameRoom"
 
 # Lobby: マッチング待機キューとペアリング判定を担当する 1 instance 固定 DO。
-# `id_from_name("default")` で routing し、Hibernation 復帰時は attachment から待機者を復元する。
+# `id_from_name("default")` で routing する。in-memory queue のみ保持。
 [[durable_objects.bindings]]
 name = "LOBBY"
 class_name = "Lobby"
-
-# RateLimiter: per-(kind, identifier) で sharding する atomic token bucket
-# (issue #622 PR3a)。LOGIN_LOBBY / CHALLENGE_LOBBY / `/ws/<room_id>` upgrade /
-# room create の 6 種類の rate limit を共通実装で担う。`id_from_name(format!(
-# "{kind}:{identifier}"))` で per-key DO instance を生成し、Cloudflare DO の
-# 単一スレッド実行モデルで `refill → try_consume → persist` の atomicity を担保する。
-# 詳細は `docs/csa-server/rate_limit.md` 参照。
-[[durable_objects.bindings]]
-name = "RATE_LIMITER"
-class_name = "RateLimiter"
 
 # SQLite-backed DO: `state.storage().sql()` を利用するため必須。
 # 本 migration tag は **初回 deploy 時にのみ apply される**。`new_sqlite_classes` の
@@ -89,19 +50,11 @@ class_name = "RateLimiter"
 tag = "v1"
 new_sqlite_classes = ["GameRoom"]
 
-# 招待 registry と接続 ID の採番を永続化する Lobby クラス。
+# Lobby を SQLite-backed として追加 (storage 利用予定はないが将来の queue TTL 永続化
+# 等を見据えて SQLite クラスとして登録しておく)。
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["Lobby"]
-
-# RateLimiter を SQLite-backed として追加 (issue #622 PR3a)。実体は
-# `state.storage().get/put` で 1 bucket 分の `TokenBucketState` (~16 byte JSON)
-# を読み書きするだけで SQLite 機能は使わない。`additive-only contract`
-# (`docs/csa-server/deployment.md` §3.4.1) に従い既存 tag (v1, v2) は触らず、
-# 新 tag = "v3" として add する (= forward-only)。
-[[migrations]]
-tag = "v3"
-new_sqlite_classes = ["RateLimiter"]
 
 # --- R2: 棋譜保存 ---
 # `GameRoom` DO が終局時に CSA V2 棋譜を書き出す先。
@@ -120,37 +73,13 @@ bucket_name = "rshogi-csa-kifu-prod"
 binding = "FLOODGATE_HISTORY_BUCKET"
 bucket_name = "rshogi-csa-floodgate-history-prod"
 
-[[d1_databases]]
-binding = "GAMES_SEARCH_DB"
-database_name = "rshogi-csa-games-search-prod"
-database_id = "0d87fa6d-a7a3-4b10-ac1f-83943e839b18"
-migrations_dir = "migrations"
-
 # --- Cron triggers ---
-# `[event(scheduled)]` ハンドラ (`lib.rs::scheduled`) を単一 cron で起動する。
-# Cloudflare の account あたり cron trigger 上限 (5) に収めるため、以前の
-# backfill 用 (`0 * * * *`) と sweep-only 用 (`15,30,45 * * * *`) の 2 cron を
-# 1 cron に統合した。
-#
-# 単一 cron `0,15,30,45 * * * *` は 0 / 15 / 30 / 45 分の 4 回発火する:
-#
-# - 0 分:
-#   `kifu-by-id/<id>.meta.json` から `games-index/` を補完 (backfill) し、
-#   `live-games-index/` の orphan を掃除する。backfill は 1 run = 1 page
-#   (1000 件) のみ。
-# - 15 / 30 / 45 分:
-#   `live-games-index/` の orphan 掃除のみを行う (backfill はスキップ)。
-#   delete best-effort 失敗からの復旧遅延を 1 時間 → 15 分に短縮するため、
-#   sweep のみ高頻度化する。sweep は 1 cron 内で pagination loop し、
-#   cron 30s 制限内で複数 page を処理する。
-#
-# 単一 cron なので発火の区別は cron 文字列でできない。`lib.rs::scheduled` が
-# `event.schedule()` 由来の「時の何分か」を見て分岐する。cron 文字列を変更する
-# 場合は `lib.rs` の `SCHEDULED_CRON` 定数も同期更新すること (wrangler test が
-# 違反を検知する)。分フィールドには必ず `BACKFILL_MINUTE` (0) を含めること —
-# 0 分を外すと backfill が無音で永久停止する (sweep は全発火で走る)。
+# `[event(scheduled)]` ハンドラ (`lib.rs::scheduled`) を毎時 0 分に起動し、
+# `kifu-by-id/<id>.meta.json` から `games-index/` を補完 (backfill) し、
+# `live-games-index/` の orphan を掃除する (Issue #551)。1 run = 1 page (1000 件)
+# のみ処理する eventual semantics。
 [triggers]
-crons = ["0,15,30,45 * * * *"]
+crons = ["0 */1 * * *"]
 
 # --- 環境変数 ---
 # `[vars]` の値は機密でないが、本番 client URL に応じて運用者が更新する。
@@ -165,16 +94,15 @@ crons = ["0,15,30,45 * * * *"]
 # では allowlist が **必須**: 空・未設定時は Origin の有無にかかわらず 403。
 # 無認可公開を防ぐ fail-closed 既定で、`ALLOW_VIEWER_API` と組で運用する。
 # 実運用では web client URL を実値に書き換えること。
-# Tauri desktop は webview から fetch するときに OS / WebView 別の Origin を付与する:
+# Tauri desktop は webview から fetch するときに OS 別の Origin を付与する:
 #   - macOS / Linux: tauri://localhost
-#   - Windows / WebView2: http://tauri.localhost または https://tauri.localhost
-# いずれも allowlist に登録して desktop からの request も通す。
-WS_ALLOWED_ORIGINS = "https://ramu-shogi.sh11235.com,tauri://localhost,http://tauri.localhost,https://tauri.localhost"
+#   - Windows: https://tauri.localhost
+# 両方を allowlist に登録して desktop からの request も通す。
+WS_ALLOWED_ORIGINS = "https://ramu-shogi.sh11235.com,tauri://localhost,https://tauri.localhost"
 
 # 対局時計。`countdown` (CSA 2014 改訂秒読み、Floodgate 互換) / `countdown_msec`
 # (ms 粒度の短時間対局向け拡張) / `fischer` (増分加算) / `stopwatch` (分単位)。
 # production は本家 Floodgate と互換の `countdown` (Time_Unit:1sec) を既定値とする。
-# 各方式の値フィールドと CLOCK_PRESETS 仕様は `docs/csa-server/clock_defaults.md` を参照。
 CLOCK_KIND = "countdown"
 # countdown / fischer 用（秒）。
 TOTAL_TIME_SEC = "600"
@@ -187,43 +115,12 @@ BYOYOMI_MS = "10000"
 TOTAL_TIME_MIN = "10"
 BYOYOMI_MIN = "1"
 
-# `game_name` 別の時計プリセット（JSON 配列文字列）。空配列 / 空文字 / 未設定で
-# 「プリセット未宣言」となり、CLOCK_KIND 等から導出する global clock を全 game_name に
-# 適用する後方互換動作にとどまる。1 件以上登録した場合は strict mode となり、
-# 未登録 game_name の LOGIN_LOBBY は `LOGIN_LOBBY:incorrect unknown_game_name` で拒否。
-# 命名規則: `byoyomi-<total_sec>-<byoyomi_sec>` /
-# `byoyomi-msec-<total_sec>-<byoyomi_ms>` / `fischer-<total_sec>-<increment_sec>F` /
-# `floodgate-<total_sec>-<byoyomi_sec>` (Floodgate 互換 alias)。
-# staging と同じ preset セットを宣言し、運用者が短時間 / 中時間 / Floodgate 互換の
-# clock を game_name 切替で選べる構成にする。
-CLOCK_PRESETS = '''[
-  {"game_name":"byoyomi-msec-10-100","kind":"countdown_msec","total_time_ms":10000,"byoyomi_ms":100},
-  {"game_name":"byoyomi-120-5","kind":"countdown","total_time_sec":120,"byoyomi_sec":5},
-  {"game_name":"fischer-60-5F","kind":"fischer","total_time_sec":60,"increment_sec":5},
-  {"game_name":"fischer-180-2F","kind":"fischer","total_time_sec":180,"increment_sec":2},
-  {"game_name":"fischer-180-2F-moves512","kind":"fischer","total_time_sec":180,"increment_sec":2,"max_moves":512},
-  {"game_name":"floodgate-600-10","kind":"countdown","total_time_sec":600,"byoyomi_sec":10},
-  {"game_name":"floodgate-600-10-moves256","kind":"countdown","total_time_sec":600,"byoyomi_sec":10,"max_moves":256},
-  {"game_name":"floodgate-600-10-moves512","kind":"countdown","total_time_sec":600,"byoyomi_sec":10,"max_moves":512}
-]'''
-
-# `%KACHI` 判定の入玉ルール (USI トークン)。未設定 / 空 / 不正トークンは 27点法
-# (`CSARule27`、電竜戦・従来 WCSC・floodgate 標準) にフォールバック。WCSC 2028 の
-# 24点法インスタンスを立てるときのみ `CSARule24` を明示する。対局開始時に確定して
-# PersistedConfig に固定されるため、途中で変更しても進行中の局は開始時ルールで判定。
-ENTERING_KING_RULE = "CSARule27"
-
-# 切断時の再接続猶予秒数。`0` または未設定で再接続プロトコルを無効化。
+# 切断時の再接続猶予秒数。`0` または未設定で再接続プロトコルを無効化（保守的既定）。
 # `> 0` を指定する構成は ALLOW_FLOODGATE_FEATURES=true との同時設定が必須。
-RECONNECT_GRACE_SECONDS = "30"
-# LOGIN OK 後の AGREE 待ち TTL (秒)。`start_match` で Game_Summary を送信した
-# 直後に予約し、両者 AGREE で cancel する。発火時は対局成立前に部屋を解放
-# (https://github.com/SH11235/rshogi/issues/600)。`0` / 未設定 / 非数値は 60 秒既定にフォールバック (TTL 0 =
-# 無効化は memory / room 枠の長期占有リスクを再現するため許容しない)。
-AGREE_TIMEOUT_SECONDS = "60"
+RECONNECT_GRACE_SECONDS = "0"
 # Floodgate 系運用機能（再接続プロトコル等）を opt-in 有効化する。`true` / `1` /
 # `yes` / `on` で有効。空または `false` のとき該当機能要求は起動 fail-fast。
-ALLOW_FLOODGATE_FEATURES = "true"
+ALLOW_FLOODGATE_FEATURES = "false"
 # viewer 配信 API (`/api/v1/games*` HTTP, `/ws/<id>/spectate` WS) を opt-in 有効化する。
 # `true` / `1` / `yes` / `on` で有効、`false` / `0` / `no` / `off` または
 # 未設定で無効化（該当 endpoint は 404）。本値は production rollout の kill-switch
@@ -234,50 +131,14 @@ ALLOW_VIEWER_API = "1"
 # LobbyDO 内 in-memory queue の総数上限。100 件を超える同時待機は LOGIN_LOBBY を
 # queue_full で reject する保守的既定。負荷に応じて引き上げ可。
 LOBBY_QUEUE_SIZE_LIMIT = "100"
-# 公開マッチング queue の entry TTL (秒)。`LOBBY_PONG` 受信から本値を超えた
-# entry を Lobby DO の Alarm purge で stale 判定し、`LOGIN_LOBBY:incorrect
-# queue_expired` 送信 + WS close する (Issue #631)。network 分断や close 遅延で
-# 残った stale entry を一定時間で掃除して後続ユーザの誤マッチを防ぐ。
-# client は TTL より短い間隔で LOBBY_PONG を送る。`0` / 未設定 / 非数値は 300 秒既定に戻る。
-LOBBY_QUEUE_ENTRY_TTL_SEC = "300"
-# 私的対局 (CHALLENGE_LOBBY) で発行される token の TTL (秒)。期限超過した
-# 未消費 token は Lobby DO の Alarm ハンドラで自動削除する。1 時間 = 3600
-# は対戦相手が招待後にゆっくり PC を起動する想定の保守的既定。
-CHALLENGE_TTL_SEC = "3600"
-# 私的対局は opt-in。公開環境で招待を受け付けるときだけ true にして再 deploy する。
-# 利用条件と本人確認は docs/csa-server/deployment.md を参照。
-PRIVATE_CHALLENGE_ENABLED = "false"
-
-# --- Rate limit / abuse protection (issue #622 PR3a) ---
-# 各値は **1 IP / 1 handle あたり 1 分間の最大試行回数**。`0` / 空 / 非数値 /
-# u32 範囲外は `crate::rate_limit::RateLimitThresholds::DEFAULTS` にフォール
-# バックする (env 設定不正で全 client が拒否される事故を避ける安全側挙動、
-# `LOBBY_QUEUE_ENTRY_TTL_SEC` と同じ流儀)。
-# production 既定は `docs/csa-server/rate_limit_design.md` §3 Q3 表の保守的値
-# (= staging E2E + 実トラフィック観測前)。Floodgate 相当 production 投入後に
-# real traffic baseline を見て調整する。閾値変更手順は
-# `docs/csa-server/rate_limit.md` の「閾値調整手順」節参照。
-LOBBY_LOGIN_RATE_PER_IP_PER_MIN = "10"
-LOBBY_LOGIN_RATE_PER_HANDLE_PER_MIN = "5"
-LOBBY_CHALLENGE_RATE_PER_IP_PER_MIN = "5"
-LOBBY_CHALLENGE_RATE_PER_HANDLE_PER_MIN = "3"
-ROOM_CREATE_RATE_PER_IP_PER_MIN = "20"
-WS_ROOM_UPGRADE_RATE_PER_IP_PER_MIN = "60"
 
 # --- secret として設定する値 ---
 # 本番運用に必要だが OSS repo には書かない値は `wrangler secret put` 経由で設定する。
 # 実値は Cloudflare 側の secret store にのみ存在し、`env.var(name)` 経由で
 # `[vars]` と同じ namespace から Worker code が読む（Cloudflare 仕様）。
 #
-# - ADMIN_API_TOKEN: WS 内 admin command (`%%ADMIN <token>`,
-#   https://github.com/SH11235/rshogi/issues/621) や将来の HTTP admin endpoint の
-#   認可基盤として `crate::admin_auth` から参照される 1 本の static API token
-#   (Floodgate audit https://github.com/SH11235/rshogi/issues/560 由来)。
-#   設定: `vp exec wrangler secret put ADMIN_API_TOKEN --config wrangler.production.toml`
+# - ADMIN_HANDLE: `%%SETBUOY` / `%%DELETEBUOY` を許可する運営ハンドル名。
+#   攻撃者が「どのハンドルを狙うか」を事前確定できないよう secret 化する。
+#   設定: `vp exec wrangler secret put ADMIN_HANDLE --config wrangler.production.toml`
 #   確認: `vp exec wrangler secret list --config wrangler.production.toml`
-#   rotation / token 生成手順は `docs/csa-server/admin_auth.md` 参照。
-#
-# 旧 ADMIN_HANDLE (handle 自称 = admin 権限) は #621 で廃止された。Cloudflare 側に
-# secret として残っていれば `wrangler secret delete ADMIN_HANDLE --config
-# wrangler.production.toml` で除去してよい (Worker code は読まなくなったので
-# 残存しても害はないが、運用上の混乱を避けるため削除推奨)。
+#   詳細は `docs/csa-server/deployment.md` §2.5 参照。

@@ -1,173 +1,46 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use crossbeam_channel::unbounded;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tools::selfplay::adjudication::{ResignRule, parse_agreement_rule};
-use tools::selfplay::cpu_affinity::{CpuAffinityMode, discover_numa_cpu_affinities};
 use tools::selfplay::game::{GameConfig, MoveEvent, run_game};
 use tools::selfplay::time_control::TimeControl;
-use tools::selfplay::types::ScoreBound;
 use tools::selfplay::{
-    EngineConfig, EngineProcess, GameOutcome, ParsedPosition, build_position,
-    ensure_start_positions_within_max_moves, load_start_positions,
+    EngineConfig, EngineProcess, GameOutcome, ParsedPosition, load_start_positions,
 };
 use tools::spsa_param_mapping::{
-    MappingTable, NOT_USED_MARKER as PARAM_NOT_USED_MARKER, RawParamRow, SPSA_PARAMS_FORMAT_HEADER,
-    parse_param_line, register_unique_parameter, validate_spsa_params_format,
+    MappingTable, NOT_USED_MARKER as PARAM_NOT_USED_MARKER, RawParamRow, parse_param_line,
 };
 
-#[path = "spsa/nps_bench.rs"]
-mod nps_bench;
-
-#[path = "spsa/async_dispatch.rs"]
-mod async_dispatch;
-
-/// `meta.json` のフォーマットバージョン。
-///
-/// v2 → v3: `params_sha256` / `init_from_sha256` / `engine_path` /
-/// `engine_param_mapping_*` / `param_name_set_hash` / `active_param_count` /
-/// `init_mode` / `init_from_path` を追加。`--init-from` の暗黙スキップを禁止し、
-/// resume 時に params 内容と name set の整合性を hash で検証する。
-///
-/// v3 → v4 (本 PR): `current_params_sha256` を追加。各反復で state.params 更新後に
-/// その時点の hash を meta に記録する。resume 起動時に on-disk state.params の hash と
-/// 突き合わせ、両者が乖離していれば「state.params だけ更新後に meta 更新前にクラッシュ」
-/// または「外部から state.params を書き換えられた」として bail (or warn)。
-///
-/// 互換性: vN は v(N-1) を読まない (hard bail)。古い run dir で resume したい場合は
-/// 新規 run dir で `--init-from <canonical>` から fresh start する。
-const META_FORMAT_VERSION: u32 = 4;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum DispatchMode {
-    /// batch_pairs 個の pair を同じ摂動で指し、全局の完了後に 1 回更新する。
-    Batch,
-    /// pair ごとに独立な摂動で指し、結果の到着順に更新する。
-    Async,
-}
-
-const fn default_cpu_affinity_mode() -> CpuAffinityMode {
-    if cfg!(target_os = "linux") {
-        CpuAffinityMode::Numa
-    } else {
-        CpuAffinityMode::Off
-    }
-}
+const META_FORMAT_VERSION: u32 = 2;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "SPSA tuner for USI engines")]
 struct Cli {
-    /// SPSA 実行ディレクトリ。state / meta / CSV を全てこの dir 配下に配置する。
-    ///
-    /// 配置されるファイル (override は個別フラグで可能):
-    /// - `<run-dir>/state.params`        : SPSA の live 状態 (batch ごとに上書き)
-    /// - `<run-dir>/meta.json`           : resume 用メタデータ
-    /// - `<run-dir>/values.csv`          : 各 batch のパラメータ値履歴
-    /// - `<run-dir>/stats.csv`           : 各 batch の統計
-    ///
-    /// 通常は `runs/spsa/$(date -u +%Y%m%d_%H%M%S)_<tag>` のように毎回新規 dir を
-    /// 切る。`--init-from <canonical>` を併用すると初回起動時に canonical を
-    /// `<run-dir>/state.params` に複製する。
-    #[arg(long, required_unless_present = "worker_stdio")]
-    run_dir: Option<PathBuf>,
-
-    /// SPSA の総 game pair 数 (fishtest `num_iter` と等価)。
-    /// total_games = 2 × total_pairs。schedule の `k` 軸の上限としても使われる。
-    /// 必須引数。後方互換のため `--games-per-iteration` + `--iterations` 併用時は
-    /// それらから自動換算する (warning 出力)。
+    /// SPSAパラメータファイル（name,type,v,min,max,c_end,r_end）
     #[arg(long)]
-    total_pairs: Option<u32>,
+    params: PathBuf,
 
-    /// 1 batch あたりの game pair 数 (batch 専用、既定 8)。同じ flip ベクトルで `2 × batch_pairs` 局を
-    /// 消化し、batch 末で θ を 1 回更新する (k は `+= batch_pairs`)。
-    /// fishtest worker の `iter += game_pairs` と等価。
-    #[arg(long)]
-    batch_pairs: Option<u32>,
+    /// 反復回数
+    #[arg(long, default_value_t = 1)]
+    iterations: u32,
 
-    /// θ の更新方式。batch は batch 末に 1 回、async は pair ごとに到着順で更新する。
-    #[arg(long, value_enum, default_value_t = DispatchMode::Batch)]
-    dispatch: DispatchMode,
-
-    /// async 専用: 適用時の lag (適用時と dispatch 時の completed_pairs の差) の上限。
-    /// 既定は 4 × --concurrency (未較正の初期値)。
-    #[arg(long)]
-    max_lag: Option<u32>,
-
-    /// async 専用: 対局を別の機械の worker に任せる。値は worker を起動する shell コマンドで、
-    /// `sh -c` で実行する (例: `ssh host /path/to/spsa --worker-stdio ...`)。複数指定できる。
-    /// 指定すると coordinator 自身は engine を起動しない (`--concurrency` は worker 側で指定する)。
-    #[arg(long = "remote-worker")]
-    remote_workers: Vec<String>,
-
-    /// `--remote-worker` の worker から何も届かない時間がこれを超えたら、切れたとみなして
-    /// その worker の pair を他へ回す (秒、既定 300)。
-    #[arg(long)]
-    remote_timeout_sec: Option<u64>,
-
-    /// `--remote-worker` の worker が使ってよい engine の sha256 (coordinator の `--engine-path` と
-    /// 別 build、例えば AVX-512 版を使うときに指定する)。複数指定できる。
-    #[arg(long = "allow-worker-engine-sha256")]
-    allow_worker_engine_sha256: Vec<String>,
-
-    /// worker として起動し、stdin で受けた pair を指して stdout に結果を返す
-    /// (`--remote-worker` の起動コマンドから使う)。engine・対局条件・`--concurrency` は
-    /// coordinator と同じ flag で指定する。
-    #[arg(long, default_value_t = false)]
-    worker_stdio: bool,
-
-    /// async 専用: `--resume` の照合 (meta と CLI の一致、journal の再生と snapshot の bit 一致) だけを行って終わる。
-    /// worker は起動せず、journal にも書かない (stats・values の CSV は再生から作り直す)。
-    /// run-dir の写しが resume できる組かを確かめるのに使う。
-    #[arg(
-        long,
-        default_value_t = false,
-        requires = "resume",
-        conflicts_with = "worker_stdio"
-    )]
-    verify_resume: bool,
-
-    /// async 専用: 1 pair の失敗 attempt 数の上限 (既定 3)。達したら snapshot を残して停止する。
-    #[arg(long)]
-    max_pair_attempts: Option<u32>,
-
-    /// async 専用: snapshot を公開する適用数の間隔 (既定 64)。
-    #[arg(long)]
-    snapshot_interval: Option<u32>,
-
-    /// **deprecated**: `--total-pairs` + `--batch-pairs` を使用してください。
-    /// 後方互換のため残置。指定された場合 `total_pairs = games_per_iteration *
-    /// iterations / 2` に自動換算 (warning 出力)。偶数必須。
-    #[arg(long)]
-    games_per_iteration: Option<u32>,
-
-    /// **deprecated**: `--total-pairs` を使用してください。
-    /// `--games-per-iteration` 併用時のみ意味を持つ (両方指定で `total_pairs` を換算)。
-    #[arg(long)]
-    iterations: Option<u32>,
+    /// 1イテレーションあたり対局数（偶数必須）
+    #[arg(long, default_value_t = 2)]
+    games_per_iteration: u32,
 
     /// 対局並列数（worker数）
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
-
-    /// engine の CPU affinity。numa は worker ごとに Threads 個の論理 CPU を
-    /// 同一 NUMA node 内から割り当てる（Linux既定、非Linuxはoff）。
-    #[arg(long, value_enum, default_value_t = default_cpu_affinity_mode())]
-    cpu_affinity: CpuAffinityMode,
 
     /// 更新移動量スケール
     #[arg(long, default_value_t = 1.0)]
@@ -185,7 +58,7 @@ struct Cli {
     #[arg(long, default_value_t = 0.101)]
     gamma: f64,
 
-    /// 再開メタデータファイル（既定: <run-dir>/meta.json）
+    /// 再開メタデータファイル（既定: <params>.meta.json）
     #[arg(long)]
     meta_file: Option<PathBuf>,
 
@@ -197,7 +70,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     force_schedule: bool,
 
-    /// 反復統計CSVの出力先（resume時は追記）。既定: <run-dir>/stats.csv
+    /// 反復統計CSVの出力先（resume時は追記）。既定: <params>.stats.csv
     #[arg(long)]
     stats_csv: Option<PathBuf>,
 
@@ -205,7 +78,15 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_stats_csv: bool,
 
-    /// 反復ごとのパラメータ値履歴CSV（wide形式）。既定: <run-dir>/values.csv
+    /// 反復統計のseed横断集計CSV（平均・分散）。既定: <params>.stats_aggregate.csv
+    #[arg(long)]
+    stats_aggregate_csv: Option<PathBuf>,
+
+    /// seed横断集計CSVの出力を無効化する
+    #[arg(long, default_value_t = false)]
+    no_stats_aggregate_csv: bool,
+
+    /// 反復ごとのパラメータ値履歴CSV（wide形式）。既定: <params>.values.csv
     #[arg(long)]
     param_values_csv: Option<PathBuf>,
 
@@ -213,24 +94,12 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_param_values_csv: bool,
 
-    /// 棋譜 (<run-dir>/games.jsonl) と batch の摂動記録 (<run-dir>/batches.jsonl) を書かない
-    #[arg(long, default_value_t = false)]
-    no_game_records: bool,
-
-    /// 乱数 seed (省略時はランダム)。SPSA の全 RNG stream は seed と batch index から
-    /// 決定論的に生成されるため、同じ seed で run を 2 回回すと同じ θ 軌跡になる。
-    ///
-    /// fishtest 整合の v4 仕様では multi-seed (`--seeds`) は撤去された
-    /// (詳細: `crates/tools/docs/spsa_runbook.md` および `CHANGELOG.md` の v4
-    /// エントリ)。複数 base_seed の探索は `--seed` を変えた独立 run dir で並列
-    /// 実行する。
-    #[arg(long)]
+    /// 乱数seed（単一）
+    #[arg(long, conflicts_with = "seeds")]
     seed: Option<u64>,
 
-    /// **deprecated/removed**: v3 の multi-seed 機能。指定するとエラー終了する。
-    /// 移行ガイドは `crates/tools/docs/spsa_runbook.md` および `CHANGELOG.md` の
-    /// v4 エントリを参照。
-    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    /// 乱数seed一覧（カンマ区切り）
+    #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with = "seed")]
     seeds: Option<Vec<u64>>,
 
     /// エンジンバイナリパス（未指定時: target/release/rshogi-usi）
@@ -240,6 +109,22 @@ struct Cli {
     /// エンジン追加引数
     #[arg(long, num_args = 1..)]
     engine_args: Option<Vec<String>>,
+
+    /// 共通の対戦相手 (例: NAGISA v4) のパス。 指定すると θ+ 対 θ− の直接対戦ではなく、
+    /// 「θ+ 対 相手」と「θ− 対 相手」を**同じ開始局面・同じ手番**で 1 局ずつ打ち (= 1 タスク 2 局)、
+    /// 得点差 (s+ − s−、 s は我々側から見た勝 +1 / 分 0 / 負 −1) を勾配の信号にする。
+    /// タスク 2k と 2k+1 は同じ開始局面で、 我々の手番を先手 / 後手に入れ替える (各局面を先後両方)。
+    /// `--games-per-iteration` はタスク数 (実局数はその 2 倍)。 未指定なら従来の自己対局モード。
+    #[arg(long)]
+    opponent_path: Option<PathBuf>,
+
+    /// 対戦相手の追加引数
+    #[arg(long, num_args = 1..)]
+    opponent_args: Option<Vec<String>>,
+
+    /// 対戦相手の USI オプション (Name=Value、 複数可)
+    #[arg(long, num_args = 1..)]
+    opponent_usi_option: Option<Vec<String>>,
 
     /// 追加USIオプション（Name=Value形式、複数指定可）
     #[arg(long = "usi-option", num_args = 1..)]
@@ -269,48 +154,13 @@ struct Cli {
     #[arg(long)]
     nodes: Option<u64>,
 
-    /// 通信障害時の追加試行数（初回を含まない）。
-    #[arg(long, default_value_t = 1)]
-    engine_retries: u32,
-
-    /// nodes 探索 1 手の運用上の期限。既定 10 分は未較正の初期値。
-    #[arg(long, default_value_t = 600_000, value_parser = clap::value_parser!(u64).range(1..))]
-    nodes_timeout_ms: u64,
-
-    /// 引分とする総手数。開始局面までの手数 (SFEN の手数欄と開始手順) も含めて数える。
+    /// 1局あたり最大手数
     #[arg(long, default_value_t = 320)]
     max_moves: u32,
 
-    /// タイムアウト判定マージン(ms)。`--nps-scaling` の倍率は掛けない (通信・回収のための絶対値)。
+    /// タイムアウト判定マージン(ms)
     #[arg(long, default_value_t = 1000)]
     timeout_margin_ms: u64,
-
-    /// async 専用: 両側の評価の一致による勝敗の裁定 (movecount=N,score=X)。勝ち側の自己視点が +X 以上、
-    /// 負け側の自己視点が -X 以下の状態が両側とも自分の直近 N 手で続いたら裁定する。既定 off。
-    #[arg(long, value_parser = parse_agreement_rule)]
-    adjudicate_agreement: Option<ResignRule>,
-
-    /// async + Fischer 専用: `--btime` / `--binc` を基準 NPS での時計とみなし、開始時に測った
-    /// この機械の NPS との比 (基準 ÷ 実測) を掛けて指す。
-    #[arg(long, default_value_t = false)]
-    nps_scaling: bool,
-
-    /// `--nps-scaling` の基準 NPS (1 thread あたり、全 slot 同時)。既定 350000。
-    #[arg(long)]
-    reference_nps: Option<u64>,
-
-    /// `--nps-scaling` の足切り。実測 NPS が基準のこの割合未満なら起動を拒否する。既定 0.5。
-    #[arg(long)]
-    min_nps_ratio: Option<f64>,
-
-    /// async 専用: 時計の時間切れ (reason `timeout`) で終わった局の率の上限 (既定 0.005)。
-    /// 超えたら snapshot を残して止める。
-    #[arg(long)]
-    max_timeout_rate: Option<f64>,
-
-    /// async 専用: 時間切れの率を出す分母の下限 (局数、既定 1000)。これより少ない間は、この局数で割る。
-    #[arg(long)]
-    timeout_rate_min_games: Option<u32>,
 
     /// 開始局面ファイル
     #[arg(long)]
@@ -332,21 +182,29 @@ struct Cli {
     #[arg(long)]
     active_only_regex: Option<String>,
 
+    /// WLDに最終評価値を混ぜる重み。0なら従来通りWLDのみ。
+    #[arg(long, default_value_t = 0.0)]
+    score_blend_weight: f64,
+
+    /// score blendで使う評価値の絶対値上限(cp)。
+    #[arg(long, default_value_t = 1000)]
+    score_blend_clamp_cp: i32,
+
+    /// plus/minusの先後割当をiteration内でランダム化する。
+    #[arg(long, default_value_t = false)]
+    randomize_plus_color: bool,
+
     /// 早期停止: avg_abs_update の閾値（以下で条件成立）
     #[arg(long)]
     early_stop_avg_abs_update_threshold: Option<f64>,
 
-    /// 早期停止: result_variance 代理指標の閾値（以下で条件成立）。
-    ///
-    /// 比較対象は `|raw_result| / batch_pairs` (0..2 の値、各 game の +1/-1 が
-    /// 完全に拮抗すると 0 に近づく)。`raw_result` の絶対値そのものではない点に注意。
-    /// 閾値値はチューニング対象の感度に応じて再調整すること。
+    /// 早期停止: result_variance の閾値（以下で条件成立）
     #[arg(long)]
     early_stop_result_variance_threshold: Option<f64>,
 
     /// 早期停止: 条件連続成立回数（0で無効）
-    #[arg(long)]
-    early_stop_patience: Option<u32>,
+    #[arg(long, default_value_t = 0)]
+    early_stop_patience: u32,
 
     /// エンジン側パラメータ名マッピング TOML（例: tune/yo_rshogi_mapping.toml）。
     /// 指定時、`.params` の rshogi 名 (`SPSA_*`) を、setoption する直前にエンジン側名前空間
@@ -355,77 +213,23 @@ struct Cli {
     #[arg(long)]
     engine_param_mapping: Option<PathBuf>,
 
-    /// canonical (起点) parameter ファイル。
-    ///
-    /// 用途:
-    /// - **fresh start**: `<run-dir>/state.params` 不在時、canonical を
-    ///   `state.params` にコピーして開始する。
-    /// - **resume の整合性検証**: `--resume` と併用すると、起動時に既存
-    ///   `state.params` と canonical の値乖離を diagnostic 出力する
-    ///   (閾値超過時の bail は `--strict-init-check` で有効化)。
-    ///
-    /// 既存 `state.params` がある状態での fresh 系操作は `--resume` か
-    /// `--force-init` のいずれかの明示が必要 (詳細: runbook §4.1)。
+    /// 正本 `.params` の上書き保護用。`--params` のパスが存在しない時に限り、
+    /// `<init-from>` の内容をコピーしてから SPSA を開始する。既に存在する場合は
+    /// resume と同じく既存ファイルを読み込んで何もしない。正本（例:
+    /// `spsa_params/suisho10_converted.params`）を `--params` に直接渡すと
+    /// 反復ごとに上書きされるので、`--params runs/spsa/<ts>/tuned.params
+    /// --init-from spsa_params/suisho10_converted.params` のパターンで使う。
     #[arg(long)]
     init_from: Option<PathBuf>,
 
-    /// 未宣言のparamsがc_end/r_endであることを明示確認する（数値・既存SHAは変更しない）
-    #[arg(long)]
-    assume_c_end_r_end: bool,
-
-    /// 既存の `<run-dir>/state.params` を canonical で atomic に上書きして
-    /// fresh start する。`--init-from` の指定が必須。
-    /// canonicalの全行とengine mappingの検証を、既存成果物の変更前に行う。
-    ///
-    /// 既存 `meta.json` / 各 CSV も削除して fresh run として扱う。`--resume`
-    /// とは同時指定不可 (意味が矛盾)。
-    #[arg(long, default_value_t = false)]
-    force_init: bool,
-
-    /// 既存 `<run-dir>/state.params` を canonical の代わりに「そのまま起点」として
-    /// fresh start を許可する。
-    ///
-    /// 通常運用ではこのフラグは不要。`--init-from` を指定して canonical を明示する
-    /// のが推奨経路。本フラグは「外部ツールで生成した state.params を直接 spsa に
-    /// 食わせる」「過去 run の最終 state を seed に新 run を始める (=resume では
-    /// なく fresh)」等の特殊ユースケース向けに、明示的な意思表示として用意する。
-    ///
-    /// 既定で `--init-from` なし + 既存 state は bail (silent fresh は事故の温床
-    /// だったため)。本フラグは `--init-from` / `--resume` / `--force-init` のいずれ
-    /// とも同時指定不可 (意味が矛盾する)。
-    #[arg(long, default_value_t = false)]
-    use_existing_state_as_init: bool,
-
-    /// `<run-dir>/.lock` が残留している場合に強制削除して取得を試みる。
-    ///
-    /// 通常 lock は process 正常終了時 / panic 時に削除される。電源断・
-    /// SIGKILL 等で残ってしまった場合のみこのフラグを使う。間違って実行中
-    /// の SPSA を巻き込むと state.params / meta.json が race condition で
-    /// 壊れるので、必ず lock 内容 (PID/hostname/start) を確認して当該
-    /// プロセスが死んでいることを目視確認してから指定すること。
-    #[arg(long, default_value_t = false)]
-    force_unlock: bool,
-
-    /// `--resume` + `--init-from` 併用時の整合性チェックを strict にする。
-    ///
-    /// デフォルトは warning 出力のみで継続。strict 指定時は median ≥ 0.5 step
-    /// または max ≥ 5 step の乖離があれば bail する。CI / 自動化で「想定外の
-    /// resume」を早期検出したい場合に使う。
-    #[arg(long, default_value_t = false)]
-    strict_init_check: bool,
-
-    /// **deprecated/removed**: v3 の multi-seed 機能。指定するとエラー終了する。
-    /// 移行ガイドは `crates/tools/docs/spsa_runbook.md` および `CHANGELOG.md` の
-    /// v4 エントリを参照。
+    /// `--seeds` を 2 つ以上指定したとき、iter 内の seed 群を並列実行する。
+    /// SPSA の数学的妥当性は保たれる（各 seed は独立な摂動方向を持ち、iter 末で
+    /// 平均化される）。`--concurrency / seeds_count` を各 seed に配分するため、
+    /// 最大効率には **`--concurrency` は `seeds_count` の倍数を推奨**
+    /// （割り切れない端数は浪費される: 例 conc=10, seeds=3 → per_seed=3, 1 枠無駄）。
+    /// 単一 seed のときは通常通り順次実行（フラグは無視）。
     #[arg(long, default_value_t = false)]
     parallel_seeds: bool,
-}
-
-impl Cli {
-    /// `--worker-stdio` 以外では clap が `--run-dir` を必須にしている。
-    fn run_dir(&self) -> &Path {
-        self.run_dir.as_deref().unwrap_or_else(|| Path::new(""))
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -451,100 +255,6 @@ struct ScheduleConfig {
     a_ratio: f64,
     mobility: f64,
     total_iterations: u32,
-}
-
-/// CLI の浮動小数点値は比較より先に非有限値を拒否する。
-fn validate_cli_finite(cli: &Cli) -> Result<()> {
-    for (name, value) in [
-        ("alpha", Some(cli.alpha)),
-        ("gamma", Some(cli.gamma)),
-        ("a-ratio", Some(cli.a_ratio)),
-        ("mobility", Some(cli.mobility)),
-        ("early-stop-avg-abs-update-threshold", cli.early_stop_avg_abs_update_threshold),
-        ("early-stop-result-variance-threshold", cli.early_stop_result_variance_threshold),
-        ("min-nps-ratio", cli.min_nps_ratio),
-        ("max-timeout-rate", cli.max_timeout_rate),
-    ] {
-        if let Some(value) = value
-            && !value.is_finite()
-        {
-            bail!("--{name} must be finite");
-        }
-    }
-    Ok(())
-}
-
-/// 正の指数の単調性から全 k の分母・摂動・更新の保守的上界を調べる。
-/// batch の勝敗和は最大 2 * batch_pairs。全反復の走査や更新式の変更はしない。
-fn validate_schedule_bounds(
-    schedule: ScheduleConfig,
-    params: &[SpsaParam],
-    active: &[bool],
-    constants: &[ParamScheduleConstants],
-    batch_pairs: u32,
-) -> Result<()> {
-    let n = f64::from(schedule.total_iterations);
-    let big_a = schedule.a_ratio * n;
-    let gamma_max = n.powf(schedule.gamma);
-    let alpha_min = (big_a + 1.0).powf(schedule.alpha);
-    let alpha_max = (big_a + n).powf(schedule.alpha);
-    for value in [big_a, big_a + n, gamma_max, alpha_min, alpha_max] {
-        if !value.is_finite() {
-            bail!("schedule constants overflow");
-        }
-    }
-    if gamma_max <= 0.0 || alpha_min <= 0.0 || alpha_max <= 0.0 {
-        bail!("schedule denominator underflow");
-    }
-    let raw_max = 2.0 * f64::from(batch_pairs.min(schedule.total_iterations));
-    for ((p, enabled), c) in params.iter().zip(active).zip(constants) {
-        if !enabled {
-            continue;
-        }
-        let check = |value: f64| -> Result<()> {
-            if !value.is_finite() {
-                bail!("{}: non-finite schedule/update bound", p.name);
-            }
-            Ok(())
-        };
-        check(c.c_0)?;
-        check(c.a_0)?;
-        let c_max = c.c_0.abs();
-        let c_min = c_max / gamma_max;
-        let range_max = p.min.abs().max(p.max.abs());
-        check(range_max + c_max)?;
-        check(c_max * params.len() as f64)?;
-        check(2.0 * range_max * params.len() as f64)?;
-        // 既存の c_end=0 による更新停止は保持する。
-        if p.c_end == 0.0 {
-            continue;
-        }
-        let denominator_min = c_min * c_min;
-        if denominator_min == 0.0 {
-            bail!("{}: schedule denominator underflow", p.name);
-        }
-        check(c_max * c_max)?;
-        let r_max = c.a_0.abs() / alpha_min / denominator_min;
-        check(r_max)?;
-        let signal_max = r_max * c_max * raw_max;
-        check(signal_max)?;
-        check(range_max + signal_max * schedule.mobility.abs())?;
-        for k in [0, schedule.total_iterations - 1] {
-            let (c_k, r_k) = c.at_iteration(k, big_a, schedule.alpha, schedule.gamma);
-            check(c_k)?;
-            check(r_k)?;
-        }
-    }
-    Ok(())
-}
-
-/// 早期停止専用の勝敗和の絶対値 / pair 数（0..2）。更新式には使わない。
-fn early_stop_result_magnitude(raw_result: f64, pairs: u32) -> f64 {
-    if pairs == 0 {
-        0.0
-    } else {
-        raw_result.abs() / f64::from(pairs)
-    }
 }
 
 /// Fishtest 方式の per-param スケジュール定数。イテレーション開始前に一度だけ計算する。
@@ -585,101 +295,20 @@ impl ParamScheduleConstants {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ResumeMetaData {
     format_version: u32,
-    /// `<run-dir>/state.params` の絶対 or 相対パス文字列 (起動時に記録)。
-    state_params_file: String,
+    params_file: String,
     completed_iterations: u32,
     total_games: usize,
     last_raw_result_mean: f64,
     last_avg_abs_update: f64,
     updated_at_utc: String,
     schedule: ScheduleConfig,
-    // --- v3 で追加 ---
-    /// 起動時 (iter 0) の `<run-dir>/state.params` 全体の SHA-256 hex。fresh start / force-init 時に
-    /// その時点の params 内容を記録する。SPSA 進行で値は変わるので resume 中の
-    /// 検証では使わず、事故解析用の起動時スナップショットとして残す。
-    init_params_sha256: String,
-    /// `--init-from` 指定時のソース hex。同 path で再走時に「同じ canonical を
-    /// 使ったか」を後追い確認可能。
-    init_from_sha256: Option<String>,
-    /// `--init-from` のパス文字列 (起動時の指定そのまま、絶対パス化はしない)。
-    init_from_path: Option<String>,
-    /// param 名集合の SHA-256 hex (sort 済み name を `\n` join して hash)。
-    /// resume 時に param 集合が変わっていないことの検証に使う。
-    param_name_set_sha256: String,
-    /// 起動時の active param 数 (active_only_regex / not_used / mapping 適用後)。
-    active_param_count: usize,
-    /// 起動時の engine binary パス (resolve 後の絶対 or 相対パス、解決時のまま)。
-    engine_path: String,
-    /// `--engine-param-mapping` のパス (指定時のみ)。
-    engine_param_mapping_path: Option<String>,
-    /// `--engine-param-mapping` ファイルの SHA-256 hex (指定時のみ)。
-    engine_param_mapping_sha256: Option<String>,
-    /// 起動モード。`InitMode` の serde 表現 (kebab-case)。
-    init_mode: InitMode,
-    // --- v4 で追加 ---
-    /// 反復ごとに更新される現 state.params の SHA-256。`save_meta` の直前に
-    /// hash を計算して記録する (write_params → meta save の transactional 復旧
-    /// 検証に使う)。
-    /// resume 起動時に on-disk hash と突き合わせ、乖離があれば「state だけ更新で
-    /// 落ちた」or「外部から state を書き換えられた」と判断して bail。
-    /// 反復 0 (起動時 snapshot) では `init_params_sha256` と同値で開始する。
-    current_params_sha256: String,
-    /// SPSA の総 game pair 数 (= fishtest `num_iter`)。schedule の k 軸の上限であり、
-    /// 全 batch 完了 = `total_pairs / batch_pairs` 個の batch を消化したとき。
-    /// resume 時に CLI 指定値と突き合わせて schedule 一致を検証する。
-    total_pairs: u32,
-    /// 1 batch あたりの game pair 数 (= fishtest worker `game_pairs`)。
-    /// resume 時に CLI 指定値と突き合わせる (途中で batch 粒度が変わると k の進行が
-    /// 不整合になるため bail)。
-    batch_pairs: u32,
-    /// SPSA schedule 上の累積 k (= 完了 game pair 数)。`completed_iterations × batch_pairs`
-    /// と等価だが、明示フィールドとして持つことで future-proof + 検証用途に使う。
-    completed_pairs: u32,
-    /// games.jsonl / batches.jsonl を書く run か。途中で切り替えると確定 batch の棋譜が
-    /// 欠けるので resume で一致を求める。記録機能より前の meta には無い (None)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    game_records: Option<bool>,
 }
 
-/// 起動時に決まる SPSA 走行モード。
-///
-/// `meta.json` 内に kebab-case 文字列で保存される (`"fresh-init-from"` 等)。
-/// String 直書きは typo の温床なので enum + serde で型安全化。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum InitMode {
-    /// `--init-from` 指定 + `<run-dir>/state.params` 不在 → canonical を copy して fresh start。
-    FreshInitFrom,
-    /// `--init-from` なし + `<run-dir>/state.params` 既存 → 既存ファイルでそのまま fresh start。
-    FreshExisting,
-    /// `--init-from` 指定 + `<run-dir>/state.params` 既存 + `--force-init` → 上書き再初期化。
-    ForceInit,
-    /// `--resume` で既存 run を継続 (run 全体としてのモードは初回起動時のもの)。
-    Resume,
-}
-
-impl std::fmt::Display for InitMode {
-    /// stderr/log 表示用 kebab-case 文字列。`meta.json` の serde 表現と一致させる
-    /// ことで「何が記録されたか」「何が起動したか」を視覚的に紐付けやすくする。
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Self::FreshInitFrom => "fresh-init-from",
-            Self::FreshExisting => "fresh-existing",
-            Self::ForceInit => "force-init",
-            Self::Resume => "resume",
-        };
-        f.write_str(s)
-    }
-}
-
-/// 1 batch 分の統計 (stats.csv 1 行に対応)。v4 仕様: seed カラム廃止、
-/// `batch_pairs` (batch 内 game pair 数) を追加。
 #[derive(Clone, Copy, Debug)]
 struct IterationStats {
-    /// batch 番号 (1-origin)。v3 では「iteration」だったが意味は等価。
     iteration: u32,
-    /// この batch で実行した game pair 数 (= games / 2)。
-    batch_pairs: u32,
+    seed: u64,
+    games: u32,
     plus_wins: u32,
     minus_wins: u32,
     draws: u32,
@@ -689,6 +318,83 @@ struct IterationStats {
     updated_params: usize,
     avg_abs_update: f64,
     max_abs_update: f64,
+    total_games: usize,
+    /// 共通相手モードのときだけ Some (stats.csv に 6 列を足す)
+    opp: Option<OppTally>,
+}
+
+/// 共通相手モードの 1 タスク (θ+ 対 相手 / θ− 対 相手) の結果。
+/// 値は我々側から見た WLD 得点 (勝 +1 / 分 0 / 負 −1)。
+#[derive(Clone, Copy, Debug)]
+struct OppPairOutcome {
+    plus: f64,
+    minus: f64,
+}
+
+/// 共通相手モードの θ+ / θ− それぞれの対相手の勝敗数。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct OppTally {
+    plus_w: u32,
+    plus_l: u32,
+    plus_d: u32,
+    minus_w: u32,
+    minus_l: u32,
+    minus_d: u32,
+}
+
+impl OppTally {
+    fn add(&mut self, r: OppPairOutcome) {
+        fn bump(s: f64, w: &mut u32, l: &mut u32, d: &mut u32) {
+            if s > 0.0 {
+                *w += 1;
+            } else if s < 0.0 {
+                *l += 1;
+            } else {
+                *d += 1;
+            }
+        }
+        bump(r.plus, &mut self.plus_w, &mut self.plus_l, &mut self.plus_d);
+        bump(r.minus, &mut self.minus_w, &mut self.minus_l, &mut self.minus_d);
+    }
+}
+
+/// 共通相手モードの 1 タスクの勾配信号 = s+ − s− (範囲 −2..=2)。
+///
+/// /2 しない理由: 小さい摂動では E[s+ − s−] = 2(q+ − q−) ≈ 2(p − 0.5) = 直接対戦 1 局の
+/// E[plus_score] (p = θ+ が θ− に勝つ確率、 q± = θ± が相手に勝つ確率) なので、
+/// 「1 タスク = 自己対局 1 局」と同じ期待値になり、 r_end の目盛りがそのまま使える。
+fn opp_pair_signal(r: OppPairOutcome) -> f64 {
+    r.plus - r.minus
+}
+
+/// 共通相手モードの配役: タスク 2k と 2k+1 を同じ開始局面にし、 我々の手番を
+/// 2k = 先手 / 2k+1 = 後手 にする (θ+ と θ− は各タスクで同じ局面・同じ手番)。
+///
+/// `--random-startpos false` + 各局面 2 行に複製した局面ファイルなら開始局面は元から対で、
+/// この関数は手番の割当だけを固定する。 自己対局モードでは呼ばない。
+fn pair_tasks_for_opponent(start_pos_indices: &mut [usize], ours_is_black: &mut [bool]) {
+    debug_assert_eq!(start_pos_indices.len(), ours_is_black.len());
+    for i in 0..start_pos_indices.len() {
+        if i % 2 == 1 {
+            start_pos_indices[i] = start_pos_indices[i - 1];
+        }
+        ours_is_black[i] = i % 2 == 0;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AggregateIterationStats {
+    iteration: u32,
+    seed_count: usize,
+    games_per_seed: u32,
+    raw_result_mean: f64,
+    raw_result_variance: f64,
+    plus_wins_mean: f64,
+    plus_wins_variance: f64,
+    minus_wins_mean: f64,
+    minus_wins_variance: f64,
+    draws_mean: f64,
+    draws_variance: f64,
     total_games: usize,
 }
 
@@ -700,134 +406,64 @@ struct GameTask {
     game_id: u32,
 }
 
+#[derive(Clone, Copy)]
 struct GameTaskResult {
     game_idx: u32,
     plus_is_black: bool,
     plus_score: f64,
     outcome: GameOutcome,
-    game_id: u32,
-    start_pos_index: usize,
-    /// 開始局面ファイルの手順を適用した後の SFEN。`moves` はこの局面から指す。
-    startpos_sfen: String,
-    reason: String,
-    plies: u32,
-    /// この結果を得るまでに engine の通信障害で指し直した回数。
-    retries: u32,
-    moves: GameMoves,
+    /// 共通相手モードのときだけ Some
+    opp: Option<OppPairOutcome>,
 }
 
-/// 1 局の手ごとの記録。各配列は手順と同じ長さで、i 番目が i+1 手目に対応する。
-///
-/// 最後の要素は終局を表す `resign` / `win` / `illegal` / `none` になり得る。
-/// `reason` が `timeout` のときは最後の要素が指し手の形でも盤面に適用されていない。
-/// 評価値・深さ・nodes は主 PV の info を項目ごとに上書きした最後の値で、全要素 null の列は省く。
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-struct GameMoves {
-    moves: Vec<String>,
-    elapsed_ms: Vec<u64>,
-    #[serde(skip_serializing_if = "all_none")]
-    score_cp: Vec<Option<i32>>,
-    #[serde(skip_serializing_if = "all_none")]
-    score_mate: Vec<Option<i32>>,
-    #[serde(skip_serializing_if = "all_none")]
-    score_bound: Vec<Option<ScoreBound>>,
-    #[serde(skip_serializing_if = "all_none")]
-    depth: Vec<Option<u32>>,
-    #[serde(skip_serializing_if = "all_none")]
-    nodes: Vec<Option<u64>>,
-}
-
-fn all_none<T>(values: &[Option<T>]) -> bool {
-    values.iter().all(Option::is_none)
-}
-
-impl GameMoves {
-    fn push(&mut self, event: &MoveEvent) {
-        let eval = event.eval.as_ref();
-        self.moves.push(event.move_usi.clone());
-        self.elapsed_ms.push(event.elapsed_ms);
-        self.score_cp.push(eval.and_then(|e| e.score_cp));
-        self.score_mate.push(eval.and_then(|e| e.score_mate));
-        self.score_bound.push(eval.and_then(|e| e.score_bound));
-        self.depth.push(eval.and_then(|e| e.depth));
-        self.nodes.push(eval.and_then(|e| e.nodes));
-    }
-}
-
-/// `games.jsonl` / `batches.jsonl` の版。項目の意味や型を変えたら上げる。
-const GAME_RECORD_SCHEMA_VERSION: u32 = 1;
-
-/// `<run-dir>/games.jsonl` の 1 行 (1 局)。読み方は crates/tools/docs/spsa.md の棋譜の節。
-#[derive(Serialize)]
-struct GameRecordLine<'a> {
-    schema: &'static str,
-    version: u32,
-    mode: &'static str,
-    pair_id: u32,
-    pair_slot: u32,
-    /// async のみ。journal の `dispatch` / `received` の attempt。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attempt: Option<u32>,
-    /// batch のみ。batch 番号 (1 始まり)。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    iteration: Option<u32>,
-    /// async のみ。係数を決めた時点の完了 pair 数。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dispatch_k: Option<u32>,
-    game_id: u32,
-    plus_is_black: bool,
-    startpos_idx: usize,
-    startpos_sfen: &'a str,
-    outcome: &'static str,
-    plus_score: i8,
-    reason: &'a str,
-    plies: u32,
-    retries: u32,
-    #[serde(flatten)]
-    moves: &'a GameMoves,
-}
-
-/// `<run-dir>/batches.jsonl` の 1 行 (1 batch)。配列は active param を params 順に並べる。
-#[derive(Serialize)]
-struct BatchRecordLine<'a> {
-    schema: &'static str,
-    version: u32,
-    iteration: u32,
-    batch_pairs: u32,
-    k_pair_start: u32,
-    params: Vec<&'a str>,
-    c_k: Vec<f64>,
-    r_k: Vec<f64>,
-    flip: Vec<i8>,
-    plus: Vec<serde_json::Number>,
-    minus: Vec<serde_json::Number>,
-}
-
-/// 1 batch の game 集計結果。raw_result = Σ plus_score (各 game pair が +1 / 0 / -1)。
 #[derive(Clone, Copy, Debug)]
-struct BatchGameStats {
+struct SeedGameStats {
     step_sum: f64,
     plus_wins: u32,
     minus_wins: u32,
     draws: u32,
+    /// 共通相手モードの θ± 対相手の勝敗 (自己対局モードでは全て 0)
+    opp: OppTally,
 }
 
-/// 1 batch 分の事前計算結果（flips / shifts / plus / minus / startpos インデックス）。
+/// 1 seed × 1 iter 分の事前計算結果（rng / flips / shifts / plus / minus / startpos インデックス）。
 ///
-/// `compute_batch_prep` で生成し、`WorkerPool::run_batch` の入力として使う。
-/// fishtest 流: 同 batch 内の全 game pair で共通の flip ベクトルと rounded plus/minus 値を使う。
-struct BatchPrep {
+/// `compute_seed_prep` で生成し、`run_seed_games_parallel` の入力として使う。
+/// 事前計算を seed 並列実行から分離することで、決定論を維持したまま重いゲーム実行のみを並列化できる。
+struct SeedPrep {
     base_seed: u64,
     flips: Vec<f64>,
     plus_values: Vec<f64>,
     minus_values: Vec<f64>,
     start_pos_indices: Vec<usize>,
+    plus_is_black: Vec<bool>,
     active_params: usize,
     avg_abs_shift: f64,
-    /// この batch 内で消化する game の (累積) 開始 game 番号。stats / log 表示と
-    /// `pick_startpos_index` の cyclic 進行に使う。
-    batch_total_games_start: usize,
+    seed_total_games_start: usize,
+}
+
+struct SeedRunContext<'a> {
+    concurrency: usize,
+    base_cfg: &'a EngineConfig,
+    params: &'a [SpsaParam],
+    plus_values: &'a [f64],
+    minus_values: &'a [f64],
+    start_positions: &'a [ParsedPosition],
+    start_pos_indices: &'a [usize],
+    plus_is_black: &'a [bool],
+    game_cfg: &'a GameConfig,
+    tc: TimeControl,
+    total_games_start: usize,
+    iteration: u32,
+    seed_idx: usize,
+    seed_count: usize,
+    base_seed: u64,
+    translator: &'a EngineNameTranslator,
+    active_mask: &'a [bool],
+    score_blend_weight: f64,
+    score_blend_clamp_cp: i32,
+    /// Some なら共通相手モード (1 タスク 2 局)
+    opponent_cfg: Option<&'a EngineConfig>,
 }
 
 /// rshogi `.params` の名前 → エンジン側 USI option 名 への翻訳器
@@ -900,222 +536,20 @@ struct EarlyStopConfig {
     patience: u32,
 }
 
-/// `<run-dir>/state.params`: SPSA の live 状態ファイル。
-fn state_params_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("state.params")
+fn default_meta_path(params_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.meta.json", params_path.display()))
 }
 
-/// `--force-init` 時に削除する run-dir 直下の派生ファイル一覧。
-///
-/// state.params は `apply_init_action` 内で atomic copy される (削除→上書きでなく
-/// rename) ため、本リストには含めない。`meta.json` も apply_init_action が個別に
-/// 「失敗で bail」セマンティクスで削除するため別扱い。
-///
-/// **CSV override 先 (`--stats-csv` / `--param-values-csv` で run-dir 外を
-/// 指定した場合) はこの関数の戻り値に含めない**:
-/// CSV は run の物理進行ログであり、外部集約 CSV に append する
-/// 運用 (複数 run の比較ログ等) を force-init で破壊しないため。なお
-/// `--meta-file` の override 先は本関数では扱わず、`apply_init_action` 側で
-/// 別途削除される (active resume state は run-dir 外でも force-init の対象)。
-fn default_force_init_cleanup_paths(run_dir: &Path) -> Vec<PathBuf> {
-    vec![
-        default_param_values_csv_path(run_dir),
-        default_stats_csv_path(run_dir),
-        // 旧 run の final.params が残っていると新 run で上書きされるまで「前回の確定値」
-        // が見え続け、tune.py apply に誤投入される事故になる。fresh 系のリスタート (force-init
-        // / fresh / use-existing) で必ず消す。
-        run_dir.join("final.params"),
-    ]
+fn default_param_values_csv_path(params_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.values.csv", params_path.display()))
 }
 
-/// fresh start (force-init を含む全 fresh 系) で削除すべき run-dir 直下のファイル。
-///
-/// `apply_init_action` は force-init 経路でのみ `default_force_init_cleanup_paths`
-/// を呼ぶ。一方、`CopyInitFromFresh` / `UseExistingFresh` 経路では既に CSV writer の
-/// `cli.resume=false` truncate で派生 CSV は上書きされるが、`final.params` は writer
-/// を持たないため放置すると stale snapshot が残り続ける。これを防ぐため fresh start
-/// 全経路で `final.params` を能動削除する。
-fn remove_stale_final_params_for_fresh_start(run_dir: &Path) -> Result<()> {
-    let final_path = run_dir.join("final.params");
-    match std::fs::remove_file(&final_path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(anyhow::Error::new(e)).with_context(|| {
-            format!(
-                "failed to remove stale final.params before fresh start: {}",
-                final_path.display()
-            )
-        }),
-    }
+fn default_stats_csv_path(params_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.stats.csv", params_path.display()))
 }
 
-fn default_meta_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("meta.json")
-}
-
-/// v3 silent migrate 時に旧形式 CSV をローテートする。
-///
-/// 旧 stats.csv は v3 までの 13 列形式 (`iteration,seed,games,...`) で、現行の
-/// 12 列ヘッダ (`iteration,batch_pairs,...`) と互換しない。append すると
-/// `spsa_stats_to_plot_csv` 等の後段ツールが列数混在を検知して破綻する。
-/// 既存ファイルを `<name>.v3.csv` にリネームして退避し、現行ヘッダで新規作成
-/// できる空き状態にする (実際のヘッダ書き出しは `open_stats_csv_writer` が担当)。
-///
-/// 旧 stats_aggregate.csv は現行で自動生成しないため、存在すれば `<name>.v3.csv`
-/// にリネームして退避するだけ (削除はせず、過去ログとして参照可能な形で残す)。
-///
-/// values.csv は param 名ベースのワイド形式で、param 名集合が変わらない限り列が
-/// 壊れない (param 名集合の hash は別途 `param_name_set_sha256` 検証で守られる)。
-/// よって values.csv は触らず append を継続する。
-///
-/// 既に `.v3.csv` 退避先が存在する場合 (= 過去に migrate を試みて何らかの理由で
-/// もう一度走った) は数字付きサフィックス (`<name>.v3.<n>.csv`) で重複回避する。
-///
-/// 引数:
-/// - `run_dir`: 走査対象。run-dir 直下の既定 path のみが対象。`--stats-csv` 等の
-///   override 先は触らない (force-init と同じ思想: 外部集約 CSV append 運用を
-///   保護する)。
-fn rotate_v3_csv_files_for_silent_migrate(run_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut rotated = Vec::new();
-    for name in ["stats.csv", "stats_aggregate.csv"] {
-        let src = run_dir.join(name);
-        if !src.exists() {
-            continue;
-        }
-        let dst = pick_v3_backup_path(&src);
-        std::fs::rename(&src, &dst).with_context(|| {
-            format!("v3 silent migrate: failed to rotate {} → {}", src.display(), dst.display())
-        })?;
-        rotated.push(dst);
-    }
-    Ok(rotated)
-}
-
-/// `<name>.csv` → `<name>.v3.csv` (or `<name>.v3.<n>.csv` で衝突回避) の退避先 path を返す。
-/// 副作用なし: 実際の rename は呼び出し側で行う。
-fn pick_v3_backup_path(src: &Path) -> PathBuf {
-    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("backup");
-    let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("csv");
-    let parent = src.parent().unwrap_or_else(|| Path::new("."));
-    let primary = parent.join(format!("{stem}.v3.{ext}"));
-    if !primary.exists() {
-        return primary;
-    }
-    // 衝突: `<name>.v3.<n>.csv` で連番を付ける (n=1..)。1000 件まで試して
-    // それでも衝突するなら諦めて最終候補を返す (実用上は到達しない)。
-    for n in 1..=1000_u32 {
-        let candidate = parent.join(format!("{stem}.v3.{n}.{ext}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    parent.join(format!("{stem}.v3.last.{ext}"))
-}
-
-fn default_param_values_csv_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("values.csv")
-}
-
-fn default_stats_csv_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("stats.csv")
-}
-
-/// v3 silent migrate 時、旧 run の `batch_pairs` 相当 (= `games_per_iteration / 2`)
-/// を `total_games / completed_iterations / 2` で推定し、CLI 指定値との不整合を
-/// 検出する。
-///
-/// v3 meta は `batch_pairs` を直接保持しないため、`completed_iterations` と
-/// `total_games` から推定した「1 iter あたりの game pair 数」を信頼する。
-/// 推定値が CLI 指定の `batch_pairs` と一致しないと、SPSA schedule の k 軸
-/// (a_k / c_k 評価のための累積 pair 数) が旧 run の続きにならず、進行状態が
-/// 破綻するため明示停止する (silent failure 防止)。
-///
-/// 動作仕様:
-/// - 推定不可 (`completed_iterations == 0` / `total_games == 0` /
-///   `total_games % completed_iterations != 0`): 強い warning + 続行。
-/// - 推定値が CLI 値と一致: warning なし。
-/// - 推定値が CLI 値と不一致 + `force_schedule == false`: bail (k 軸ズレ確実)。
-/// - 推定値が CLI 値と不一致 + `force_schedule == true`: warning + 続行。
-///
-/// 副作用: ユーザ向け warning は stderr (`eprintln!`)。bail は `Result::Err`。
-/// 純粋に検証だけ行い、`completed_pairs` の再構築や schedule 上書きは
-/// 呼び出し側の責務。
-fn check_v3_batch_pairs_consistency(
-    completed_iterations: u32,
-    total_games: usize,
-    cli_batch_pairs: u32,
-    force_schedule: bool,
-) -> Result<()> {
-    if completed_iterations == 0 || total_games == 0 {
-        eprintln!(
-            "v3 → v4 silent migrate: completed_iterations={completed_iterations}, \
-             total_games={total_games} のため batch_pairs 推定はスキップしました。\n  \
-             CLI 指定の --batch-pairs={cli_batch_pairs} がそのまま採用されます。\n  \
-             旧 run の `games_per_iteration / 2` と一致しないと SPSA schedule の \
-             k 軸が破綻するため、必ず一致する値を指定してください。"
-        );
-        return Ok(());
-    }
-    let total_iters = completed_iterations as usize;
-    if !total_games.is_multiple_of(total_iters) {
-        eprintln!(
-            "v3 → v4 silent migrate: total_games={total_games} が completed_iterations \
-             ={completed_iterations} で割り切れず、batch_pairs を推定できません。\n  \
-             (旧 run が早期停止 / multi-seed 等で 1 iter あたりの game 数が変動した可能性)\n  \
-             CLI 指定の --batch-pairs={cli_batch_pairs} がそのまま採用されます。\n  \
-             k 軸ズレに注意してください。"
-        );
-        return Ok(());
-    }
-    let games_per_iter = total_games / total_iters;
-    if !games_per_iter.is_multiple_of(2) {
-        eprintln!(
-            "v3 → v4 silent migrate: 推定 games_per_iter={games_per_iter} が偶数でなく、\
-             paired antithetic と整合しません。\n  \
-             CLI 指定の --batch-pairs={cli_batch_pairs} がそのまま採用されます。\n  \
-             k 軸ズレに注意してください。"
-        );
-        return Ok(());
-    }
-    // 巨大値や破損 meta で `u32::MAX` を超える場合は推定不可扱いにする
-    // (`as u32` の暗黙切り詰めだと意図しない一致 / 不一致を生む可能性がある)。
-    let estimated_batch_pairs = match u32::try_from(games_per_iter / 2) {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "v3 → v4 silent migrate: 推定 batch_pairs={} が u32 範囲外のため batch_pairs \
-                 推定はスキップしました。\n  \
-                 (meta が破損しているか異常に大きい可能性)\n  \
-                 CLI 指定の --batch-pairs={cli_batch_pairs} がそのまま採用されます。\n  \
-                 k 軸ズレに注意してください。",
-                games_per_iter / 2
-            );
-            return Ok(());
-        }
-    };
-    if estimated_batch_pairs == cli_batch_pairs {
-        return Ok(());
-    }
-    if force_schedule {
-        eprintln!(
-            "warning: v3 → v4 silent migrate で batch_pairs 推定値と CLI 値が不一致だが \
-             --force-schedule で続行します\n  \
-             推定 batch_pairs (= total_games / completed_iterations / 2) = {estimated_batch_pairs}\n  \
-             CLI --batch-pairs                                          = {cli_batch_pairs}\n  \
-             k 軸ズレが起きる可能性があります。"
-        );
-        return Ok(());
-    }
-    bail!(
-        "v3 → v4 silent migrate: batch_pairs 推定値と CLI 値が不一致です。\n  \
-           推定 batch_pairs (= total_games / completed_iterations / 2) = {estimated_batch_pairs}\n  \
-           CLI --batch-pairs                                          = {cli_batch_pairs}\n\
-         このまま続行すると SPSA schedule の k 軸が旧 run の続きにならず、進行状態が \
-         破綻します。対処:\n  \
-           (a) --batch-pairs {estimated_batch_pairs} を指定して旧 run と一致させる\n  \
-           (b) 旧 run と異なる schedule で再開したい場合は --force-schedule を明示\n  \
-           (c) §10.7 の手順で旧 run の最終値を canonical にして新 run を fresh start"
-    );
+fn default_stats_aggregate_csv_path(params_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.stats_aggregate.csv", params_path.display()))
 }
 
 fn schedule_matches(lhs: ScheduleConfig, rhs: ScheduleConfig) -> bool {
@@ -1127,33 +561,56 @@ fn schedule_matches(lhs: ScheduleConfig, rhs: ScheduleConfig) -> bool {
         && lhs.total_iterations == rhs.total_iterations
 }
 
-/// エンジンへ適用できる項目。regex は摂動・更新の選択にだけ使う。
-fn is_param_applicable(param: &SpsaParam, translator: &EngineNameTranslator) -> bool {
-    !param.not_used && (!translator.is_enabled() || translator.is_mapped(&param.name))
-}
-
 fn is_param_active(
     param: &SpsaParam,
     active_only_regex: Option<&Regex>,
     translator: &EngineNameTranslator,
 ) -> bool {
-    is_param_applicable(param, translator)
-        && active_only_regex.is_none_or(|re| re.is_match(&param.name))
+    if param.not_used {
+        return false;
+    }
+    if let Some(re) = active_only_regex
+        && !re.is_match(&param.name)
+    {
+        return false;
+    }
+    // P1: マッピング表がロード済みかつ name が未マッピングの場合、エンジン側で
+    // setoption が黙ってスキップされるため SPSA で摂動・更新するのは無駄かつ有害
+    // （unmapped.rshogi 系の値がランダムウォークして .params を汚染する）。
+    // ここで active 集合から除外する。
+    if translator.is_enabled() && !translator.is_mapped(&param.name) {
+        return false;
+    }
+    true
 }
 
 fn format_param_value_for_csv(param: &SpsaParam) -> String {
-    // B-3 以降: θ は is_int でも f64 のまま保持するため、CSV も `{:.6}` 固定桁で
-    // 出力する。整数値が "42.000000" のように表示されるが、人間可読性より
-    // resume 整合性 (write_params と一致) を優先する。
-    format!("{:.6}", param.value)
+    if param.is_int {
+        format!("{}", param.value.round() as i64)
+    } else {
+        format!("{:.6}", param.value)
+    }
 }
 
-fn write_stats_csv_header(writer: &mut BufWriter<File>) -> Result<()> {
-    // v4 仕様: seed カラム削除、games → batch_pairs へ変更。1 batch = 1 行。
+/// 共通相手モードで stats.csv の末尾に足す列 (θ+ / θ− それぞれの対相手 勝-負-分)
+const OPP_STATS_COLUMNS: &str =
+    ",plus_vs_opp_w,plus_vs_opp_l,plus_vs_opp_d,minus_vs_opp_w,minus_vs_opp_l,minus_vs_opp_d";
+
+fn write_stats_csv_header(writer: &mut BufWriter<File>, opponent_mode: bool) -> Result<()> {
     writeln!(
         writer,
-        "iteration,batch_pairs,plus_wins,minus_wins,draws,raw_result,active_params,\
-         avg_abs_shift,updated_params,avg_abs_update,max_abs_update,total_games"
+        "iteration,seed,games,plus_wins,minus_wins,draws,raw_result,active_params,\
+         avg_abs_shift,updated_params,avg_abs_update,max_abs_update,total_games{}",
+        if opponent_mode { OPP_STATS_COLUMNS } else { "" }
+    )?;
+    Ok(())
+}
+
+fn write_stats_aggregate_csv_header(writer: &mut BufWriter<File>) -> Result<()> {
+    writeln!(
+        writer,
+        "iteration,seeds,games_per_seed,raw_result_mean,raw_result_variance,\
+         plus_wins_mean,plus_wins_variance,minus_wins_mean,minus_wins_variance,draws_mean,draws_variance,total_games"
     )?;
     Ok(())
 }
@@ -1167,22 +624,11 @@ fn write_param_values_csv_header(writer: &mut BufWriter<File>, params: &[SpsaPar
     Ok(())
 }
 
-/// CSV writer の出力先の親ディレクトリを必要に応じて作成する。
-///
-/// `--stats-csv subdir/foo.csv` のように override で深いパスを指定された
-/// 場合、親 dir が存在しないと `open()` が失敗する。run-dir デフォルト経路
-/// では `apply_init_action` が `--run-dir` を作成済みのため redundant だが、
-/// override 経路でのみ意味がある (race-safe な idempotent 操作)。
-fn ensure_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create parent dir for {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn open_stats_csv_writer(path: &Path, resume: bool) -> Result<BufWriter<File>> {
-    ensure_parent_dir(path)?;
+fn open_stats_csv_writer(
+    path: &Path,
+    resume: bool,
+    opponent_mode: bool,
+) -> Result<BufWriter<File>> {
     let write_header = if resume {
         if !path.exists() {
             true
@@ -1211,7 +657,42 @@ fn open_stats_csv_writer(path: &Path, resume: bool) -> Result<BufWriter<File>> {
     };
     let mut writer = BufWriter::new(file);
     if write_header {
-        write_stats_csv_header(&mut writer)?;
+        write_stats_csv_header(&mut writer, opponent_mode)?;
+        writer.flush()?;
+    }
+    Ok(writer)
+}
+
+fn open_stats_aggregate_csv_writer(path: &Path, resume: bool) -> Result<BufWriter<File>> {
+    let write_header = if resume {
+        if !path.exists() {
+            true
+        } else {
+            std::fs::metadata(path)
+                .with_context(|| format!("failed to stat {}", path.display()))?
+                .len()
+                == 0
+        }
+    } else {
+        true
+    };
+    let file = if resume {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open {} for append", path.display()))?
+    } else {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("failed to create {}", path.display()))?
+    };
+    let mut writer = BufWriter::new(file);
+    if write_header {
+        write_stats_aggregate_csv_header(&mut writer)?;
         writer.flush()?;
     }
     Ok(writer)
@@ -1222,7 +703,6 @@ fn open_param_values_csv_writer(
     resume: bool,
     params: &[SpsaParam],
 ) -> Result<BufWriter<File>> {
-    ensure_parent_dir(path)?;
     let write_header = if resume {
         if !path.exists() {
             true
@@ -1257,171 +737,13 @@ fn open_param_values_csv_writer(
     Ok(writer)
 }
 
-fn default_games_jsonl_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("games.jsonl")
-}
-
-fn default_batches_jsonl_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("batches.jsonl")
-}
-
-/// fresh start では空にし、resume では追記する JSONL を開く。
-///
-/// 追記側の回収 (rsync の append 転送) が先頭からの一致を前提にするため、resume で既存の
-/// 行は消さない。書き込み途中で落ちた末尾行は改行だけ補い、次の行と連結させない。
-fn open_jsonl_writer(path: &Path, resume: bool) -> Result<BufWriter<File>> {
-    ensure_parent_dir(path)?;
-    let existed = path.exists();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(!resume)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    if !existed {
-        async_dispatch::sync_dir(
-            path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")),
-        )?;
-    }
-    let len = file
-        .metadata()
-        .with_context(|| format!("failed to stat {}", path.display()))?
-        .len();
-    let needs_newline = if len == 0 {
-        false
-    } else {
-        file.seek(SeekFrom::Start(len - 1))?;
-        let mut last = [0u8; 1];
-        file.read_exact(&mut last)?;
-        last[0] != b'\n'
-    };
-    file.seek(SeekFrom::End(0))?;
-    let mut writer = BufWriter::new(file);
-    if needs_newline {
-        writer.write_all(b"\n")?;
-    }
-    Ok(writer)
-}
-
-/// 1 行を BufWriter に書く。同期は呼び出し側が `sync_jsonl` でまとめて行う。
-fn write_jsonl_line<T: Serialize>(writer: &mut BufWriter<File>, line: &T) -> Result<()> {
-    serde_json::to_writer(&mut *writer, line)?;
-    writer.write_all(b"\n")?;
-    Ok(())
-}
-
-fn sync_jsonl(writer: &mut BufWriter<File>) -> Result<()> {
-    writer.flush()?;
-    writer.get_ref().sync_data()?;
-    Ok(())
-}
-
-/// batch モードの棋譜 (`games.jsonl`) と摂動 (`batches.jsonl`) の追記先。
-struct BatchRecordWriter {
-    games: BufWriter<File>,
-    batches: BufWriter<File>,
-}
-
-impl BatchRecordWriter {
-    fn open(run_dir: &Path, resume: bool) -> Result<Self> {
-        Ok(Self {
-            games: open_jsonl_writer(&default_games_jsonl_path(run_dir), resume)?,
-            batches: open_jsonl_writer(&default_batches_jsonl_path(run_dir), resume)?,
-        })
-    }
-
-    /// 1 batch 分を追記して fsync する。checkpoint (state.params / meta) より前に呼ぶ。
-    fn append_batch(
-        &mut self,
-        iteration: u32,
-        batch: &BatchRecordLine<'_>,
-        games: &[GameTaskResult],
-    ) -> Result<()> {
-        for game in games {
-            write_jsonl_line(
-                &mut self.games,
-                &GameRecordLine {
-                    schema: "spsa_game",
-                    version: GAME_RECORD_SCHEMA_VERSION,
-                    mode: "batch",
-                    // completed_pairs と同じ軸で数える (v3 から移行した run は total_games と
-                    // completed_pairs がずれ得るので game_id からは求めない)。
-                    pair_id: batch.k_pair_start + game.game_idx / 2,
-                    pair_slot: game.game_idx % 2,
-                    attempt: None,
-                    iteration: Some(iteration),
-                    dispatch_k: None,
-                    game_id: game.game_id,
-                    plus_is_black: game.plus_is_black,
-                    startpos_idx: game.start_pos_index,
-                    startpos_sfen: &game.startpos_sfen,
-                    outcome: game.outcome.label(),
-                    plus_score: game.plus_score as i8,
-                    reason: &game.reason,
-                    plies: game.plies,
-                    retries: game.retries,
-                    moves: &game.moves,
-                },
-            )?;
-        }
-        write_jsonl_line(&mut self.batches, batch)?;
-        sync_jsonl(&mut self.games)?;
-        sync_jsonl(&mut self.batches)
-    }
-}
-
-/// `batches.jsonl` の 1 行を組み立てる。plus / minus は engine へ送る文字列と同じ丸めで記録する。
-fn batch_record_line<'a>(
-    ctx: &BatchPrepCtx<'a>,
-    iteration: u32,
-    k_pair_start: u32,
-    prep: &BatchPrep,
-) -> Result<BatchRecordLine<'a>> {
-    let sent = |p: &SpsaParam, v: f64| -> Result<serde_json::Number> {
-        option_value_string(p, v)
-            .parse()
-            .with_context(|| format!("non-finite value for {}", p.name))
-    };
-    let mut line = BatchRecordLine {
-        schema: "spsa_batch",
-        version: GAME_RECORD_SCHEMA_VERSION,
-        iteration,
-        batch_pairs: u32::try_from(ctx.batch_pairs).context("batch_pairs overflow")?,
-        k_pair_start,
-        params: Vec::new(),
-        c_k: Vec::new(),
-        r_k: Vec::new(),
-        flip: Vec::new(),
-        plus: Vec::new(),
-        minus: Vec::new(),
-    };
-    for (idx, p) in ctx.params.iter().enumerate() {
-        if !is_param_active(p, ctx.active_only_regex, ctx.translator) {
-            continue;
-        }
-        let (c_k, r_k) = ctx.param_schedules[idx].at_iteration(
-            k_pair_start,
-            ctx.big_a,
-            ctx.schedule.alpha,
-            ctx.schedule.gamma,
-        );
-        line.params.push(&p.name);
-        line.c_k.push(c_k);
-        line.r_k.push(r_k);
-        line.flip.push(prep.flips[idx] as i8);
-        line.plus.push(sent(p, prep.plus_values[idx])?);
-        line.minus.push(sent(p, prep.minus_values[idx])?);
-    }
-    Ok(line)
-}
-
 fn write_stats_csv_row(writer: &mut BufWriter<File>, stats: IterationStats) -> Result<()> {
-    writeln!(
+    write!(
         writer,
-        "{},{},{},{},{},{:+.6},{},{:.6},{},{:.6},{:.6},{}",
+        "{},{},{},{},{},{},{:+.6},{},{:.6},{},{:.6},{:.6},{}",
         stats.iteration,
-        stats.batch_pairs,
+        stats.seed,
+        stats.games,
         stats.plus_wins,
         stats.minus_wins,
         stats.draws,
@@ -1431,6 +753,37 @@ fn write_stats_csv_row(writer: &mut BufWriter<File>, stats: IterationStats) -> R
         stats.updated_params,
         stats.avg_abs_update,
         stats.max_abs_update,
+        stats.total_games
+    )?;
+    if let Some(t) = stats.opp {
+        write!(
+            writer,
+            ",{},{},{},{},{},{}",
+            t.plus_w, t.plus_l, t.plus_d, t.minus_w, t.minus_l, t.minus_d
+        )?;
+    }
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn write_stats_aggregate_csv_row(
+    writer: &mut BufWriter<File>,
+    stats: AggregateIterationStats,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "{},{},{},{:+.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
+        stats.iteration,
+        stats.seed_count,
+        stats.games_per_seed,
+        stats.raw_result_mean,
+        stats.raw_result_variance,
+        stats.plus_wins_mean,
+        stats.plus_wins_variance,
+        stats.minus_wins_mean,
+        stats.minus_wins_variance,
+        stats.draws_mean,
+        stats.draws_variance,
         stats.total_games
     )?;
     Ok(())
@@ -1449,686 +802,20 @@ fn write_param_values_csv_row(
     Ok(())
 }
 
-/// `meta.json` の format_version だけ軽量に取り出すための struct。
-///
-/// `ResumeMetaData` の full schema で deserialize すると、古い meta に対して
-/// 必須フィールド不在で先に失敗するため、format_version 不一致の親切な
-/// hard bail メッセージに到達できない。version だけ別 struct で先読みする。
-#[derive(Deserialize)]
-struct MetaFormatVersionOnly {
-    format_version: u32,
-}
-
-/// v3 形式の meta から v4 silent migration に必要な field を抽出する struct。
-/// v3 では `seeds_count` / `games_per_iteration` 相当の情報を保持していた
-/// (実際には実装上 v3 にこれらのフィールドはなかったが、`completed_iterations`
-/// と外部の CLI から `total_pairs` を再構築する)。
-#[derive(Deserialize)]
-struct V3MetaSubset {
-    schedule: ScheduleConfig,
-    completed_iterations: u32,
-    total_games: usize,
-    init_params_sha256: String,
-    init_from_sha256: Option<String>,
-    init_from_path: Option<String>,
-    param_name_set_sha256: String,
-    active_param_count: usize,
-    engine_path: String,
-    engine_param_mapping_path: Option<String>,
-    engine_param_mapping_sha256: Option<String>,
-    init_mode: InitMode,
-    current_params_sha256: String,
-    state_params_file: String,
-    last_raw_result_mean: f64,
-    last_avg_abs_update: f64,
-    updated_at_utc: String,
-}
-
 fn load_meta(path: &Path) -> Result<ResumeMetaData> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to open {}", path.display()))?;
-    // 先に format_version だけ取り出して、互換性チェックを serde 失敗より優先する
-    let version_probe: MetaFormatVersionOnly =
-        serde_json::from_slice(&bytes).with_context(|| {
-            format!("failed to parse JSON {} (format_version probe)", path.display())
-        })?;
-    if version_probe.format_version == META_FORMAT_VERSION {
-        let meta = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse JSON {}", path.display()))?;
-        return Ok(meta);
-    }
-    if version_probe.format_version == 3 {
-        // v3 → v4 silent migration: v3 に multi-seed の痕跡 (`seeds_count > 1` 等) や
-        // 奇数 games_per_iteration の痕跡が無いことを前提に、completed_iterations を
-        // そのまま v4 batch 番号として継承する。total_pairs / batch_pairs / completed_pairs
-        // は CLI 側で確定させてから resume 検証で再合致を確認する経路を取る。
-        //
-        // 注意: v3 では multi-seed 機能があったが、本 silent migration は単一 seed run の
-        // meta のみを扱う想定。v3 で multi-seed run だった meta は **使用者が自ら**
-        // 新規 run dir で fresh start するべき (検出は困難なため migration ではせず、
-        // resume 後の schedule 不一致 / k 軸ズレで間接的に表面化させる)。
-        let v3: V3MetaSubset = serde_json::from_slice(&bytes).with_context(|| {
-            format!("v3 → v4 silent migration: failed to parse v3 meta {}", path.display())
-        })?;
-        eprintln!(
-            "warning: v3 meta を v4 として silent migrate します ({}).\n  \
-               completed_iterations={} → そのまま batch 番号として継承します。\n  \
-               total_pairs/batch_pairs/completed_pairs は CLI 指定値から再構築されます。\n  \
-             詳細: crates/tools/docs/spsa_runbook.md および CHANGELOG.md の v4 エントリ",
-            path.display(),
-            v3.completed_iterations,
-        );
-        // total_pairs / batch_pairs は呼び出し側で CLI から再合致させる。ここでは
-        // 一旦 0 で埋め、main 側で resume 整合性検証時に CLI 値を入れる。これは
-        // ResumeMetaData の immutable 不変条件を破るが、silent migration の特例として許容。
-        return Ok(ResumeMetaData {
-            format_version: META_FORMAT_VERSION,
-            state_params_file: v3.state_params_file,
-            completed_iterations: v3.completed_iterations,
-            total_games: v3.total_games,
-            last_raw_result_mean: v3.last_raw_result_mean,
-            last_avg_abs_update: v3.last_avg_abs_update,
-            updated_at_utc: v3.updated_at_utc,
-            schedule: v3.schedule,
-            init_params_sha256: v3.init_params_sha256,
-            init_from_sha256: v3.init_from_sha256,
-            init_from_path: v3.init_from_path,
-            param_name_set_sha256: v3.param_name_set_sha256,
-            active_param_count: v3.active_param_count,
-            engine_path: v3.engine_path,
-            engine_param_mapping_path: v3.engine_param_mapping_path,
-            engine_param_mapping_sha256: v3.engine_param_mapping_sha256,
-            init_mode: v3.init_mode,
-            current_params_sha256: v3.current_params_sha256,
-            // 0 sentinel: main 側で CLI 値とのマッチを skip するシグナルにも使う。
-            total_pairs: 0,
-            batch_pairs: 0,
-            completed_pairs: 0,
-            game_records: None,
-        });
-    }
-    if version_probe.format_version == async_dispatch::ASYNC_META_FORMAT_VERSION {
-        bail!(
-            "{} は --dispatch async の run です。--dispatch async --resume で再開してください",
-            path.display()
-        );
-    }
-    bail!(
-        "meta format version 不一致 (got v{}, expected v{}) in {}.\n\
-         v{} 形式は v{} とは互換性がありません。\n\
-         新規 run dir で `--init-from <canonical>` から fresh start してください。\n\
-         詳細: crates/tools/docs/spsa_runbook.md および CHANGELOG.md の v4 エントリ",
-        version_probe.format_version,
-        META_FORMAT_VERSION,
-        path.display(),
-        version_probe.format_version,
-        META_FORMAT_VERSION,
-    );
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let meta = serde_json::from_reader(reader)
+        .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+    Ok(meta)
 }
 
-/// `meta.json` を atomic に保存する (temp file + rename)。
-///
-/// 注意: serde_json::to_writer_pretty は内部で flush しないため、明示的に
-/// `BufWriter::flush()` を呼ぶ必要がある (Drop での自動 flush は失敗を握り潰す)。
-/// さらに `std::fs::rename` は同一 filesystem 内で atomic なので、書き込み途中の
-/// クラッシュで既存 meta が破損するのを防げる。
 fn save_meta(path: &Path, meta: &ResumeMetaData) -> Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".spsa_meta_")
-        .suffix(".json.tmp")
-        .tempfile_in(parent)
-        .with_context(|| format!("failed to create temp file under {}", parent.display()))?;
-    {
-        let mut writer = BufWriter::new(tmp.as_file_mut());
-        serde_json::to_writer_pretty(&mut writer, meta)
-            .with_context(|| format!("failed to write JSON {}", path.display()))?;
-        writer
-            .flush()
-            .with_context(|| format!("failed to flush meta writer for {}", path.display()))?;
-    }
-    tmp.persist(path)
-        .with_context(|| format!("failed to atomic-rename meta to {}", path.display()))?;
-    Ok(())
-}
-
-// =============================================================================
-// init-from 安全性: 状態遷移と検証ヘルパ (v3 新設)
-// =============================================================================
-
-/// `--init-from` / `<run-dir>/state.params` の有無 / `--resume` / `--force-init` の
-/// 4 引数から起動時に取るべき動作を一意に決める純粋関数。
-///
-/// テスト容易性のため副作用 (FS 操作 / println) を持たない。実 dispatch は
-/// `apply_init_action` 側で行う。
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum InitAction {
-    /// `--init-from` を `<run-dir>/state.params` にコピーして fresh start。
-    /// (state 不在 + init-from 指定 + !resume + !force-init)
-    CopyInitFromFresh,
-    /// 既存 `<run-dir>/state.params` をそのまま fresh start で使う。
-    /// (state 存在 + init-from なし + !resume + !force-init)
-    UseExistingFresh,
-    /// 既存 `<run-dir>/state.params` で resume 継続。
-    /// (state 存在 + resume 指定。init-from は整合性検証にのみ使う)
-    Resume { verify_init: bool },
-    /// 既存 `<run-dir>/state.params` を atomic に上書きして fresh start (init-from 強制適用)。
-    /// (state 存在 + init-from 指定 + force-init + !resume)
-    ForceInitOverwrite,
-    /// 設定エラーで bail。
-    Bail(InitError),
-}
-
-/// `apply_init_action` 通過後の確定モード。`Bail` を排除した narrow type で
-/// main 側の match から `unreachable!` を消すために使う。
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum NonBailAction {
-    CopyInitFromFresh,
-    UseExistingFresh,
-    Resume { verify_init: bool },
-    ForceInitOverwrite,
-}
-
-impl NonBailAction {
-    fn from_init_action(a: &InitAction) -> Option<Self> {
-        match a {
-            InitAction::CopyInitFromFresh => Some(Self::CopyInitFromFresh),
-            InitAction::UseExistingFresh => Some(Self::UseExistingFresh),
-            InitAction::Resume { verify_init } => Some(Self::Resume {
-                verify_init: *verify_init,
-            }),
-            InitAction::ForceInitOverwrite => Some(Self::ForceInitOverwrite),
-            InitAction::Bail(_) => None,
-        }
-    }
-
-    fn init_mode(&self) -> InitMode {
-        match self {
-            Self::CopyInitFromFresh => InitMode::FreshInitFrom,
-            Self::UseExistingFresh => InitMode::FreshExisting,
-            Self::ForceInitOverwrite => InitMode::ForceInit,
-            Self::Resume { .. } => InitMode::Resume,
-        }
-    }
-
-    /// 「今この起動で何をしたか」を表す kebab-case ラベル (startup summary 用)。
-    ///
-    /// run の **出自** (= 初回起動モード) を表す `InitMode` (`meta.init_mode`) とは
-    /// 別軸で、毎回の起動アクションを示す。fresh 系初回起動なら `InitMode` と
-    /// 同値、resume 起動なら `"resume"` と `InitMode::FreshInitFrom` 等の組み合わせ
-    /// になる。これにより summary 上で「今 resume なのか fresh なのか」と
-    /// 「この run は最初に何で生まれたか」を独立に確認できる。
-    fn launch_label(&self) -> &'static str {
-        match self {
-            Self::CopyInitFromFresh => "fresh-init-from",
-            Self::UseExistingFresh => "fresh-existing",
-            Self::ForceInitOverwrite => "force-init",
-            Self::Resume { .. } => "resume",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum InitError {
-    /// `--init-from` 指定済み + `<run-dir>/state.params` 既存 + `--resume` も `--force-init` もなし。
-    InitFromExistsRequiresFlag,
-    /// `--resume` と `--force-init` は意味が矛盾するため同時指定不可。
-    ResumeForceInitConflict,
-    /// `--resume` 指定だが `<run-dir>/state.params` が存在しない。
-    ResumeRequiresExistingParams,
-    /// `--force-init` 指定だが `--init-from` が指定されていない。
-    ForceInitRequiresInitFrom,
-    /// `--force-init` 指定だが `<run-dir>/state.params` が存在しない (上書き対象がない)。
-    ForceInitRequiresExistingParams,
-    /// `<run-dir>/state.params` 不在 + `--init-from` なし + `--resume` なし。
-    NoInitNorExistingParams,
-    /// 既存 `<run-dir>/state.params` あり + `--init-from` / `--resume` / `--force-init`
-    /// すべてなし。silent な fresh start は事故の温床のため明示フラグを要求する。
-    UseExistingRequiresFlag,
-    /// `--use-existing-state-as-init` が他のフラグ (`--init-from` / `--resume` /
-    /// `--force-init`) と同時指定された。
-    UseExistingConflictsWithOtherFlags,
-}
-
-impl InitError {
-    fn message(&self) -> String {
-        match self {
-            Self::InitFromExistsRequiresFlag => {
-                "--init-from が指定されていますが <run-dir>/state.params は既に存在します。\n\
-                 意図に応じて以下のいずれかを指定してください:\n  \
-                 --resume     : 既存 state から続行 (--init-from は内容検証にのみ使用)\n  \
-                 --force-init : 既存 state を atomic 上書きして --init-from から再初期化\n  \
-                 または --run-dir に新規 timestamped dir を指定する"
-                    .to_owned()
-            }
-            Self::ResumeForceInitConflict => {
-                "--resume と --force-init は同時指定できません (意味が矛盾します)。\n\
-                 - 継続実行したい → --resume のみ\n\
-                 - 既存を破棄して再初期化したい → --force-init のみ"
-                    .to_owned()
-            }
-            Self::ResumeRequiresExistingParams => {
-                "--resume が指定されていますが <run-dir>/state.params が存在しません。\n\
-                 fresh start したい場合は --resume を外してください。"
-                    .to_owned()
-            }
-            Self::ForceInitRequiresInitFrom => {
-                "--force-init には --init-from の指定が必須です (上書き元が必要)。".to_owned()
-            }
-            Self::ForceInitRequiresExistingParams => {
-                "--force-init は既存の <run-dir>/state.params を上書きする操作ですが、対象ファイルがありません。\n\
-                 fresh start なら --force-init を外して --init-from だけで起動してください。"
-                    .to_owned()
-            }
-            Self::NoInitNorExistingParams => {
-                "<run-dir>/state.params が存在せず --init-from も指定されていません。\n\
-                 --init-from で canonical (起点) ファイルを指定してください。"
-                    .to_owned()
-            }
-            Self::UseExistingRequiresFlag => {
-                "<run-dir>/state.params が既に存在しますが --init-from / --resume / --force-init / --use-existing-state-as-init のいずれも指定されていません。\n\
-                 意図に応じて以下のいずれかを指定してください:\n  \
-                 --init-from CANON --force-init      : 既存 state を canonical で atomic 上書き再初期化\n  \
-                 --resume                            : 既存 state から続行 (推奨経路)\n  \
-                 --use-existing-state-as-init        : 既存 state を canonical 代わりに fresh start (特殊用途)"
-                    .to_owned()
-            }
-            Self::UseExistingConflictsWithOtherFlags => {
-                "--use-existing-state-as-init は --init-from / --resume / --force-init と同時指定できません。\n\
-                 これらは「state.params をどう用意するか」の意思表示が排他的に重なるためです。\n\
-                 既存 state をそのまま起点にしたいなら --use-existing-state-as-init のみ指定してください。"
-                    .to_owned()
-            }
-        }
-    }
-}
-
-/// 純粋関数: CLI フラグと FS 状態 (params 存在性) から `InitAction` を決定する。
-///
-/// 入力 5 boolean (32 通り)。`use_existing_state_as_init` は他フラグと排他的
-/// 意思表示として、true 時は他フラグ全て false でなければ bail する。
-fn decide_init_action(
-    has_init_from: bool,
-    params_exists: bool,
-    resume: bool,
-    force_init: bool,
-    use_existing_state_as_init: bool,
-) -> InitAction {
-    use InitAction::*;
-    use InitError::*;
-
-    // フラグ間の矛盾を最優先で弾く
-    if resume && force_init {
-        return Bail(ResumeForceInitConflict);
-    }
-    if force_init && !has_init_from {
-        return Bail(ForceInitRequiresInitFrom);
-    }
-    // --use-existing-state-as-init は他の意思表示フラグと排他
-    if use_existing_state_as_init && (has_init_from || resume || force_init) {
-        return Bail(UseExistingConflictsWithOtherFlags);
-    }
-    // --use-existing-state-as-init は state.params が無いと意味がない
-    if use_existing_state_as_init && !params_exists {
-        return Bail(NoInitNorExistingParams);
-    }
-    // resume は params 必須 (force_init との矛盾は上で除去済み)
-    if resume && !params_exists {
-        return Bail(ResumeRequiresExistingParams);
-    }
-    // 通常分岐 (この時点で use_existing_state_as_init=true なら他フラグは全て false かつ params_exists=true)
-    if use_existing_state_as_init {
-        return UseExistingFresh;
-    }
-    match (has_init_from, params_exists, resume, force_init) {
-        // resume
-        (true, true, true, false) => Resume { verify_init: true },
-        (false, true, true, false) => Resume { verify_init: false },
-        // force-init
-        (true, true, false, true) => ForceInitOverwrite,
-        (true, false, false, true) => Bail(ForceInitRequiresExistingParams),
-        // 通常
-        (true, false, false, false) => CopyInitFromFresh,
-        (true, true, false, false) => Bail(InitFromExistsRequiresFlag),
-        (false, true, false, false) => Bail(UseExistingRequiresFlag),
-        (false, false, false, false) => Bail(NoInitNorExistingParams),
-        // 上のガードで除去済みの組み合わせ (型システム上 unreachable)
-        _ => unreachable!("decide_init_action: invariant violated by guards above"),
-    }
-}
-
-/// SHA-256 hex (lowercase) を計算する。ファイル全体を一度に読む。
-fn sha256_hex_of_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read for hash: {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// param 名集合の hash。sort 済みで決定的。
-///
-/// **前提**: name に改行 `\n` を含まないこと。`spsa_param_mapping::parse_param_line`
-/// が CSV 1 行 1 param で読み込むため、現状この前提は parse 段階で実質保証されている。
-/// 将来 parse 経路を変える場合、この関数も区切り文字を `\0` 等に変更すること
-/// (改行混入時に異なる名前集合が同じ hash を返す可能性があるため)。
-///
-/// debug ビルドでは `\n` 含有を `debug_assert!` で検知し、parse 経路変更時の
-/// regression を test 段階で捕捉する。release ビルドではコストゼロ。
-fn param_name_set_sha256(params: &[SpsaParam]) -> String {
-    let mut names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
-    names.sort_unstable();
-    let mut hasher = Sha256::new();
-    for n in &names {
-        debug_assert!(
-            !n.contains('\n'),
-            "param name must not contain '\\n' (would corrupt name-set hash): {n:?}"
-        );
-        hasher.update(n.as_bytes());
-        hasher.update(b"\n");
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-/// `--init-from` の内容と既存 `<run-dir>/state.params` の値列を比較し、診断結果を返す。
-///
-/// resume 時に「想定の canonical で開始した run を resume しているか」の検証に使う。
-/// `--strict-init-check` 時は閾値超過で error、デフォルトでは warning に留める。
-#[derive(Debug)]
-struct InitMatchReport {
-    total: usize,
-    matched_within_half_step: usize,
-    median_step_units: f64,
-    max_step_units: f64,
-    extra_in_init: Vec<String>,
-    missing_in_init: Vec<String>,
-    top_diffs: Vec<(String, f64, f64, f64)>, // (name, init_v, existing_v, |Δ|/step)
-}
-
-fn verify_init_matches_existing(
-    init_path: &Path,
-    existing_path: &Path,
-    assume_c_end_r_end: bool,
-) -> Result<InitMatchReport> {
-    let init_params = read_params(init_path, assume_c_end_r_end)
-        .with_context(|| format!("verify: failed to read init-from {}", init_path.display()))?;
-    let existing_params = read_params(existing_path, assume_c_end_r_end)
-        .with_context(|| format!("verify: failed to read existing {}", existing_path.display()))?;
-
-    use std::collections::BTreeSet;
-    let init_names: BTreeSet<&str> = init_params.iter().map(|p| p.name.as_str()).collect();
-    let exist_names: BTreeSet<&str> = existing_params.iter().map(|p| p.name.as_str()).collect();
-    let extra: Vec<String> = init_names.difference(&exist_names).map(|s| (*s).to_owned()).collect();
-    let missing: Vec<String> =
-        exist_names.difference(&init_names).map(|s| (*s).to_owned()).collect();
-
-    let exist_by_name: HashMap<&str, &SpsaParam> =
-        existing_params.iter().map(|p| (p.name.as_str(), p)).collect();
-    let mut diffs: Vec<(String, f64, f64, f64)> = Vec::new();
-    for ip in &init_params {
-        if let Some(ep) = exist_by_name.get(ip.name.as_str()) {
-            // step は c_end (= 最終摂動幅) をそのまま使う。
-            // c_end == 0 の防御的フォールバックのみ 1.0 に補正する。
-            // (旧実装の `c_end.max(1.0)` は c_end < 1 のパラメータで σ を過小評価していた)
-            let step = if ip.c_end > 0.0 { ip.c_end } else { 1.0 };
-            let d = (ip.value - ep.value).abs() / step;
-            if d.is_nan() {
-                bail!(
-                    "verify_init: NaN diff detected for param '{}' (init.value={} existing.value={} step={})",
-                    ip.name,
-                    ip.value,
-                    ep.value,
-                    step
-                );
-            }
-            diffs.push((ip.name.clone(), ip.value, ep.value, d));
-        }
-    }
-    let total = diffs.len();
-    let matched = diffs.iter().filter(|(_, _, _, d)| *d < 0.5).count();
-    let mut sorted_d: Vec<f64> = diffs.iter().map(|(_, _, _, d)| *d).collect();
-    sorted_d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // 厳密中央値: 偶数個のときは下側中値と上側中値の平均を取る。
-    // 旧実装は `sorted_d[n/2]` で常に上側中値を返しており、--strict-init-check の
-    // 閾値 (0.5σ) 判定をわずかに過大評価していた。
-    let median = match sorted_d.len() {
-        0 => 0.0,
-        n if n.is_multiple_of(2) => (sorted_d[n / 2 - 1] + sorted_d[n / 2]) / 2.0,
-        n => sorted_d[n / 2],
-    };
-    let max = sorted_d.iter().copied().fold(0.0_f64, f64::max);
-
-    // 上位 5 件の乖離を抽出 (大きい順)
-    let mut top = diffs.clone();
-    top.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
-    top.truncate(5);
-
-    Ok(InitMatchReport {
-        total,
-        matched_within_half_step: matched,
-        median_step_units: median,
-        max_step_units: max,
-        extra_in_init: extra,
-        missing_in_init: missing,
-        top_diffs: top,
-    })
-}
-
-impl InitMatchReport {
-    /// strict mode で bail すべきか判定。median ≥ 0.5 step または max ≥ 5 step で true。
-    fn exceeds_strict_threshold(&self) -> bool {
-        self.median_step_units >= 0.5 || self.max_step_units >= 5.0
-    }
-
-    /// 名前集合に差異があるかどうか。
-    fn has_name_set_mismatch(&self) -> bool {
-        !self.extra_in_init.is_empty() || !self.missing_in_init.is_empty()
-    }
-
-    /// 整合性の人間可読サマリを stderr に出す。
-    fn print_summary(&self, init_path: &Path, existing_path: &Path) {
-        eprintln!(
-            "init-from 整合性チェック: init={} vs existing={}",
-            init_path.display(),
-            existing_path.display()
-        );
-        eprintln!(
-            "  名前一致: {} (init側にしかない: {}, existing側にしかない: {})",
-            self.total,
-            self.extra_in_init.len(),
-            self.missing_in_init.len()
-        );
-        eprintln!(
-            "  値整合性 (|Δ|/step): median={:.3}σ, max={:.3}σ, <0.5σ 一致率={}/{}",
-            self.median_step_units, self.max_step_units, self.matched_within_half_step, self.total
-        );
-        if !self.top_diffs.is_empty() && self.max_step_units >= 0.5 {
-            eprintln!("  上位乖離 (最大 5 件):");
-            for (name, iv, ev, d) in &self.top_diffs {
-                eprintln!("    {name}: init={iv:.3} existing={ev:.3} |Δ|/step={d:.3}σ");
-            }
-        }
-    }
-}
-
-/// `decide_init_action` の結果を実際に FS に反映するヘルパ。
-///
-/// 副作用: ファイル copy / atomic overwrite / 関連 (meta / CSV) の削除。
-/// `force_init` 時は **削除を先に行い** (失敗時は bail)、その後 params を atomic copy
-/// する。順序が逆だと「新 params + 旧 meta」の不整合 run dir が中断時に残り、
-/// 次回 resume で `completed_iterations` 等が古いまま継ぎ足される事故になる。
-///
-/// 戻り値: `Bail` を排除した `NonBailAction`。呼び出し側の `match` から
-/// `unreachable!` 分岐を消せる。
-fn apply_init_action(
-    action: &InitAction,
-    init_from: Option<&Path>,
-    params_path: &Path,
-    meta_path: &Path,
-    related_csv_paths: &[&Path],
-) -> Result<NonBailAction> {
-    match action {
-        InitAction::CopyInitFromFresh => {
-            let src = init_from.expect("CopyInitFromFresh requires init_from");
-            atomic_copy_file(src, params_path)?;
-            eprintln!(
-                "init-from: copied {} -> {} (fresh start)",
-                src.display(),
-                params_path.display()
-            );
-        }
-        InitAction::UseExistingFresh => {
-            eprintln!(
-                "init: using existing {} as fresh start (no --init-from, no --resume)",
-                params_path.display()
-            );
-        }
-        InitAction::Resume { .. } => {
-            // resume 時は params をそのまま使う。verify_init は呼び出し側で実施。
-            eprintln!("init: resuming from existing {}", params_path.display());
-        }
-        InitAction::ForceInitOverwrite => {
-            let src = init_from.expect("ForceInitOverwrite requires init_from");
-            // (1) meta を先に削除 (失敗で bail)。中断耐性のため atomic copy より前に行う。
-            //     params を先に書くと「中断 → 新 params + 旧 meta」となり、次回 resume で
-            //     completed_iterations が古いまま継ぎ足される事故が起きる。
-            if meta_path.exists() {
-                std::fs::remove_file(meta_path).with_context(|| {
-                    format!("force-init: failed to remove stale meta {}", meta_path.display())
-                })?;
-            }
-            // (2) related CSV を削除 (best-effort warn だが、削除に失敗するファイルは
-            //     後段の append/truncate で再処理可能なので致命ではない)。
-            for p in related_csv_paths {
-                if p.exists()
-                    && let Err(e) = std::fs::remove_file(p)
-                {
-                    eprintln!("warning: force-init: failed to remove stale {} ({e})", p.display());
-                }
-            }
-            // (3) params を atomic copy で上書き (rename は同一 FS 内 atomic)。
-            atomic_copy_file(src, params_path)?;
-            eprintln!(
-                "init-from: force-init overwrite {} -> {} (stale meta/CSV removed)",
-                src.display(),
-                params_path.display()
-            );
-        }
-        InitAction::Bail(err) => bail!("init/resume 設定エラー: {}", err.message()),
-    }
-    // ここに到達するのは Bail 以外の 4 バリアント。`Bail` は上の match で `bail!` 早期 return
-    // するため、`from_init_action` が `None` を返す経路は論理的に到達不能。
-    // `unreachable!` でなく `expect` を使うのは、万が一バグで Bail が漏れたときに
-    // 内部 invariant 違反として明示的に panic するため (anyhow::Error にせず fail-fast)。
-    Ok(NonBailAction::from_init_action(action)
-        .expect("invariant: Bail handled above; non-Bail variants always convertible"))
-}
-
-/// 起動時にしか変わらないメタフィールドのスナップショット。
-///
-/// fresh / force-init 時は `for_fresh_start` で計算、resume 時は `from_existing_meta`
-/// で既存 meta から引き継ぐ。これにより resume が「最初に何で起動したか」の情報を
-/// 失わずに保持できる。
-#[derive(Clone, Debug)]
-struct InitMetaSnapshot {
-    init_params_sha256: String,
-    init_from_sha256: Option<String>,
-    init_from_path: Option<String>,
-    engine_path: String,
-    engine_param_mapping_path: Option<String>,
-    engine_param_mapping_sha256: Option<String>,
-    init_mode: InitMode,
-}
-
-impl InitMetaSnapshot {
-    /// fresh / force-init 起動用に現在の状態から構築する。
-    ///
-    /// `Resume` バリアントは `from_existing_meta` を使うべきで、ここに渡したら
-    /// プログラムバグなので panic で fail-fast する (silent な "unknown" 化を防ぐ)。
-    fn for_fresh_start(
-        action: &NonBailAction,
-        params_path: &Path,
-        init_from: Option<&Path>,
-        engine_path: &Path,
-        engine_param_mapping: Option<&Path>,
-    ) -> Result<Self> {
-        if matches!(action, NonBailAction::Resume { .. }) {
-            unreachable!(
-                "for_fresh_start should not be called with Resume; use from_existing_meta instead"
-            );
-        }
-        let init_mode = action.init_mode();
-        let init_params_sha256 = sha256_hex_of_file(params_path)?;
-        let (init_from_sha256, init_from_path) = match init_from {
-            Some(p) => (Some(sha256_hex_of_file(p)?), Some(p.display().to_string())),
-            None => (None, None),
-        };
-        let (mapping_path, mapping_sha) = match engine_param_mapping {
-            Some(p) => (Some(p.display().to_string()), Some(sha256_hex_of_file(p)?)),
-            None => (None, None),
-        };
-        // TODO(PR2 / follow-up): engine_path / mapping_path は CLI 引数のままで
-        // cwd 相対の場合がある。後追い解析で「どのバイナリで起動したか」を知るには
-        // `std::fs::canonicalize` を通したい (失敗時は raw path にフォールバック)。
-        Ok(Self {
-            init_params_sha256,
-            init_from_sha256,
-            init_from_path,
-            engine_path: engine_path.display().to_string(),
-            engine_param_mapping_path: mapping_path,
-            engine_param_mapping_sha256: mapping_sha,
-            init_mode,
-        })
-    }
-
-    /// resume 時に既存 meta から起動時情報を復元する。
-    fn from_existing_meta(meta: &ResumeMetaData) -> Self {
-        Self {
-            init_params_sha256: meta.init_params_sha256.clone(),
-            init_from_sha256: meta.init_from_sha256.clone(),
-            init_from_path: meta.init_from_path.clone(),
-            engine_path: meta.engine_path.clone(),
-            engine_param_mapping_path: meta.engine_param_mapping_path.clone(),
-            engine_param_mapping_sha256: meta.engine_param_mapping_sha256.clone(),
-            init_mode: meta.init_mode,
-        }
-    }
-}
-
-/// `src` の内容を `dst` に atomic にコピーする (temp file + rename)。
-///
-/// 同一 filesystem 内なら rename は atomic なので、書き込み中のクラッシュで
-/// `dst` が中途半端な状態になることを防ぐ。
-///
-/// **前提**:
-/// - `dst.parent()` (or 親が空なら CWD) に書き込み権限と十分な inode/space が必要。
-/// - 同一 FS 内 atomic を担保するため tempfile を `dst.parent()` 直下に作成する。
-///   tmpfs/persist FS 跨ぎ (`/tmp` から `/mnt`) では `tempfile::persist` が
-///   `EXDEV` で失敗する可能性がある (rename(2) の制約)。
-/// - tempfile の permission は umask 由来 (通常 0600)。元 `dst` が group/world
-///   readable だった場合、rename 後に permission が縮退する可能性がある。共有
-///   FS 運用では呼び出し側で chmod 後処理を行うこと。
-fn atomic_copy_file(src: &Path, dst: &Path) -> Result<()> {
-    let parent = dst.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create parent dir for {}", dst.display()))?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".spsa_init_")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .with_context(|| format!("failed to create temp file under {}", parent.display()))?;
-    {
-        let mut reader = File::open(src)
-            .with_context(|| format!("failed to open init source {}", src.display()))?;
-        let mut writer = BufWriter::new(tmp.as_file_mut());
-        std::io::copy(&mut reader, &mut writer)
-            .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))?;
-        writer
-            .flush()
-            .with_context(|| format!("failed to flush copy writer for {}", dst.display()))?;
-    }
-    tmp.persist(dst)
-        .with_context(|| format!("failed to atomic-rename to {}", dst.display()))?;
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, meta)
+        .with_context(|| format!("failed to write JSON {}", path.display()))?;
     Ok(())
 }
 
@@ -2146,188 +833,39 @@ impl SpsaParam {
             not_used,
         } = raw;
         let is_int = kind.eq_ignore_ascii_case("int");
-        let value: f64 = value_text
-            .parse::<f64>()
-            .with_context(|| format!("invalid v at line {line_no}"))?;
-        let min: f64 = min_text
-            .parse::<f64>()
-            .with_context(|| format!("invalid min at line {line_no}"))?;
-        let max: f64 = max_text
-            .parse::<f64>()
-            .with_context(|| format!("invalid max at line {line_no}"))?;
-        let c_end: f64 = col5_text
-            .parse::<f64>()
-            .with_context(|| format!("invalid c_end at line {line_no}"))?;
-        let r_end: f64 = col6_text
-            .parse::<f64>()
-            .with_context(|| format!("invalid r_end at line {line_no}"))?;
-        // 数値の妥当性検証。f64::clamp は NaN bound で panic、`as i64` は NaN/Inf で
-        // 0 や i64::MAX/MIN に化けるため、入口で必ず弾く。SPSA tuner はパラメータ
-        // ファイルを長時間信頼する前提なので、ここで Result にして早期発見する。
-        for (label, v) in [
-            ("v", value),
-            ("min", min),
-            ("max", max),
-            ("c_end", c_end),
-            ("r_end", r_end),
-        ] {
-            if !v.is_finite() {
-                bail!("non-finite {label}={v} at line {line_no}");
-            }
-        }
-        if min > max {
-            bail!("min ({min}) > max ({max}) at line {line_no}");
-        }
-        if value < min || value > max {
-            bail!("v ({value}) is out of [min={min}, max={max}] at line {line_no}");
-        }
         Ok(SpsaParam {
             name,
             type_name: kind,
             is_int,
-            value,
-            min,
-            max,
-            c_end,
-            r_end,
+            value: value_text
+                .parse::<f64>()
+                .with_context(|| format!("invalid v at line {line_no}"))?,
+            min: min_text
+                .parse::<f64>()
+                .with_context(|| format!("invalid min at line {line_no}"))?,
+            max: max_text
+                .parse::<f64>()
+                .with_context(|| format!("invalid max at line {line_no}"))?,
+            c_end: col5_text
+                .parse::<f64>()
+                .with_context(|| format!("invalid c_end at line {line_no}"))?,
+            r_end: col6_text
+                .parse::<f64>()
+                .with_context(|| format!("invalid r_end at line {line_no}"))?,
             comment,
             not_used,
         })
     }
 }
 
-/// `<run-dir>/.lock` の中身。lock 衝突時にユーザが「誰が掴んでいるか」を
-/// 判断するための forensic 情報。
-#[derive(Debug, Serialize, Deserialize)]
-struct LockInfo {
-    pid: u32,
-    hostname: String,
-    started_at_utc: String,
-}
-
-/// run-dir の排他 lock。`OpenOptions::create_new(true)` の atomic file
-/// creation を使うので、同一 host の同一 FS 内でのみ有効 (NFS では
-/// create_new の atomicity が保証されないため非推奨)。
-///
-/// 取得後は `Drop` で lock ファイルを削除する。panic 時も Drop は走るが、
-/// SIGKILL / 電源断では残留する。残留 lock は `--force-unlock` で削除可能。
-///
-/// race-safety: `Drop` は「自分が書いた body」と現在の lock ファイル内容を
-/// 突き合わせ、一致した場合だけ削除する。これにより、他プロセスに
-/// `--force-unlock` で消され別 lock に置き換わった状況で、自分の Drop が
-/// 他プロセスの lock を巻き添えで消す race を防ぐ。
-#[derive(Debug)]
-struct RunDirLock {
-    path: PathBuf,
-    /// 自分が書き込んだ正本 body (改行込み)。`Drop` 時に内容一致確認に使う。
-    expected_body: String,
-}
-
-impl RunDirLock {
-    fn acquire(run_dir: &Path, force_unlock: bool) -> Result<Self> {
-        let path = run_dir.join(".lock");
-        if force_unlock && path.exists() {
-            std::fs::remove_file(&path).with_context(|| {
-                format!("failed to remove stale lock {} (--force-unlock)", path.display())
-            })?;
-            eprintln!("--force-unlock: 古い lock {} を削除しました", path.display());
-        }
-        match OpenOptions::new().create_new(true).write(true).open(&path) {
-            Ok(mut f) => {
-                let info = LockInfo {
-                    pid: std::process::id(),
-                    hostname: read_hostname(),
-                    started_at_utc: Utc::now().to_rfc3339(),
-                };
-                let body_json =
-                    serde_json::to_string(&info).context("failed to serialize lock info")?;
-                writeln!(f, "{body_json}").with_context(|| {
-                    format!("failed to write lock contents to {}", path.display())
-                })?;
-                f.flush().with_context(|| {
-                    format!("failed to flush lock contents to {}", path.display())
-                })?;
-                // `writeln!` は OS によらず常に `\n` を付ける (Windows でも `\r\n` には
-                // ならない) ため、`expected_body` の構築では `\n` 固定で良い。Drop での
-                // 内容一致比較もこの前提に依存している。
-                let expected_body = format!("{body_json}\n");
-                Ok(RunDirLock {
-                    path,
-                    expected_body,
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let body = std::fs::read_to_string(&path).unwrap_or_else(|_| "(unreadable)".into());
-                bail!(
-                    "他プロセスが run-dir を使用中の可能性があります: {}\n  内容: {}\n  当該プロセスが既に死んでいることを目視確認したうえで --force-unlock を指定してください。",
-                    path.display(),
-                    body.trim()
-                );
-            }
-            Err(e) => Err(anyhow::Error::new(e))
-                .with_context(|| format!("failed to create lock {}", path.display())),
-        }
-    }
-}
-
-impl Drop for RunDirLock {
-    fn drop(&mut self) {
-        // 自分が書いた body と現在の lock 内容が一致するときだけ削除する。
-        // `--force-unlock` で別プロセスに置き換わっていた場合は触らない (race-safe)。
-        match std::fs::read_to_string(&self.path) {
-            Ok(current) if current == self.expected_body => {
-                let _ = std::fs::remove_file(&self.path);
-            }
-            // 内容不一致 / 既に消された / 読めない: いずれも削除しない (他者の lock を
-            // 巻き込まないことが優先)。
-            _ => {}
-        }
-    }
-}
-
-/// hostname 取得。forensic 用途なので exact correctness より「何かしら名前が
-/// 入る」ことを優先する。優先順: $HOSTNAME → /proc/sys/kernel/hostname →
-/// "unknown"。
-fn read_hostname() -> String {
-    if let Ok(h) = std::env::var("HOSTNAME")
-        && !h.is_empty()
-    {
-        return h;
-    }
-    if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
-        let trimmed = h.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    "unknown".into()
-}
-
-fn read_params(path: &Path, assume_c_end_r_end: bool) -> Result<Vec<SpsaParam>> {
-    read_params_with_translator(path, &EngineNameTranslator::empty(), assume_c_end_r_end)
-}
-
-fn read_params_with_translator(
-    path: &Path,
-    translator: &EngineNameTranslator,
-    assume_c_end_r_end: bool,
-) -> Result<Vec<SpsaParam>> {
-    validate_spsa_params_format(path, assume_c_end_r_end)?;
+fn read_params(path: &Path) -> Result<Vec<SpsaParam>> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut params = Vec::new();
-    let mut names = HashMap::new();
-    let mut translated_names = HashMap::new();
     for (idx, line) in reader.lines().enumerate() {
         let line_no = idx + 1;
         let line = line?;
         if let Some(raw) = parse_param_line(&line, line_no)? {
-            register_unique_parameter(&mut names, &raw.name, line_no)?;
-            if !raw.not_used && (!translator.is_enabled() || translator.is_mapped(&raw.name)) {
-                let (target, _) = translator.translate(&raw.name, 0.0);
-                register_unique_parameter(&mut translated_names, target, line_no)
-                    .with_context(|| format!("translated parameter {} -> {target}", raw.name))?;
-            }
             params.push(SpsaParam::from_raw(raw, line_no)?);
         }
     }
@@ -2337,63 +875,35 @@ fn read_params_with_translator(
     Ok(params)
 }
 
-/// state.params を tempfile + persist で atomic に書き込む。
-///
-/// 反復ごとに呼ばれるため、SIGINT / OOM / 電源断で truncate 中の壊れた
-/// state.params が残ると resume 不能になる。`atomic_copy_file` と同じ
-/// 「同一 FS 内 tempfile → flush → persist (rename)」パターンに統一する。
 fn write_params(path: &Path, params: &[SpsaParam]) -> Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create parent dir for {}", path.display()))?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".spsa_state_")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .with_context(|| format!("failed to create temp file under {}", parent.display()))?;
-    {
-        let mut w = BufWriter::new(tmp.as_file_mut());
-        writeln!(w, "{SPSA_PARAMS_FORMAT_HEADER}")?;
-        for p in params {
-            // float は `{:.6}` で固定桁にしてラウンドトリップ・git diff の安定性を保つ
-            // (`{}` (Display) は `1e-7` のような指数表記や精度不定の桁を出すため)
-            // B-3: θ 内部状態は is_int でも f64 のまま保持する (fishtest 流)。
-            // engine への送信時にのみ stochastic round が掛かる (compute_batch_prep)。
-            // 過去 (B-3 以前) は state.params 書き出しで int 丸めしていたが、resume を
-            // 挟むと小数部が消えて「小さな更新が連続消失」する元バグが復活するため、
-            // is_int でも `{:.6}` で f64 を保存する。canonical (engine 配布用) を別途
-            // 整数化したい場合は専用エクスポート経路で行う。
-            let v_str = format!("{:.6}", p.value);
-            let mut line = format!(
-                "{},{},{},{},{},{},{}",
-                p.name, p.type_name, v_str, p.min, p.max, p.c_end, p.r_end
-            );
-            if p.not_used {
-                line.push(' ');
-                line.push_str(PARAM_NOT_USED_MARKER);
-            }
-            if !p.comment.is_empty() {
-                line.push_str(" //");
-                line.push_str(&p.comment);
-            }
-            writeln!(w, "{line}")?;
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut w = BufWriter::new(file);
+    for p in params {
+        // float は `{:.6}` で固定桁にしてラウンドトリップ・git diff の安定性を保つ
+        // (`{}` (Display) は `1e-7` のような指数表記や精度不定の桁を出すため)
+        let v_str = if p.is_int {
+            format!("{}", p.value.round() as i64)
+        } else {
+            format!("{:.6}", p.value)
+        };
+        let mut line = format!(
+            "{},{},{},{},{},{},{}",
+            p.name, p.type_name, v_str, p.min, p.max, p.c_end, p.r_end
+        );
+        if !p.comment.is_empty() {
+            line.push_str(" //");
+            line.push_str(&p.comment);
         }
-        w.flush()
-            .with_context(|| format!("failed to flush state writer for {}", path.display()))?;
+        if p.not_used {
+            line.push_str(PARAM_NOT_USED_MARKER);
+        }
+        writeln!(w, "{line}")?;
     }
-    tmp.persist(path)
-        .with_context(|| format!("failed to atomic-rename to {}", path.display()))?;
+    w.flush()?;
     Ok(())
 }
 
-/// engine に setoption 文字列として送る値の整形。
-///
-/// is_int=true の場合、`value` は **既に stochastic round 済み整数値の f64 表現**
-/// であることを呼び出し側 (`compute_batch_prep`) が保証する。理屈上は `as i64` で
-/// truncation すれば足りるが、浮動小数誤差で `9.9999...` のような値が来ても事故
-/// 化しないよう **防御的に `round` を適用** する (整数 f64 への round は no-op で
-/// 既存 stochastic 抽選結果を上書きしない)。NaN / 無限大は呼び出し側 (clamp 適用
-/// 済み) で排除されている前提。
 fn option_value_string(param: &SpsaParam, value: f64) -> String {
     if param.is_int {
         format!("{}", value.round() as i64)
@@ -2404,16 +914,6 @@ fn option_value_string(param: &SpsaParam, value: f64) -> String {
 
 fn clamped_value(param: &SpsaParam, raw: f64) -> f64 {
     raw.clamp(param.min, param.max)
-}
-
-/// 摂動しない項目を engine へ送る値。
-fn fixed_engine_value(param: &SpsaParam) -> f64 {
-    let value = clamped_value(param, param.value);
-    if param.is_int {
-        clamped_value(param, value.round())
-    } else {
-        value
-    }
 }
 
 fn resolve_engine_path(cli: &Cli) -> Result<PathBuf> {
@@ -2431,43 +931,20 @@ fn resolve_engine_path(cli: &Cli) -> Result<PathBuf> {
     bail!("engine binary not found. specify --engine-path or build target/release/rshogi-usi");
 }
 
-/// 調整する定数をエンジンが `usi` で広告しているかを確かめる。広告していない名前は
-/// `set_option_if_available` が送らないので、そのまま対局を続けると定数が変わらないまま調整が進む
-/// (SPSA の値を焼き込んだ rshogi-usi は `SPSA_*` を広告しない)。設定の誤りなので、呼び出し側は
-/// 再試行の対象 (`EngineFailure`) にしない。
-fn ensure_tuned_options_advertised(
-    engine: &EngineProcess,
-    params: &[SpsaParam],
-    translator: &EngineNameTranslator,
-    application_mask: &[bool],
-) -> Result<()> {
-    for (p, &applicable) in params.iter().zip(application_mask.iter()) {
-        if !applicable {
-            continue;
-        }
-        let (engine_name, _) = translator.translate(&p.name, 0.0);
-        if !engine.is_option_available(engine_name) {
-            bail!(
-                "engine does not advertise USI option '{engine_name}' (tuned parameter '{}'); use a build that exposes the tuning options",
-                p.name
-            );
-        }
-    }
-    Ok(())
-}
-
 fn apply_parameter_vector(
     engine: &mut EngineProcess,
     params: &[SpsaParam],
     values: &[f64],
     translator: &EngineNameTranslator,
-    application_mask: &[bool],
+    active_mask: &[bool],
 ) -> Result<()> {
     debug_assert_eq!(params.len(), values.len());
-    debug_assert_eq!(params.len(), application_mask.len());
-    for ((p, &v), &applicable) in params.iter().zip(values.iter()).zip(application_mask.iter()) {
-        // regex 対象外も基準値を送る。not_used / unmapped だけを除外する。
-        if !applicable {
+    debug_assert_eq!(params.len(), active_mask.len());
+    for ((p, &v), &active) in params.iter().zip(values.iter()).zip(active_mask.iter()) {
+        // 非 active (not_used / regex 不一致 / translator enabled & unmapped) は
+        // engine 側で `set_option_if_available` が黙ってスキップする上、SPSA 側でも
+        // 値が変わらないので毎ゲーム送信は無駄。
+        if !active {
             continue;
         }
         let (engine_name, engine_value) = translator.translate(&p.name, v);
@@ -2502,6 +979,39 @@ fn plus_score_from_outcome(outcome: GameOutcome, plus_is_black: bool) -> f64 {
     }
 }
 
+fn eval_cp_from_black_perspective(event: &MoveEvent) -> Option<i32> {
+    let eval = event.eval.as_ref()?;
+    let cp = match (eval.score_cp, eval.score_mate) {
+        (Some(cp), _) => cp,
+        (None, Some(mate)) => mate.signum() * 32000,
+        (None, None) => return None,
+    };
+    Some(if event.side == rshogi_core::types::Color::Black {
+        cp
+    } else {
+        -cp
+    })
+}
+
+fn blend_score_with_eval(
+    wld_score: f64,
+    mean_black_cp: Option<f64>,
+    plus_is_black: bool,
+    weight: f64,
+    clamp_cp: i32,
+) -> f64 {
+    if weight <= 0.0 {
+        return wld_score;
+    }
+    let Some(black_cp) = mean_black_cp else {
+        return wld_score;
+    };
+    let clamp = f64::from(clamp_cp.max(1));
+    let plus_cp = if plus_is_black { black_cp } else { -black_cp };
+    let clamped = plus_cp.clamp(-clamp, clamp) / clamp;
+    wld_score + weight * clamped
+}
+
 fn pick_startpos_index(
     start_positions_len: usize,
     rng: &mut impl rand::Rng,
@@ -2518,24 +1028,55 @@ fn pick_startpos_index(
     }
 }
 
+fn resolve_seeds(cli: &Cli) -> Vec<u64> {
+    if let Some(seeds) = &cli.seeds {
+        return seeds.clone();
+    }
+    if let Some(seed) = cli.seed {
+        return vec![seed];
+    }
+    let mut rng = rand::rng();
+    vec![rng.random()]
+}
+
+fn mean_and_variance(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mean = values.iter().copied().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let diff = value - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    (mean, variance)
+}
+
+/// `JoinHandle::join` の panic payload から人間可読なメッセージを抽出する。
+/// `panic!` に渡された値が `&'static str` か `String` の典型ケースのみ拾い、
+/// それ以外は型情報のみのプレースホルダを返す。
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<panic payload of unknown type>".to_string()
+    }
+}
+
 fn seed_for_iteration(base_seed: u64, iteration_index: u32) -> u64 {
     let iter_term = (iteration_index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     base_seed ^ iter_term
 }
 
-/// flip 抽選用 RNG の salt。base_seed に XOR して `seed_for_iteration` に渡すことで
-/// rounding RNG と独立な stream を確保する。同じ base_seed でも flip と rounding が
-/// 同 RNG state を共有しないようにすることが目的（fishtest worker と同じ分離方針）。
-const FLIP_RNG_SALT: u64 = 0xF11D_F11D_F11D_F11D;
-/// stochastic rounding 用 RNG の salt。`int` 型 SPSA param を engine に送る際の
-/// `floor(v + U(0,1))` 抽選で使う。flip と独立させることで「flip パターンが
-/// rounding 結果に相関する」退行を防ぐ。
-const ROUNDING_RNG_SALT: u64 = 0xC0DD_C0DD_C0DD_C0DD;
-
-/// `compute_batch_prep` のセッション定数バンドル (run 全体で不変)。
+/// `compute_seed_prep` のセッション定数バンドル（iter 内で全 seed 共通）。
 ///
-/// 引数増加によるシグネチャ複雑化を避けるため `compute_batch_prep` の入力をまとめる。
-struct BatchPrepCtx<'a> {
+/// 引数増加によるシグネチャ複雑化を避けるため `compute_seed_prep` の入力をまとめる。
+struct SeedPrepCtx<'a> {
     big_a: f64,
     schedule: ScheduleConfig,
     params: &'a [SpsaParam],
@@ -2543,39 +1084,24 @@ struct BatchPrepCtx<'a> {
     active_only_regex: Option<&'a Regex>,
     translator: &'a EngineNameTranslator,
     start_positions_len: usize,
-    /// 1 batch あたりの game pair 数 (fishtest worker の `game_pairs` と等価)。
-    /// 1 batch で `2 × batch_pairs` 局を消化する。
-    batch_pairs: usize,
+    games_per_iteration: usize,
     random_startpos: bool,
+    randomize_plus_color: bool,
 }
 
-/// 1 batch 分の事前計算 (RNG / flips / shifts / plus/minus / startpos インデックス)。
+/// 1 seed × 1 iter 分の事前計算（RNG / flips / shifts / plus/minus / startpos インデックス）。
 ///
-/// SPSA schedule の `k` 軸はこの batch の開始時点での累積 game pair 数 (`k_pair_start`)
-/// を渡す。同 batch 内の全 game pair は同じ flip ベクトルと plus/minus 値を共有する
-/// (fishtest 流: 1 batch = 1 update 単位)。
-///
-/// 引数:
-/// - `batch_idx`: batch 番号 (0-origin)。RNG の seed に使う (async では pair_id)。
-/// - `k_pair_start`: schedule 評価時刻 (= 累積 game pair 数, 0-origin)。
-/// - `total_games_start`: startpos cyclic 進行用 (累積消化 game 数, 0-origin)。
-fn compute_batch_prep(
-    ctx: &BatchPrepCtx<'_>,
-    batch_idx: u32,
-    k_pair_start: u32,
+/// 各 seed 独立に決定論的に計算可能なため、後段の重いゲーム実行を seed 並列化する際の
+/// 前処理として使う。`seed_total_games_start` は startpos の cyclic indexing にのみ使われ、
+/// 並列実行時はセッション累積 + `seed_idx * games_per_iter` で seed 間の重複を避ける。
+fn compute_seed_prep(
+    ctx: &SeedPrepCtx<'_>,
+    iter: u32,
     base_seed: u64,
-    total_games_start: usize,
-) -> Result<BatchPrep> {
-    // flip / rounding / startpos の RNG stream を独立化する。
-    // - flip_rng: Bernoulli ±1 抽選用 (seed = base_seed ^ FLIP_RNG_SALT, batch_idx)。
-    // - rounding_rng: stochastic rounding 用 (seed = base_seed ^ ROUNDING_RNG_SALT, batch_idx)。
-    // - rng (本関数 local): startpos cyclic 進行用。base_seed (salt なし) を使用。
-    let flip_seed = seed_for_iteration(base_seed ^ FLIP_RNG_SALT, batch_idx);
-    let rounding_seed = seed_for_iteration(base_seed ^ ROUNDING_RNG_SALT, batch_idx);
-    let startpos_seed = seed_for_iteration(base_seed, batch_idx);
-    let mut flip_rng = ChaCha8Rng::seed_from_u64(flip_seed);
-    let mut rounding_rng = ChaCha8Rng::seed_from_u64(rounding_seed);
-    let mut rng = ChaCha8Rng::seed_from_u64(startpos_seed);
+    seed_total_games_start: usize,
+) -> Result<SeedPrep> {
+    let iter_seed = seed_for_iteration(base_seed, iter);
+    let mut rng = ChaCha8Rng::seed_from_u64(iter_seed);
 
     // Per-param Fishtest 摂動: shift_j = c_k_j × flip_j
     let flips: Vec<f64> = ctx
@@ -2584,15 +1110,13 @@ fn compute_batch_prep(
         .map(|p| {
             if !is_param_active(p, ctx.active_only_regex, ctx.translator) {
                 0.0
-            } else if flip_rng.random_bool(0.5) {
+            } else if rng.random_bool(0.5) {
                 1.0
             } else {
                 -1.0
             }
         })
         .collect();
-    // schedule の k 軸 = batch 開始時点の累積 game pair 数 (`k_pair_start`)。
-    // batch 内では k は固定 (= 全 game pair で同じ flip / shifts / c_k を使う)。
     let shifts: Vec<f64> = ctx
         .params
         .iter()
@@ -2602,56 +1126,24 @@ fn compute_batch_prep(
             if !is_param_active(p, ctx.active_only_regex, ctx.translator) {
                 0.0
             } else {
-                let (c_k, _) = sched.at_iteration(
-                    k_pair_start,
-                    ctx.big_a,
-                    ctx.schedule.alpha,
-                    ctx.schedule.gamma,
-                );
+                let (c_k, _) =
+                    sched.at_iteration(iter, ctx.big_a, ctx.schedule.alpha, ctx.schedule.gamma);
                 c_k * flip
             }
         })
         .collect();
-    // engine に送る plus/minus 値を確定する。
-    //
-    // is_int=false (実数 param): clamp のみ。
-    // is_int=true (整数 param): fishtest worker 互換の stochastic rounding を適用。
-    //   - 期待値は連続 f64 値と一致するため、長期平均で int 丸めバイアスが消える
-    //   - clamp → round → 再 clamp の順序で「max=10, v=10.4 → floor(10.4 + 0.7)=11
-    //     → 10 へ再 clamp」のような範囲外滑り込みを吸収する
-    //
-    // 注: rounding は **batch (= 1 iter) 単位で 1 回**。同じ batch 内の game pair は
-    // 全て同じ rounded 値を engine に送る (fishtest と等価)。
-    let mut round_int = |p: &SpsaParam, raw: f64| -> f64 {
-        if p.is_int {
-            let clamped = clamped_value(p, raw);
-            // floor(v + U(0,1)) の stochastic rounding。期待値は v、誤差は ±0.5 以内。
-            let u: f64 = rounding_rng.random();
-            let rounded = (clamped + u).floor();
-            clamped_value(p, rounded)
-        } else {
-            clamped_value(p, raw)
-        }
-    };
-    // ⚠ 順序依存: plus_values の各 param で rounding_rng を 1 回消費し、続けて
-    // minus_values でも 1 回消費する。param ごとに plus → minus の順で交互に進める
-    // ことで stream を予測可能にする (将来 ±同 round 値で揃えたくなったら別 stream)。
-    let mut plus_values: Vec<f64> = Vec::with_capacity(ctx.params.len());
-    let mut minus_values: Vec<f64> = Vec::with_capacity(ctx.params.len());
-    for (p, s) in ctx.params.iter().zip(shifts.iter()) {
-        let plus = round_int(p, p.value + s);
-        let minus = round_int(p, p.value - s);
-        if is_param_active(p, ctx.active_only_regex, ctx.translator) {
-            plus_values.push(plus);
-            minus_values.push(minus);
-        } else {
-            // 固定項目は両側・全 batch で同じ値。既存の active 項目の乱数列を
-            // 変えないため、上の抽選回数は維持し、固定値だけを共通化する。
-            let fixed = fixed_engine_value(p);
-            plus_values.push(fixed);
-            minus_values.push(fixed);
-        }
-    }
+    let plus_values: Vec<f64> = ctx
+        .params
+        .iter()
+        .zip(shifts.iter())
+        .map(|(p, s)| clamped_value(p, p.value + s))
+        .collect();
+    let minus_values: Vec<f64> = ctx
+        .params
+        .iter()
+        .zip(shifts.iter())
+        .map(|(p, s)| clamped_value(p, p.value - s))
+        .collect();
 
     let mut active_params = 0usize;
     let mut abs_shift_sum = 0.0f64;
@@ -2668,475 +1160,620 @@ fn compute_batch_prep(
         0.0
     };
 
-    // Paired antithetic: 同じ start_pos を 2 局連続 (先後入替) で消化することで
-    // 開局選択ノイズと先手有利バイアスを互いにキャンセルする (fishtest 互換)。
-    //
-    // batch_pairs 個の startpos を選び、各 pair で game 2k と 2k+1 が同じ index を
-    // 共有する。`plus_is_black` は呼び出し側 (WorkerPool::run_batch) で
-    // `idx % 2 == 0` を参照するので、ここでは index 配列のみを生成すれば足りる。
-    //
-    // `pick_startpos_index` の `game_index` 引数は cyclic mode (random=false) で
-    // startpos を周回するためのものなので、pair ごとに 1 ずつ進める。
-    let pair_total_games_start = total_games_start / 2;
-    let games_in_batch = ctx.batch_pairs * 2;
-    let mut start_pos_indices = Vec::with_capacity(games_in_batch);
-    for pair_idx in 0..ctx.batch_pairs {
-        let idx = pick_startpos_index(
+    let mut start_pos_indices = Vec::with_capacity(ctx.games_per_iteration);
+    let mut plus_is_black = Vec::with_capacity(ctx.games_per_iteration);
+    for game_idx in 0..ctx.games_per_iteration {
+        start_pos_indices.push(pick_startpos_index(
             ctx.start_positions_len,
             &mut rng,
             ctx.random_startpos,
-            pair_total_games_start + pair_idx,
-        )?;
-        // 同じ startpos を 2 連続 push (game 2k=plus黒, 2k+1=plus白)。
-        start_pos_indices.push(idx);
-        start_pos_indices.push(idx);
+            seed_total_games_start + game_idx,
+        )?);
+        plus_is_black.push(if ctx.randomize_plus_color {
+            rng.random_bool(0.5)
+        } else {
+            game_idx % 2 == 0
+        });
     }
 
-    Ok(BatchPrep {
+    Ok(SeedPrep {
         base_seed,
         flips,
         plus_values,
         minus_values,
         start_pos_indices,
+        plus_is_black,
         active_params,
         avg_abs_shift,
-        batch_total_games_start: total_games_start,
+        seed_total_games_start,
     })
 }
 
-#[derive(Clone, Copy, Debug)]
-struct UpdateStats {
-    updated_params: usize,
-    avg_abs_update: f64,
-    max_abs_update: f64,
-}
-
-fn apply_spsa_update(
-    params: &mut [SpsaParam],
-    flips: &[f64],
-    param_schedules: &[ParamScheduleConstants],
-    active_mask: &[bool],
-    schedule: ScheduleConfig,
-    k_for_update: u32,
-    raw_result: f64,
-) -> UpdateStats {
-    let big_a = schedule.a_ratio * schedule.total_iterations as f64;
-    let mut update_sums = vec![0.0f64; params.len()];
-    for (idx, (p, (&flip, sched))) in
-        params.iter().zip(flips.iter().zip(param_schedules.iter())).enumerate()
-    {
-        if !active_mask[idx] || p.c_end.abs() <= f64::EPSILON {
-            continue;
-        }
-        let (c_k, r_k) = sched.at_iteration(k_for_update, big_a, schedule.alpha, schedule.gamma);
-        update_sums[idx] = r_k * c_k * raw_result * flip;
-    }
-
-    // θ 更新。1 batch = 1 update (fishtest 流)。
-    let mut updated_params = 0usize;
-    let mut abs_update_sum = 0.0f64;
-    let mut max_abs_update = 0.0f64;
-    for (idx, p) in params.iter_mut().enumerate() {
-        if !active_mask[idx] || p.c_end.abs() <= f64::EPSILON {
-            continue;
-        }
-        let before = p.value;
-        let signal = update_sums[idx];
-        // θ 内部状態は is_int に関わらず f64 のまま保持する (fishtest 流)。
-        p.value = clamped_value(p, p.value + signal * schedule.mobility);
-        let abs_update = (p.value - before).abs();
-        updated_params += 1;
-        abs_update_sum += abs_update;
-        if abs_update > max_abs_update {
-            max_abs_update = abs_update;
-        }
-    }
-    let avg_abs_update = if updated_params > 0 {
-        abs_update_sum / updated_params as f64
-    } else {
-        0.0
-    };
-
-    UpdateStats {
-        updated_params,
-        avg_abs_update,
-        max_abs_update,
+fn duplicate_engine_config(cfg: &EngineConfig) -> EngineConfig {
+    EngineConfig {
+        path: cfg.path.clone(),
+        args: cfg.args.clone(),
+        threads: cfg.threads,
+        hash_mb: cfg.hash_mb,
+        network_delay: cfg.network_delay,
+        network_delay2: cfg.network_delay2,
+        minimum_thinking_time: cfg.minimum_thinking_time,
+        slowmover: cfg.slowmover,
+        ponder: cfg.ponder,
+        usi_options: cfg.usi_options.clone(),
     }
 }
 
-struct BatchValues {
-    plus: Vec<f64>,
-    minus: Vec<f64>,
-}
+fn run_seed_games_parallel(ctx: SeedRunContext<'_>) -> Result<SeedGameStats> {
+    let SeedRunContext {
+        concurrency,
+        opponent_cfg,
+        base_cfg,
+        params,
+        plus_values,
+        minus_values,
+        start_positions,
+        start_pos_indices,
+        plus_is_black,
+        game_cfg,
+        tc,
+        total_games_start,
+        iteration,
+        seed_idx,
+        seed_count,
+        base_seed,
+        translator,
+        active_mask,
+        score_blend_weight,
+        score_blend_clamp_cp,
+    } = ctx;
 
-#[derive(Clone, Copy)]
-struct WorkerContext<'a> {
-    base_cfg: &'a EngineConfig,
-    params: &'a [SpsaParam],
-    start_positions: &'a [ParsedPosition],
-    game_cfg: &'a GameConfig,
-    tc: TimeControl,
-    translator: &'a EngineNameTranslator,
-    application_mask: &'a [bool],
-    cpu_affinities: Option<&'a [Vec<usize>]>,
-}
-
-struct PoolTask {
-    iteration: u32,
-    game: GameTask,
-    values: Arc<BatchValues>,
-}
-
-struct WorkerPool<'scope> {
-    tasks: Option<crossbeam_channel::Sender<PoolTask>>,
-    results: crossbeam_channel::Receiver<Result<GameTaskResult>>,
-    cancel: Arc<AtomicBool>,
-    handles: Vec<std::thread::ScopedJoinHandle<'scope, ()>>,
-}
-
-impl<'scope> WorkerPool<'scope> {
-    fn new<'env: 'scope>(
-        scope: &'scope std::thread::Scope<'scope, 'env>,
-        count: usize,
-        ctx: WorkerContext<'scope>,
-        retries: u32,
-    ) -> Result<Self> {
-        let (tasks, task_rx) = unbounded::<PoolTask>();
-        let (result_tx, results) = unbounded();
-        let cancel = ctx
-            .game_cfg
-            .cancel
-            .clone()
-            .context("worker pool requires a shared cancel flag")?;
-        let mut handles = Vec::new();
-        for idx in 0..count {
-            let task_rx = task_rx.clone();
-            let result_tx = result_tx.clone();
-            let cancel = cancel.clone();
-            handles.push(scope.spawn(move || {
-                // panic も結果 channel へ通知し、他 worker の sender による受信待ちを防ぐ。
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    worker_loop(ctx, idx, task_rx, &result_tx, &cancel, retries)
-                }));
-                let error = match result {
-                    Ok(Ok(())) => return,
-                    Ok(Err(error)) => error,
-                    Err(_) => anyhow::anyhow!("worker panic"),
-                };
-                cancel.store(true, Ordering::Release);
-                let _ = result_tx.send(Err(error));
-            }));
-        }
-        Ok(Self {
-            tasks: Some(tasks),
-            results,
-            cancel,
-            handles,
-        })
-    }
-
-    /// 1 batch の全局を指し、集計と game_idx 順に並べた各局の結果を返す。
-    fn run_batch(
-        &self,
-        prep: &BatchPrep,
-        iteration: u32,
-    ) -> Result<(BatchGameStats, Vec<GameTaskResult>)> {
-        let values = Arc::new(BatchValues {
-            plus: prep.plus_values.clone(),
-            minus: prep.minus_values.clone(),
-        });
-        let game_count = prep.start_pos_indices.len();
-        for (idx, &start_pos_index) in prep.start_pos_indices.iter().enumerate() {
-            self.tasks
-                .as_ref()
-                .context("worker pool closed")?
-                .send(PoolTask {
-                    iteration,
-                    game: GameTask {
-                        game_idx: u32::try_from(idx).context("game index overflow")?,
-                        plus_is_black: idx % 2 == 0,
-                        start_pos_index,
-                        game_id: u32::try_from(prep.batch_total_games_start + idx + 1)
-                            .context("game id overflow")?,
-                    },
-                    values: values.clone(),
-                })
-                .context("failed to dispatch game task")?;
-        }
-        let mut stats = BatchGameStats {
+    let game_count = start_pos_indices.len();
+    if game_count == 0 {
+        return Ok(SeedGameStats {
             step_sum: 0.0,
             plus_wins: 0,
             minus_wins: 0,
             draws: 0,
-        };
-        let mut games = Vec::with_capacity(game_count);
+            opp: OppTally::default(),
+        });
+    }
+    let worker_count = concurrency.clamp(1, game_count);
+    let (task_tx, task_rx) = unbounded::<GameTask>();
+    let (result_tx, result_rx) = unbounded::<Result<GameTaskResult>>();
+
+    std::thread::scope(|scope| -> Result<SeedGameStats> {
+        for worker_idx in 0..worker_count {
+            let task_rx = task_rx.clone();
+            let result_tx = result_tx.clone();
+            let worker_cfg = duplicate_engine_config(base_cfg);
+            let worker_label = format!("seed{}_worker{}", seed_idx + 1, worker_idx + 1);
+            scope.spawn(move || {
+                let mut plus_engine =
+                    match EngineProcess::spawn(&worker_cfg, format!("plus_{worker_label}")) {
+                        Ok(engine) => engine,
+                        Err(err) => {
+                            let _ = result_tx.send(Err(err));
+                            return;
+                        }
+                    };
+                let mut minus_engine =
+                    match EngineProcess::spawn(&worker_cfg, format!("minus_{worker_label}")) {
+                        Ok(engine) => engine,
+                        Err(err) => {
+                            let _ = result_tx.send(Err(err));
+                            return;
+                        }
+                    };
+                // 共通相手モード: もう 1 本、 相手のエンジンを立てる
+                let mut opp_engine = match opponent_cfg {
+                    Some(cfg) => match EngineProcess::spawn(cfg, format!("opp_{worker_label}")) {
+                        Ok(engine) => Some(engine),
+                        Err(err) => {
+                            let _ = result_tx.send(Err(err));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                for task in task_rx {
+                    let result = (|| -> Result<GameTaskResult> {
+                        // ---- 共通相手モード: θ+ 対 相手 / θ− 対 相手 を同じ開始局面・同じ手番で 1 局ずつ ----
+                        // 2026-11-20 書き直し: θ+ は plus_engine、 θ− は minus_engine で打つ (値の入れ替えはしない)。
+                        // task.plus_is_black はこのモードでは「我々 (θ+ と θ− の両方) が先手か」を表す。
+                        // new_game() = usinewgame + isready で双方の置換表を毎局消す (θ+ の局の TT が θ− の局に漏れない)。
+                        if let Some(opp) = opp_engine.as_mut() {
+                            let start_pos = &start_positions[task.start_pos_index];
+                            let ours_black = task.plus_is_black;
+                            let mut play = |ours: &mut EngineProcess,
+                                            vals: &[f64],
+                                            role: &str|
+                             -> Result<f64> {
+                                apply_parameter_vector(
+                                    ours,
+                                    params,
+                                    vals,
+                                    translator,
+                                    active_mask,
+                                )?;
+                                ours.new_game()?;
+                                opp.new_game()?;
+                                let mut no_events = |_: &MoveEvent| {};
+                                let r = if ours_black {
+                                    run_game(
+                                        ours,
+                                        opp,
+                                        start_pos,
+                                        tc,
+                                        game_cfg,
+                                        task.game_id,
+                                        &mut no_events,
+                                        None,
+                                    )?
+                                } else {
+                                    run_game(
+                                        opp,
+                                        ours,
+                                        start_pos,
+                                        tc,
+                                        game_cfg,
+                                        task.game_id,
+                                        &mut no_events,
+                                        None,
+                                    )?
+                                };
+                                let s = plus_score_from_outcome(r.outcome, ours_black);
+                                // 1 局ごとの配役ログ (誰が先手か / θ+ か θ− か / どの engine か)
+                                println!(
+                                    "opp_game iter={} seed={} task={} game_id={} pos={} role={} \
+                                         engine={} black={} white={} outcome={} reason={} plies={} \
+                                         ours_score={:+.0}",
+                                    iteration,
+                                    seed_idx + 1,
+                                    task.game_idx + 1,
+                                    task.game_id,
+                                    task.start_pos_index,
+                                    role,
+                                    ours.label,
+                                    if ours_black { "ours" } else { "opp" },
+                                    if ours_black { "opp" } else { "ours" },
+                                    r.outcome.label(),
+                                    r.reason,
+                                    r.plies,
+                                    s
+                                );
+                                Ok(s)
+                            };
+                            let s_plus = play(&mut plus_engine, plus_values, "plus")?;
+                            let s_minus = play(&mut minus_engine, minus_values, "minus")?;
+                            let pair = OppPairOutcome {
+                                plus: s_plus,
+                                minus: s_minus,
+                            };
+                            let plus_score = opp_pair_signal(pair);
+                            return Ok(GameTaskResult {
+                                game_idx: task.game_idx,
+                                plus_is_black: task.plus_is_black,
+                                plus_score,
+                                // 表示用 (このモードの outcome は「θ+ 側が良かったか」)
+                                outcome: if plus_score > 0.0 {
+                                    GameOutcome::BlackWin
+                                } else if plus_score < 0.0 {
+                                    GameOutcome::WhiteWin
+                                } else {
+                                    GameOutcome::Draw
+                                },
+                                opp: Some(pair),
+                            });
+                        }
+                        // 2026-11-19 修正: 以前は plus_is_black=false のとき値を入れ替えたうえで
+                        // 下の run_game でも先後を入れ替えていた (二重の入れ替え) ため、 θ+ が
+                        // 常に先手になり、 plus_score の符号が半分の局で逆になっていた。
+                        // 値は常に plus_engine=θ+ / minus_engine=θ- とし、 先後は run_game 側だけで決める。
+                        apply_parameter_vector(
+                            &mut plus_engine,
+                            params,
+                            plus_values,
+                            translator,
+                            active_mask,
+                        )?;
+                        apply_parameter_vector(
+                            &mut minus_engine,
+                            params,
+                            minus_values,
+                            translator,
+                            active_mask,
+                        )?;
+                        plus_engine.new_game()?;
+                        minus_engine.new_game()?;
+
+                        let start_pos = &start_positions[task.start_pos_index];
+                        let mut black_cp_sum = 0.0;
+                        let mut black_cp_count = 0u32;
+                        let mut on_move = |event: &MoveEvent| {
+                            if let Some(cp) = eval_cp_from_black_perspective(event) {
+                                black_cp_sum += f64::from(cp);
+                                black_cp_count += 1;
+                            }
+                        };
+                        let result = if task.plus_is_black {
+                            run_game(
+                                &mut plus_engine,
+                                &mut minus_engine,
+                                start_pos,
+                                tc,
+                                game_cfg,
+                                task.game_id,
+                                &mut on_move,
+                                None,
+                            )?
+                        } else {
+                            run_game(
+                                &mut minus_engine,
+                                &mut plus_engine,
+                                start_pos,
+                                tc,
+                                game_cfg,
+                                task.game_id,
+                                &mut on_move,
+                                None,
+                            )?
+                        };
+                        let wld_score = plus_score_from_outcome(result.outcome, task.plus_is_black);
+                        let mean_black_cp = if black_cp_count == 0 {
+                            None
+                        } else {
+                            Some(black_cp_sum / f64::from(black_cp_count))
+                        };
+                        let plus_score = blend_score_with_eval(
+                            wld_score,
+                            mean_black_cp,
+                            task.plus_is_black,
+                            score_blend_weight,
+                            score_blend_clamp_cp,
+                        );
+                        Ok(GameTaskResult {
+                            game_idx: task.game_idx,
+                            plus_is_black: task.plus_is_black,
+                            plus_score,
+                            outcome: result.outcome,
+                            opp: None,
+                        })
+                    })();
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(task_rx);
+        drop(result_tx);
+
+        for (idx, (&start_pos_index, &plus_is_black)) in
+            start_pos_indices.iter().zip(plus_is_black.iter()).enumerate()
+        {
+            let game_idx = u32::try_from(idx).context("game index overflow")?;
+            let game_id = u32::try_from(total_games_start + idx + 1).context("game id overflow")?;
+            task_tx
+                .send(GameTask {
+                    game_idx,
+                    plus_is_black,
+                    start_pos_index,
+                    game_id,
+                })
+                .context("failed to dispatch game task")?;
+        }
+        drop(task_tx);
+
+        let mut step_sum = 0.0f64;
+        let mut plus_wins = 0u32;
+        let mut minus_wins = 0u32;
+        let mut draws = 0u32;
+        let mut opp_tally = OppTally::default();
+
         for _ in 0..game_count {
             let result =
-                self.results.recv().context("failed to receive game result from worker")??;
-            stats.step_sum += result.plus_score;
+                result_rx.recv().context("failed to receive game result from worker")??;
+            step_sum += result.plus_score;
             if result.plus_score > 0.0 {
-                stats.plus_wins += 1;
+                plus_wins += 1;
             } else if result.plus_score < 0.0 {
-                stats.minus_wins += 1;
+                minus_wins += 1;
             } else {
-                stats.draws += 1;
+                draws += 1;
             }
-            eprintln!(
-                "batch={} seed={} game={}/{} plus_is_black={} outcome={} plus_score={:+.1}",
+            if let Some(pair) = result.opp {
+                opp_tally.add(pair);
+                println!(
+                    "iter={} seed={}/{}({}) task={}/{} ours_is_black={} plus_vs_opp={:+.0} \
+                     minus_vs_opp={:+.0} plus_score={:+.3}",
+                    iteration,
+                    seed_idx + 1,
+                    seed_count,
+                    base_seed,
+                    result.game_idx + 1,
+                    game_count,
+                    result.plus_is_black,
+                    pair.plus,
+                    pair.minus,
+                    result.plus_score
+                );
+                continue;
+            }
+            println!(
+                "iter={} seed={}/{}({}) game={}/{} plus_is_black={} outcome={} plus_score={:+.3}",
                 iteration,
-                prep.base_seed,
+                seed_idx + 1,
+                seed_count,
+                base_seed,
                 result.game_idx + 1,
                 game_count,
                 result.plus_is_black,
                 result.outcome.label(),
                 result.plus_score
             );
-            games.push(result);
         }
-        games.sort_by_key(|game| game.game_idx);
-        Ok((stats, games))
-    }
-}
 
-#[derive(Debug)]
-struct WorkerCancelled;
-
-impl std::fmt::Display for WorkerCancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("worker cancelled")
-    }
-}
-
-impl std::error::Error for WorkerCancelled {}
-
-fn play_pool_task(
-    ctx: WorkerContext<'_>,
-    task: &PoolTask,
-    plus: &mut EngineProcess,
-    minus: &mut EngineProcess,
-) -> Result<GameTaskResult> {
-    use tools::selfplay::game::EngineFailure;
-    for engine in [&*plus, &*minus] {
-        ensure_tuned_options_advertised(engine, ctx.params, ctx.translator, ctx.application_mask)?;
-    }
-    apply_parameter_vector(
-        plus,
-        ctx.params,
-        &task.values.plus,
-        ctx.translator,
-        ctx.application_mask,
-    )
-    .context(EngineFailure)?;
-    apply_parameter_vector(
-        minus,
-        ctx.params,
-        &task.values.minus,
-        ctx.translator,
-        ctx.application_mask,
-    )
-    .context(EngineFailure)?;
-    plus.new_game().context(EngineFailure)?;
-    minus.new_game().context(EngineFailure)?;
-    let game = task.game;
-    let (black, white) = if game.plus_is_black {
-        (plus, minus)
-    } else {
-        (minus, plus)
-    };
-    let start_pos = &ctx.start_positions[game.start_pos_index];
-    let pass_rights = ctx.game_cfg.pass_rights;
-    let startpos_sfen =
-        build_position(start_pos, pass_rights.map(|(b, _)| b), pass_rights.map(|(_, w)| w))?
-            .to_sfen();
-    let mut moves = GameMoves::default();
-    let result = run_game(
-        black,
-        white,
-        start_pos,
-        ctx.tc,
-        ctx.game_cfg,
-        game.game_id,
-        &mut |event: &MoveEvent| moves.push(event),
-        None,
-    )?;
-    if result.reason == "watchdog" {
-        return Err(anyhow::anyhow!("watchdog: 運用上の探索期限超過").context(EngineFailure));
-    }
-    if result.reason == "cancelled" {
-        return Err(WorkerCancelled.into());
-    }
-    Ok(GameTaskResult {
-        game_idx: game.game_idx,
-        plus_is_black: game.plus_is_black,
-        plus_score: plus_score_from_outcome(result.outcome, game.plus_is_black),
-        outcome: result.outcome,
-        game_id: game.game_id,
-        start_pos_index: game.start_pos_index,
-        startpos_sfen,
-        reason: result.reason,
-        plies: result.plies,
-        retries: 0,
-        moves,
+        Ok(SeedGameStats {
+            step_sum,
+            plus_wins,
+            minus_wins,
+            draws,
+            opp: opp_tally,
+        })
     })
 }
 
-fn spawn_worker_engines(
-    ctx: WorkerContext<'_>,
-    idx: usize,
-    cancel: &AtomicBool,
-    last_attempt: bool,
-) -> Result<(EngineProcess, EngineProcess)> {
-    use tools::selfplay::game::EngineFailure;
-    if cancel.load(Ordering::Acquire) {
-        return Err(WorkerCancelled.into());
+fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Stderr)
+        .init();
+
+    let cli = Cli::parse();
+    if cli.games_per_iteration == 0 || cli.games_per_iteration % 2 != 0 {
+        bail!("--games-per-iteration must be an even number >= 2");
     }
-    // 最終失敗だけを通知し、? によるローカル engine の破棄より先に cancel を立てる。
-    let notify_failure = |error| {
-        if last_attempt {
-            cancel.store(true, Ordering::Release);
+    if cli.iterations == 0 {
+        bail!("--iterations must be >= 1");
+    }
+    if cli.concurrency == 0 {
+        bail!("--concurrency must be >= 1");
+    }
+    if cli.alpha <= 0.0 || cli.gamma <= 0.0 {
+        bail!("--alpha and --gamma must be > 0");
+    }
+    if cli.a_ratio < 0.0 {
+        bail!("--a-ratio must be >= 0");
+    }
+    if cli.score_blend_weight < 0.0 {
+        bail!("--score-blend-weight must be >= 0");
+    }
+    if cli.score_blend_clamp_cp <= 0 {
+        bail!("--score-blend-clamp-cp must be > 0");
+    }
+    let opponent_mode = cli.opponent_path.is_some();
+    if opponent_mode && cli.randomize_plus_color {
+        bail!(
+            "--opponent-path では手番はタスクの偶奇で固定する (--randomize-plus-color は使えない)"
+        );
+    }
+    if opponent_mode && cli.score_blend_weight > 0.0 {
+        bail!("--opponent-path では --score-blend-weight は使えない (WLD のみ)");
+    }
+    if let Some(v) = cli.early_stop_avg_abs_update_threshold
+        && v < 0.0
+    {
+        bail!("--early-stop-avg-abs-update-threshold must be >= 0");
+    }
+    if let Some(v) = cli.early_stop_result_variance_threshold
+        && v < 0.0
+    {
+        bail!("--early-stop-result-variance-threshold must be >= 0");
+    }
+    let early_stop_config = match (
+        cli.early_stop_avg_abs_update_threshold,
+        cli.early_stop_result_variance_threshold,
+        cli.early_stop_patience,
+    ) {
+        (None, None, 0) => None,
+        (Some(avg), Some(var), patience) if patience > 0 => Some(EarlyStopConfig {
+            avg_abs_update_threshold: avg,
+            result_variance_threshold: var,
+            patience,
+        }),
+        _ => {
+            bail!(
+                "early stopを有効化するには \
+                 --early-stop-avg-abs-update-threshold, \
+                 --early-stop-result-variance-threshold, \
+                 --early-stop-patience(>0) を全て指定してください"
+            );
         }
-        error
     };
-    let cpu_affinity = ctx.cpu_affinities.map(|sets| sets[idx].as_slice());
-    let mut plus = EngineProcess::spawn_uninitialized_with_cpu_affinity(
-        ctx.base_cfg,
-        format!("plus_worker{}", idx + 1),
-        cpu_affinity,
-    )
-    .context(EngineFailure)
-    .map_err(notify_failure)?;
-    plus.initialize(ctx.base_cfg).context(EngineFailure).map_err(notify_failure)?;
-    if cancel.load(Ordering::Acquire) {
-        return Err(WorkerCancelled.into());
+
+    let active_only_regex = cli
+        .active_only_regex
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .context("invalid --active-only-regex")?;
+    let seed_values = resolve_seeds(&cli);
+    if seed_values.is_empty() {
+        bail!("at least one seed is required");
     }
-    let mut minus = EngineProcess::spawn_uninitialized_with_cpu_affinity(
-        ctx.base_cfg,
-        format!("minus_worker{}", idx + 1),
-        cpu_affinity,
-    )
-    .context(EngineFailure)
-    .map_err(notify_failure)?;
-    minus.initialize(ctx.base_cfg).context(EngineFailure).map_err(notify_failure)?;
-    Ok((plus, minus))
-}
+    println!("using base seeds: {:?}", seed_values);
 
-/// engine を所有する変数より後に宣言し、異常終了では破棄より先に通知する。
-struct WorkerCancelGuard<'a> {
-    cancel: &'a AtomicBool,
-    armed: bool,
-}
-
-impl Drop for WorkerCancelGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.cancel.store(true, Ordering::Release);
+    // --parallel-seeds 指定時、`cli.concurrency` が seed 数で割り切れない、または
+    // 1 seed あたりの worker 数が `games_per_iteration` を超える設定だと実効並列度が
+    // 指定値より下がる（`run_seed_games_parallel` 側で `worker_count.clamp(1, game_count)`
+    // の clamp が効くため）。vast.ai 等で `--concurrency` を盛ったときに気付けないと
+    // 単純に CPU が余るので、起動時に一度だけ警告して気付かせる。
+    if cli.parallel_seeds && seed_values.len() >= 2 {
+        let per_seed_concurrency = (cli.concurrency / seed_values.len()).max(1);
+        let games_per_iter = cli.games_per_iteration as usize;
+        let effective_per_seed = per_seed_concurrency.min(games_per_iter);
+        let effective_total = effective_per_seed * seed_values.len();
+        if effective_total < cli.concurrency {
+            eprintln!(
+                "warning: --parallel-seeds の実効並列度が --concurrency より低い \
+                 (concurrency={}, seeds={}, games_per_iteration={} → \
+                 per_seed={} (clamped to {}), 実効合計={}, 未使用={})。\
+                 `--concurrency` を seeds × games_per_iteration の倍数に揃えると無駄なく回る。",
+                cli.concurrency,
+                seed_values.len(),
+                games_per_iter,
+                per_seed_concurrency,
+                effective_per_seed,
+                effective_total,
+                cli.concurrency - effective_total,
+            );
         }
     }
-}
 
-fn worker_loop(
-    ctx: WorkerContext<'_>,
-    idx: usize,
-    tasks: crossbeam_channel::Receiver<PoolTask>,
-    results: &crossbeam_channel::Sender<Result<GameTaskResult>>,
-    cancel: &AtomicBool,
-    retries: u32,
-) -> Result<()> {
-    use tools::selfplay::game::EngineFailure;
-    if cancel.load(Ordering::Acquire) {
-        return Ok(());
+    let engine_path = resolve_engine_path(&cli)?;
+    let engine_args = cli.engine_args.clone().unwrap_or_default();
+    // parent dir を先に確保（init-from 指定有無に関わらず後段で write_params が
+    // 同じパスに書き出すため、堅牢性のため init-from 外で create_dir_all する）
+    if let Some(parent) = cli.params.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent dir for {}", cli.params.display()))?;
     }
-    let mut initial_spawn = None;
-    let mut engines = None;
-    let mut guard = WorkerCancelGuard {
-        cancel,
-        armed: true,
-    };
-    let result = (|| {
-        let spawned = spawn_worker_engines(ctx, idx, cancel, retries == 0);
-        if retries == 0 && spawned.is_err() {
-            return spawned.map(|_| ());
-        }
-        initial_spawn = Some(spawned);
-        for task in tasks {
-            if cancel.load(Ordering::Acquire) {
-                break;
+
+    if let Some(init_src) = &cli.init_from {
+        // TOCTOU 緩和: `exists()` チェック→ `fs::copy` の間に他プロセスが書き込むと
+        // 上書きしてしまう。`OpenOptions::create_new` で atomic に作成失敗 (AlreadyExists)
+        // を検出し、その場合は既存ファイルを尊重する。
+        match OpenOptions::new().create_new(true).write(true).open(&cli.params) {
+            Ok(out) => {
+                let mut writer = BufWriter::new(out);
+                let mut reader = File::open(init_src)
+                    .with_context(|| format!("failed to open {}", init_src.display()))?;
+                std::io::copy(&mut reader, &mut writer).with_context(|| {
+                    format!("failed to copy {} -> {}", init_src.display(), cli.params.display())
+                })?;
+                writer.flush()?;
+                println!(
+                    "initialized {} from canonical {}",
+                    cli.params.display(),
+                    init_src.display()
+                );
             }
-            for attempt in 0..=retries {
-                if cancel.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                let result = (|| {
-                    if engines.is_none() {
-                        engines = Some(match initial_spawn.take() {
-                            Some(result) => result?,
-                            None => spawn_worker_engines(ctx, idx, cancel, attempt == retries)?,
-                        });
-                    }
-                    let (plus, minus) = engines.as_mut().context("missing worker engines")?;
-                    play_pool_task(ctx, &task, plus, minus)
-                })();
-                match result {
-                    Ok(mut result) => {
-                        result.retries = attempt;
-                        if results.send(Ok(result)).is_err() {
-                            return Ok(());
-                        }
-                        break;
-                    }
-                    Err(error) => {
-                        if error.downcast_ref::<EngineFailure>().is_none() || attempt == retries {
-                            return Err(error.context(format!(
-                                "batch={} game_id={}",
-                                task.iteration, task.game.game_id
-                            )));
-                        }
-                        if cancel.load(Ordering::Acquire) {
-                            return Ok(());
-                        }
-                        eprintln!(
-                            "retry batch={} game_id={} attempt={} cause={}",
-                            task.iteration,
-                            task.game.game_id,
-                            u64::from(attempt) + 2,
-                            format!("{error:#}").replace(['\r', '\n'], " ")
-                        );
-                        drop(engines.take());
-                    }
-                }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                println!(
+                    "init-from: {} already exists, leaving as-is (canonical {} not copied)",
+                    cli.params.display(),
+                    init_src.display()
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(e)
+                    .context(format!("failed to create {} for init-from", cli.params.display())));
             }
         }
-        Ok(())
-    })();
-    // 初回 spawn・再試行・手境界の全経路で、他 worker による中止は通知しない。
-    // 根本原因の Err は engine Drop 後に届くため、中止通知で先取りさせない。
-    let result = match result {
-        Err(error)
-            if cancel.load(Ordering::Acquire)
-                && error.downcast_ref::<WorkerCancelled>().is_some() =>
-        {
-            Ok(())
+    }
+    let translator = match &cli.engine_param_mapping {
+        Some(path) => {
+            let t = EngineNameTranslator::from_mapping_file(path)?;
+            println!("engine param mapping: {} entries loaded from {}", t.len(), path.display());
+            t
         }
-        result => result,
+        None => EngineNameTranslator::empty(),
     };
-    if result.is_ok() {
-        guard.armed = false;
-    }
-    result
-}
-
-impl Drop for WorkerPool<'_> {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
-        drop(self.tasks.take());
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
+    let mut params = read_params(&cli.params)?;
+    let schedule = ScheduleConfig {
+        alpha: cli.alpha,
+        gamma: cli.gamma,
+        a_ratio: cli.a_ratio,
+        mobility: cli.mobility,
+        total_iterations: cli.iterations,
+    };
+    let meta_path = cli.meta_file.clone().unwrap_or_else(|| default_meta_path(&cli.params));
+    let (start_iteration, mut total_games) = if cli.resume {
+        let meta = load_meta(&meta_path).with_context(|| {
+            format!("--resume was set but metadata load failed: {}", meta_path.display())
+        })?;
+        if meta.format_version != META_FORMAT_VERSION {
+            bail!(
+                "unsupported meta format version {} in {}",
+                meta.format_version,
+                meta_path.display()
+            );
         }
-    }
-}
+        if !schedule_matches(meta.schedule, schedule) {
+            if cli.force_schedule {
+                eprintln!(
+                    "warning: schedule differs from metadata but continuing due to --force-schedule \
+                     (meta={}, meta_schedule={:?}, cli_schedule={:?})",
+                    meta_path.display(),
+                    meta.schedule,
+                    schedule
+                );
+            } else {
+                bail!(
+                    "schedule mismatch with {}. use --force-schedule to override \
+                     (meta_schedule={:?}, cli_schedule={:?})",
+                    meta_path.display(),
+                    meta.schedule,
+                    schedule
+                );
+            }
+        }
+        (meta.completed_iterations, meta.total_games)
+    } else {
+        (0, 0)
+    };
+    let end_iteration = start_iteration
+        .checked_add(cli.iterations)
+        .context("iteration index overflow")?;
+    let stats_csv_path: Option<PathBuf> = if cli.no_stats_csv {
+        None
+    } else {
+        Some(cli.stats_csv.clone().unwrap_or_else(|| default_stats_csv_path(&cli.params)))
+    };
+    let aggregate_csv_path: Option<PathBuf> = if cli.no_stats_aggregate_csv {
+        None
+    } else if let Some(path) = &cli.stats_aggregate_csv {
+        Some(path.clone())
+    } else if seed_values.len() > 1 {
+        // 互換性: --stats-csv が明示指定されている場合は従来の派生
+        // (<stats_csv>.aggregate.csv) を維持。さもなければ <params>.stats_aggregate.csv。
+        // これにより既存ジョブを --resume したとき既定の集計CSV出力先が変わらない。
+        // 詳細: crates/tools/docs/spsa_runbook.md §3 「集計CSV のパス導出規則」
+        if let Some(stats_path) = &cli.stats_csv {
+            Some(PathBuf::from(format!("{}.aggregate.csv", stats_path.display())))
+        } else {
+            Some(default_stats_aggregate_csv_path(&cli.params))
+        }
+    } else {
+        None
+    };
+    let mut stats_csv_writer = if let Some(path) = stats_csv_path.as_deref() {
+        Some(open_stats_csv_writer(path, cli.resume, opponent_mode)?)
+    } else {
+        None
+    };
+    let mut stats_aggregate_csv_writer = if let Some(path) = aggregate_csv_path.as_deref() {
+        Some(open_stats_aggregate_csv_writer(path, cli.resume)?)
+    } else {
+        None
+    };
+    let param_values_csv_path: Option<PathBuf> = if cli.no_param_values_csv {
+        None
+    } else {
+        Some(
+            cli.param_values_csv
+                .clone()
+                .unwrap_or_else(|| default_param_values_csv_path(&cli.params)),
+        )
+    };
+    let mut param_values_csv_writer = if let Some(path) = param_values_csv_path.as_deref() {
+        Some(open_param_values_csv_writer(path, cli.resume, &params)?)
+    } else {
+        None
+    };
 
-/// `--startpos-file` / `--sfen` から開始局面を読み、max_moves 内に収まることを確かめる。
-fn load_run_start_positions(cli: &Cli) -> Result<Vec<ParsedPosition>> {
     if cli.startpos_file.is_none() {
         if cli.require_startpos_file {
             bail!("--require-startpos-file was set but --startpos-file was not provided");
@@ -3148,31 +1785,13 @@ fn load_run_start_positions(cli: &Cli) -> Result<Vec<ParsedPosition>> {
 
     let (start_positions, _) =
         load_start_positions(cli.startpos_file.as_deref(), cli.sfen.as_deref(), None, None)?;
-    ensure_start_positions_within_max_moves(&start_positions, cli.max_moves)?;
-    Ok(start_positions)
-}
-
-struct ParamMasks {
-    active: Vec<bool>,
-    application: Vec<bool>,
-    active_count: usize,
-}
-
-/// 摂動・更新の対象 (active) と engine へ送る対象 (application) を決める。
-fn compute_param_masks(
-    params: &[SpsaParam],
-    active_only_regex: Option<&Regex>,
-    translator: &EngineNameTranslator,
-    cli: &Cli,
-) -> Result<ParamMasks> {
     // active mask は iteration 中に変化しない（params の値だけが更新され、name/not_used
-    // /regex マッチ性は不変）ため、適用用と摂動・更新用を分けて 1 度だけ計算する。
+    // /regex マッチ性は不変）ため、ここで 1 度だけ計算してホットパス (apply_parameter_vector)
+    // で再利用する。
     let active_mask: Vec<bool> = params
         .iter()
-        .map(|p| is_param_active(p, active_only_regex, translator))
+        .map(|p| is_param_active(p, active_only_regex.as_ref(), &translator))
         .collect();
-    let application_mask: Vec<bool> =
-        params.iter().map(|p| is_param_applicable(p, translator)).collect();
     let active_param_count = active_mask.iter().filter(|&&b| b).count();
     if active_param_count == 0 {
         bail!(
@@ -3180,7 +1799,7 @@ fn compute_param_masks(
             cli.active_only_regex
         );
     }
-    eprintln!("active params: {active_param_count}/{}", params.len());
+    println!("active params: {active_param_count}/{}", params.len());
 
     // 翻訳器有効時、`active_only_regex` でマッチしたが unmapped で除外されたパラメータを
     // info 出力する。「期待した parameter が摂動されていない」事象に気づきやすくする。
@@ -3189,30 +1808,23 @@ fn compute_param_masks(
             .iter()
             .filter(|p| {
                 !p.not_used
-                    && active_only_regex.is_none_or(|re| re.is_match(&p.name))
+                    && active_only_regex.as_ref().is_none_or(|re| re.is_match(&p.name))
                     && !translator.is_mapped(&p.name)
             })
             .map(|p| p.name.as_str())
             .collect();
         if !unmapped_active.is_empty() {
             unmapped_active.sort();
-            eprintln!(
+            println!(
                 "info: {} param(s) matched --active-only-regex but are unmapped (translator skipped):",
                 unmapped_active.len()
             );
             for n in &unmapped_active {
-                eprintln!("  - {n}");
+                println!("  - {n}");
             }
         }
     }
-    Ok(ParamMasks {
-        active: active_mask,
-        application: application_mask,
-        active_count: active_param_count,
-    })
-}
 
-fn build_engine_config(cli: &Cli, engine_path: PathBuf) -> EngineConfig {
     // 公平な対局条件のため、tournament と同様に NetworkDelay=0 と
     // MinimumThinkingTime をデフォルトで注入する。ユーザーが明示的に
     // --usi-option で指定した場合はそちらを優先。
@@ -3239,9 +1851,9 @@ fn build_engine_config(cli: &Cli, engine_path: PathBuf) -> EngineConfig {
         }
     }
 
-    EngineConfig {
+    let base_cfg = EngineConfig {
         path: engine_path,
-        args: cli.engine_args.clone().unwrap_or_default(),
+        args: engine_args,
         threads: cli.threads,
         hash_mb: cli.hash_mb,
         network_delay: None,
@@ -3250,30 +1862,33 @@ fn build_engine_config(cli: &Cli, engine_path: PathBuf) -> EngineConfig {
         slowmover: None,
         ponder: false,
         usi_options,
-    }
-}
+    };
 
-/// 全 worker で共有する対局設定。cancel flag は panic hook からも立てる。
-fn build_game_setup(cli: &Cli) -> (GameConfig, TimeControl) {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let panic_cancel = cancel.clone();
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        default_hook(info);
-        // unwind 前に通知し、初期化途中のローカル engine の Drop にも先行する。
-        panic_cancel.store(true, Ordering::Release);
-    }));
+    // 共通相手モードの設定 (--opponent-path が無ければ None = 従来の直接対戦)
+    let opponent_cfg: Option<EngineConfig> = cli.opponent_path.as_ref().map(|p| EngineConfig {
+        path: p.clone(),
+        args: cli.opponent_args.clone().unwrap_or_default(),
+        threads: cli.threads,
+        hash_mb: cli.hash_mb,
+        network_delay: None,
+        network_delay2: None,
+        minimum_thinking_time: None,
+        slowmover: None,
+        ponder: false,
+        usi_options: cli.opponent_usi_option.clone().unwrap_or_default(),
+    });
+    let opponent_cfg_ref: Option<&EngineConfig> = opponent_cfg.as_ref();
+    if let Some(cfg) = opponent_cfg_ref {
+        println!(
+            "共通相手モード: {} (1 タスク = θ+ 対 相手 + θ− 対 相手 の 2 局 / 1 iteration {} タスク = {} 局)",
+            cfg.path.display(),
+            cli.games_per_iteration,
+            cli.games_per_iteration * 2
+        );
+    }
+
     let game_cfg = GameConfig {
-        limit_only_timeout_ms: cli.nodes.map(|_| cli.nodes_timeout_ms),
-        cancel: Some(cancel),
-        resign_rule: None,
-        win_rule: None,
-        draw_rule: None,
-        agreement_rule: cli.adjudicate_agreement,
-        // Fischer の async では pair ごとの時計から決めて上書きする。
-        game_time_limit_ms: None,
         max_moves: cli.max_moves,
-        preserve_start_history: false,
         timeout_margin_ms: cli.timeout_margin_ms,
         pass_rights: None,
         go_depth: None,
@@ -3288,2026 +1903,356 @@ fn build_game_setup(cli: &Cli) -> (GameConfig, TimeControl) {
     } else {
         TimeControl::new(0, 0, 0, 0, cli.byoyomi)
     };
-    (game_cfg, tc)
-}
+    let mut early_stop_consecutive = 0u32;
 
-/// Fishtest 方式の per-param スケジュール定数。k 軸の上限は total_pairs。
-fn compute_param_schedules(
-    params: &[SpsaParam],
-    schedule: ScheduleConfig,
-) -> Vec<ParamScheduleConstants> {
-    params
+    // Fishtest 方式: per-param スケジュール定数を初期化
+    let big_a = schedule.a_ratio * end_iteration as f64;
+    let param_schedules: Vec<ParamScheduleConstants> = params
         .iter()
         .map(|p| {
             ParamScheduleConstants::compute(
                 p.c_end,
                 p.r_end,
-                schedule.total_iterations,
+                end_iteration,
                 schedule.a_ratio,
                 schedule.alpha,
                 schedule.gamma,
             )
         })
-        .collect()
-}
-
-fn plan_cpu_affinities(cli: &Cli, worker_count: usize) -> Result<Option<Vec<Vec<usize>>>> {
-    Ok(if worker_count == 0 {
-        None
-    } else {
-        match cli.cpu_affinity {
-            CpuAffinityMode::Off => None,
-            CpuAffinityMode::Numa => {
-                let sets = discover_numa_cpu_affinities(cli.threads, worker_count)?;
-                eprintln!(
-                    "CPU affinity: {worker_count} worker(s), {} CPU(s)/worker, NUMA-local",
-                    cli.threads
-                );
-                for (index, cpus) in sets.iter().enumerate() {
-                    eprintln!("  worker{}: {cpus:?}", index + 1);
-                }
-                Some(sets)
-            }
-        }
-    })
-}
-
-/// `print_startup_summary` の入力をまとめた構造体。位置引数の取り違えを防ぎ、
-/// 将来項目を増やしても呼び出し側の修正が小さくなる。
-struct StartupContext<'a> {
-    snapshot: &'a InitMetaSnapshot,
-    /// 今回の起動アクション (resume / fresh-init-from / fresh-existing / force-init)。
-    /// `snapshot.init_mode` (run 全体の出自) とは別軸で表示するため別途渡す。
-    launch_action: &'a NonBailAction,
-    schedule: &'a ScheduleConfig,
-    params: &'a [SpsaParam],
-    active_mask: &'a [bool],
-    active_param_count: usize,
-    /// 起動時の batch 進行範囲 (`[start_batch, end_batch)`)。
-    start_iteration: u32,
-    end_iteration: u32,
-    /// 単一 base seed (v4 で multi-seed は撤去済み)。
-    base_seed: u64,
-    /// SPSA 全体の game pair 上限 (= schedule k 軸上限)。
-    total_pairs: u32,
-    /// 1 batch あたりの game pair 数。
-    batch_pairs: u32,
-    params_path: &'a Path,
-    meta_path: &'a Path,
-}
-
-/// scalar (i32 想定の f64) を `is_int` に応じて整形する小ヘルパ。`frac` は
-/// 浮動小数時の有効桁。startup summary 内の value/min/max を統一表記するため。
-fn fmt_param_scalar(p: &SpsaParam, v: f64, frac: usize) -> String {
-    if p.is_int {
-        format!("{}", v.round() as i64)
-    } else {
-        format!("{:.*}", frac, v)
-    }
-}
-
-/// SPSA 起動時に「どんな状態で SPSA を始めるのか」を 1 ブロックで stderr に出力する。
-///
-/// 「init mode が想定通り」「active params 上位 5 件が想定値」を起動 5 秒で目視確認
-/// できる形にすることで、誤った canonical を投入したまま長時間 run を回す
-/// 事故への二度目の予防線とする。出力先は stderr なので CSV パイプ運用
-/// (`spsa | tee log.csv`) を阻害しない。
-fn print_startup_summary(ctx: &StartupContext<'_>) {
-    eprintln!("=== SPSA Startup Summary ===");
-    // launch action: 「今この起動で何をしたか」 (= NonBailAction)。
-    // origin mode: 「この run は最初に何で生まれたか」 (= meta.init_mode)。
-    // fresh 系初回起動なら両者は一致、resume では割れる (resume / fresh-init-from 等)。
-    eprintln!("launch action:  {}", ctx.launch_action.launch_label());
-    eprintln!("origin mode:    {}", ctx.snapshot.init_mode);
-    eprintln!("params:         {}", ctx.params_path.display());
-    eprintln!("meta:           {}", ctx.meta_path.display());
-    eprintln!("params sha256:  {} (起動時スナップショット)", ctx.snapshot.init_params_sha256);
-    if let (Some(p), Some(h)) =
-        (ctx.snapshot.init_from_path.as_deref(), ctx.snapshot.init_from_sha256.as_deref())
-    {
-        eprintln!("--init-from:    {p} (sha256: {h})");
-    } else {
-        eprintln!("--init-from:    (none)");
-    }
-    eprintln!("engine:         {}", ctx.snapshot.engine_path);
-    if let Some(p) = ctx.snapshot.engine_param_mapping_path.as_deref() {
-        let h = ctx.snapshot.engine_param_mapping_sha256.as_deref().unwrap_or("?");
-        eprintln!("mapping:        {p} (sha256: {h})");
-    }
-    eprintln!(
-        "schedule:       α={} γ={} a_ratio={} mobility={} total_pairs={}",
-        ctx.schedule.alpha,
-        ctx.schedule.gamma,
-        ctx.schedule.a_ratio,
-        ctx.schedule.mobility,
-        ctx.schedule.total_iterations
-    );
-    eprintln!(
-        "batch plan:     batch {} → {} ({} new batch), batch_pairs={}, total_pairs={}, seed={}",
-        ctx.start_iteration,
-        ctx.end_iteration,
-        ctx.end_iteration.saturating_sub(ctx.start_iteration),
-        ctx.batch_pairs,
-        ctx.total_pairs,
-        ctx.base_seed,
-    );
-    eprintln!("active params:  {}/{}", ctx.active_param_count, ctx.params.len());
-
-    // 起動時 active params の上位 5 件を表示。
-    // active_mask を使うことで「active_only_regex / mapping translator で除外された
-    // param が誤って summary に出る」のを防ぐ (not_used フィルタだけだと不十分)。
-    let preview: Vec<&SpsaParam> = ctx
-        .params
-        .iter()
-        .zip(ctx.active_mask.iter())
-        .filter(|(_, a)| **a)
-        .map(|(p, _)| p)
-        .take(5)
         .collect();
-    if !preview.is_empty() {
-        eprintln!("starting values (first 5 of {} active params):", ctx.active_param_count);
-        for p in preview {
-            eprintln!(
-                "  {:<48} = {:>10} (range [{}, {}], step {})",
-                p.name,
-                fmt_param_scalar(p, p.value, 4),
-                fmt_param_scalar(p, p.min, 2),
-                fmt_param_scalar(p, p.max, 2),
-                p.c_end
-            );
-        }
-    }
-    eprintln!("=== End Summary ===");
-}
 
-fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Stderr)
-        .init();
+    for iter in start_iteration..end_iteration {
+        let mut update_sums = vec![0.0f64; params.len()];
+        let mut seed_raw_results = Vec::with_capacity(seed_values.len());
+        let mut seed_plus_wins = Vec::with_capacity(seed_values.len());
+        let mut seed_minus_wins = Vec::with_capacity(seed_values.len());
+        let mut seed_draws = Vec::with_capacity(seed_values.len());
+        let mut seed_rows = Vec::with_capacity(seed_values.len());
 
-    let cli = Cli::parse();
-    validate_cli_finite(&cli)?;
-    if cli.worker_stdio {
-        return async_dispatch::run_worker(&cli);
-    }
-    match cli.dispatch {
-        DispatchMode::Batch => {
-            for (flag, given) in [
-                ("--max-lag", cli.max_lag.is_some()),
-                ("--max-pair-attempts", cli.max_pair_attempts.is_some()),
-                ("--snapshot-interval", cli.snapshot_interval.is_some()),
-                ("--adjudicate-agreement", cli.adjudicate_agreement.is_some()),
-                ("--nps-scaling", cli.nps_scaling),
-                ("--reference-nps", cli.reference_nps.is_some()),
-                ("--min-nps-ratio", cli.min_nps_ratio.is_some()),
-                ("--max-timeout-rate", cli.max_timeout_rate.is_some()),
-                ("--timeout-rate-min-games", cli.timeout_rate_min_games.is_some()),
-                ("--remote-worker", !cli.remote_workers.is_empty()),
-                ("--remote-timeout-sec", cli.remote_timeout_sec.is_some()),
-                ("--allow-worker-engine-sha256", !cli.allow_worker_engine_sha256.is_empty()),
-                ("--verify-resume", cli.verify_resume),
-            ] {
-                if given {
-                    bail!("{flag} は --dispatch async 専用です");
-                }
-            }
-        }
-        DispatchMode::Async => async_dispatch::validate_cli(&cli)?,
-    }
-
-    // v3 multi-seed 機能撤去: --seeds / --parallel-seeds は hard error。
-    // 移行ガイドへ案内 (crates/tools/docs/spsa_runbook.md および CHANGELOG.md の v4 エントリ)。
-    if cli.seeds.is_some() {
-        bail!(
-            "--seeds は v4 で撤去されました。複数 base_seed の探索は --seed を変えた\n\
-             独立 run dir で並列実行してください。詳細: crates/tools/docs/spsa_runbook.md および CHANGELOG.md の v4 エントリ"
-        );
-    }
-    if cli.parallel_seeds {
-        bail!(
-            "--parallel-seeds は v4 で撤去されました。詳細: crates/tools/docs/spsa_runbook.md および CHANGELOG.md の v4 エントリ"
-        );
-    }
-
-    // 新 CLI: --total-pairs / --batch-pairs。後方互換: --games-per-iteration +
-    // --iterations 併用なら自動換算。
-    let (total_pairs, batch_pairs) = match (
-        cli.total_pairs,
-        cli.batch_pairs.unwrap_or(8),
-        cli.games_per_iteration,
-        cli.iterations,
-    ) {
-        (Some(tp), bp, None, None) => {
-            if bp == 0 {
-                bail!("--batch-pairs must be >= 1");
-            }
-            (tp, bp)
-        }
-        (None, _bp, Some(gpi), Some(iters)) => {
-            if !gpi.is_multiple_of(2) || gpi == 0 {
-                bail!(
-                    "--games-per-iteration must be an even number >= 2 \
-                     (paired antithetic は同 startpos の先後入替 2 局を 1 単位とする)"
-                );
-            }
-            if iters == 0 {
-                bail!("--iterations must be >= 1");
-            }
-            let derived_total_pairs =
-                gpi.checked_mul(iters).context("games_per_iteration * iterations overflow")? / 2;
-            // batch_pairs 既定値 8 だが、deprecate 経路では「1 iter = 1 batch」を
-            // 維持するために gpi/2 を採用する (= ユーザの旧運用で update 頻度を保つ)。
-            let derived_batch_pairs = gpi / 2;
-            eprintln!(
-                "warning: --games-per-iteration/--iterations は deprecated です。\n  \
-                   自動換算: --total-pairs {derived_total_pairs} --batch-pairs {derived_batch_pairs}\n  \
-                 crates/tools/docs/spsa_runbook.md および CHANGELOG.md の v4 エントリ を参照して新 CLI へ移行してください。"
-            );
-            (derived_total_pairs, derived_batch_pairs)
-        }
-        (Some(_), _, Some(_), _) | (Some(_), _, _, Some(_)) => {
-            bail!(
-                "--total-pairs と --games-per-iteration/--iterations は同時指定できません。\n\
-                 crates/tools/docs/spsa_runbook.md および CHANGELOG.md の v4 エントリ を参照して新 CLI に統一してください。"
-            );
-        }
-        (None, _, _, _) => {
-            bail!(
-                "--total-pairs を指定してください (deprecated 経路は --games-per-iteration\n\
-                 と --iterations の両方が必要です)。crates/tools/docs/spsa_runbook.md および CHANGELOG.md の v4 エントリ 参照。"
-            );
-        }
-    };
-    if total_pairs == 0 {
-        bail!("--total-pairs must be >= 1");
-    }
-    if batch_pairs == 0 {
-        bail!("--batch-pairs must be >= 1");
-    }
-    if cli.concurrency == 0 {
-        bail!("--concurrency must be >= 1");
-    }
-    if cli.threads == 0 {
-        bail!("--threads must be >= 1");
-    }
-    if cli.alpha <= 0.0 || cli.gamma <= 0.0 {
-        bail!("--alpha and --gamma must be > 0");
-    }
-    if cli.a_ratio < 0.0 {
-        bail!("--a-ratio must be >= 0");
-    }
-    if let Some(v) = cli.early_stop_avg_abs_update_threshold
-        && v < 0.0
-    {
-        bail!("--early-stop-avg-abs-update-threshold must be >= 0");
-    }
-    if let Some(v) = cli.early_stop_result_variance_threshold
-        && v < 0.0
-    {
-        bail!("--early-stop-result-variance-threshold must be >= 0");
-    }
-    let early_stop_config = match (
-        cli.early_stop_avg_abs_update_threshold,
-        cli.early_stop_result_variance_threshold,
-        cli.early_stop_patience.unwrap_or(0),
-    ) {
-        (None, None, 0) => None,
-        (Some(avg), Some(var), patience) if patience > 0 => Some(EarlyStopConfig {
-            avg_abs_update_threshold: avg,
-            result_variance_threshold: var,
-            patience,
-        }),
-        _ => {
-            bail!(
-                "early stopを有効化するには \
-                 --early-stop-avg-abs-update-threshold, \
-                 --early-stop-result-variance-threshold, \
-                 --early-stop-patience(>0) を全て指定してください"
-            );
-        }
-    };
-
-    let active_only_regex = cli
-        .active_only_regex
-        .as_deref()
-        .map(Regex::new)
-        .transpose()
-        .context("invalid --active-only-regex")?;
-    let base_seed = cli.seed.unwrap_or_else(|| rand::rng().random::<u64>());
-    if cli.dispatch == DispatchMode::Batch {
-        eprintln!("using base seed: {base_seed}");
-    }
-
-    let engine_path = resolve_engine_path(&cli)?;
-    // engine_options.txt で SPSA_* を固定されると、送った値が無視されて調整が進まない
-    tools::book_fingerprint::ensure_no_engine_options(&engine_path)?;
-    // run_dir を確保 (state / meta / CSV を全て同 dir 配下に置く前提)
-    std::fs::create_dir_all(cli.run_dir())
-        .with_context(|| format!("failed to create run-dir {}", cli.run_dir().display()))?;
-
-    // 同一 run-dir に対する二重起動を防ぐため、最初に exclusive lock を取る。
-    // 取得失敗時は他プロセスが state.params/meta.json/CSV を書き換える危険が
-    // あるので即 bail。lock は process 終了時 (Drop) に自動削除されるが、
-    // SIGKILL / 電源断で残留した場合は --force-unlock で消せる。
-    let _run_dir_lock = RunDirLock::acquire(cli.run_dir(), cli.force_unlock)?;
-
-    let state_params = state_params_path(cli.run_dir());
-
-    // ========================================================================
-    // init/resume 分岐: decide_init_action で意思決定 → apply_init_action で副作用を実行
-    // ========================================================================
-    let meta_path = cli.meta_file.clone().unwrap_or_else(|| default_meta_path(cli.run_dir()));
-    let init_action = decide_init_action(
-        cli.init_from.is_some(),
-        state_params.exists(),
-        cli.resume,
-        cli.force_init,
-        cli.use_existing_state_as_init,
-    );
-    // force-init 時に削除する run-dir 直下の派生 CSV 群。CSV writer は cli.resume=false
-    // で truncate もするが、能動削除しておくことで run-dir の状態を fresh と一致させる
-    // (例: --no-stats-csv で writer が走らないケースでも stale CSV が残らない)。
-    // CSV override (--stats-csv / --param-values-csv) で
-    // run-dir 外を指定した場合、その override 先は本リストに含まれない (外部集約 CSV
-    // append 運用を保護するため)。一方 --meta-file の override 先は active resume
-    // state とみなし `apply_init_action` 側で別途削除される。詳細は
-    // `default_force_init_cleanup_paths` の doc を参照。
-    let force_init_cleanup_paths = default_force_init_cleanup_paths(cli.run_dir());
-    let force_init_cleanup_refs: Vec<&Path> =
-        force_init_cleanup_paths.iter().map(|p| p.as_path()).collect();
-    let translator = match &cli.engine_param_mapping {
-        Some(path) => {
-            let t = EngineNameTranslator::from_mapping_file(path)?;
-            eprintln!("engine param mapping: {} entries loaded from {}", t.len(), path.display());
-            t
-        }
-        None => EngineNameTranslator::empty(),
-    };
-    let async_resume = cli.dispatch == DispatchMode::Async && cli.resume;
-    if let Some(path) = &cli.init_from
-        && !async_resume
-    {
-        read_params_with_translator(path, &translator, cli.assume_c_end_r_end)?;
-    }
-    // schedule.total_iterations は **k 軸の上限 = total_pairs** として再解釈する
-    // (v4 流: schedule の k 軸は累積 game pair 数)。field 名は v3 互換のため維持。
-    let schedule = ScheduleConfig {
-        alpha: cli.alpha,
-        gamma: cli.gamma,
-        a_ratio: cli.a_ratio,
-        mobility: cli.mobility,
-        total_iterations: total_pairs,
-    };
-    // async の resume は gen0 の param 定義を正本にし、view の state.params を読まない。
-    if async_resume {
-        if cli.force_init || cli.use_existing_state_as_init {
-            bail!("--resume と --force-init / --use-existing-state-as-init は同時に指定できません");
-        }
-        if cli.init_from.is_some() {
-            eprintln!(
-                "info: --dispatch async の resume は --init-from を使いません (起点は gen0 snapshot)"
-            );
-        }
-        return async_dispatch::run(async_dispatch::AsyncSetup {
-            cli: &cli,
-            action: &NonBailAction::Resume { verify_init: false },
-            params: async_dispatch::load_resume_params(&cli)?,
-            translator: &translator,
+        // Phase A: 全 seed の事前計算（CPU-light, sequential）。各 seed の RNG/flips/shifts/
+        // start_pos_indices を生成。total_games_start はセッション累積に seed_idx × games_per_iter
+        // を足して決定論的に求める。
+        let prep_ctx = SeedPrepCtx {
+            big_a,
+            schedule,
+            params: &params,
+            param_schedules: &param_schedules,
             active_only_regex: active_only_regex.as_ref(),
-            schedule,
-            total_pairs,
-            engine_path,
-            fresh_seed: base_seed,
-        });
-    }
-    let effective_action = apply_init_action(
-        &init_action,
-        cli.init_from.as_deref(),
-        &state_params,
-        meta_path.as_path(),
-        &force_init_cleanup_refs,
-    )?;
-
-    let mut params =
-        read_params_with_translator(&state_params, &translator, cli.assume_c_end_r_end)?;
-    if cli.dispatch == DispatchMode::Async {
-        return async_dispatch::run(async_dispatch::AsyncSetup {
-            cli: &cli,
-            action: &effective_action,
-            params,
             translator: &translator,
-            active_only_regex: active_only_regex.as_ref(),
-            schedule,
-            total_pairs,
-            engine_path,
-            fresh_seed: base_seed,
-        });
-    }
-    // v4 resume の戻り値: (start_batch, completed_pairs, total_games, init_snapshot,
-    //                       needs_v3_csv_rotate)。
-    // - start_batch: 次に実行する batch 番号 (0-origin)。
-    // - completed_pairs: 既に完了した game pair 数 (= schedule k 軸の起点)。
-    // - needs_v3_csv_rotate: v3 silent migrate を通過した経路だけ true。後続の
-    //   resume 系全検証を抜けた後に旧 stats.csv 等を rotate するためのフラグ。
-    let (start_batch, mut completed_pairs, mut total_games, init_snapshot, needs_v3_csv_rotate) =
-        match &effective_action {
-            NonBailAction::Resume { verify_init } => {
-                // load_meta が format_version 不一致を先に hard bail するため、ここでは
-                // 全フィールド込みの deserialize 成功を前提にできる。
-                let mut meta = load_meta(&meta_path).with_context(|| {
-                    format!("--resume was set but metadata load failed: {}", meta_path.display())
-                })?;
-                // 記録機能より前の meta (v3 を含む) は項目を持たない。その run で記録した後
-                // checkpoint の前に落ちていれば中身のある記録ファイルが残るので、記録していた run
-                // として扱う。空のファイルは何も記録していないので判定に使わない。
-                let recorded = meta.game_records.or_else(|| {
-                    let non_empty =
-                        |path: PathBuf| std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
-                    let written = non_empty(default_games_jsonl_path(cli.run_dir()))
-                        || non_empty(default_batches_jsonl_path(cli.run_dir()));
-                    written.then_some(true)
-                });
-                if let Some(recorded) = recorded
-                    && recorded == cli.no_game_records
-                {
-                    bail!(
-                        "この run は game records = {recorded} で始まっています。\
-                         resume で切り替えると確定 batch の棋譜が欠けるため、\
-                         --no-game-records の有無を開始時と揃えてください"
-                    );
-                }
-                // v3 → v4 silent migrate された meta は `schedule.total_iterations` の意味が
-                // 異なる (v3: iterations, v4: total_pairs)。silent migrate ケースでは
-                // total_iterations だけ比較対象から外す (CLI 値で上書き) ことで運用衝突を避ける。
-                // 例: v3 で `gpi=16, iters=100` の meta を v4 `total_pairs=800` で resume する
-                // 正当ケースを誤って bail させない。
-                let v3_silent_migrated = meta.total_pairs == 0 && meta.batch_pairs == 0;
-                if v3_silent_migrated {
-                    meta.schedule.total_iterations = total_pairs;
-                    // ⚠ ここでは「副作用なしの検証」のみ実施する。
-                    //   FS 副作用 (CSV rotate) は resume 系の全検証 (`schedule_matches`、
-                    //   state hash、param 名集合 hash、verify_init、total_pairs/batch_pairs
-                    //   一致など) を通過した後に行う。bail で run-dir に半端な変更が残ると
-                    //   ユーザが原因を直して再 resume したときに状態が変わって混乱する
-                    //   ため、bail 経路は run-dir を一切いじらない不変条件を守る。
-                    //
-                    // v3 meta は `batch_pairs` を直接保持しないが、`total_games` と
-                    // `completed_iterations` から推定値 `games_per_iter ≈ total_games
-                    // / completed_iterations` を計算できる。これが CLI の `batch_pairs
-                    // × 2` (= 1 iter あたりの game 数) と一致しないと、SPSA schedule の
-                    // k 軸が旧 run の続きにならず、a_k/c_k 評価が破綻するため bail。
-                    check_v3_batch_pairs_consistency(
-                        meta.completed_iterations,
-                        meta.total_games,
-                        batch_pairs,
-                        cli.force_schedule,
-                    )?;
-                }
-                if !schedule_matches(meta.schedule, schedule) {
-                    if cli.force_schedule {
-                        eprintln!(
-                            "warning: schedule differs from metadata but continuing due to --force-schedule \
-                         (meta={}, meta_schedule={:?}, cli_schedule={:?})",
-                            meta_path.display(),
-                            meta.schedule,
-                            schedule
-                        );
-                    } else {
-                        bail!(
-                            "schedule mismatch with {}. use --force-schedule to override \
-                         (meta_schedule={:?}, cli_schedule={:?})",
-                            meta_path.display(),
-                            meta.schedule,
-                            schedule
-                        );
-                    }
-                }
-                // state.params の transactional 整合性検証 (v4 で追加):
-                // 反復ごとに「write_params → meta save」の順で書くため、両者の間で落ちると
-                // meta.completed_iterations より state.params が 1 反復先行する状態が残る。
-                // resume 時に on-disk state.params の hash を meta.current_params_sha256 と
-                // 突き合わせ、乖離があれば bail させて状況をユーザに見せる。
-                let on_disk_state_hash = sha256_hex_of_file(&state_params)?;
-                if meta.current_params_sha256 != on_disk_state_hash {
-                    bail!(
-                        "state.params と meta.json が不整合です ({}).\n\
-                     meta.current_params_sha256 = {}\n\
-                     on-disk state.params hash  = {}\n\
-                     考えられる原因:\n  \
-                       1. write_params → save_meta の間で前回 run がクラッシュした (1 反復差)\n  \
-                       2. state.params が外部から書き換えられた\n  \
-                     いずれにせよ resume を継続すると SPSA の進行状態が破綻するため停止します。\n\
-                     対処 (どちらか):\n  \
-                       (a) 新規 run dir で `--init-from <canonical>` から fresh start する\n  \
-                       (b) 1 反復差を許容して既存 state を起点に新 run を始める:\n        \
-                           cp {state_path} <new-run-dir>/state.params\n        \
-                           spsa --run-dir <new-run-dir> --use-existing-state-as-init ...",
-                        meta_path.display(),
-                        meta.current_params_sha256,
-                        on_disk_state_hash,
-                        state_path = state_params.display(),
-                    );
-                }
-
-                // param 名集合の hash 検証 (resume 時に param 集合が変わっていないこと)。
-                // TODO(PR2): mapping 表に新パラメータを追加した正当な変更も現状 hard bail
-                // になる。`--force-name-set` か `--allow-param-set-change` の escape hatch を
-                // PR2 で導入検討。それまでは新規 run dir で fresh start する運用で凌ぐ。
-                let current_name_hash = param_name_set_sha256(&params);
-                if meta.param_name_set_sha256 != current_name_hash {
-                    bail!(
-                        "param 名集合が meta と不一致です ({}).\n\
-                     meta.param_name_set_sha256 = {}\n\
-                     current  param_name_set_sha256 = {}\n\
-                     param 集合変更は resume 不可 (本 PR では escape hatch なし)。\n\
-                     新規 run dir で fresh start してください。",
-                        meta_path.display(),
-                        meta.param_name_set_sha256,
-                        current_name_hash,
-                    );
-                }
-                // --init-from 指定時は整合性検証を実施 (resume が想定 canonical で開始した
-                // run なら値は近いはず。乖離があれば誤った canonical 混入のサイン)。
-                if *verify_init {
-                    let init_path = cli
-                        .init_from
-                        .as_ref()
-                        .expect("Resume{verify_init:true} requires init_from");
-                    let report = verify_init_matches_existing(
-                        init_path,
-                        &state_params,
-                        cli.assume_c_end_r_end,
-                    )?;
-                    report.print_summary(init_path, &state_params);
-                    if report.has_name_set_mismatch() {
-                        eprintln!(
-                            "warning: --init-from と既存 params で param 名集合が異なります \
-                         (extra_in_init={}, missing_in_init={})",
-                            report.extra_in_init.len(),
-                            report.missing_in_init.len()
-                        );
-                    }
-                    if cli.strict_init_check && report.exceeds_strict_threshold() {
-                        bail!(
-                            "--strict-init-check: init-from と existing で乖離が閾値超過 \
-                         (median={:.3}σ, max={:.3}σ)",
-                            report.median_step_units,
-                            report.max_step_units
-                        );
-                    }
-                }
-                // v4 schedule 検証: 既存 meta の total_pairs / batch_pairs と CLI 指定値の一致。
-                // v3 → v4 silent migration 経路では meta.total_pairs == 0 (sentinel) のため
-                // CLI 値を信頼して継承する (meta は migrate 直後で値を持たない)。
-                // sentinel 判定は L2520 で `v3_silent_migrated` として確定済み。ここでは
-                // それを再利用して二重定義を避ける。
-                if !v3_silent_migrated
-                    && (meta.total_pairs != total_pairs || meta.batch_pairs != batch_pairs)
-                {
-                    if cli.force_schedule {
-                        eprintln!(
-                            "warning: total_pairs/batch_pairs が meta と異なるが --force-schedule で続行 \
-                         (meta total_pairs={}, batch_pairs={} / cli total_pairs={}, batch_pairs={})",
-                            meta.total_pairs, meta.batch_pairs, total_pairs, batch_pairs
-                        );
-                    } else {
-                        bail!(
-                            "total_pairs/batch_pairs が meta と異なります \
-                         (meta total_pairs={}, batch_pairs={} / cli total_pairs={}, batch_pairs={}). \
-                         --force-schedule を指定するか crates/tools/docs/spsa_runbook.md および CHANGELOG.md の v4 エントリ を参照してください。",
-                            meta.total_pairs,
-                            meta.batch_pairs,
-                            total_pairs,
-                            batch_pairs
-                        );
-                    }
-                }
-                // completed_pairs: v4 meta は記録されたものを使う。v3 silent migrate 時は
-                // `completed_iterations × batch_pairs` で再構築する (v3 では 1 iter = 1 batch
-                // = 1 update で k は iter index と等価だったため)。
-                let resumed_completed_pairs = if v3_silent_migrated {
-                    meta.completed_iterations.saturating_mul(batch_pairs)
-                } else {
-                    meta.completed_pairs
-                };
-                let snapshot = InitMetaSnapshot::from_existing_meta(&meta);
-                (
-                    meta.completed_iterations,
-                    resumed_completed_pairs,
-                    meta.total_games,
-                    snapshot,
-                    v3_silent_migrated,
-                )
-            }
-            NonBailAction::CopyInitFromFresh
-            | NonBailAction::UseExistingFresh
-            | NonBailAction::ForceInitOverwrite => {
-                // 旧 run の final.params が残っていると、新 run 完了時に再書き込みされるまで
-                // 「前回の確定値」が見え続ける (= apply 入力に誤投入される)。fresh 系は
-                // すべてここで能動削除する (force-init の cleanup paths にも入っているが、
-                // CopyInitFromFresh / UseExistingFresh では cleanup paths は呼ばれないため)。
-                remove_stale_final_params_for_fresh_start(cli.run_dir())?;
-                let snapshot = InitMetaSnapshot::for_fresh_start(
-                    &effective_action,
-                    &state_params,
-                    cli.init_from.as_deref(),
-                    &engine_path,
-                    cli.engine_param_mapping.as_deref(),
-                )?;
-                // fresh 系経路は v3 silent migrate 不在なので false。
-                (0, 0, 0, snapshot, false)
-            }
+            start_positions_len: start_positions.len(),
+            games_per_iteration: cli.games_per_iteration as usize,
+            random_startpos: cli.random_startpos,
+            randomize_plus_color: cli.randomize_plus_color,
         };
-    // batch 数 = ceil(total_pairs / batch_pairs)。最終 batch は端数の game pair 数になる。
-    let total_batches = total_pairs.div_ceil(batch_pairs);
-    // resume 不変条件チェック: completed_pairs と completed_iterations の関係が
-    // 設定上ありえない値になっていないか (CLI 指定ミス / silent migrate 不整合等で発生し得る)。
-    if completed_pairs > total_pairs {
-        bail!(
-            "completed_pairs ({completed_pairs}) > total_pairs ({total_pairs}). \
-             既存 meta が現在の --total-pairs より進んでいます。\
-             total_pairs を増やすか、新規 run dir で --use-existing-state-as-init してください。"
-        );
-    }
-    if start_batch > total_batches {
-        bail!(
-            "completed_iterations ({start_batch}) > total_batches ({total_batches}). \
-             total_pairs / batch_pairs と既存 meta の整合性が崩れています。",
-        );
-    }
-    // 中間 batch では `completed_pairs == start_batch * batch_pairs` が必ず成り立つ
-    // (端数 batch は最終 batch にのみ発生し、その後 resume はあり得ないので)。
-    // start_batch < total_batches のときのみチェックする。
-    if start_batch < total_batches {
-        let expected_pairs = start_batch.saturating_mul(batch_pairs);
-        if completed_pairs != expected_pairs {
-            bail!(
-                "completed_pairs ({completed_pairs}) と completed_iterations × batch_pairs \
-                 ({expected_pairs}) が不整合です。meta が破損しているか、batch_pairs を \
-                 途中で変更した可能性があります。--force-schedule では救えないので新規 \
-                 run dir で fresh start してください。"
-            );
-        }
-    }
-    if start_batch >= total_batches {
-        eprintln!(
-            "info: 既に全 batch ({total_batches}) を完了しています (start_batch={start_batch})。何もせず終了します。"
-        );
-    }
-    let end_batch = total_batches;
-
-    // v3 silent migrate を通過した経路は、ここまでで resume 系全検証
-    // (`schedule_matches` / state hash / param 名集合 hash / verify_init /
-    //  total_pairs/batch_pairs 一致 / completed_pairs 不変条件) を抜けている。
-    // これより手前で bail する経路では run-dir に副作用を残さない不変条件を
-    // 守るため、CSV rotate (FS 副作用) はこの位置にまとめている。
-    if needs_v3_csv_rotate {
-        let rotated = rotate_v3_csv_files_for_silent_migrate(cli.run_dir())?;
-        for p in &rotated {
-            eprintln!("v3 → v4 silent migrate: rotated legacy CSV → {}", p.display());
-        }
-    }
-
-    let stats_csv_path: Option<PathBuf> = if cli.no_stats_csv {
-        None
-    } else {
-        Some(cli.stats_csv.clone().unwrap_or_else(|| default_stats_csv_path(cli.run_dir())))
-    };
-    let mut stats_csv_writer = if let Some(path) = stats_csv_path.as_deref() {
-        Some(open_stats_csv_writer(path, cli.resume)?)
-    } else {
-        None
-    };
-    let param_values_csv_path: Option<PathBuf> = if cli.no_param_values_csv {
-        None
-    } else {
-        Some(
-            cli.param_values_csv
-                .clone()
-                .unwrap_or_else(|| default_param_values_csv_path(cli.run_dir())),
-        )
-    };
-    let mut param_values_csv_writer = if let Some(path) = param_values_csv_path.as_deref() {
-        Some(open_param_values_csv_writer(path, cli.resume, &params)?)
-    } else {
-        None
-    };
-
-    // iter 0 スナップショット: 起動時の params を記録する (fresh / force-init / use-existing-fresh)。
-    // resume 時は既存 CSV に既に iter 0 行が含まれる前提で append 継続するため、ここではスキップ。
-    // 判定は `effective_action` (NonBailAction) で行うことで、ユーザが手動で
-    // `meta.completed_iterations: 0` を作って --resume したエッジケースで重複書きを防ぐ
-    // (`start_iteration == 0` だけだとそのケースで誤って iter 0 行を append してしまう)。
-    // これがあれば事故解析時 (誤った canonical 混入等) に「最初に何で起動したか」を CSV だけで追える。
-    let is_fresh_start = matches!(
-        effective_action,
-        NonBailAction::CopyInitFromFresh
-            | NonBailAction::UseExistingFresh
-            | NonBailAction::ForceInitOverwrite,
-    );
-    if is_fresh_start && let Some(writer) = param_values_csv_writer.as_mut() {
-        write_param_values_csv_row(writer, 0, &params)?;
-        // 即 flush: iter 1 完了前にクラッシュしても iter 0 行を CSV に残し、
-        // 「何で起動したか」を後追い解析できるようにする (事故解析用途で必須)。
-        writer.flush()?;
-    }
-
-    let start_positions = load_run_start_positions(&cli)?;
-    let ParamMasks {
-        active: active_mask,
-        application: application_mask,
-        active_count: active_param_count,
-    } = compute_param_masks(&params, active_only_regex.as_ref(), &translator, &cli)?;
-
-    print_startup_summary(&StartupContext {
-        snapshot: &init_snapshot,
-        launch_action: &effective_action,
-        schedule: &schedule,
-        params: &params,
-        active_mask: &active_mask,
-        active_param_count,
-        start_iteration: start_batch,
-        end_iteration: end_batch,
-        base_seed,
-        total_pairs,
-        batch_pairs,
-        params_path: &state_params,
-        meta_path: &meta_path,
-    });
-
-    let base_cfg = build_engine_config(&cli, engine_path);
-    let (game_cfg, tc) = build_game_setup(&cli);
-
-    let mut early_stop_consecutive = 0u32;
-
-    // Fishtest 方式: per-param スケジュール定数を初期化。
-    // schedule.total_iterations は **k 軸の上限 = total_pairs** として再解釈する。
-    let big_a = schedule.a_ratio * total_pairs as f64;
-    let param_schedules = compute_param_schedules(&params, schedule);
-    validate_schedule_bounds(schedule, &params, &active_mask, &param_schedules, batch_pairs)?;
-
-    let batch_faults = async_dispatch::FaultPlan::from_env()?;
-    // 起動条件の検証より後に作る。検証で止まる起動に空の games.jsonl を残すと、旧 meta の run が
-    // 記録していたと判定されるため。
-    let mut game_record_writer = if cli.no_game_records {
-        if !cli.resume {
-            // fresh start で前の run の棋譜を今回の run のものと誤読させない。
-            for path in [
-                default_games_jsonl_path(cli.run_dir()),
-                default_batches_jsonl_path(cli.run_dir()),
-            ] {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(anyhow::Error::new(e))
-                            .with_context(|| format!("failed to remove {}", path.display()));
+        let mut preps = Vec::with_capacity(seed_values.len());
+        for (seed_idx, base_seed) in seed_values.iter().copied().enumerate() {
+            let seed_total_games_start = total_games
+                .checked_add(seed_idx * cli.games_per_iteration as usize)
+                .context("total_games offset overflow")?;
+            let mut prep = compute_seed_prep(&prep_ctx, iter, base_seed, seed_total_games_start)?;
+            if opponent_mode {
+                pair_tasks_for_opponent(&mut prep.start_pos_indices, &mut prep.plus_is_black);
+                // 配役の確認用: この iteration の θ+ / θ− の値 (active な鍵だけ)
+                for ((p, (&pv, &mv)), &active) in params
+                    .iter()
+                    .zip(prep.plus_values.iter().zip(prep.minus_values.iter()))
+                    .zip(active_mask.iter())
+                {
+                    if active {
+                        println!(
+                            "theta iter={} seed={} {} plus={} minus={}",
+                            iter + 1,
+                            base_seed,
+                            p.name,
+                            option_value_string(p, pv),
+                            option_value_string(p, mv)
+                        );
                     }
                 }
             }
+            preps.push(prep);
         }
-        None
-    } else {
-        Some(BatchRecordWriter::open(cli.run_dir(), cli.resume)?)
-    };
 
-    if is_fresh_start {
-        let meta = ResumeMetaData {
-            format_version: META_FORMAT_VERSION,
-            state_params_file: state_params.display().to_string(),
-            completed_iterations: 0,
-            total_games,
-            last_raw_result_mean: 0.0,
-            last_avg_abs_update: 0.0,
-            updated_at_utc: Utc::now().to_rfc3339(),
-            schedule,
-            init_params_sha256: init_snapshot.init_params_sha256.clone(),
-            init_from_sha256: init_snapshot.init_from_sha256.clone(),
-            init_from_path: init_snapshot.init_from_path.clone(),
-            param_name_set_sha256: param_name_set_sha256(&params),
-            active_param_count,
-            engine_path: init_snapshot.engine_path.clone(),
-            engine_param_mapping_path: init_snapshot.engine_param_mapping_path.clone(),
-            engine_param_mapping_sha256: init_snapshot.engine_param_mapping_sha256.clone(),
-            init_mode: init_snapshot.init_mode,
-            current_params_sha256: sha256_hex_of_file(&state_params)?,
-            total_pairs,
-            batch_pairs,
-            completed_pairs,
-            game_records: Some(!cli.no_game_records),
+        // Phase B: ゲーム実行（heavy）。--parallel-seeds 指定 + seed 数 ≥ 2 のとき thread::scope
+        // で seed 並列実行、それ以外は順次実行。--concurrency を seed 数で分配して
+        // CPU の取り合いを避ける。
+        let parallelize = cli.parallel_seeds && seed_values.len() >= 2;
+        let per_seed_concurrency = if parallelize {
+            (cli.concurrency / seed_values.len()).max(1)
+        } else {
+            cli.concurrency
         };
-        save_meta(&meta_path, &meta)?;
-    }
+        let seed_count = seed_values.len();
+        let run_stats: Vec<SeedGameStats> = if parallelize {
+            // 借用を closure 外で確定 (move closure でも参照を捕捉)
+            let base_cfg_ref = &base_cfg;
+            let params_ref = &params;
+            let start_positions_ref = &start_positions;
+            let game_cfg_ref = &game_cfg;
+            let translator_ref = &translator;
+            let active_mask_ref = &active_mask;
+            let preps_ref = &preps;
+            std::thread::scope(|scope| -> Result<Vec<SeedGameStats>> {
+                let handles: Vec<_> = (0..seed_count)
+                    .map(|seed_idx| {
+                        let h = scope.spawn(move || -> Result<SeedGameStats> {
+                            let prep = &preps_ref[seed_idx];
+                            run_seed_games_parallel(SeedRunContext {
+                                concurrency: per_seed_concurrency,
+                                base_cfg: base_cfg_ref,
+                                params: params_ref,
+                                plus_values: &prep.plus_values,
+                                minus_values: &prep.minus_values,
+                                start_positions: start_positions_ref,
+                                start_pos_indices: &prep.start_pos_indices,
+                                plus_is_black: &prep.plus_is_black,
+                                game_cfg: game_cfg_ref,
+                                tc,
+                                total_games_start: prep.seed_total_games_start,
+                                iteration: iter + 1,
+                                seed_idx,
+                                seed_count,
+                                base_seed: prep.base_seed,
+                                translator: translator_ref,
+                                active_mask: active_mask_ref,
+                                score_blend_weight: cli.score_blend_weight,
+                                score_blend_clamp_cp: cli.score_blend_clamp_cp,
+                                opponent_cfg: opponent_cfg_ref,
+                            })
+                        });
+                        (seed_idx, h)
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|(seed_idx, h)| {
+                        h.join().map_err(|payload| {
+                            anyhow::anyhow!(
+                                "seed worker panicked: seed_idx={seed_idx}: {}",
+                                panic_payload_to_string(&payload),
+                            )
+                        })?
+                    })
+                    .collect()
+            })?
+        } else {
+            preps
+                .iter()
+                .enumerate()
+                .map(|(seed_idx, prep)| -> Result<SeedGameStats> {
+                    run_seed_games_parallel(SeedRunContext {
+                        concurrency: per_seed_concurrency,
+                        base_cfg: &base_cfg,
+                        params: &params,
+                        plus_values: &prep.plus_values,
+                        minus_values: &prep.minus_values,
+                        start_positions: &start_positions,
+                        start_pos_indices: &prep.start_pos_indices,
+                        plus_is_black: &prep.plus_is_black,
+                        game_cfg: &game_cfg,
+                        tc,
+                        total_games_start: prep.seed_total_games_start,
+                        iteration: iter + 1,
+                        seed_idx,
+                        seed_count,
+                        base_seed: prep.base_seed,
+                        translator: &translator,
+                        active_mask: &active_mask,
+                        score_blend_weight: cli.score_blend_weight,
+                        score_blend_clamp_cp: cli.score_blend_clamp_cp,
+                        opponent_cfg: opponent_cfg_ref,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
 
-    let remaining_pairs = total_pairs - completed_pairs;
-    let worker_count = cli.concurrency.min(2 * batch_pairs.min(remaining_pairs) as usize);
-    let cpu_affinities = plan_cpu_affinities(&cli, worker_count)?;
-
-    let worker_params = params.clone();
-    std::thread::scope(|scope| -> Result<()> {
-        if remaining_pairs == 0 {
-            return Ok(());
-        }
-        let pool = WorkerPool::new(
-            scope,
-            worker_count,
-            WorkerContext {
-                base_cfg: &base_cfg,
-                params: &worker_params,
-                start_positions: &start_positions,
-                game_cfg: &game_cfg,
-                tc,
-                translator: &translator,
-                application_mask: &application_mask,
-                cpu_affinities: cpu_affinities.as_deref(),
-            },
-            cli.engine_retries,
-        )?;
-        for batch_idx in start_batch..end_batch {
-            // この batch で消化する game pair 数。最終 batch は端数になり得る。
-            let pairs_remaining = total_pairs - completed_pairs;
-            let this_batch_pairs = pairs_remaining.min(batch_pairs);
-            if this_batch_pairs == 0 {
-                break;
-            }
-
-            // params は batch 末で更新するため、prep_ctx は batch ごとに作り直す。
-            let batch_ctx = BatchPrepCtx {
-                big_a,
-                schedule,
-                params: &params,
-                param_schedules: &param_schedules,
-                active_only_regex: active_only_regex.as_ref(),
-                translator: &translator,
-                start_positions_len: start_positions.len(),
-                batch_pairs: this_batch_pairs as usize,
-                random_startpos: cli.random_startpos,
-            };
-
-            // Phase A: 事前計算。schedule の k 軸 = batch 開始時点の累積 game pair 数。
-            // RNG 用の batch_idx は 0-origin で渡す (`seed_for_iteration` 内で `+1` され
-            // 重複しない iter_term を作るため、ここで `+1` する必要はない)。
-            let prep =
-                compute_batch_prep(&batch_ctx, batch_idx, completed_pairs, base_seed, total_games)?;
-
-            // Phase B: ゲーム実行 (heavy)。
-            let (stats, games) = pool.run_batch(&prep, batch_idx + 1)?;
-            // checkpoint より前に書く。ここで落ちると resume で同じ iteration を指し直して
-            // 再度追記するため、読む側は pair 番号ごとに後の行を採り、completed_pairs で確定を判定する。
-            if let Some(writer) = game_record_writer.as_mut() {
-                let batch = batch_record_line(&batch_ctx, batch_idx + 1, completed_pairs, &prep)?;
-                writer.append_batch(batch_idx + 1, &batch, &games)?;
-                batch_faults.hit("batch_after_records");
-            }
-
-            // Phase C: 集計と更新。
-            let games_in_batch = (this_batch_pairs * 2) as usize;
-            total_games =
-                total_games.checked_add(games_in_batch).context("total_games overflow")?;
-            completed_pairs = completed_pairs
-                .checked_add(this_batch_pairs)
-                .context("completed_pairs overflow")?;
+        // Phase C: 集計（CPU-light, sequential, seed 順序維持）。
+        for (prep, stats) in preps.iter().zip(run_stats.iter()) {
+            total_games = total_games
+                .checked_add(cli.games_per_iteration as usize)
+                .context("total_games overflow")?;
 
             let raw_result = stats.step_sum;
             let plus_wins = stats.plus_wins;
             let minus_wins = stats.minus_wins;
             let draws = stats.draws;
 
-            // Fishtest 更新: signal_j = R_k_j × c_k_j × result × flip_j。
-            // k 軸は batch 開始時点 (`completed_pairs - this_batch_pairs`) の累積 pair 数を使う。
-            let k_for_update = completed_pairs - this_batch_pairs;
-            let UpdateStats {
-                updated_params,
-                avg_abs_update,
-                max_abs_update,
-            } = apply_spsa_update(
-                &mut params,
-                &prep.flips,
-                &param_schedules,
-                &active_mask,
-                schedule,
-                k_for_update,
-                raw_result,
-            );
-            // stats.csv: v4 仕様 1 batch = 1 行。
-            if let Some(writer) = stats_csv_writer.as_mut() {
-                let row = IterationStats {
-                    iteration: batch_idx + 1,
-                    batch_pairs: this_batch_pairs,
-                    plus_wins,
-                    minus_wins,
-                    draws,
-                    raw_result,
-                    active_params: prep.active_params,
-                    avg_abs_shift: prep.avg_abs_shift,
-                    updated_params,
-                    avg_abs_update,
-                    max_abs_update,
-                    total_games,
-                };
-                write_stats_csv_row(writer, row)?;
-                writer.flush()?;
-            }
-
-            write_params(&state_params, &params)?;
-            if let Some(writer) = param_values_csv_writer.as_mut() {
-                write_param_values_csv_row(writer, batch_idx + 1, &params)?;
-                writer.flush()?;
-            }
-            // state.params 更新 → meta 更新の transactional 復旧用に、書き込み直後の
-            // state.params を hash して meta に焼き込む。
-            let current_params_sha256 = sha256_hex_of_file(&state_params)?;
-            let meta = ResumeMetaData {
-                format_version: META_FORMAT_VERSION,
-                state_params_file: state_params.display().to_string(),
-                completed_iterations: batch_idx + 1,
-                total_games,
-                last_raw_result_mean: raw_result,
-                last_avg_abs_update: avg_abs_update,
-                updated_at_utc: Utc::now().to_rfc3339(),
-                schedule,
-                init_params_sha256: init_snapshot.init_params_sha256.clone(),
-                init_from_sha256: init_snapshot.init_from_sha256.clone(),
-                init_from_path: init_snapshot.init_from_path.clone(),
-                param_name_set_sha256: param_name_set_sha256(&params),
-                active_param_count,
-                engine_path: init_snapshot.engine_path.clone(),
-                engine_param_mapping_path: init_snapshot.engine_param_mapping_path.clone(),
-                engine_param_mapping_sha256: init_snapshot.engine_param_mapping_sha256.clone(),
-                init_mode: init_snapshot.init_mode,
-                current_params_sha256,
-                total_pairs,
-                batch_pairs,
-                completed_pairs,
-                game_records: Some(!cli.no_game_records),
-            };
-            save_meta(&meta_path, &meta)?;
-            eprintln!(
-                "batch={}/{} k_pair={}/{} batch_pairs={} raw_result={:+.3} \
-             avg_abs_update={:.6} max_abs_update={:.6} checkpoint={} meta={}",
-                batch_idx + 1,
-                end_batch,
-                completed_pairs,
-                total_pairs,
-                this_batch_pairs,
-                raw_result,
-                avg_abs_update,
-                max_abs_update,
-                state_params.display(),
-                meta_path.display()
-            );
-
-            if let Some(config) = early_stop_config {
-                // raw_result_variance は v3 で「seed 横断分散」だった。v4 は単一 batch
-                // なので raw_result の絶対値を **batch_pairs で正規化** した値 (= 1 game pair
-                // あたりの平均勝率乖離; 0..2 の範囲) を分散の代理指標として使う。
-                // raw_result == 0 ⇔ +1/-1 が完全に拮抗 ⇔ SPSA 収束のシグナル。
-                // 旧 v3 と完全互換ではないため、閾値設計はユーザ側で再調整が必要 (docs に明記)。
-                let raw_result_variance = early_stop_result_magnitude(raw_result, this_batch_pairs);
-                let early_stop_hit = avg_abs_update <= config.avg_abs_update_threshold
-                    && raw_result_variance <= config.result_variance_threshold;
-                if early_stop_hit {
-                    early_stop_consecutive = early_stop_consecutive.saturating_add(1);
-                } else {
-                    early_stop_consecutive = 0;
+            // Fishtest 更新: signal_j = R_k_j × c_k_j × result × flip_j
+            for (idx, (p, (&flip, sched))) in
+                params.iter().zip(prep.flips.iter().zip(param_schedules.iter())).enumerate()
+            {
+                if !is_param_active(p, active_only_regex.as_ref(), &translator)
+                    || p.c_end.abs() <= f64::EPSILON
+                {
+                    continue;
                 }
-                eprintln!(
-                    "batch={} early_stop_hit={} consecutive={}/{} \
-                 thresholds(avg_abs_update<={:.6}, |raw_result|/batch_pairs[0..2]<={:.6})",
-                    batch_idx + 1,
-                    early_stop_hit,
-                    early_stop_consecutive,
-                    config.patience,
-                    config.avg_abs_update_threshold,
-                    config.result_variance_threshold
+                let (c_k, r_k) = sched.at_iteration(iter, big_a, schedule.alpha, schedule.gamma);
+                update_sums[idx] += r_k * c_k * raw_result * flip;
+            }
+
+            seed_raw_results.push(raw_result);
+            seed_plus_wins.push(plus_wins as f64);
+            seed_minus_wins.push(minus_wins as f64);
+            seed_draws.push(draws as f64);
+
+            seed_rows.push(IterationStats {
+                iteration: iter + 1,
+                seed: prep.base_seed,
+                games: cli.games_per_iteration,
+                plus_wins,
+                minus_wins,
+                draws,
+                raw_result,
+                active_params: prep.active_params,
+                avg_abs_shift: prep.avg_abs_shift,
+                updated_params: 0,
+                avg_abs_update: 0.0,
+                max_abs_update: 0.0,
+                total_games: 0,
+                opp: opponent_mode.then_some(stats.opp),
+            });
+            if opponent_mode {
+                let t = stats.opp;
+                println!(
+                    "iter={} seed={} vs_opp: plus W-L-D {}-{}-{} / minus W-L-D {}-{}-{} / raw_result={:+.1}",
+                    iter + 1,
+                    prep.base_seed,
+                    t.plus_w,
+                    t.plus_l,
+                    t.plus_d,
+                    t.minus_w,
+                    t.minus_l,
+                    t.minus_d,
+                    raw_result
                 );
-                if early_stop_consecutive >= config.patience {
-                    eprintln!(
-                        "early stop triggered at batch={} (consecutive={})",
-                        batch_idx + 1,
-                        early_stop_consecutive
-                    );
-                    break;
-                }
             }
         }
 
-        Ok(())
-    })?;
+        // Seed 平均後にパラメータ更新
+        let mut updated_params = 0usize;
+        let mut abs_update_sum = 0.0f64;
+        let mut max_abs_update = 0.0f64;
+        for (idx, p) in params.iter_mut().enumerate() {
+            if !is_param_active(p, active_only_regex.as_ref(), &translator)
+                || p.c_end.abs() <= f64::EPSILON
+            {
+                continue;
+            }
+            let before = p.value;
+            let avg_signal = update_sums[idx] / seed_values.len() as f64;
+            let updated = clamped_value(p, p.value + avg_signal * cli.mobility);
+            p.value = if p.is_int { updated.round() } else { updated };
+            let abs_update = (p.value - before).abs();
+            updated_params += 1;
+            abs_update_sum += abs_update;
+            if abs_update > max_abs_update {
+                max_abs_update = abs_update;
+            }
+        }
+        let avg_abs_update = if updated_params > 0 {
+            abs_update_sum / updated_params as f64
+        } else {
+            0.0
+        };
+        if let Some(writer) = stats_csv_writer.as_mut() {
+            for row in &mut seed_rows {
+                row.updated_params = updated_params;
+                row.avg_abs_update = avg_abs_update;
+                row.max_abs_update = max_abs_update;
+                row.total_games = total_games;
+                write_stats_csv_row(writer, *row)?;
+            }
+            writer.flush()?;
+        }
 
-    // 正常完了時に <run-dir>/final.params を atomic に書き出す。
-    // state.params は反復ごとに更新され続ける live state なので、外部ツール
-    // (tune.py apply 等) に渡す確定スナップショットとして final.params を別 path で
-    // 提供する。これにより SPSA を裏で続行しつつ確定値の apply を並行実行できる。
-    let final_path = cli.run_dir().join("final.params");
-    write_params(&final_path, &params)?;
-    eprintln!("final params written: {}", final_path.display());
+        let (raw_result_mean, raw_result_variance) = mean_and_variance(&seed_raw_results);
+        let (plus_wins_mean, plus_wins_variance) = mean_and_variance(&seed_plus_wins);
+        let (minus_wins_mean, minus_wins_variance) = mean_and_variance(&seed_minus_wins);
+        let (draws_mean, draws_variance) = mean_and_variance(&seed_draws);
+
+        write_params(&cli.params, &params)?;
+        if let Some(writer) = param_values_csv_writer.as_mut() {
+            write_param_values_csv_row(writer, iter + 1, &params)?;
+            writer.flush()?;
+        }
+        let meta = ResumeMetaData {
+            format_version: META_FORMAT_VERSION,
+            params_file: cli.params.display().to_string(),
+            completed_iterations: iter + 1,
+            total_games,
+            last_raw_result_mean: raw_result_mean,
+            last_avg_abs_update: avg_abs_update,
+            updated_at_utc: Utc::now().to_rfc3339(),
+            schedule,
+        };
+        save_meta(&meta_path, &meta)?;
+        println!(
+            "iter={} seeds={} raw_result_mean={:+.3} raw_result_var={:.6} \
+             avg_abs_update={:.6} max_abs_update={:.6} checkpoint={} meta={}",
+            iter + 1,
+            seed_values.len(),
+            raw_result_mean,
+            raw_result_variance,
+            avg_abs_update,
+            max_abs_update,
+            cli.params.display(),
+            meta_path.display()
+        );
+        if let Some(writer) = stats_aggregate_csv_writer.as_mut() {
+            write_stats_aggregate_csv_row(
+                writer,
+                AggregateIterationStats {
+                    iteration: iter + 1,
+                    seed_count: seed_values.len(),
+                    games_per_seed: cli.games_per_iteration,
+                    raw_result_mean,
+                    raw_result_variance,
+                    plus_wins_mean,
+                    plus_wins_variance,
+                    minus_wins_mean,
+                    minus_wins_variance,
+                    draws_mean,
+                    draws_variance,
+                    total_games,
+                },
+            )?;
+            writer.flush()?;
+        }
+
+        if let Some(config) = early_stop_config {
+            let early_stop_hit = avg_abs_update <= config.avg_abs_update_threshold
+                && raw_result_variance <= config.result_variance_threshold;
+            if early_stop_hit {
+                early_stop_consecutive = early_stop_consecutive.saturating_add(1);
+            } else {
+                early_stop_consecutive = 0;
+            }
+            println!(
+                "iter={} early_stop_hit={} consecutive={}/{} thresholds(avg_abs_update<={:.6}, result_variance<={:.6})",
+                iter + 1,
+                early_stop_hit,
+                early_stop_consecutive,
+                config.patience,
+                config.avg_abs_update_threshold,
+                config.result_variance_threshold
+            );
+            if early_stop_consecutive >= config.patience {
+                println!(
+                    "early stop triggered at iter={} (consecutive={})",
+                    iter + 1,
+                    early_stop_consecutive
+                );
+                break;
+            }
+        }
+    }
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn cpu_affinity_default_matches_platform() {
-        #[cfg(target_os = "linux")]
-        assert_eq!(super::default_cpu_affinity_mode(), super::CpuAffinityMode::Numa);
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(super::default_cpu_affinity_mode(), super::CpuAffinityMode::Off);
-    }
-
-    #[test]
-    fn duplicate_parameter_rows_and_translated_aliases_are_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("input.params");
-        for (first, second) in [
-            ("SPSA_X", "SPSA_X"),
-            ("SPSA_NET_ft_b_1", "SPSA_NET_ft_b_01"),
-        ] {
-            std::fs::write(&path, format!("{SPSA_PARAMS_FORMAT_HEADER}\n{first},int,1,0,10,1,0.002\n\n{second},int,2,0,10,1,0.002 [[NOT USED]]\n")).unwrap();
-            let error = read_params(&path, false).unwrap_err().to_string();
-            assert!(error.contains("line 4") && error.contains("line 2"), "{error}");
-        }
-        std::fs::write(
-            &path,
-            "# spsa-format: c-end-r-end-v1\nSPSA_A,int,1,0,10,1,0.002\nSPSA_B,int,2,0,10,1,0.002\n",
-        )
-        .unwrap();
-        assert_eq!(read_params(&path, false).unwrap().len(), 2);
-        let translator = EngineNameTranslator {
-            table: HashMap::from([
-                ("SPSA_A".into(), ("SPSA_NET_ft_b_1".into(), false)),
-                ("SPSA_B".into(), ("SPSA_NET_ft_b_01".into(), true)),
-            ]),
-            enabled: true,
-        };
-        let error =
-            format!("{:#}", read_params_with_translator(&path, &translator, false).unwrap_err());
-        assert!(
-            error.contains("translated parameter SPSA_B")
-                && error.contains("line 3")
-                && error.contains("line 2"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn schedule_bounds_reject_overflow_and_underflow_without_changing_normal_math() {
-        let schedule = ScheduleConfig {
-            alpha: 1.0,
-            gamma: 1.0,
-            a_ratio: 0.25,
-            mobility: 1.0,
-            total_iterations: 4,
-        };
-        let mut p = make_param("X", 10.0, 2.0);
-        p.r_end = 0.5;
-        let build = |s: ScheduleConfig, p: &SpsaParam| {
-            ParamScheduleConstants::compute(
-                p.c_end,
-                p.r_end,
-                s.total_iterations,
-                s.a_ratio,
-                s.alpha,
-                s.gamma,
-            )
-        };
-        let c = build(schedule, &p);
-        validate_schedule_bounds(schedule, &[p.clone()], &[true], &[c], 2).unwrap();
-        assert_eq!((c.c_0, c.a_0), (8.0, 10.0));
-        assert_eq!(c.at_iteration(0, 1.0, 1.0, 1.0), (8.0, 0.078125));
-        assert_eq!(c.at_iteration(3, 1.0, 1.0, 1.0), (2.0, 0.5));
-        for bad in [
-            ScheduleConfig {
-                alpha: 1e308,
-                ..schedule
-            },
-            ScheduleConfig {
-                gamma: 1e308,
-                ..schedule
-            },
-            ScheduleConfig {
-                a_ratio: 1e308,
-                ..schedule
-            },
-            ScheduleConfig {
-                mobility: 1e308,
-                ..schedule
-            },
-        ] {
-            assert!(
-                validate_schedule_bounds(bad, &[p.clone()], &[true], &[build(bad, &p)], 2).is_err()
-            );
-        }
-        p.c_end = 1e-200;
-        assert!(
-            validate_schedule_bounds(schedule, &[p.clone()], &[true], &[build(schedule, &p)], 2)
-                .is_err()
-        );
-        p.c_end = 0.0;
-        validate_schedule_bounds(schedule, &[p.clone()], &[true], &[build(schedule, &p)], 2)
-            .unwrap();
-        let normal = ScheduleConfig {
-            alpha: 0.602,
-            gamma: 0.101,
-            a_ratio: 0.1,
-            mobility: 1.0,
-            total_iterations: u32::MAX,
-        };
-        p.c_end = 2.0;
-        validate_schedule_bounds(normal, &[p.clone()], &[true], &[build(normal, &p)], 8).unwrap();
-    }
-
-    #[test]
-    fn early_stop_magnitude_keeps_zero_to_two_threshold_units() {
-        assert_eq!(early_stop_result_magnitude(2.0, 1), 2.0);
-        assert_eq!(early_stop_result_magnitude(-2.0, 1), 2.0);
-        assert_eq!(early_stop_result_magnitude(0.0, 1), 0.0);
-        assert_eq!(early_stop_result_magnitude(1.0, 1), 1.0);
-        assert_eq!(early_stop_result_magnitude(0.0, 0), 0.0);
-    }
-
     use super::*;
-
-    #[test]
-    fn worker_cancel_guard_notifies_before_resource_drop_on_panic_and_error() {
-        struct Resource<'a>(&'a AtomicBool, &'a AtomicBool);
-        impl Drop for Resource<'_> {
-            fn drop(&mut self) {
-                self.1.store(self.0.load(Ordering::Acquire), Ordering::Release);
-            }
-        }
-        for panic in [false, true] {
-            let cancel = AtomicBool::new(false);
-            let observed = AtomicBool::new(false);
-            let result = std::panic::catch_unwind(|| -> anyhow::Result<()> {
-                let resource = Resource(&cancel, &observed);
-                let guard = WorkerCancelGuard {
-                    cancel: &cancel,
-                    armed: true,
-                };
-                if panic {
-                    panic!("worker panic test");
-                }
-                // Err による unwind でも宣言の逆順で guard が先に drop される。
-                let error: anyhow::Result<()> = Err(anyhow::anyhow!("fatal error"));
-                error?;
-                drop(guard);
-                drop(resource);
-                Ok(())
-            });
-            assert!(cancel.load(Ordering::Acquire));
-            assert!(observed.load(Ordering::Acquire));
-            if panic {
-                assert!(result.is_err());
-            } else {
-                assert!(result.unwrap().is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn worker_cancel_guard_disarms_on_success() {
-        let cancel = AtomicBool::new(false);
-        let mut guard = WorkerCancelGuard {
-            cancel: &cancel,
-            armed: true,
-        };
-        guard.armed = false;
-        drop(guard);
-        assert!(!cancel.load(Ordering::Acquire));
-    }
-
-    // ========================================================================
-    // decide_init_action: 16 通り (4 boolean 入力) を網羅
-    // ========================================================================
-
-    fn decide(init: bool, exists: bool, resume: bool, force: bool) -> InitAction {
-        decide_init_action(init, exists, resume, force, false)
-    }
-
-    fn decide_with_use_existing(
-        init: bool,
-        exists: bool,
-        resume: bool,
-        force: bool,
-        use_existing: bool,
-    ) -> InitAction {
-        decide_init_action(init, exists, resume, force, use_existing)
-    }
-
-    #[test]
-    fn decide_resume_force_init_conflict() {
-        for init in [false, true] {
-            for exists in [false, true] {
-                let action = decide(init, exists, true, true);
-                assert!(
-                    matches!(action, InitAction::Bail(InitError::ResumeForceInitConflict)),
-                    "init={init} exists={exists} resume=force=true → ResumeForceInitConflict, got {action:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn decide_force_init_requires_init_from() {
-        // force_init=true && has_init_from=false (resume=false 限定)
-        for exists in [false, true] {
-            let action = decide(false, exists, false, true);
-            assert!(
-                matches!(action, InitAction::Bail(InitError::ForceInitRequiresInitFrom)),
-                "init=false exists={exists} force=true → ForceInitRequiresInitFrom, got {action:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn decide_resume_requires_existing_params() {
-        // resume=true && exists=false && force=false
-        for init in [false, true] {
-            let action = decide(init, false, true, false);
-            assert!(
-                matches!(action, InitAction::Bail(InitError::ResumeRequiresExistingParams)),
-                "init={init} exists=false resume=true → ResumeRequiresExistingParams, got {action:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn decide_resume_with_existing_params() {
-        // init=false → verify_init=false
-        let action = decide(false, true, true, false);
-        assert_eq!(action, InitAction::Resume { verify_init: false });
-        // init=true → verify_init=true
-        let action = decide(true, true, true, false);
-        assert_eq!(action, InitAction::Resume { verify_init: true });
-    }
-
-    #[test]
-    fn decide_force_init_overwrite_happy_path() {
-        let action = decide(true, true, false, true);
-        assert_eq!(action, InitAction::ForceInitOverwrite);
-    }
-
-    #[test]
-    fn decide_force_init_requires_existing_params() {
-        let action = decide(true, false, false, true);
-        assert!(matches!(action, InitAction::Bail(InitError::ForceInitRequiresExistingParams)));
-    }
-
-    #[test]
-    fn decide_copy_init_from_fresh() {
-        let action = decide(true, false, false, false);
-        assert_eq!(action, InitAction::CopyInitFromFresh);
-    }
-
-    #[test]
-    fn decide_init_from_exists_requires_flag() {
-        // --init-from の暗黙スキップを bail する本命ケース
-        let action = decide(true, true, false, false);
-        assert!(matches!(action, InitAction::Bail(InitError::InitFromExistsRequiresFlag)));
-    }
-
-    #[test]
-    fn decide_use_existing_requires_flag() {
-        // 旧版の silent fresh start を bail する。
-        // 既存 state + フラグ指定なし → UseExistingRequiresFlag bail
-        let action = decide(false, true, false, false);
-        assert!(
-            matches!(action, InitAction::Bail(InitError::UseExistingRequiresFlag)),
-            "got {action:?}"
-        );
-    }
-
-    #[test]
-    fn decide_use_existing_state_as_init_happy_path() {
-        // 既存 state + --use-existing-state-as-init のみ指定 → UseExistingFresh
-        let action = decide_with_use_existing(false, true, false, false, true);
-        assert_eq!(action, InitAction::UseExistingFresh);
-    }
-
-    #[test]
-    fn decide_use_existing_state_as_init_without_state_bails() {
-        // state 不在で --use-existing-state-as-init を指定 → 意味がないため bail
-        let action = decide_with_use_existing(false, false, false, false, true);
-        assert!(
-            matches!(action, InitAction::Bail(InitError::NoInitNorExistingParams)),
-            "got {action:?}"
-        );
-    }
-
-    #[test]
-    fn decide_use_existing_state_as_init_conflicts_with_other_flags() {
-        // --use-existing-state-as-init は他の意思表示フラグと排他。
-        // 他フラグ間の矛盾 (e.g. force=true && !init → ForceInitRequiresInitFrom)
-        // が先に発火するケースもあるので、ここでは「何らかの Bail に落ちること」のみ assert。
-        for (init, resume, force) in [
-            (true, false, false), // init + use_existing
-            (false, true, false), // resume + use_existing
-            (false, false, true), // force + use_existing (force は init 必須で別 Bail)
-            (true, true, false),  // init + resume + use_existing
-            (true, false, true),  // init + force + use_existing
-        ] {
-            let action = decide_with_use_existing(init, true, resume, force, true);
-            assert!(
-                matches!(action, InitAction::Bail(_)),
-                "init={init} resume={resume} force={force}: 期待は Bail、got {action:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn decide_no_init_nor_existing_params() {
-        let action = decide(false, false, false, false);
-        assert!(matches!(action, InitAction::Bail(InitError::NoInitNorExistingParams)));
-    }
-
-    // ========================================================================
-    // hash ヘルパ: 決定性 / 順序非依存
-    // ========================================================================
-
-    fn make_param_for_hash(name: &str) -> SpsaParam {
-        SpsaParam {
-            name: name.to_string(),
-            type_name: "int".into(),
-            is_int: true,
-            value: 0.0,
-            min: 0.0,
-            max: 1.0,
-            c_end: 1.0,
-            r_end: 0.002,
-            comment: String::new(),
-            not_used: false,
-        }
-    }
-
-    #[test]
-    fn param_name_set_sha256_is_order_independent() {
-        let a = vec![
-            make_param_for_hash("foo"),
-            make_param_for_hash("bar"),
-            make_param_for_hash("baz"),
-        ];
-        let b = vec![
-            make_param_for_hash("baz"),
-            make_param_for_hash("foo"),
-            make_param_for_hash("bar"),
-        ];
-        assert_eq!(param_name_set_sha256(&a), param_name_set_sha256(&b));
-    }
-
-    #[test]
-    fn param_name_set_sha256_distinguishes_different_sets() {
-        let a = vec![make_param_for_hash("foo"), make_param_for_hash("bar")];
-        let b = vec![make_param_for_hash("foo"), make_param_for_hash("BAR")];
-        assert_ne!(param_name_set_sha256(&a), param_name_set_sha256(&b));
-    }
-
-    #[test]
-    fn sha256_hex_of_file_matches_known_vector() {
-        // 空ファイルの SHA-256 は既知の固定値
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("empty");
-        std::fs::write(&p, b"").unwrap();
-        let hex = sha256_hex_of_file(&p).unwrap();
-        assert_eq!(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-    }
-
-    // ========================================================================
-    // verify_init_matches_existing: 整合性検証ロジック
-    // ========================================================================
-
-    fn write_params_file(path: &Path, lines: &[&str]) {
-        std::fs::write(path, format!("{SPSA_PARAMS_FORMAT_HEADER}\n{}\n", lines.join("\n")))
-            .unwrap();
-    }
-
-    #[test]
-    fn verify_median_with_even_count_uses_average_of_middle_pair() {
-        // 4 件 (偶数) で diff が step 単位で {0, 2, 4, 6} になるよう構築。
-        // 厳密中央値 = (2 + 4) / 2 = 3.0σ (旧実装 `[n/2]` だと上側中値 4.0σ になる)。
-        let dir = tempfile::tempdir().unwrap();
-        let init = dir.path().join("init.params");
-        let existing = dir.path().join("existing.params");
-        // step=10 で diff が 0/20/40/60 → step 単位 {0, 2, 4, 6}
-        write_params_file(
-            &init,
-            &[
-                "p0,int,100,0,1000,10,0.002",
-                "p1,int,100,0,1000,10,0.002",
-                "p2,int,100,0,1000,10,0.002",
-                "p3,int,100,0,1000,10,0.002",
-            ],
-        );
-        write_params_file(
-            &existing,
-            &[
-                "p0,int,100,0,1000,10,0.002",
-                "p1,int,120,0,1000,10,0.002",
-                "p2,int,140,0,1000,10,0.002",
-                "p3,int,160,0,1000,10,0.002",
-            ],
-        );
-        let report = verify_init_matches_existing(&init, &existing, false).unwrap();
-        assert_eq!(report.total, 4);
-        assert!(
-            (report.median_step_units - 3.0).abs() < 1e-9,
-            "median should be 3.0σ (average of 2 and 4), got {}",
-            report.median_step_units
-        );
-    }
-
-    #[test]
-    fn verify_reports_perfect_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let init = dir.path().join("init.params");
-        let existing = dir.path().join("existing.params");
-        let line = "foo,int,100,0,1000,50,0.002";
-        write_params_file(&init, &[line]);
-        write_params_file(&existing, &[line]);
-        let report = verify_init_matches_existing(&init, &existing, false).unwrap();
-        assert_eq!(report.total, 1);
-        assert_eq!(report.matched_within_half_step, 1);
-        assert!((report.median_step_units - 0.0).abs() < 1e-9);
-        assert!((report.max_step_units - 0.0).abs() < 1e-9);
-        assert!(!report.exceeds_strict_threshold());
-        assert!(!report.has_name_set_mismatch());
-    }
-
-    #[test]
-    fn verify_reports_strict_threshold_exceeded() {
-        let dir = tempfile::tempdir().unwrap();
-        let init = dir.path().join("init.params");
-        let existing = dir.path().join("existing.params");
-        // step=50 で diff=300 → 6σ (>5σ)
-        write_params_file(&init, &["foo,int,100,0,1000,50,0.002"]);
-        write_params_file(&existing, &["foo,int,400,0,1000,50,0.002"]);
-        let report = verify_init_matches_existing(&init, &existing, false).unwrap();
-        assert_eq!(report.total, 1);
-        assert!(report.max_step_units >= 5.0);
-        assert!(report.exceeds_strict_threshold());
-    }
-
-    #[test]
-    fn verify_uses_actual_c_end_for_step_when_below_one() {
-        // c_end=0.1 のパラメータで diff=1 → 10σ。
-        // 旧実装の `c_end.max(1.0)` だと step=1 と扱われ 1σ になり strict が誤って通る。
-        let dir = tempfile::tempdir().unwrap();
-        let init = dir.path().join("init.params");
-        let existing = dir.path().join("existing.params");
-        write_params_file(&init, &["foo,int,1,0,10,0.1,0.002"]);
-        write_params_file(&existing, &["foo,int,2,0,10,0.1,0.002"]);
-        let report = verify_init_matches_existing(&init, &existing, false).unwrap();
-        // diff=1, step=0.1 → 10σ
-        assert!(
-            report.max_step_units > 5.0,
-            "c_end < 1 should not be inflated to 1; got max={}σ",
-            report.max_step_units
-        );
-        assert!(report.exceeds_strict_threshold());
-    }
-
-    #[test]
-    fn verify_handles_zero_c_end_gracefully() {
-        // c_end=0 は防御的に step=1 にフォールバック (NaN/inf を出さない)。
-        let dir = tempfile::tempdir().unwrap();
-        let init = dir.path().join("init.params");
-        let existing = dir.path().join("existing.params");
-        write_params_file(&init, &["foo,int,5,0,10,0,0.002"]);
-        write_params_file(&existing, &["foo,int,5,0,10,0,0.002"]);
-        let report = verify_init_matches_existing(&init, &existing, false).unwrap();
-        assert!(!report.max_step_units.is_nan());
-        assert_eq!(report.matched_within_half_step, 1);
-    }
-
-    #[test]
-    fn verify_detects_name_set_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let init = dir.path().join("init.params");
-        let existing = dir.path().join("existing.params");
-        write_params_file(&init, &["foo,int,100,0,1000,50,0.002", "bar,int,200,0,1000,50,0.002"]);
-        write_params_file(
-            &existing,
-            &["foo,int,100,0,1000,50,0.002", "qux,int,200,0,1000,50,0.002"],
-        );
-        let report = verify_init_matches_existing(&init, &existing, false).unwrap();
-        assert!(report.has_name_set_mismatch());
-        assert_eq!(report.extra_in_init, vec!["bar"]);
-        assert_eq!(report.missing_in_init, vec!["qux"]);
-    }
-
-    // ========================================================================
-    // atomic_copy_file / save_meta: I/O ヘルパ
-    // ========================================================================
-
-    #[test]
-    fn atomic_copy_file_replaces_destination() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        let dst = dir.path().join("dst");
-        std::fs::write(&src, b"hello").unwrap();
-        std::fs::write(&dst, b"old content").unwrap();
-        atomic_copy_file(&src, &dst).unwrap();
-        assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
-    }
-
-    #[test]
-    fn write_params_replaces_existing_file_atomically() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.params");
-        // 古い内容を残して、tempfile + persist で完全置換されることを確認
-        std::fs::write(&path, b"STALE,STALE,STALE\n").unwrap();
-        let params = vec![SpsaParam {
-            name: "Foo".into(),
-            type_name: "int".into(),
-            is_int: true,
-            value: 42.0,
-            min: 0.0,
-            max: 100.0,
-            c_end: 1.0,
-            r_end: 0.001,
-            comment: String::new(),
-            not_used: false,
-        }];
-        write_params(&path, &params).unwrap();
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            body.starts_with(&format!("{SPSA_PARAMS_FORMAT_HEADER}\nFoo,int,42.000000,")),
-            "actual: {body}"
-        );
-        // ラウンドトリップ (parse は f64 なので "42" / "42.000000" のどちらでも復元可能)
-        let reloaded = read_params(&path, false).unwrap();
-        assert_eq!(reloaded.len(), 1);
-        assert_eq!(reloaded[0].name, "Foo");
-        assert_eq!(reloaded[0].value, 42.0);
-        // 一時ファイルが残っていないこと
-        for entry in std::fs::read_dir(dir.path()).unwrap() {
-            let name = entry.unwrap().file_name();
-            let s = name.to_string_lossy();
-            assert!(!s.starts_with(".spsa_state_"), "tempfile leaked: {s}");
-        }
-    }
-
-    #[test]
-    fn write_params_round_trips_not_used_and_comments() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.params");
-        let params = vec![
-            SpsaParam {
-                name: "CommentNotUsed".into(),
-                type_name: "int".into(),
-                is_int: true,
-                value: 1.0,
-                min: 0.0,
-                max: 10.0,
-                c_end: 1.0,
-                r_end: 0.002,
-                comment: "base=1".into(),
-                not_used: true,
-            },
-            SpsaParam {
-                name: "NoCommentNotUsed".into(),
-                type_name: "int".into(),
-                is_int: true,
-                value: 2.0,
-                min: 0.0,
-                max: 10.0,
-                c_end: 1.0,
-                r_end: 0.002,
-                comment: String::new(),
-                not_used: true,
-            },
-            SpsaParam {
-                name: "CommentUsed".into(),
-                type_name: "int".into(),
-                is_int: true,
-                value: 3.0,
-                min: 0.0,
-                max: 10.0,
-                c_end: 1.0,
-                r_end: 0.002,
-                comment: "base=3".into(),
-                not_used: false,
-            },
-        ];
-
-        write_params(&path, &params).unwrap();
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            body,
-            "# spsa-format: c-end-r-end-v1\n\
-             CommentNotUsed,int,1.000000,0,10,1,0.002 [[NOT USED]] //base=1\n\
-             NoCommentNotUsed,int,2.000000,0,10,1,0.002 [[NOT USED]]\n\
-             CommentUsed,int,3.000000,0,10,1,0.002 //base=3\n"
-        );
-
-        let reloaded = read_params(&path, false).unwrap();
-        assert_eq!(reloaded.len(), 3);
-        assert_eq!(reloaded[0].name, "CommentNotUsed");
-        assert!(reloaded[0].not_used);
-        assert_eq!(reloaded[0].comment, "base=1");
-        assert_eq!(reloaded[1].name, "NoCommentNotUsed");
-        assert!(reloaded[1].not_used);
-        assert!(reloaded[1].comment.is_empty());
-        assert_eq!(reloaded[2].name, "CommentUsed");
-        assert!(!reloaded[2].not_used);
-        assert_eq!(reloaded[2].comment, "base=3");
-    }
-
-    #[test]
-    fn atomic_copy_file_creates_parent_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        let dst = dir.path().join("nested/sub/dst");
-        std::fs::write(&src, b"data").unwrap();
-        atomic_copy_file(&src, &dst).unwrap();
-        assert_eq!(std::fs::read(&dst).unwrap(), b"data");
-    }
-
-    // ========================================================================
-    // RunDirLock: 排他制御
-    // ========================================================================
-
-    #[test]
-    fn run_dir_lock_prevents_double_acquire() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock1 = RunDirLock::acquire(dir.path(), false).unwrap();
-        let err = RunDirLock::acquire(dir.path(), false).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("他プロセスが run-dir を使用中"), "actual: {msg}");
-        // 中身に PID が記録されていること
-        let body = std::fs::read_to_string(dir.path().join(".lock")).unwrap();
-        assert!(body.contains("\"pid\""), "lock body: {body}");
-        drop(lock1);
-        // drop 後は再取得可能
-        let _lock2 = RunDirLock::acquire(dir.path(), false).unwrap();
-    }
-
-    #[test]
-    fn run_dir_lock_force_unlock_removes_stale() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".lock"), "stale").unwrap();
-        // force_unlock なしでは衝突
-        assert!(RunDirLock::acquire(dir.path(), false).is_err());
-        // force_unlock 指定で取得成功
-        let _lock = RunDirLock::acquire(dir.path(), true).unwrap();
-    }
-
-    #[test]
-    fn run_dir_lock_drop_cleans_up_file() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let _lock = RunDirLock::acquire(dir.path(), false).unwrap();
-            assert!(dir.path().join(".lock").exists());
-        }
-        assert!(!dir.path().join(".lock").exists());
-    }
-
-    #[test]
-    fn run_dir_lock_drop_does_not_remove_others_lock() {
-        // race scenario: 別プロセスに --force-unlock で lock を奪われ別 lock に
-        // 置き換わった状況で、自分の Drop が他者の lock を誤って削除しないこと。
-        let dir = tempfile::tempdir().unwrap();
-        let lock = RunDirLock::acquire(dir.path(), false).unwrap();
-        // 他者が .lock を別内容で上書き済み (force-unlock 後の reacquire を模擬)
-        std::fs::write(dir.path().join(".lock"), "other process took over").unwrap();
-        drop(lock);
-        // 内容不一致なので自分の Drop は削除を控える
-        let body = std::fs::read_to_string(dir.path().join(".lock")).unwrap();
-        assert_eq!(body, "other process took over");
-    }
-
-    #[test]
-    fn non_bail_action_from_bail_returns_none() {
-        assert!(
-            NonBailAction::from_init_action(&InitAction::Bail(InitError::NoInitNorExistingParams))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn apply_force_init_overwrites_params_and_removes_meta() {
-        // 順序バグ (params copy → meta 削除) の再発検知用 file-level テスト。
-        let dir = tempfile::tempdir().unwrap();
-        let canonical = dir.path().join("canonical.params");
-        let target_params = dir.path().join("existing.params");
-        let target_meta = dir.path().join("existing.params.meta.json");
-        let stale_csv = dir.path().join("existing.params.values.csv");
-
-        std::fs::write(&canonical, b"foo,int,100,0,1000,50,0.002\n").unwrap();
-        std::fs::write(&target_params, b"foo,int,999,0,1000,50,0.002\n").unwrap();
-        std::fs::write(&target_meta, b"{\"old\":\"meta\"}").unwrap();
-        std::fs::write(&stale_csv, b"old,csv,content").unwrap();
-
-        let action = InitAction::ForceInitOverwrite;
-        let stale_csvs: &[&Path] = &[stale_csv.as_path()];
-        let result = apply_init_action(
-            &action,
-            Some(canonical.as_path()),
-            &target_params,
-            &target_meta,
-            stale_csvs,
-        )
-        .unwrap();
-        assert_eq!(result, NonBailAction::ForceInitOverwrite);
-
-        // params は canonical で上書きされている
-        assert_eq!(std::fs::read(&target_params).unwrap(), b"foo,int,100,0,1000,50,0.002\n");
-        // meta は削除されている (順序的に必ず消える)
-        assert!(!target_meta.exists(), "meta should be removed by force-init");
-        // stale CSV も削除されている (best-effort)
-        assert!(!stale_csv.exists(), "stale CSV should be removed");
-    }
-
-    #[test]
-    fn apply_force_init_bails_on_meta_remove_failure() {
-        // meta が削除できない (= dir として存在) 場合に bail することを確認。
-        // params は上書きされない (順序保証: meta 削除失敗 → そこで return)。
-        let dir = tempfile::tempdir().unwrap();
-        let canonical = dir.path().join("canonical.params");
-        let target_params = dir.path().join("existing.params");
-        // meta_path に「ディレクトリ」を置くと remove_file が失敗する
-        let blocked_meta_dir = dir.path().join("existing.params.meta.json");
-        std::fs::create_dir(&blocked_meta_dir).unwrap();
-
-        std::fs::write(&canonical, b"new content\n").unwrap();
-        std::fs::write(&target_params, b"old content\n").unwrap();
-
-        let action = InitAction::ForceInitOverwrite;
-        let result = apply_init_action(
-            &action,
-            Some(canonical.as_path()),
-            &target_params,
-            &blocked_meta_dir,
-            &[],
-        );
-        assert!(result.is_err(), "should bail when meta removal fails");
-        // params は触られていない (atomic copy が走らない)
-        assert_eq!(std::fs::read(&target_params).unwrap(), b"old content\n");
-    }
-
-    #[test]
-    fn non_bail_action_launch_label_covers_all_variants() {
-        // launch_label と init_mode の対応関係:
-        //   - fresh 系 (CopyInitFromFresh / UseExistingFresh / ForceInitOverwrite) は
-        //     launch_label と init_mode の文字列が同値 (run の出自 = 今回の起動)
-        //   - Resume では launch_label="resume" / init_mode は元 run の出自を保持
-        assert_eq!(NonBailAction::CopyInitFromFresh.launch_label(), "fresh-init-from");
-        assert_eq!(NonBailAction::UseExistingFresh.launch_label(), "fresh-existing");
-        assert_eq!(NonBailAction::ForceInitOverwrite.launch_label(), "force-init");
-        assert_eq!(NonBailAction::Resume { verify_init: false }.launch_label(), "resume");
-        assert_eq!(NonBailAction::Resume { verify_init: true }.launch_label(), "resume");
-
-        // fresh 系では launch_label と init_mode (kebab-case Display) が一致する
-        for action in [
-            NonBailAction::CopyInitFromFresh,
-            NonBailAction::UseExistingFresh,
-            NonBailAction::ForceInitOverwrite,
-        ] {
-            assert_eq!(action.launch_label(), format!("{}", action.init_mode()));
-        }
-    }
-
-    #[test]
-    fn init_mode_display_matches_serde_kebab_case() {
-        // Display と serde 表現を一致させる契約 (startup summary の表記と
-        // meta.json の値が同じ文字列で見えることを担保)
-        assert_eq!(format!("{}", InitMode::FreshInitFrom), "fresh-init-from");
-        assert_eq!(format!("{}", InitMode::FreshExisting), "fresh-existing");
-        assert_eq!(format!("{}", InitMode::ForceInit), "force-init");
-        assert_eq!(format!("{}", InitMode::Resume), "resume");
-
-        // serde で round-trip して同じ文字列で出ることも確認
-        let json = serde_json::to_string(&InitMode::FreshInitFrom).unwrap();
-        assert_eq!(json, "\"fresh-init-from\"");
-    }
-
-    #[test]
-    fn run_dir_path_helpers_use_consistent_layout() {
-        let dir = Path::new("/tmp/some_run");
-        assert_eq!(state_params_path(dir), dir.join("state.params"));
-        assert_eq!(default_meta_path(dir), dir.join("meta.json"));
-        assert_eq!(default_param_values_csv_path(dir), dir.join("values.csv"));
-        assert_eq!(default_stats_csv_path(dir), dir.join("stats.csv"));
-    }
-
-    #[test]
-    fn default_force_init_cleanup_paths_returns_run_dir_only() {
-        // override 先 (--stats-csv で run-dir 外を指定する等) が混入しないことを担保。
-        // force-init 時の削除対象は run-dir 直下の派生 CSV + final.params のみで、
-        // state.params / meta.json は apply_init_action 側で別管理。
-        // v4: stats_aggregate.csv は撤去 (multi-seed 機能と共に削除)。
-        let dir = Path::new("/tmp/some_run");
-        let paths = default_force_init_cleanup_paths(dir);
-        assert_eq!(paths.len(), 3, "exactly 3 derived files (2 CSV + final.params)");
-        assert!(paths.contains(&dir.join("values.csv")));
-        assert!(paths.contains(&dir.join("stats.csv")));
-        assert!(paths.contains(&dir.join("final.params")));
-        // state.params と meta.json は含めない (apply_init_action が個別管理)
-        assert!(!paths.contains(&dir.join("state.params")));
-        assert!(!paths.contains(&dir.join("meta.json")));
-    }
-
-    #[test]
-    fn remove_stale_final_params_for_fresh_start_handles_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        // 不在ファイルでも Ok を返すこと (idempotent)
-        remove_stale_final_params_for_fresh_start(dir.path()).unwrap();
-        // 存在するファイルは消えること
-        let final_path = dir.path().join("final.params");
-        std::fs::write(&final_path, b"stale").unwrap();
-        assert!(final_path.exists());
-        remove_stale_final_params_for_fresh_start(dir.path()).unwrap();
-        assert!(!final_path.exists());
-    }
-
-    /// v3 silent migrate 経路で旧 stats.csv / stats_aggregate.csv が
-    /// `<name>.v3.csv` に退避されること、values.csv は触られないこと、
-    /// 不在ファイルがあっても error にならないことを確認。
-    #[test]
-    fn rotate_v3_csv_files_preserves_legacy_and_skips_others() {
-        let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path();
-        assert!(rotate_v3_csv_files_for_silent_migrate(run_dir).unwrap().is_empty());
-        std::fs::write(run_dir.join("stats.csv"), b"iteration,seed,games,...\n1,1,2,...\n")
-            .unwrap();
-        std::fs::write(run_dir.join("stats_aggregate.csv"), b"iteration,seeds,...\n1,1,...\n")
-            .unwrap();
-        let values_body = b"iteration,Search_a\n0,1000\n1,1010\n";
-        std::fs::write(run_dir.join("values.csv"), values_body).unwrap();
-
-        let rotated = rotate_v3_csv_files_for_silent_migrate(run_dir).unwrap();
-
-        // 旧 stats.csv / stats_aggregate.csv は消え、退避先が存在
-        assert!(!run_dir.join("stats.csv").exists(), "旧 stats.csv は退避されるべき");
-        assert!(
-            !run_dir.join("stats_aggregate.csv").exists(),
-            "旧 stats_aggregate.csv は退避されるべき"
-        );
-        assert!(run_dir.join("stats.v3.csv").exists());
-        assert!(run_dir.join("stats_aggregate.v3.csv").exists());
-        assert_eq!(rotated.len(), 2);
-
-        // values.csv は触られないこと (param 名ベースのワイド形式は append 互換)
-        let values_after = std::fs::read(run_dir.join("values.csv")).unwrap();
-        assert_eq!(values_after, values_body, "values.csv は退避対象ではない");
-
-        // 旧 stats.csv の中身が `.v3.csv` に保持されていること
-        let v3_body = std::fs::read_to_string(run_dir.join("stats.v3.csv")).unwrap();
-        assert!(v3_body.starts_with("iteration,seed,games,"));
-    }
-
-    /// `<name>.v3.csv` が既に存在する場合は `<name>.v3.1.csv` 等で衝突回避すること。
-    /// 過去に migrate を走らせた run dir に再度 silent migrate が掛かる事故ケース。
-    #[test]
-    fn rotate_v3_csv_files_avoids_overwriting_existing_backup() {
-        let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path();
-        std::fs::write(run_dir.join("stats.csv"), b"new-v3-content").unwrap();
-        // 既存の退避先を意図的に作る (過去 migrate の残骸を模擬)
-        std::fs::write(run_dir.join("stats.v3.csv"), b"earlier-v3-backup").unwrap();
-
-        let rotated = rotate_v3_csv_files_for_silent_migrate(run_dir).unwrap();
-
-        // 既存退避先は触られず、新規は連番で保存される
-        assert_eq!(std::fs::read(run_dir.join("stats.v3.csv")).unwrap(), b"earlier-v3-backup");
-        assert!(run_dir.join("stats.v3.1.csv").exists(), "連番退避先が作られるべき");
-        assert_eq!(std::fs::read(run_dir.join("stats.v3.1.csv")).unwrap(), b"new-v3-content");
-        assert_eq!(rotated.len(), 1);
-    }
-
-    /// `pick_v3_backup_path` は副作用を持たず、衝突がなければ `<stem>.v3.<ext>` を返す。
-    #[test]
-    fn pick_v3_backup_path_returns_canonical_when_no_conflict() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("stats.csv");
-        let backup = pick_v3_backup_path(&src);
-        assert_eq!(backup, dir.path().join("stats.v3.csv"));
-    }
-
-    /// 推定 batch_pairs == CLI 指定値: warning も bail もなく Ok。
-    #[test]
-    fn check_v3_batch_pairs_consistency_passes_when_estimate_matches() {
-        // total_games=64, completed_iterations=4 → games_per_iter=16 → batch_pairs=8。
-        let res = check_v3_batch_pairs_consistency(4, 64, 8, false);
-        assert!(res.is_ok());
-    }
-
-    /// 推定 batch_pairs ≠ CLI、force_schedule=false: bail する。
-    #[test]
-    fn check_v3_batch_pairs_consistency_bails_on_mismatch_without_force() {
-        // 推定 batch_pairs = 8 だが CLI は 16 を渡す。
-        let res = check_v3_batch_pairs_consistency(4, 64, 16, false);
-        let err = res.expect_err("不一致では bail するはず");
-        let msg = format!("{err}");
-        assert!(msg.contains("推定 batch_pairs"), "推定値の表示が必要: {msg}");
-        assert!(msg.contains("--batch-pairs"), "CLI 値の説明が必要: {msg}");
-        assert!(msg.contains("--force-schedule"), "force-schedule 案内が必要: {msg}");
-    }
-
-    /// 推定 batch_pairs ≠ CLI、force_schedule=true: warning + 続行 (Ok)。
-    #[test]
-    fn check_v3_batch_pairs_consistency_warns_with_force() {
-        let res = check_v3_batch_pairs_consistency(4, 64, 16, true);
-        assert!(res.is_ok(), "force_schedule=true なら続行するはず");
-    }
-
-    /// completed_iterations == 0: 推定不可で warning のみ (Ok)。
-    #[test]
-    fn check_v3_batch_pairs_consistency_skips_when_iterations_zero() {
-        let res = check_v3_batch_pairs_consistency(0, 64, 8, false);
-        assert!(res.is_ok(), "completed_iterations=0 では推定スキップして続行");
-    }
-
-    /// total_games == 0: 推定不可で warning のみ (Ok)。
-    #[test]
-    fn check_v3_batch_pairs_consistency_skips_when_games_zero() {
-        let res = check_v3_batch_pairs_consistency(4, 0, 8, false);
-        assert!(res.is_ok(), "total_games=0 では推定スキップして続行");
-    }
-
-    /// total_games が completed_iterations で割り切れない: 推定不可で warning のみ (Ok)。
-    #[test]
-    fn check_v3_batch_pairs_consistency_skips_when_not_divisible() {
-        // 65 / 4 = 16 余 1 → 推定不可
-        let res = check_v3_batch_pairs_consistency(4, 65, 8, false);
-        assert!(res.is_ok(), "割り切れない場合は推定スキップして続行");
-    }
-
-    /// games_per_iter が奇数: 推定不可で warning のみ (Ok)。
-    /// 例: completed_iterations=2, total_games=6 → games_per_iter=3 (奇数)。
-    /// paired antithetic と整合しない異常データ。
-    #[test]
-    fn check_v3_batch_pairs_consistency_skips_when_games_per_iter_is_odd() {
-        let res = check_v3_batch_pairs_consistency(2, 6, 1, false);
-        assert!(res.is_ok(), "奇数 games_per_iter では推定スキップして続行");
-    }
-
-    /// 推定 batch_pairs が `u32::MAX` を超える破損 meta: `as u32` 切り詰めではなく
-    /// 推定不可扱いで warning + Ok。`u32::try_from` 経由で安全に検出する。
-    /// 64bit 環境 (`usize == u64`) でのみ意味を持つテスト。
-    #[cfg(target_pointer_width = "64")]
-    #[test]
-    fn check_v3_batch_pairs_consistency_skips_on_u32_overflow() {
-        // 推定 batch_pairs = total_games / completed_iterations / 2 が u32::MAX 超え
-        // となる組み合わせ。completed_iterations = 1、total_games = (u32::MAX as
-        // usize + 2) * 2 で games_per_iter / 2 = u32::MAX + 1。
-        let total_games = (u32::MAX as usize + 1) * 2;
-        let res = check_v3_batch_pairs_consistency(1, total_games, 8, false);
-        assert!(res.is_ok(), "u32 範囲外の推定値では切り詰めず推定不可扱いで続行するはず");
-    }
-
-    #[test]
-    fn save_and_load_meta_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("meta.json");
-        let meta = ResumeMetaData {
-            format_version: META_FORMAT_VERSION,
-            state_params_file: "state.params".to_owned(),
-            completed_iterations: 5,
-            total_games: 1000,
-            last_raw_result_mean: -0.5,
-            last_avg_abs_update: 1.2,
-            updated_at_utc: "2026-01-01T00:00:00Z".to_owned(),
-            schedule: ScheduleConfig {
-                alpha: 0.602,
-                gamma: 0.101,
-                a_ratio: 0.1,
-                mobility: 1.0,
-                total_iterations: 200,
-            },
-            init_params_sha256: "abc123".to_owned(),
-            init_from_sha256: Some("def456".to_owned()),
-            init_from_path: Some("canonical.params".to_owned()),
-            param_name_set_sha256: "names_hash".to_owned(),
-            active_param_count: 100,
-            engine_path: "/path/to/engine".to_owned(),
-            engine_param_mapping_path: None,
-            engine_param_mapping_sha256: None,
-            init_mode: InitMode::FreshInitFrom,
-            current_params_sha256: "abc123".to_owned(),
-            total_pairs: 200,
-            batch_pairs: 8,
-            completed_pairs: 40,
-            game_records: Some(true),
-        };
-        save_meta(&path, &meta).unwrap();
-        let loaded = load_meta(&path).unwrap();
-        assert_eq!(loaded.format_version, meta.format_version);
-        assert_eq!(loaded.init_params_sha256, meta.init_params_sha256);
-        assert_eq!(loaded.init_from_sha256, meta.init_from_sha256);
-        assert_eq!(loaded.param_name_set_sha256, meta.param_name_set_sha256);
-        assert_eq!(loaded.active_param_count, meta.active_param_count);
-        assert_eq!(loaded.init_mode, meta.init_mode);
-        assert_eq!(loaded.current_params_sha256, meta.current_params_sha256);
-        assert_eq!(loaded.total_pairs, meta.total_pairs);
-        assert_eq!(loaded.batch_pairs, meta.batch_pairs);
-        assert_eq!(loaded.completed_pairs, meta.completed_pairs);
-    }
-
-    // ========================================================================
-    // 既存テスト群
-    // ========================================================================
 
     #[test]
     fn schedule_at_final_iteration_matches_end_values() {
@@ -5387,20 +2332,13 @@ mod tests {
         }
     }
 
-    /// テスト用 `BatchPrepCtx`。`games_per_iteration` 引数は v3 名残で受け取るが
-    /// 内部的には `batch_pairs = games_per_iteration / 2` に変換して新仕様に渡す。
-    /// テスト本体の意図を変えずに新 API へ追従するためのシム。
     fn make_test_ctx<'a>(
         params: &'a [SpsaParam],
         schedules: &'a [ParamScheduleConstants],
         translator: &'a EngineNameTranslator,
         games_per_iteration: usize,
-    ) -> BatchPrepCtx<'a> {
-        assert!(
-            games_per_iteration.is_multiple_of(2),
-            "make_test_ctx: games_per_iteration must be even"
-        );
-        BatchPrepCtx {
+    ) -> SeedPrepCtx<'a> {
+        SeedPrepCtx {
             big_a: 10.0,
             schedule: ScheduleConfig {
                 alpha: 0.602,
@@ -5414,57 +2352,37 @@ mod tests {
             active_only_regex: None,
             translator,
             start_positions_len: 1957,
-            batch_pairs: games_per_iteration / 2,
+            games_per_iteration,
             random_startpos: true,
+            randomize_plus_color: false,
         }
     }
 
-    /// `compute_batch_prep` のスナップショットテスト。`ChaCha8Rng` は決定論的なため、
+    /// `compute_seed_prep` のスナップショットテスト。`ChaCha8Rng` は決定論的なため、
     /// 同じ `(base_seed, iter)` に対して flips / shifts / start_pos_indices が完全一致する。
     /// 並列化後も Phase A の事前計算結果がブレないことを保証。
     #[test]
-    fn fixed_baseline_eligibility_and_rounding_are_shared() {
-        let mut params = vec![
-            make_param("fixed", 20.5, 1.0),
-            make_param("active", 5.0, 1.0),
-            make_param("unused", 3.0, 1.0),
-            make_param("unmapped", 4.0, 1.0),
+    fn compute_seed_prep_is_deterministic_across_calls() {
+        let params = vec![
+            make_param("Search_a", 1000.0, 100.0),
+            make_param("Search_b", 2000.0, 200.0),
         ];
-        params[2].not_used = true;
-        let translator = EngineNameTranslator {
-            table: [
-                ("fixed".into(), ("Fixed".into(), true)),
-                ("active".into(), ("Active".into(), false)),
-                ("unused".into(), ("Unused".into(), false)),
-            ]
-            .into(),
-            enabled: true,
-        };
-        let regex = Regex::new("^active$").unwrap();
-        assert_eq!(
-            params.iter().map(|p| is_param_applicable(p, &translator)).collect::<Vec<_>>(),
-            vec![true, true, false, false]
-        );
-        assert_eq!(
-            params
-                .iter()
-                .map(|p| is_param_active(p, Some(&regex), &translator))
-                .collect::<Vec<_>>(),
-            vec![false, true, false, false]
-        );
-        let schedules = params
+        let schedules: Vec<ParamScheduleConstants> = params
             .iter()
             .map(|p| ParamScheduleConstants::compute(p.c_end, p.r_end, 100, 0.1, 0.602, 0.101))
-            .collect::<Vec<_>>();
-        let mut ctx = make_test_ctx(&params, &schedules, &translator, 2);
-        ctx.active_only_regex = Some(&regex);
-        for batch in 0..32 {
-            let prep = compute_batch_prep(&ctx, batch, batch, 42, 0).unwrap();
-            assert_eq!(prep.plus_values[0], 21.0);
-            assert_eq!(prep.minus_values[0], 21.0);
-            assert_eq!(translator.translate("fixed", prep.plus_values[0]), ("Fixed", -21.0));
-            assert_eq!(prep.active_params, 1);
-        }
+            .collect();
+        let translator = EngineNameTranslator::empty();
+        let ctx = make_test_ctx(&params, &schedules, &translator, 8);
+
+        let prep1 = compute_seed_prep(&ctx, 5, 42, 100).expect("prep1");
+        let prep2 = compute_seed_prep(&ctx, 5, 42, 100).expect("prep2");
+
+        assert_eq!(prep1.flips, prep2.flips, "flips must be deterministic from seed/iter");
+        assert_eq!(prep1.plus_values, prep2.plus_values);
+        assert_eq!(prep1.minus_values, prep2.minus_values);
+        assert_eq!(prep1.start_pos_indices, prep2.start_pos_indices);
+        assert_eq!(prep1.plus_is_black, prep2.plus_is_black);
+        assert_eq!(prep1.active_params, prep2.active_params);
     }
 
     /// 異なる `base_seed` が異なる flip パターンを生むことを保証（並列実行時の seed 間独立性）。
@@ -5472,7 +2390,7 @@ mod tests {
     /// 全一致にならないことをスナップショットテストとして確認する。パラメータ数を 6 に増やして
     /// 取り得る flip パターンを 2^6=64 通りに広げ、隣接 seed ペアの直接比較で意図を明確化。
     #[test]
-    fn compute_batch_prep_seeds_produce_independent_flips() {
+    fn compute_seed_prep_seeds_produce_independent_flips() {
         let params: Vec<_> = (0..6)
             .map(|i| make_param(&format!("Search_p{i}"), 1000.0 + i as f64 * 100.0, 100.0))
             .collect();
@@ -5483,10 +2401,10 @@ mod tests {
         let translator = EngineNameTranslator::empty();
         let ctx = make_test_ctx(&params, &schedules, &translator, 32);
 
-        let prep1 = compute_batch_prep(&ctx, 5, 5, 1, 100).expect("prep1");
-        let prep2 = compute_batch_prep(&ctx, 5, 5, 2, 100).expect("prep2");
-        let prep3 = compute_batch_prep(&ctx, 5, 5, 3, 100).expect("prep3");
-        let prep4 = compute_batch_prep(&ctx, 5, 5, 4, 100).expect("prep4");
+        let prep1 = compute_seed_prep(&ctx, 5, 1, 100).expect("prep1");
+        let prep2 = compute_seed_prep(&ctx, 5, 2, 100).expect("prep2");
+        let prep3 = compute_seed_prep(&ctx, 5, 3, 100).expect("prep3");
+        let prep4 = compute_seed_prep(&ctx, 5, 4, 100).expect("prep4");
 
         // 隣接 seed ペアそれぞれで flip パターンが異なることを直接確認
         assert_ne!(prep1.flips, prep2.flips, "seed=1 vs seed=2 flips must differ");
@@ -5494,235 +2412,109 @@ mod tests {
         assert_ne!(prep3.flips, prep4.flips, "seed=3 vs seed=4 flips must differ");
     }
 
-    /// Paired antithetic: pair 内 2 局 (game 2k, 2k+1) は **同じ start_pos** を共有し、
-    /// `plus_is_black` のみ反転させる。fishtest と等価のノイズ削減を行うための
-    /// 最重要不変条件で、これが崩れると pair 化が形骸化して開局ノイズが残る。
+    /// 共通相手モード: タスク 2k/2k+1 が同じ局面・我々の手番が先手/後手になる。
     #[test]
-    fn compute_batch_prep_pairs_share_startpos() {
-        let params = vec![make_param("Search_a", 1000.0, 100.0)];
-        let schedules: Vec<ParamScheduleConstants> = params
-            .iter()
-            .map(|p| ParamScheduleConstants::compute(p.c_end, p.r_end, 100, 0.1, 0.602, 0.101))
-            .collect();
-        let translator = EngineNameTranslator::empty();
-        // games_per_iteration = 16 → pair_count = 8。
-        let ctx = make_test_ctx(&params, &schedules, &translator, 16);
-
-        let prep = compute_batch_prep(&ctx, 5, 5, 42, 100).expect("prep");
-
-        assert_eq!(prep.start_pos_indices.len(), 16, "16 game 分の index がある");
-        // pair 内 (2k, 2k+1) で同じ startpos
-        for pair_idx in 0..8 {
-            let a = prep.start_pos_indices[pair_idx * 2];
-            let b = prep.start_pos_indices[pair_idx * 2 + 1];
-            assert_eq!(
-                a,
-                b,
-                "pair {pair_idx}: game {} と {} は同じ start_pos でなければならない",
-                pair_idx * 2,
-                pair_idx * 2 + 1
-            );
-        }
+    fn pair_tasks_for_opponent_pairs_positions_and_colors() {
+        let mut idx = vec![5, 9, 7, 3, 7, 7];
+        let mut black = vec![false, false, true, true, false, true];
+        pair_tasks_for_opponent(&mut idx, &mut black);
+        assert_eq!(idx, vec![5, 5, 7, 7, 7, 7]);
+        assert_eq!(black, vec![true, false, true, false, true, false]);
     }
 
-    /// Stochastic rounding の境界テスト: `p.value = max` の状態で
-    /// `floor(v + U(0,1))` が `max + 1` になるケースが、再 clamp で `max` に戻る
-    /// ことを確認。`clamp → round → 再 clamp` の順序が崩れると、U が大きい batch
-    /// で max を超えた値が engine に送られて事故になる。
+    /// 符号: θ+ が勝ち θ− が負けなら +2、 逆なら −2、 同じ結果なら 0。 勝敗数は θ± 別に数える。
     #[test]
-    fn stochastic_rounding_clamps_after_round_at_upper_bound() {
-        let mut p = make_param("Search_a", 10.0, 1.0);
-        p.is_int = true;
-        p.min = 0.0;
-        p.max = 10.0;
-        let params = vec![p];
-        let schedules: Vec<ParamScheduleConstants> = params
-            .iter()
-            .map(|p| ParamScheduleConstants::compute(p.c_end, p.r_end, 100, 0.1, 0.602, 0.101))
-            .collect();
-        let translator = EngineNameTranslator::empty();
-        let ctx = make_test_ctx(&params, &schedules, &translator, 2);
-        // 多数 iter を回し、plus_value/minus_value が常に [min, max] に収まることを確認。
-        for iter in 0..1000_u32 {
-            let prep = compute_batch_prep(&ctx, iter, iter, 99, 0).expect("prep");
-            for v in prep.plus_values.iter().chain(prep.minus_values.iter()) {
-                assert!(
-                    *v >= 0.0 && *v <= 10.0,
-                    "iter={iter}: rounded value {v} 範囲外 (再 clamp が機能していない)"
-                );
-            }
-        }
-    }
-
-    /// `c_end = 0.0` 版の期待値テスト (上の `_matches_continuous` を補完する直接版)。
-    ///
-    /// shift = 0 が確定するため、plus_value も minus_value も `stochastic_round(10.4)`
-    /// (= 10 or 11) しか取らない。多数試行平均が直接 10.4 に収束することを確認する
-    /// (上の版は shift の対称性に頼って間接的に 10.4 に収束させていた)。
-    /// 「shift と rounding の影響を分離して検証する」ガードレールとして残す。
-    ///
-    /// 注意: plus と minus は同一 rounding_rng stream を順に消費するため、
-    /// shift=0 でも個々の値は一致しない (期待値だけが 10.4 に揃う)。
-    #[test]
-    fn stochastic_rounding_mean_with_and_without_shift() {
-        for shift in [0.0, 1.0] {
-            let mut params = vec![make_param("Search_a", 10.4, 1.0)];
-            params[0].is_int = true;
-            params[0].min = 0.0;
-            params[0].max = 100.0;
-            params[0].c_end = shift;
-            let schedules: Vec<ParamScheduleConstants> = params
-                .iter()
-                .map(|p| ParamScheduleConstants::compute(p.c_end, p.r_end, 100, 0.1, 0.602, 0.101))
-                .collect();
-            let translator = EngineNameTranslator::empty();
-            let ctx = make_test_ctx(&params, &schedules, &translator, 2);
-
-            let n_iters = 4000_u32;
-            let mut sum = 0.0f64;
-            let mut count = 0_usize;
-            for iter in 0..n_iters {
-                let prep = compute_batch_prep(&ctx, iter, iter, 67890, 0).expect("prep");
-                // shift=0 のケースでは各値は10または11に限られる。
-                for v in [prep.plus_values[0], prep.minus_values[0]] {
-                    assert!(
-                        shift != 0.0 || v == 10.0 || v == 11.0,
-                        "c_end=0 で stochastic_round(10.4) は 10 か 11 のはず: 実際 {v}"
-                    );
-                    sum += v;
-                    count += 1;
-                }
-            }
-            let mean = sum / count as f64;
-            let err = (mean - 10.4).abs();
-            assert!(
-                err < 0.05,
-                "stochastic rounding 平均 {mean} が連続値 10.4 から {err} 乖離 (許容 < 0.05)"
-            );
-        }
-    }
-
-    /// 完全再現性: 同一 seed/iter で 2 回 `compute_batch_prep` を回したとき、
-    /// flip / shifts / plus_values / minus_values / start_pos_indices 全てが
-    /// bit-identical に一致することを確認。stochastic rounding 導入後も RNG stream を
-    /// 分離した上で seed_for_iteration から決定論的に生成しているため、保証される。
-    #[test]
-    fn compute_batch_prep_full_reproducibility_with_rounding() {
-        let mut params = vec![
-            make_param("Search_a", 1234.5, 50.0),
-            make_param("Search_b", 9876.7, 100.0),
-        ];
-        for p in params.iter_mut() {
-            p.is_int = true;
-        }
-        let schedules: Vec<ParamScheduleConstants> = params
-            .iter()
-            .map(|p| ParamScheduleConstants::compute(p.c_end, p.r_end, 100, 0.1, 0.602, 0.101))
-            .collect();
-        let translator = EngineNameTranslator::empty();
-        let ctx = make_test_ctx(&params, &schedules, &translator, 8);
-
-        let prep1 = compute_batch_prep(&ctx, 7, 7, 99, 200).expect("prep1");
-        let prep2 = compute_batch_prep(&ctx, 7, 7, 99, 200).expect("prep2");
-
-        assert_eq!(prep1.flips, prep2.flips);
-        assert_eq!(prep1.plus_values, prep2.plus_values);
-        assert_eq!(prep1.minus_values, prep2.minus_values);
-        assert_eq!(prep1.start_pos_indices, prep2.start_pos_indices);
-
-        // 整数 round 結果が実際に整数になっていることを確認
-        for v in prep1.plus_values.iter().chain(prep1.minus_values.iter()) {
-            assert_eq!(v.fract(), 0.0, "is_int param で fractional 値が残った: {v}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod update_tests {
-    use super::*;
-
-    fn param() -> SpsaParam {
-        SpsaParam {
-            name: "P".into(),
-            type_name: "int".into(),
-            is_int: true,
-            value: 5.0,
-            min: 0.0,
-            max: 10.0,
-            c_end: 2.0,
-            r_end: 0.125,
-            comment: String::new(),
-            not_used: false,
-        }
-    }
-
-    fn update(
-        params: &mut [SpsaParam],
-        flips: &[f64],
-        active: &[bool],
-        mobility: f64,
-        raw: f64,
-    ) -> UpdateStats {
-        let schedule = ScheduleConfig {
-            alpha: 0.0,
-            gamma: 0.0,
-            a_ratio: 0.0,
-            mobility,
-            total_iterations: 4,
+    fn opp_pair_signal_and_tally_signs() {
+        let win_loss = OppPairOutcome {
+            plus: 1.0,
+            minus: -1.0,
         };
-        let constants: Vec<_> = params
-            .iter()
-            .map(|p| ParamScheduleConstants::compute(p.c_end, p.r_end, 4, 0.0, 0.0, 0.0))
-            .collect();
-        apply_spsa_update(params, flips, &constants, active, schedule, 0, raw)
+        let loss_win = OppPairOutcome {
+            plus: -1.0,
+            minus: 1.0,
+        };
+        let same = OppPairOutcome {
+            plus: 0.0,
+            minus: 0.0,
+        };
+        assert_eq!(opp_pair_signal(win_loss), 2.0);
+        assert_eq!(opp_pair_signal(loss_win), -2.0);
+        assert_eq!(opp_pair_signal(same), 0.0);
+        let mut t = OppTally::default();
+        t.add(win_loss);
+        t.add(win_loss);
+        t.add(same);
+        assert_eq!(
+            t,
+            OppTally {
+                plus_w: 2,
+                plus_l: 0,
+                plus_d: 1,
+                minus_w: 0,
+                minus_l: 2,
+                minus_d: 1,
+            }
+        );
     }
 
+    /// 自己対局モードの stats.csv の書式が従来と 1 バイトも変わらないこと。
     #[test]
-    fn update_one_integer_keeps_fractional_theta() {
-        let mut params = [param()];
-        let stats = update(&mut params, &[1.0], &[true], 1.0, 1.0);
-        assert_eq!(params[0].value, 5.25);
-        assert_eq!(stats.updated_params, 1);
-        assert_eq!(stats.avg_abs_update, 0.25);
-        assert_eq!(stats.max_abs_update, 0.25);
-    }
-
-    #[test]
-    fn update_flip_reverses_signal() {
-        let mut params = [param(), param()];
-        update(&mut params, &[1.0, -1.0], &[true, true], 1.0, 1.0);
-        assert_eq!((params[0].value, params[1].value), (5.25, 4.75));
-    }
-
-    #[test]
-    fn update_mobility_is_applied_once() {
-        let mut params = [param()];
-        let stats = update(&mut params, &[1.0], &[true], 3.0, 2.0);
-        assert_eq!(params[0].value, 6.5);
-        assert_eq!(stats.avg_abs_update, 1.5);
-    }
-
-    #[test]
-    fn update_clamps_and_counts_unchanged_targets() {
-        let mut params = [param(), param()];
-        params[0].value = 9.75;
-        params[1].value = 10.0;
-        let stats = update(&mut params, &[1.0, 1.0], &[true, true], 8.0, 1.0);
-        assert_eq!((params[0].value, params[1].value), (10.0, 10.0));
-        assert_eq!(stats.updated_params, 2);
-        assert_eq!(stats.avg_abs_update, 0.125);
-        assert_eq!(stats.max_abs_update, 0.25);
-    }
-
-    #[test]
-    fn update_excludes_inactive_and_near_zero_c_end() {
-        let mut params = [param(), param(), param()];
-        params[1].c_end = 0.0;
-        params[2].c_end = f64::EPSILON;
-        let stats = update(&mut params, &[1.0; 3], &[false, true, true], 1.0, 1.0);
-        assert!(params.iter().all(|p| p.value == 5.0));
-        assert_eq!(stats.updated_params, 0);
-        assert_eq!(stats.avg_abs_update, 0.0);
-        assert_eq!(stats.max_abs_update, 0.0);
+    fn stats_csv_selfplay_format_unchanged() {
+        let dir = std::env::temp_dir().join(format!("spsa_stats_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("stats.csv");
+        let row = IterationStats {
+            iteration: 3,
+            seed: 1119,
+            games: 128,
+            plus_wins: 63,
+            minus_wins: 61,
+            draws: 4,
+            raw_result: 2.0,
+            active_params: 24,
+            avg_abs_shift: 30.290694,
+            updated_params: 24,
+            avg_abs_update: 0.883695,
+            max_abs_update: 3.177332,
+            total_games: 2432,
+            opp: None,
+        };
+        {
+            let mut w = open_stats_csv_writer(&path, false, false).expect("open");
+            write_stats_csv_row(&mut w, row).expect("row");
+            w.flush().expect("flush");
+        }
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            text,
+            "iteration,seed,games,plus_wins,minus_wins,draws,raw_result,active_params,\
+             avg_abs_shift,updated_params,avg_abs_update,max_abs_update,total_games\n\
+             3,1119,128,63,61,4,+2.000000,24,30.290694,24,0.883695,3.177332,2432\n"
+        );
+        let opp_path = dir.join("stats_opp.csv");
+        {
+            let mut w = open_stats_csv_writer(&opp_path, false, true).expect("open");
+            let t = OppTally {
+                plus_w: 1,
+                plus_l: 2,
+                plus_d: 3,
+                minus_w: 4,
+                minus_l: 5,
+                minus_d: 6,
+            };
+            write_stats_csv_row(
+                &mut w,
+                IterationStats {
+                    opp: Some(t),
+                    ..row
+                },
+            )
+            .expect("row");
+            w.flush().expect("flush");
+        }
+        let text = std::fs::read_to_string(&opp_path).expect("read");
+        assert!(text.lines().next().is_some_and(|h| h.ends_with(OPP_STATS_COLUMNS)));
+        assert!(text.lines().nth(1).is_some_and(|l| l.ends_with(",2432,1,2,3,4,5,6")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

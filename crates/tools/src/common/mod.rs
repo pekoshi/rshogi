@@ -1,8 +1,8 @@
 //! Floodgate棋譜取得・変換用の共通モジュール
 
+pub mod bloom;
 pub mod dedup;
 pub mod floodgate;
 pub mod io;
-pub mod memory;
 pub mod sfen;
 pub mod sfen_ops;

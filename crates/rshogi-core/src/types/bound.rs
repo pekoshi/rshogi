@@ -31,7 +31,7 @@ impl Bound {
 
     /// 下界（Lower）または正確（Exact）か
     ///
-    /// Singular Extension判定で使用。
+    /// Singular Extension判定で使用。YaneuraOuの`(ttBound & BOUND_LOWER)`に相当。
     #[inline]
     pub const fn is_lower_or_exact(self) -> bool {
         matches!(self, Bound::Lower | Bound::Exact)
@@ -81,5 +81,10 @@ mod tests {
 
         // None は常にカットオフ不可
         assert!(!Bound::None.can_cutoff(value, beta));
+    }
+
+    #[test]
+    fn test_bound_default() {
+        assert_eq!(Bound::default(), Bound::None);
     }
 }

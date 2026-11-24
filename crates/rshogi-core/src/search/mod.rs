@@ -11,27 +11,19 @@
 mod stats;
 
 mod alpha_beta;
-mod analysis;
 mod engine;
 mod eval_helpers;
-#[cfg(not(target_arch = "wasm32"))]
-mod game_mate;
 mod history;
 mod limits;
+mod mate_dfpn;
 mod movepicker;
-mod numa;
-#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
-mod progress;
 mod pruning;
 mod qsearch;
 mod search_helpers;
-mod shared_history;
 mod skill;
 mod thread;
 mod time_manager;
 mod time_options;
-#[cfg(feature = "search-tree-sample")]
-mod tree_sample;
 mod tt_history;
 mod tt_sanity;
 mod tune_params;
@@ -41,24 +33,16 @@ mod types;
 mod tests;
 
 pub use alpha_beta::*;
-pub use analysis::{
-    AnalysisBudget, AnalysisEndReason, AnalysisError, AnalysisFinished, AnalysisRunHandle,
-    AnalysisSession,
-};
 pub use engine::*;
 pub use history::*;
 pub use limits::*;
 pub use movepicker::*;
-pub use numa::NumaPolicy;
-pub use shared_history::SharedHistories;
 pub use skill::*;
 #[cfg(feature = "search-stats")]
 pub use stats::SearchStats;
 pub use thread::*;
 pub use time_manager::*;
 pub use time_options::*;
-#[cfg(feature = "search-tree-sample")]
-pub use tree_sample::{TreeSample, TreeSampleConfig, TreeSampleStats};
 pub use tt_history::*;
 pub use tune_params::*;
 pub use types::*;

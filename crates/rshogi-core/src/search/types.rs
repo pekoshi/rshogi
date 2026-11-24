@@ -2,15 +2,17 @@
 //!
 //! - `NodeType`: ノードの種類（Root, PV, NonPV）
 //! - `Stack`: 探索スタック
-//! - `PvTable`: PV 三角配列（ヒープ割り当てなし）
+//! - `PvTable`: PV 三角配列（Reckless 由来のヒープ割り当てなし方式）
 //! - `RootMove`: ルート手の情報
 //! - `RootMoves`: ルート手のリスト
 
+use std::mem::MaybeUninit;
+
 use crate::movegen::{MoveList, generate_legal_with_pass};
 use crate::position::Position;
-use crate::types::{Bound, MAX_PLY, Move, Piece, RepetitionState, Square, Value};
+use crate::types::{MAX_PLY, Move, Piece, RepetitionState, Square, Value};
 
-use super::history::{CorrectionPieceToHistory, PieceToHistory};
+use super::history::PieceToHistory;
 use std::ptr::NonNull;
 
 // =============================================================================
@@ -20,9 +22,9 @@ use std::ptr::NonNull;
 /// PV サイズ上限（MAX_PLY + 1）
 const PV_SIZE: usize = MAX_PLY as usize + 1;
 
-/// PV 三角配列
+/// PV 三角配列（Reckless 由来）
 ///
-/// 各 ply の PV を固定長配列で保持し、`Vec<Move>` のヒープ割り当てを回避する。
+/// 各 ply の PV を固定長配列で保持し、Vec<Move> のヒープ割り当てを回避する。
 /// `table[ply][0..len[ply]]` が ply の PV ライン。
 /// `update(ply, mv)` で `table[ply] = [mv] + table[ply+1]` にコピー。
 pub struct PvTable {
@@ -111,7 +113,7 @@ impl NodeType {
 
 /// ContinuationHistoryを参照するためのキー情報
 ///
-/// 各ノードで指し手実行後に設定し、
+/// YaneuraOu方式: 各ノードで指し手実行後に設定し、
 /// 後続のノードでContinuationHistoryテーブルを参照する際に使用する。
 #[derive(Clone, Copy, Debug)]
 pub struct ContHistKey {
@@ -150,6 +152,15 @@ impl ContHistKey {
             to: Square::SQ_11,
         }
     }
+
+    /// このキーが null sentinel (null move / 未設定) であるか判定。
+    ///
+    /// C-7 で `Option<ContHistKey>` を廃止し、 Stack には常に有効な
+    /// `ContHistKey` を保持する設計に変更。 null は `piece == NONE` で表現する。
+    #[inline]
+    pub fn is_null(self) -> bool {
+        self.piece.is_none()
+    }
 }
 
 // =============================================================================
@@ -164,18 +175,10 @@ pub struct Stack {
     /// tree-changing な探索改善でのみ参照する。
     pub follow_pv: bool,
 
-    /// ContinuationCorrectionHistoryへの参照
-    ///
-    /// # Safety
-    ///
-    /// このポインタは以下の不変条件を満たす：
-    /// - 常に有効な`CorrectionPieceToHistory`テーブルを指す（`dangling()`は初期値のみ）
-    /// - `SearchWorker::reset_cont_history_ptrs()`でsentinelに初期化される
-    /// - 指し手実行時に`CorrectionHistory`内の対応テーブルへ更新される
-    /// - 参照先を所有する`HistoryCell`は`SearchWorker`の生存期間中に再配置されない
-    pub cont_correction_ptr: NonNull<CorrectionPieceToHistory>,
+    /// ContinuationHistoryへの参照インデックス（旧方式、互換性のため残す）
+    pub cont_history_idx: usize,
 
-    /// ContinuationHistoryへの参照
+    /// ContinuationHistoryへの参照（YaneuraOu方式、MovePicker直結）
     ///
     /// sentinelをセットする前提のためOptionではなく生ポインタで保持する。
     ///
@@ -188,9 +191,13 @@ pub struct Stack {
     /// - 参照先は `SearchWorker::history` フィールドが所有しており、`SearchWorker` の生存期間中は有効
     pub cont_history_ptr: NonNull<PieceToHistory>,
 
-    /// ContinuationHistoryキー
-    /// do_move後に設定し、後続ノードでContinuationHistory参照に使用
-    pub cont_hist_key: Option<ContHistKey>,
+    /// ContinuationHistoryキー（YaneuraOu方式）
+    ///
+    /// do_move 後に設定し、 後続ノードで ContinuationHistory 参照に使用。
+    /// C-7 で `Option<ContHistKey>` → 直接 `ContHistKey` に変更。
+    /// 未設定状態は `ContHistKey::null_sentinel()` で表現し、 利用側は
+    /// `key.is_null()` で判定する。 Option の discriminant load + branch を排除。
+    pub cont_hist_key: ContHistKey,
 
     /// ルートからの手数
     pub ply: i32,
@@ -230,9 +237,9 @@ impl Default for Stack {
     fn default() -> Self {
         Self {
             follow_pv: false,
-            cont_correction_ptr: NonNull::dangling(),
+            cont_history_idx: 0,
             cont_history_ptr: NonNull::dangling(),
-            cont_hist_key: None,
+            cont_hist_key: ContHistKey::null_sentinel(),
             ply: 0,
             current_move: Move::NONE,
             excluded_move: Move::NONE,
@@ -336,7 +343,7 @@ impl<const N: usize> Default for SmallMoveList<N> {
     }
 }
 
-/// 探索用の固定長指し手リスト
+/// 探索用の固定長指し手リスト（YaneuraOu SEARCHEDLIST_CAPACITY相当）
 pub const SEARCHED_MOVES_CAPACITY: usize = 32;
 
 /// quiets_tried / captures_tried 用の型エイリアス
@@ -346,10 +353,137 @@ pub const SEARCHED_MOVES_CAPACITY: usize = 32;
 pub type SearchedMoveList = SmallMoveList<SEARCHED_MOVES_CAPACITY>;
 
 // =============================================================================
+// OrderedMovesBuffer（指し手生成用の固定長バッファ）
+// =============================================================================
+
+/// 指し手生成バッファの最大サイズ
+///
+/// 将棋の合法手数は理論上593手（証明済み）だが、実用上256手を超えることは極めて稀。
+/// 統計データ: 平均82手、99.9パーセンタイル347手。
+/// キャッシュ効率（L1に収まる1024バイト）を優先して256を採用。
+///
+/// 万一256手を超える局面でも、MovePickerの順序付け（TT手→捕獲手→キラー手→
+/// history順の静かな手）により重要な手は先頭付近に集中するため、
+/// 257手目以降に最善手がある確率は極めて低く、実質的な影響はほぼない。
+///
+/// MaybeUninitを使用して初期化コストを回避している。
+pub const ORDERED_MOVES_CAPACITY: usize = 256;
+
+/// 指し手生成結果を保持する固定長バッファ
+///
+/// generate_ordered_movesやqsearchで使用し、Vecのヒープ割り当てを回避する。
+/// MaybeUninitを使用して初期化コストをゼロにしている。
+pub struct OrderedMovesBuffer {
+    buf: [MaybeUninit<Move>; ORDERED_MOVES_CAPACITY],
+    len: usize,
+}
+
+impl OrderedMovesBuffer {
+    /// 空のバッファを作成
+    ///
+    /// MaybeUninitにより初期化コストはゼロ。
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            // Safety: MaybeUninitの配列は未初期化のまま作成可能
+            buf: unsafe { MaybeUninit::uninit().assume_init() },
+            len: 0,
+        }
+    }
+
+    /// 指し手を追加
+    ///
+    /// 容量を超えた場合は無視する（実用上593手を超えることはない）
+    #[inline]
+    pub fn push(&mut self, mv: Move) {
+        if self.len < ORDERED_MOVES_CAPACITY {
+            self.buf[self.len].write(mv);
+            self.len += 1;
+        }
+    }
+
+    /// 指定位置に指し手を挿入
+    ///
+    /// index以降の要素を後方にシフトして挿入する。
+    /// 容量を超えた場合は無視する。
+    #[inline]
+    pub fn insert(&mut self, index: usize, mv: Move) {
+        if self.len >= ORDERED_MOVES_CAPACITY {
+            return;
+        }
+        let index = index.min(self.len);
+        // index以降を1つ後ろにシフト
+        if index < self.len {
+            // SAFETY: ptr::copy の安全性:
+            // - src: buf[index..len] は初期化済み（len までが有効な要素）
+            // - dst: buf[index+1..len+1] は len < CAPACITY より配列範囲内
+            // - 要素数 (len - index) は非負（index <= len より保証）
+            // - Move は Copy トレイトを持ち、ビット単位コピーが安全
+            // - 重複領域の場合も copy は正しく処理する
+            unsafe {
+                std::ptr::copy(
+                    self.buf.as_ptr().add(index),
+                    self.buf.as_mut_ptr().add(index + 1),
+                    self.len - index,
+                );
+            }
+        }
+        self.buf[index].write(mv);
+        self.len += 1;
+    }
+
+    /// 指し手が含まれているかチェック（線形探索）
+    #[inline]
+    pub fn contains(&self, mv: &Move) -> bool {
+        self.as_slice().contains(mv)
+    }
+
+    /// バッファをクリア
+    ///
+    /// MoveはCopy型なのでDropは不要。lenをリセットするだけ。
+    #[inline]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// 現在の要素数
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// 空かどうか
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// スライスとして取得
+    #[inline]
+    pub fn as_slice(&self) -> &[Move] {
+        // Safety: 0..len の範囲は全て push() で初期化済み
+        unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const Move, self.len) }
+    }
+
+    /// イテレータを返す
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = Move> + '_ {
+        self.as_slice().iter().copied()
+    }
+}
+
+impl Default for OrderedMovesBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
 // RootMove（ルート手の情報）
 // =============================================================================
 
 /// ルートでの指し手情報
+#[derive(Clone)]
 pub struct RootMove {
     /// 探索スコア
     pub score: Value,
@@ -368,48 +502,8 @@ pub struct RootMove {
     /// この手の探索にかかったeffort（ノード数の割合）
     pub effort: f64,
     /// PV（Principal Variation）
-    /// `pv[0]`が指し手自体
+    /// pv[0]が指し手自体
     pub pv: Vec<Move>,
-}
-
-impl Clone for RootMove {
-    fn clone(&self) -> Self {
-        Self {
-            score: self.score,
-            previous_score: self.previous_score,
-            average_score: self.average_score,
-            mean_squared_score: self.mean_squared_score,
-            score_lower_bound: self.score_lower_bound,
-            score_upper_bound: self.score_upper_bound,
-            sel_depth: self.sel_depth,
-            effort: self.effort,
-            pv: self.pv.clone(),
-        }
-    }
-
-    fn clone_from(&mut self, source: &Self) {
-        // 完了iterationの退避で、各ルート手のPV容量も再利用する。
-        let Self {
-            score,
-            previous_score,
-            average_score,
-            mean_squared_score,
-            score_lower_bound,
-            score_upper_bound,
-            sel_depth,
-            effort,
-            pv,
-        } = source;
-        self.score = *score;
-        self.previous_score = *previous_score;
-        self.average_score = *average_score;
-        self.mean_squared_score = *mean_squared_score;
-        self.score_lower_bound = *score_lower_bound;
-        self.score_upper_bound = *score_upper_bound;
-        self.sel_depth = *sel_depth;
-        self.effort = *effort;
-        self.pv.clone_from(pv);
-    }
 }
 
 impl RootMove {
@@ -434,18 +528,6 @@ impl RootMove {
         self.pv[0]
     }
 
-    /// 最後に探索した窓に対する `score` の種類。窓の外で返った値は下界・上界になる。
-    #[inline]
-    pub fn score_bound(&self) -> Bound {
-        if self.score_lower_bound {
-            Bound::Lower
-        } else if self.score_upper_bound {
-            Bound::Upper
-        } else {
-            Bound::Exact
-        }
-    }
-
     /// PVを更新
     pub fn update_pv(&mut self, child_pv: &[Move]) {
         // pv[0]（自分自身の手）は保持し、child_pvを追加
@@ -459,7 +541,7 @@ impl RootMove {
         false
     }
 
-    /// 平均スコア・二乗平均スコアを蓄積（aspiration の初期窓用）
+    /// 平均スコア・二乗平均スコアを蓄積（YaneuraOuのaspiration初期窓用）
     pub fn accumulate_score_stats(&mut self, value: Value) {
         // average_score: 初回はそのまま、2回目以降は前回と現在の平均
         self.average_score = if self.average_score.raw() == -Value::INFINITE.raw() {
@@ -511,19 +593,6 @@ impl Ord for RootMove {
 /// ルート局面での候補手リスト
 pub struct RootMoves {
     moves: Vec<RootMove>,
-}
-
-impl Clone for RootMoves {
-    fn clone(&self) -> Self {
-        Self {
-            moves: self.moves.clone(),
-        }
-    }
-
-    fn clone_from(&mut self, source: &Self) {
-        // 反復ごとの退避では既存バッファを再利用する。
-        self.moves.clone_from(&source.moves);
-    }
 }
 
 impl RootMoves {
@@ -625,11 +694,12 @@ impl RootMoves {
 
     /// スコアでソート（降順）
     pub fn sort(&mut self) {
-        Self::sort_slice(&mut self.moves);
+        self.moves.sort();
     }
 
     /// 指定範囲をスコア降順で安定ソート
     ///
+    /// YaneuraOuの std::stable_sort に相当。
     /// 同じスコアの場合、元の順序を保持する。
     ///
     /// # Arguments
@@ -640,27 +710,12 @@ impl RootMoves {
             return;
         }
 
-        Self::sort_slice(&mut self.moves[start..end]);
-    }
-
-    fn sort_slice(moves: &mut [RootMove]) {
-        // 少数候補の順位変更は確保せず直し、移動量が線形の上限を超えれば安定sortへ戻す。
-        let mut remaining_shifts = moves.len().saturating_mul(2);
-        for index in 1..moves.len() {
-            if !moves[index - 1].cmp(&moves[index]).is_gt() {
-                continue;
-            }
-            // prefixは整列済み。同点候補の後ろへ挿入し、元の相対順序を保持する。
-            let destination =
-                moves[..index].partition_point(|root| !root.cmp(&moves[index]).is_gt());
-            let shifts = index - destination;
-            if shifts > remaining_shifts {
-                moves.sort();
-                return;
-            }
-            moves[destination..=index].rotate_right(1);
-            remaining_shifts -= shifts;
-        }
+        // std::stable_sort相当: score降順、同点はprevious_score降順
+        // Rustのslice::sort_byは安定ソートなので同値時は元順序を保持する
+        self.moves[start..end].sort_by(|a, b| match b.score.cmp(&a.score) {
+            std::cmp::Ordering::Equal => b.previous_score.cmp(&a.previous_score),
+            ord => ord,
+        });
     }
 
     /// RootMoveを末尾に追加
@@ -680,7 +735,7 @@ impl RootMoves {
 
     /// 開始インデックスを指定して手を検索
     ///
-    /// start 以降から指定した手を探す。
+    /// YaneuraOuの `std::find(rootMoves.begin() + pvIdx, rootMoves.end(), move)` に対応。
     pub fn find_from(&self, mv: Move, start: usize) -> Option<usize> {
         self.moves[start..].iter().position(|rm| rm.mv() == mv).map(|i| i + start)
     }
@@ -754,7 +809,7 @@ pub fn value_from_tt(v: Value, ply: i32) -> Value {
 /// 千日手/優劣局面を評価値に変換
 ///
 /// draw_value_table は SearchContext.draw_value_table を渡す。
-/// REPETITION_DRAW の場合、`drawValueTable[stm]` を返す。
+/// REPETITION_DRAW の場合、drawValueTable[stm] を返す。
 #[inline]
 pub fn draw_value(
     state: RepetitionState,
@@ -866,47 +921,6 @@ mod tests {
     }
 
     #[test]
-    fn root_moves_snapshot_reuses_pv_and_copies_metadata() {
-        let mv = Move::from_usi("7g7f").unwrap();
-        let reply = Move::from_usi("3c3d").unwrap();
-        let mut source = RootMoves::from_vec(vec![RootMove::new(mv)]);
-        let mut target = source.clone();
-        target.moves[0].pv.reserve(32);
-        let capacity = target.moves[0].pv.capacity();
-        let pointer = target.moves[0].pv.as_ptr();
-        let rm = &mut source.moves[0];
-        rm.score = Value::new(123);
-        rm.previous_score = Value::new(-42);
-        rm.average_score = Value::new(17);
-        rm.mean_squared_score = Some(-12345);
-        rm.score_lower_bound = true;
-        rm.score_upper_bound = true;
-        rm.sel_depth = 31;
-        rm.effort = 0.75;
-        rm.pv.push(reply);
-
-        for length in [2, 1] {
-            source.moves[0].pv.truncate(length);
-            target.clone_from(&source);
-            let actual = &target.moves[0];
-            let expected = &source.moves[0];
-            assert_eq!(actual.pv.as_ptr(), pointer);
-            assert_eq!(actual.pv.capacity(), capacity);
-            assert_eq!(actual.pv, expected.pv);
-            assert_eq!(actual.score, expected.score);
-            assert_eq!(actual.previous_score, expected.previous_score);
-            assert_eq!(actual.average_score, expected.average_score);
-            assert_eq!(actual.mean_squared_score, expected.mean_squared_score);
-            assert_eq!(actual.score_lower_bound, expected.score_lower_bound);
-            assert_eq!(actual.score_upper_bound, expected.score_upper_bound);
-            assert_eq!(actual.sel_depth, expected.sel_depth);
-            assert_eq!(actual.effort, expected.effort);
-        }
-        source.moves[0].pv[0] = reply;
-        assert_eq!(target.moves[0].pv, vec![mv]);
-    }
-
-    #[test]
     fn test_root_move_ordering() {
         let mv1 = Move::from_usi("7g7f").unwrap();
         let mv2 = Move::from_usi("2g2f").unwrap();
@@ -998,7 +1012,7 @@ mod tests {
         let restored = value_from_tt(converted, ply);
         assert_eq!(restored.raw(), loss.raw());
 
-        // 無効値はそのまま保持される
+        // 無効値はそのまま保持される（YaneuraOu value_from_tt 準拠）
         assert_eq!(value_to_tt(Value::NONE, ply), Value::NONE);
         assert_eq!(value_from_tt(Value::NONE, ply), Value::NONE);
     }
@@ -1125,5 +1139,68 @@ mod tests {
         let mv = Move::from_usi("2g2f").unwrap();
         list.push(mv);
         assert_eq!(list.len(), SEARCHED_MOVES_CAPACITY);
+    }
+
+    #[test]
+    fn test_ordered_moves_buffer_basic() {
+        let mut buf = OrderedMovesBuffer::new();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+
+        let mv1 = Move::from_usi("7g7f").unwrap();
+        let mv2 = Move::from_usi("2g2f").unwrap();
+
+        buf.push(mv1);
+        assert_eq!(buf.len(), 1);
+        assert!(!buf.is_empty());
+        assert!(buf.contains(&mv1));
+        assert!(!buf.contains(&mv2));
+
+        buf.push(mv2);
+        assert_eq!(buf.len(), 2);
+        assert!(buf.contains(&mv2));
+
+        let moves: Vec<_> = buf.iter().collect();
+        assert_eq!(moves, vec![mv1, mv2]);
+
+        // as_slice のテスト
+        assert_eq!(buf.as_slice(), &[mv1, mv2]);
+    }
+
+    #[test]
+    fn test_ordered_moves_buffer_clear() {
+        let mut buf = OrderedMovesBuffer::new();
+        let mv1 = Move::from_usi("7g7f").unwrap();
+        let mv2 = Move::from_usi("2g2f").unwrap();
+
+        buf.push(mv1);
+        buf.push(mv2);
+        assert_eq!(buf.len(), 2);
+
+        buf.clear();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+        assert!(!buf.contains(&mv1));
+
+        // clear後も再利用可能
+        buf.push(mv1);
+        assert_eq!(buf.len(), 1);
+        assert!(buf.contains(&mv1));
+    }
+
+    #[test]
+    fn test_ordered_moves_buffer_capacity() {
+        let mut buf = OrderedMovesBuffer::new();
+        let mv = Move::from_usi("7g7f").unwrap();
+
+        // 多数の手を追加（実用上の上限テスト）
+        for _ in 0..100 {
+            buf.push(mv);
+        }
+        assert_eq!(buf.len(), 100);
+
+        // イテレーションが正しく動作することを確認
+        let count = buf.iter().count();
+        assert_eq!(count, 100);
     }
 }

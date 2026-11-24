@@ -264,7 +264,7 @@ pub fn make_input_features(pos: &Position, features1: &mut [f32], features2: &mu
 }
 
 // ============================================================
-// Policy move label (移動方向と移動先から作る policy の出力の番号)
+// Policy move label (cshogi の make_move_label 相当)
 // ============================================================
 
 /// ポリシーヘッドの移動方向ラベル
@@ -272,7 +272,7 @@ pub fn make_input_features(pos: &Position, features1: &mut [f32], features2: &mu
 /// 10 方向 × 2 (不成り/成り) = 20 盤上方向 + 7 持ち駒 = 合計 27 カテゴリ。
 /// ポリシー出力サイズ: 27 × 81 = 2187。
 ///
-/// 値の順は学習済みモデルの policy 出力の並びそのものなので変えない。
+/// cshogi の `MOVE_DIRECTION` enum と同一順序。
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoveDirection {
@@ -336,7 +336,8 @@ fn get_move_direction(dir_x: i32, dir_y: i32) -> MoveDirection {
 
 /// 指し手をポリシー出力のラベルインデックスに変換する
 ///
-/// 学習済みモデルの policy 出力の番号と一致させる必要がある。後手番では盤面を 180 度回転して先手視点に正規化する。
+/// cshogi の `__dlshogi_make_move_label` と同一ロジック。
+/// 後手番では盤面を 180 度回転して先手視点に正規化する。
 ///
 /// 戻り値は `0..2187` のインデックス。
 pub fn make_move_label(mv: Move, color: Color) -> usize {
@@ -383,7 +384,8 @@ pub fn make_move_label(mv: Move, color: Color) -> usize {
 
 /// 勝率 (0..1) をセンチポーン値に変換
 ///
-/// `scale` は学習側の --scale と揃える。
+/// dlshogi の Eval_Coef に相当する逆変換。
+/// `scale` で bullet-shogi の --scale と整合させる。
 /// winrate = sigmoid(cp / scale) の逆関数: cp = scale * ln(p / (1-p))
 pub fn winrate_to_cp(winrate: f32, scale: f32) -> i32 {
     let clamped = winrate.clamp(0.001, 0.999);
@@ -480,12 +482,47 @@ mod tests {
     }
 
     #[test]
+    fn test_make_move_label_range() {
+        // 初期局面の全合法手がラベル範囲内に収まること
+        use rshogi_core::movegen::{MoveList, generate_legal};
+
+        let mut pos = Position::new();
+        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
+            .unwrap();
+        let mut list = MoveList::new();
+        generate_legal(&pos, &mut list);
+
+        for mv in list.iter() {
+            let label = make_move_label(*mv, Color::Black);
+            assert!(label < MAX_MOVE_LABEL_NUM, "label {label} out of range for {}", mv.to_usi());
+        }
+    }
+
+    #[test]
+    fn test_make_move_label_up_move_black() {
+        // 7g7f (先手): file=6→6, rank=6→5 → dir_x=0, dir_y=-1 → UP
+        // to_sq = 6*9+5 = 59, label = 81*0 + 59 = 59
+        let mv = Move::from_usi("7g7f").unwrap();
+        let label = make_move_label(mv, Color::Black);
+        assert_eq!(label, 59);
+    }
+
+    #[test]
     fn test_make_move_label_promote() {
         // 2d2c+ (先手): file=1→1, rank=3→2 → dir_x=0, dir_y=-1 → UP_PROMOTE=10
         // to_sq = 1*9+2 = 11, label = 81*10 + 11 = 821
         let mv = Move::from_usi("2d2c+").unwrap();
         let label = make_move_label(mv, Color::Black);
         assert_eq!(label, 821);
+    }
+
+    #[test]
+    fn test_make_move_label_drop_pawn() {
+        // P*5e (先手): hand_piece=0(Pawn), direction=20
+        // to_sq = 4*9+4 = 40, label = 81*20 + 40 = 1660
+        let mv = Move::from_usi("P*5e").unwrap();
+        let label = make_move_label(mv, Color::Black);
+        assert_eq!(label, 1660);
     }
 
     #[test]

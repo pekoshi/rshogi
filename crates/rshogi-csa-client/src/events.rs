@@ -34,7 +34,7 @@
 //! 通常対局:
 //!
 //! ```text
-//! Connected → GameSummary → (REJECT 後の GameSummary)* → (START 確定 ID の GameSummary)? → GameStarted → 通常対局
+//! Connected → GameSummary → GameStarted → 通常対局
 //! ```
 //!
 //! 再接続成立後の resume:
@@ -51,12 +51,12 @@
 //!
 //! ## SearchInfoSnapshot の semantics
 //!
-//! [`SessionProgress::SearchInfo`] の [`SearchInfoSnapshot`] は USI `info` 行を観測する都度 **累積
+//! [`SearchInfoSnapshot`] は対局ループが USI `info` 行を観測する都度 **累積
 //! snapshot** として更新する値である (depth / score / pv 等は最後に観測した
 //! 値で上書き)。`emit_on_depth_change` や `emit_final` のフラグはこの累積値を
 //! いつ [`SessionProgress::SearchInfo`] として発火するかを制御するだけで、
 //! snapshot の中身そのものは差分ではなく常に「現時点までで最も新しい値の集合」
-//! を表す。bestmove 確定前の観測値なので、指された手の評価値とは限らない。
+//! を表す。
 //!
 //! ## rustls CryptoProvider に関する注意
 //!
@@ -203,9 +203,14 @@ pub enum DisconnectReason {
 // SearchInfo / Move / BestMove payload
 // ────────────────────────────────────────────
 
-/// 探索途中の最終観測値、または指し手に採用した主の info 行の探索情報。
-/// [`SessionProgress::SearchInfo`] は項目ごとの累積値、[`BestMoveEvent::search`] と
-/// [`MoveEvent::search`] は指し手に対応すると確かめられた主の info 行だけを持つ。
+/// USI `info` 行から抽出した探索情報の累積 snapshot。
+///
+/// 対局ループが USI `info` 行を観測する都度、最後に観測した値で各 field を
+/// 上書きする (= 累積 snapshot)。各 field は USI engine が送ってこない場合
+/// `None` のまま。`pv` は最後に観測した PV 一式。
+///
+/// この snapshot は [`SessionProgress::SearchInfo`] / [`BestMoveEvent::search`]
+/// / [`MoveEvent::search`] で同型として使われる。
 #[derive(Debug, Clone, Default)]
 pub struct SearchInfoSnapshot {
     /// `depth N`
@@ -278,8 +283,8 @@ pub struct BestMoveEvent {
     pub ply: u32,
     /// この bestmove を生み出した探索の種別。
     pub search_origin: SearchOrigin,
-    /// score と読み筋から、この指し手に対応すると確かめられた主の info 行。
-    /// 対応を確認できなければ `None`。
+    /// この bestmove を出した時点の累積 [`SearchInfoSnapshot`]。
+    /// USI engine から `info` 行が 1 度も来なかった場合は `None`。
     pub search: Option<SearchInfoSnapshot>,
 }
 
@@ -304,7 +309,7 @@ pub struct MoveEvent {
     /// この手の手数 (1 始まり)。
     pub ply: u32,
     /// この手の消費時間 (秒)。`MoveSent` 時は `None`、`MoveConfirmed` 時は
-    /// サーバ報告値を秒へ換算（秒未満切り捨て）して `Some`。
+    /// サーバ報告値があれば `Some`。
     pub time_sec: Option<u32>,
     /// この手を指す前の SFEN。
     pub sfen_before: String,
@@ -312,7 +317,7 @@ pub struct MoveEvent {
     pub sfen_after: String,
     /// 自エンジンが指した手の場合のみ `Some`。相手の手は `None`。
     pub search_origin: Option<SearchOrigin>,
-    /// 自エンジンの手に対応すると確かめられた主の info 行。確認できなければ `None`。
+    /// 自エンジンが指した手の場合のみ `Some` (探索情報 snapshot)。相手の手は `None`。
     pub search: Option<SearchInfoSnapshot>,
 }
 
@@ -326,8 +331,7 @@ pub struct MoveEvent {
 ///
 /// ```text
 /// Connected
-///   → GameSummary (REJECT のたびに次候補の GameSummary が届く)
-///   → GameSummary (START で ID が確定した場合のみ更新通知)
+///   → GameSummary
 ///   → GameStarted
 ///   → (BestMoveSelected → MoveSent → MoveConfirmed)*  // 自エンジンの手番
 ///   → (MoveConfirmed)*                                // 相手の手番
@@ -343,9 +347,7 @@ pub struct MoveEvent {
 pub enum SessionProgress {
     /// CSA transport の物理接続 + LOGIN 成功直後の marker。Game_Summary 受信前。
     Connected,
-    /// 対局候補の `END Game_Summary` を受信するたびに発火する。
-    /// REJECT 後は新しい候補で置き換える。START で ID が変わった場合も、
-    /// 確定 ID を持つサマリーを `GameStarted` の直前に再通知する。
+    /// `BEGIN Game_Summary` ... `END Game_Summary` を受信し終えた時点で 1 度発火。
     GameSummary(Arc<GameSummary>),
     /// 再接続成立後 (`run_resumed_session_with_events`) に 1 度発火し、resume 用
     /// の Game_Summary と Reconnect_State を同梱する。詳細は [`ReconnectState`]

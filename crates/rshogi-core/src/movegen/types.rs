@@ -4,8 +4,6 @@ use std::mem::MaybeUninit;
 
 use crate::types::Move;
 
-mod splat;
-
 /// 1局面での最大合法手数
 /// 理論上の最大は593手だが、余裕を持たせる
 pub const MAX_MOVES: usize = 600;
@@ -77,7 +75,6 @@ impl GenType {
 
 /// 指し手とスコアのペア（オーダリング用）
 #[derive(Debug, Clone, Copy)]
-#[repr(C)]
 pub struct ExtMove {
     /// 指し手
     pub mv: Move,
@@ -177,6 +174,25 @@ impl ExtMoveBuffer {
         }
     }
 
+    /// Move を追加（内部生成ループ専用、境界チェックなし）。
+    ///
+    /// # Safety
+    ///
+    /// 呼び出し側は `self.len < MAX_MOVES` を保証すること。
+    /// movegen の内部生成では、将棋の合法/疑似合法手数が `MAX_MOVES` を超えない
+    /// という不変条件に依存している。公開 API ではなく、ホットパスの分岐削減用。
+    #[inline(always)]
+    pub(crate) unsafe fn push_move_unchecked(&mut self, mv: Move) {
+        debug_assert!(self.len < MAX_MOVES);
+        // SAFETY:
+        // - 呼び出し側が `self.len < MAX_MOVES` を保証する。
+        // - `self.len` 未満の要素は初期化済みで、新規スロットにのみ write する。
+        unsafe {
+            self.buf.get_unchecked_mut(self.len).write(ExtMove { mv, value: 0 });
+        }
+        self.len += 1;
+    }
+
     /// 現在の要素数
     #[inline]
     pub fn len(&self) -> usize {
@@ -195,13 +211,12 @@ impl ExtMoveBuffer {
         self.len = 0;
     }
 
-    /// 初期化済みの要素数を指定した長さまで短縮する。
+    /// 長さを設定
     ///
-    /// 現在の長さ以下を渡すこと。要素の追加には `push()` / `set()` を使う。
-    // MovePicker で手ごとに通るため、release では範囲を検査しない。
+    /// 直接配列に書き込んだ後にlenを更新するために使用。
     #[inline]
     pub fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= self.len, "cannot extend buffer length without initializing elements");
+        debug_assert!(len <= MAX_MOVES, "len out of bounds: {len} > {MAX_MOVES}");
         self.len = len;
     }
 
@@ -220,49 +235,47 @@ impl ExtMoveBuffer {
     }
 
     /// 指定インデックスの要素を取得
-    ///
-    /// `idx < len()` を渡すこと。
-    // MovePicker で手ごとに通るため、release では範囲を検査しない。
     #[inline]
     pub fn get(&self, idx: usize) -> ExtMove {
         debug_assert!(idx < self.len, "index out of bounds: {idx} >= {}", self.len);
-        // SAFETY: idx < len であれば初期化済みで、buf の長さは MAX_MOVES >= len。
+        // SAFETY: idx < len <= MAX_MOVES であれば初期化済み。
+        //         buf の長さは MAX_MOVES。
         unsafe { self.buf.get_unchecked(idx).assume_init() }
     }
 
-    /// 指定インデックスを上書きする。`idx == len()` なら末尾に追加する。
-    ///
-    /// # Panics
-    /// `idx > len()` または `idx >= MAX_MOVES` の場合は panic する。
+    /// 指定インデックスに値を設定
     #[inline]
     pub fn set(&mut self, idx: usize, ext: ExtMove) {
-        assert!(idx <= self.len, "cannot leave uninitialized elements before the index");
-        self.buf[idx].write(ext);
+        debug_assert!(idx < MAX_MOVES, "index out of bounds: {idx} >= {MAX_MOVES}");
+        // SAFETY: idx は生成手数の上限 MAX_MOVES=600 を超えない。
+        //         手生成器は最大 MAX_MOVES 手までしか生成しないため、
+        //         呼び出し元から範囲外インデックスは渡されない。buf の長さは MAX_MOVES。
+        unsafe { self.buf.get_unchecked_mut(idx) }.write(ext);
         if idx >= self.len {
             self.len = idx + 1;
         }
     }
 
     /// 指定インデックスのvalueを設定
-    ///
-    /// # Panics
-    /// `idx >= len()` の場合は panic する。
     #[inline]
     pub fn set_value(&mut self, idx: usize, value: i32) {
-        self.as_mut_slice()[idx].value = value;
+        debug_assert!(idx < self.len, "index out of bounds: {idx} >= {}", self.len);
+        // SAFETY: idx < len であれば初期化済み
+        unsafe {
+            let ptr = self.buf[idx].as_mut_ptr();
+            (*ptr).value = value;
+        }
     }
 
     /// 2つの要素を入れ替え
-    ///
-    /// どちらのインデックスも `len()` 未満を渡すこと。
-    // MovePicker で手ごとに通るため、release では範囲を検査しない。
     #[inline]
     pub fn swap(&mut self, i: usize, j: usize) {
         debug_assert!(i < self.len && j < self.len, "index out of bounds");
-        // SAFETY: i, j < len であれば初期化済み。ptr::swap は i == j でも正しい。
+        // SAFETY: i, j < len であれば初期化済み
         unsafe {
-            let base = self.buf.as_mut_ptr();
-            std::ptr::swap(base.add(i), base.add(j));
+            let pi = self.buf.as_mut_ptr().add(i);
+            let pj = self.buf.as_mut_ptr().add(j);
+            std::ptr::swap(pi, pj);
         }
     }
 
@@ -323,66 +336,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buffer_preserves_initialized_prefix() {
-        let mut buffer = ExtMoveBuffer::new();
-        buffer.set(0, ExtMove::new(Move::NULL, 10));
-        buffer.push_move(Move::PASS);
-        buffer.set_value(1, 20);
-        buffer.swap(0, 1);
-        assert_eq!(buffer.get(0).mv, Move::PASS);
-        assert_eq!(buffer.get(0).value, 20);
-        assert_eq!(buffer.get(1).mv, Move::NULL);
-        buffer.set_len(1);
-        buffer.set(1, ExtMove::new(Move::WIN, 30));
-        assert_eq!(buffer.len(), 2);
-        buffer.retain(|mv| !mv.is_pass());
-        assert_eq!(buffer.get(0).mv, Move::WIN);
-        assert_eq!(buffer.get(0).value, 30);
-        buffer.clear();
-        assert!(buffer.as_slice().is_empty());
-        buffer.push(ExtMove::new(Move::NONE, 40));
-        assert_eq!(buffer.get(0).value, 40);
+    fn test_ext_move_new() {
+        let mv = Move::NONE;
+        let ext = ExtMove::new(mv, 100);
+        assert_eq!(ext.mv, mv);
+        assert_eq!(ext.value, 100);
     }
 
     #[test]
-    fn buffer_set_rejects_uninitialized_and_out_of_bounds_index() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        let mut buffer = ExtMoveBuffer::new();
-        assert!(catch_unwind(AssertUnwindSafe(|| buffer.set_value(0, 7))).is_err());
-        assert!(buffer.is_empty());
-
-        buffer.push(ExtMove::new(Move::NULL, 10));
-        for index in [1, MAX_MOVES, usize::MAX] {
-            assert!(catch_unwind(AssertUnwindSafe(|| buffer.set_value(index, 7))).is_err());
-        }
-        for index in [2, MAX_MOVES, usize::MAX] {
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| buffer.set(index, ExtMove::new(Move::WIN, 20))))
-                    .is_err()
-            );
-        }
-        assert_eq!(buffer.len(), 1);
-        assert_eq!(buffer.get(0).mv, Move::NULL);
-        assert_eq!(buffer.get(0).value, 10);
-    }
-
-    #[test]
-    fn buffer_set_cannot_exceed_capacity() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        let mut buffer = ExtMoveBuffer::new();
-        for index in 0..MAX_MOVES {
-            buffer.set(index, ExtMove::new(Move::NULL, index as i32));
-        }
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                buffer.set(MAX_MOVES, ExtMove::new(Move::WIN, 0))
-            }))
-            .is_err()
-        );
-        assert_eq!(buffer.len(), MAX_MOVES);
-        assert_eq!(buffer.get(MAX_MOVES - 1).value, (MAX_MOVES - 1) as i32);
+    fn test_ext_move_from_move() {
+        let mv = Move::NONE;
+        let ext: ExtMove = mv.into();
+        assert_eq!(ext.mv, mv);
+        assert_eq!(ext.value, 0);
     }
 
     #[test]

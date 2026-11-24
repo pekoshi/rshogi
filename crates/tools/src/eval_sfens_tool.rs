@@ -1,55 +1,53 @@
-//! eval_sfens - SFEN テキストファイルから指定局面を LayerStacks NNUE で評価
+//! eval_sfens - SFEN 繝・く繧ｹ繝医ヵ繧｡繧､繝ｫ縺九ｉ謖・ｮ壼ｱ髱｢繧・LayerStacks NNUE 縺ｧ隧穂ｾ｡
 //!
-//! # 使用方法
-//!
+//! # 菴ｿ逕ｨ譁ｹ豕・//!
 //! ```bash
 //! cargo run --release -p tools --bin eval_sfens -- \
 //!   --nnue path/to/quantised.bin \
 //!   --sfens path/to/sfens.txt \
-//!   --progress-coeff path/to/progress.bin \
-//!   --progress-buckets 8 \
 //!   --count 10
 //! ```
 
-use crate::nnue_routing::{LayerStackBucketer, NativeRouting, ProgressCoefficients};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::io::{BufRead, BufReader};
+use std::mem::size_of;
 use std::path::PathBuf;
 
 use rshogi_core::nnue::{
-    AccumulatorLayerStacks, AffineTransform, FeatureSet, LayerStackBucketMode, LsFeatureSpec,
-    NNUENetwork, NetworkLayerStacks, ls_dispatch_ft_size, sqr_clipped_relu_transform,
+    AccumulatorLayerStacks, AffineTransform, FeatureSet, HalfKA_hm_FeatureSet,
+    LayerStackBucketMode, LayerStacksNetwork, NNUENetwork, NetworkLayerStacks,
+    SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, compute_layer_stack_progress8kpabs_bucket_index,
+    get_layer_stack_progress_kpabs_weights, set_layer_stack_bucket_mode,
+    set_layer_stack_progress_kpabs_weights, sqr_clipped_relu_transform,
 };
 use rshogi_core::position::Position;
 use rshogi_core::types::Color;
 
 #[derive(Parser)]
-#[command(name = "eval_sfens", about = "LayerStacks NNUE で SFEN 局面を評価")]
+#[command(
+    name = "eval_sfens",
+    about = "LayerStacks NNUE 縺ｧ SFEN 螻髱｢繧定ｩ穂ｾ｡"
+)]
 struct Cli {
-    /// NNUE ファイルパス
+    /// NNUE 繝輔ぃ繧､繝ｫ繝代せ
     #[arg(long)]
     nnue: PathBuf,
 
-    /// SFEN ファイルパス（1行1局面）
-    #[arg(long)]
+    /// SFEN 繝輔ぃ繧､繝ｫ繝代せ・・陦・螻髱｢・・    #[arg(long)]
     sfens: PathBuf,
 
-    /// 評価する局面数
+    /// 隧穂ｾ｡縺吶ｋ螻髱｢謨ｰ
     #[arg(long, default_value_t = 10)]
     count: usize,
 
-    /// 進行度方式（既定: progresskpabs）。ヘッダに ls_bucket= があれば spec を使う。
-    #[arg(long, value_enum)]
-    bucket_mode: Option<BucketMode>,
+    /// Output bucket mode (progress8kpabs)
+    #[arg(long, value_enum, default_value = "progress8kpabs")]
+    bucket_mode: BucketMode,
 
-    /// progress.bin (f64 LE の KP-absolute 進行度重み) のパス
+    /// progress.bin (YaneuraOu 莠呈鋤 KP-absolute 騾ｲ陦悟ｺｦ驥阪∩) 縺ｮ繝代せ
     #[arg(long)]
     progress_coeff: Option<PathBuf>,
-
-    /// 進行度方式が推論に使う bucket 数。
-    #[arg(long)]
-    progress_buckets: Option<usize>,
 
     /// Dump detailed intermediates for the first evaluated position (to stderr)
     #[arg(long, default_value_t = false)]
@@ -58,19 +56,25 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum BucketMode {
-    #[value(name = "progresskpabs")]
-    ProgressKpabs,
-    #[value(name = "progresskpabsq16")]
-    ProgressKpabsQ16,
+    Progress8kpabs,
 }
 
-impl BucketMode {
-    fn mode(self) -> LayerStackBucketMode {
-        match self {
-            Self::ProgressKpabs => LayerStackBucketMode::ProgressKPAbs,
-            Self::ProgressKpabsQ16 => LayerStackBucketMode::ProgressKPAbsQ16,
-        }
+fn load_progress_coeff_kpabs(path: &PathBuf) -> Result<Box<[f32]>, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read --progress-coeff '{}': {e}", path.display()))?;
+    let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * size_of::<f64>();
+    if bytes.len() != expected {
+        return Err(format!(
+            "progress.bin size mismatch: got {} bytes, expected {}",
+            bytes.len(),
+            expected
+        ));
     }
+    let weights: Vec<f32> = bytes
+        .chunks_exact(size_of::<f64>())
+        .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")) as f32)
+        .collect();
+    Ok(weights.into_boxed_slice())
 }
 
 fn padded_input(input_dim: usize) -> usize {
@@ -175,10 +179,9 @@ fn recompute_ft_scalar<
     const LS_L1_OUT: usize,
     const LS_L2_IN: usize,
     const LS_L2_PADDED_INPUT: usize,
-    const LS_L2_OUT: usize,
-    FT: LsFeatureSpec,
+    const LS_L3: usize,
 >(
-    network: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, FT, LS_L2_OUT>,
+    network: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, LS_L3>,
     pos: &Position,
     perspective: Color,
 ) -> [i32; L1] {
@@ -186,11 +189,11 @@ fn recompute_ft_scalar<
     for (dst, &b) in acc.iter_mut().zip(network.feature_transformer.biases.0.iter()) {
         *dst = i32::from(b);
     }
-    let active = <FT::Set as FeatureSet>::collect_active_indices(pos, perspective);
+    let active = HalfKA_hm_FeatureSet::collect_active_indices(pos, perspective);
     for index in active.iter() {
         let offset = index * L1;
         for (i, dst) in acc.iter_mut().enumerate() {
-            *dst += i32::from(network.feature_transformer.piece_weight(offset + i));
+            *dst += i32::from(network.feature_transformer.weights[offset + i]);
         }
     }
     acc
@@ -201,10 +204,9 @@ fn dump_debug_first<
     const LS_L1_OUT: usize,
     const LS_L2_IN: usize,
     const LS_L2_PADDED_INPUT: usize,
-    const LS_L2_OUT: usize,
-    FT: LsFeatureSpec,
+    const LS_L3: usize,
 >(
-    network: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, FT, LS_L2_OUT>,
+    network: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, LS_L3>,
     pos: &Position,
     acc: &AccumulatorLayerStacks<L1>,
     sfen: &str,
@@ -217,8 +219,8 @@ fn dump_debug_first<
     eprintln!("[debug] side_to_move={:?}", pos.side_to_move());
     eprintln!("[debug] bucket={bucket_index} raw={raw} score={score}");
 
-    let black_active = <FT::Set as FeatureSet>::collect_active_indices(pos, Color::Black);
-    let white_active = <FT::Set as FeatureSet>::collect_active_indices(pos, Color::White);
+    let black_active = HalfKA_hm_FeatureSet::collect_active_indices(pos, Color::Black);
+    let white_active = HalfKA_hm_FeatureSet::collect_active_indices(pos, Color::White);
     eprintln!(
         "[debug] active_features black={} white={}",
         black_active.len(),
@@ -264,8 +266,8 @@ fn dump_debug_first<
     let main_dim = LS_L1_OUT - 1;
     let mut l1_simd = [0i32; LS_L1_OUT];
     let mut l1_scalar = [0i32; LS_L1_OUT];
-    bucket.l1().propagate(&transformed, &mut l1_simd);
-    affine_scalar(bucket.l1(), &transformed, &mut l1_scalar);
+    bucket.l1.propagate(&transformed, &mut l1_simd);
+    affine_scalar(&bucket.l1, &transformed, &mut l1_scalar);
     compare_i32_slices("LayerStack L1(simd vs scalar)", &l1_simd, &l1_scalar);
     eprintln!("[debug] l1_out={l1_simd:?}");
 
@@ -280,14 +282,14 @@ fn dump_debug_first<
     }
     eprintln!("[debug] l2_input[0..{LS_L2_IN}]={:?}", &l2_input[..LS_L2_IN]);
 
-    let mut l2_simd = [0i32; LS_L2_OUT];
-    let mut l2_scalar = [0i32; LS_L2_OUT];
+    let mut l2_simd = [0i32; LS_L3];
+    let mut l2_scalar = [0i32; LS_L3];
     bucket.l2.propagate(&l2_input, &mut l2_simd);
     affine_scalar(&bucket.l2, &l2_input, &mut l2_scalar);
     compare_i32_slices("LayerStack L2(simd vs scalar)", &l2_simd, &l2_scalar);
     eprintln!("[debug] l2_out first16={:?}", &l2_simd[..16]);
 
-    let mut l2_relu = [0u8; LS_L2_OUT];
+    let mut l2_relu = [0u8; LS_L3];
     for (dst, &v) in l2_relu.iter_mut().zip(l2_simd.iter()) {
         *dst = (v >> 6).clamp(0, 127) as u8;
     }
@@ -312,24 +314,18 @@ fn run_eval_for_network<
     const LS_L1_OUT: usize,
     const LS_L2_IN: usize,
     const LS_L2_PADDED_INPUT: usize,
-    const LS_L2_OUT: usize,
-    FT: LsFeatureSpec,
+    const LS_L3: usize,
 >(
     cli: &Cli,
-    network: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, FT, LS_L2_OUT>,
+    network: &NetworkLayerStacks<L1, LS_L1_OUT, LS_L2_IN, LS_L2_PADDED_INPUT, LS_L3>,
 ) -> Result<()> {
     eprintln!("fv_scale: {}", network.fv_scale);
-    let spec = network.bucket_spec();
-    let bucketer = if let Some(buckets) = cli.progress_buckets {
-        eprintln!(
-            "bucket_mode: {}",
-            cli.bucket_mode.unwrap_or(BucketMode::ProgressKpabs).mode().as_str()
-        );
-        Some(LayerStackBucketer::from_configured(network.num_buckets, buckets)?)
-    } else {
-        eprintln!("bucket_mode: spec");
-        None
-    };
+    eprintln!(
+        "bucket_mode: {}",
+        match cli.bucket_mode {
+            BucketMode::Progress8kpabs => "progress8kpabs",
+        }
+    );
 
     let file = std::fs::File::open(&cli.sfens)
         .with_context(|| format!("Failed to open: {:?}", cli.sfens))?;
@@ -339,8 +335,7 @@ fn run_eval_for_network<
     let mut acc = AccumulatorLayerStacks::<L1>::new();
     let mut dumped_debug = false;
 
-    // raw は network head 出力、score は Value 内部スケール (歩=90)、score_cp は cp (歩=100)。
-    println!("sfen\tbucket\traw\tscore\tscore_cp");
+    println!("sfen\tbucket\traw\tscore");
     for (i, line) in reader.lines().enumerate() {
         if i >= cli.count {
             break;
@@ -354,11 +349,7 @@ fn run_eval_for_network<
         pos.set_sfen(&sfen).with_context(|| format!("Invalid SFEN: {sfen}"))?;
         network.refresh_accumulator(&pos, &mut acc);
 
-        let bucket_index = match spec {
-            Some(spec) => spec.bucket(&pos),
-            None => bucketer.as_ref().expect("validated routing").bucket(&pos),
-        };
-        let value = network.evaluate_with_bucket(&pos, &acc, bucket_index);
+        let value = network.evaluate(&mut pos, &acc);
 
         let side_to_move = pos.side_to_move();
         let (us_acc, them_acc) = if side_to_move == Color::Black {
@@ -370,6 +361,12 @@ fn run_eval_for_network<
         let mut transformed = [0u8; L1];
         sqr_clipped_relu_transform(us_acc, them_acc, &mut transformed);
 
+        let bucket_index = match cli.bucket_mode {
+            BucketMode::Progress8kpabs => {
+                let weights = get_layer_stack_progress_kpabs_weights();
+                compute_layer_stack_progress8kpabs_bucket_index(&pos, side_to_move, weights)
+            }
+        };
         let raw = network.layer_stacks.evaluate_raw(bucket_index, &transformed);
 
         if cli.dump_debug_first && !dumped_debug {
@@ -377,7 +374,7 @@ fn run_eval_for_network<
             dumped_debug = true;
         }
 
-        println!("{sfen}\t{bucket_index}\t{raw}\t{}\t{}", value.raw(), value.to_cp());
+        println!("{sfen}\t{bucket_index}\t{raw}\t{}", value.raw());
     }
 
     Ok(())
@@ -386,43 +383,71 @@ fn run_eval_for_network<
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    eprintln!("Loading NNUE: {:?}", cli.nnue);
-    // 中間層を dump するため静的 network の内部にアクセスする。
-    let ls_net = NNUENetwork::load_static_layer_stacks(&cli.nnue)
-        .with_context(|| format!("静的 LayerStacks NNUE を読み込めません: {:?}", cli.nnue))?;
-    if ls_net.bucket_spec().is_some() {
-        if matches!(cli.bucket_mode, Some(BucketMode::ProgressKpabsQ16)) {
-            anyhow::bail!("NNUE ls_bucket routing conflicts with --bucket-mode progresskpabsq16");
+    match cli.bucket_mode {
+        BucketMode::Progress8kpabs => {
+            let coeff_path = cli.progress_coeff.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("--bucket-mode progress8kpabs requires --progress-coeff")
+            })?;
+            let weights = load_progress_coeff_kpabs(coeff_path)
+                .map_err(|e| anyhow::anyhow!("failed to load --progress-coeff: {e}"))?;
+            set_layer_stack_progress_kpabs_weights(weights)
+                .map_err(|e| anyhow::anyhow!("failed to set kpabs weights: {e}"))?;
+            set_layer_stack_bucket_mode(LayerStackBucketMode::Progress8KPAbs);
         }
-        if cli.progress_buckets.is_some() {
-            anyhow::bail!("NNUE ls_bucket routing conflicts with --progress-buckets");
-        }
-        if cli.progress_coeff.is_some() {
-            anyhow::bail!("NNUE ls_bucket routing conflicts with --progress-coeff");
-        }
-    } else {
-        let buckets = cli
-            .progress_buckets
-            .context("--progress-buckets is required for a net without ls_bucket")?;
-        let plan = NativeRouting::prepare(
-            Some(ls_net.num_buckets()),
-            Some(cli.bucket_mode.unwrap_or(BucketMode::ProgressKpabs).mode()),
-            Some(buckets),
-            cli.progress_coeff.is_some(),
-        )
-        .context("native routing: --progress-buckets / --progress-coeff")?
-        .expect("LayerStacks routing");
-        plan.apply(|| {
-            cli.progress_coeff
-                .as_ref()
-                .map(|path| ProgressCoefficients::load(path.as_ref()))
-                .transpose()
-        })?;
     }
 
-    ls_dispatch_ft_size!(
-        &ls_net,
-        |concrete_net| run_eval_for_network(&cli, concrete_net),
-        _ => anyhow::bail!("有効な LayerStacks (FT × L1) バリアントがありません"),
-    )
+    eprintln!("Loading NNUE: {:?}", cli.nnue);
+    let network = NNUENetwork::load(&cli.nnue)
+        .with_context(|| format!("Failed to load NNUE: {:?}", cli.nnue))?;
+    let ls_net = match &network {
+        NNUENetwork::LayerStacks(net) => net,
+        _ => anyhow::bail!("eval_sfens requires a LayerStacks NNUE"),
+    };
+
+    macro_rules! with_network {
+        ($net:expr, |$inner:ident| $body:expr) => {
+            match $net {
+                #[cfg(feature = "layerstacks-1536x16x32")]
+                LayerStacksNetwork::L1536x16x32($inner) => $body,
+                #[cfg(feature = "layerstacks-1536x32x32")]
+                LayerStacksNetwork::L1536x32x32($inner) => $body,
+                #[cfg(feature = "layerstacks-1536x8x96")]
+                LayerStacksNetwork::L1536x8x96($inner) => $body,
+                #[cfg(feature = "layerstacks-1536x16x96")]
+                LayerStacksNetwork::L1536x16x96($inner) => $body,
+                #[cfg(feature = "layerstacks-1536x32x96")]
+                LayerStacksNetwork::L1536x32x96($inner) => $body,
+                #[cfg(feature = "layerstacks-1536x48x96")]
+                LayerStacksNetwork::L1536x48x96($inner) => $body,
+                #[cfg(feature = "layerstacks-1536x64x96")]
+                LayerStacksNetwork::L1536x64x96($inner) => $body,
+                #[cfg(feature = "layerstacks-1536x16x48")]
+                LayerStacksNetwork::L1536x16x48($inner) => $body,
+                #[cfg(feature = "layerstacks-1024x16x48")]
+                LayerStacksNetwork::L1024x16x48($inner) => $body,
+                #[cfg(feature = "layerstacks-768x32x96")]
+                LayerStacksNetwork::L768x32x96($inner) => $body,
+                #[cfg(feature = "layerstacks-768x16x32")]
+                LayerStacksNetwork::L768x16x32($inner) => $body,
+                #[cfg(feature = "layerstacks-768x8x32")]
+                LayerStacksNetwork::L768x8x32($inner) => $body,
+                #[cfg(feature = "layerstacks-512x16x32")]
+                LayerStacksNetwork::L512x16x32($inner) => $body,
+                #[allow(unreachable_patterns)]
+                _ => anyhow::bail!("no enabled LayerStacks variant"),
+            }
+        };
+    }
+
+    with_network!(ls_net, |concrete_net| run_eval_for_network(&cli, concrete_net))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_entry_is_reachable_in_tests() {
+        let _ = run as fn() -> Result<()>;
+    }
 }

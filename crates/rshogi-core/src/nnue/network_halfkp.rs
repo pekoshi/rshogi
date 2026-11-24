@@ -33,19 +33,19 @@
 //! # 特徴量
 //!
 //! - 入力次元: 125,388 (81キング位置 × 1,548 BonaPiece)
-//! - 従来の classic NNUE
+//! - 従来の classic NNUE（水匠/tanuki互換）
 
 use std::io::{self, Read, Seek};
 use std::marker::PhantomData;
 
 use super::accumulator::{
     AccumulatorCacheGeneric, Aligned as AlignedGeneric, AlignedBox, AlignedI16, DirtyPiece,
-    IndexList, MAX_CHANGED_FEATURES, MAX_PATH_LENGTH,
+    IndexList, MAX_ACTIVE_FEATURES, MAX_CHANGED_FEATURES, MAX_PATH_LENGTH,
 };
 use super::activation::FtActivation;
 use super::constants::{FV_SCALE, HALFKP_DIMENSIONS, MAX_ARCH_LEN, NNUE_VERSION};
 use super::features::{Feature, FeatureSet, HalfKP, HalfKPFeatureSet};
-use super::network::{get_fv_scale_override, parse_fv_scale_from_arch};
+use super::network::get_fv_scale_override;
 use crate::position::Position;
 use crate::types::{Color, Value};
 
@@ -54,7 +54,20 @@ use crate::types::{Color, Value};
 // =============================================================================
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use super::layers::m256_add_dpbusd_epi32;
+#[inline]
+unsafe fn m256_add_dpbusd_epi32(
+    acc: &mut std::arch::x86_64::__m256i,
+    a: std::arch::x86_64::__m256i,
+    b: std::arch::x86_64::__m256i,
+) {
+    // SAFETY: 呼び出し側が avx2 フィーチャを保証する
+    unsafe {
+        use std::arch::x86_64::*;
+        let product = _mm256_maddubs_epi16(a, b);
+        let product32 = _mm256_madd_epi16(product, _mm256_set1_epi16(1));
+        *acc = _mm256_add_epi32(*acc, product32);
+    }
+}
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
@@ -97,7 +110,20 @@ unsafe fn hsum_i32_sse2(v: std::arch::x86_64::__m128i) -> i32 {
     target_feature = "ssse3",
     not(target_feature = "avx2")
 ))]
-use super::layers::m128_add_dpbusd_epi32;
+#[inline]
+unsafe fn m128_add_dpbusd_epi32(
+    acc: &mut std::arch::x86_64::__m128i,
+    a: std::arch::x86_64::__m128i,
+    b: std::arch::x86_64::__m128i,
+) {
+    // SAFETY: 呼び出し側が ssse3 フィーチャを保証する
+    unsafe {
+        use std::arch::x86_64::*;
+        let product = _mm_maddubs_epi16(a, b);
+        let product32 = _mm_madd_epi16(product, _mm_set1_epi16(1));
+        *acc = _mm_add_epi32(*acc, product32);
+    }
+}
 
 // =============================================================================
 // AccumulatorHalfKP - const generics 版アキュムレータ
@@ -112,7 +138,7 @@ use super::layers::m128_add_dpbusd_epi32;
 /// - キャッシュ効率の向上
 #[repr(C, align(64))]
 pub struct AccumulatorHalfKP<const L1: usize> {
-    /// アキュムレータバッファ `[perspective][L1]`（64バイトアライン、インライン）
+    /// アキュムレータバッファ [perspective][L1]（64バイトアライン、インライン）
     pub accumulation: [AlignedI16<L1>; 2],
     /// 計算済みフラグ
     pub computed_accumulation: bool,
@@ -127,13 +153,26 @@ impl<const L1: usize> AccumulatorHalfKP<L1> {
         }
     }
 
-    /// アキュムレータ用の未初期化ストレージを作成する。
+    /// 未初期化で作成（ゼロ初期化をスキップ）
     ///
-    /// 戻り値は `MaybeUninit<Self>`。`write(Self::new())` などで構造体全体を
-    /// 初期化してから利用する。即座に使える値が必要なら `new()` を呼ぶ。
+    /// # Safety
+    ///
+    /// 呼び出し側が使用前にaccumulationを初期化する責任を持つ。
+    /// AccumulatorStackHalfKP::push()で使用され、直後にrefresh_accumulatorか
+    /// update_accumulatorで全要素が上書きされる。
+    ///
+    /// Clippy警告(uninit_assumed_init)を許可しているが、これは呼び出し直後に
+    /// 全要素が上書きされることが保証されているため安全である。
     #[inline]
-    pub fn new_uninit() -> std::mem::MaybeUninit<Self> {
-        std::mem::MaybeUninit::uninit()
+    #[allow(clippy::uninit_assumed_init)]
+    pub unsafe fn new_uninit() -> Self {
+        // SAFETY: 呼び出し直後に全要素が上書きされることを呼び出し側が保証する
+        unsafe {
+            Self {
+                accumulation: std::mem::MaybeUninit::uninit().assume_init(),
+                computed_accumulation: false,
+            }
+        }
     }
 
     /// クリア
@@ -246,13 +285,15 @@ impl<const L1: usize> AccumulatorStackHalfKP<L1> {
 
     /// プッシュ
     ///
-    /// アキュムレータの保存領域はゼロで初期化し、局面の計算済みフラグは落とす。
-    /// 評価前に refresh_accumulator か update_accumulator で局面を反映する。
+    /// アキュムレータは未初期化で作成される。呼び出し側が直後に
+    /// refresh_accumulatorかupdate_accumulatorを呼ぶ責任を持つ。
     pub fn push(&mut self, dirty_piece: DirtyPiece) {
         let prev_idx = self.current_idx;
         self.current_idx = self.entries.len();
+        // SAFETY: push後は必ずrefresh_accumulatorかupdate_accumulatorが呼ばれ、
+        // accumulationの全要素が上書きされる
         self.entries.push(AccumulatorEntryHalfKP {
-            accumulator: AccumulatorHalfKP::new(),
+            accumulator: unsafe { AccumulatorHalfKP::new_uninit() },
             dirty_piece,
             previous: Some(prev_idx),
         });
@@ -342,7 +383,10 @@ impl<const L1: usize> AccumulatorStackHalfKP<L1> {
             if !path.push(idx) {
                 return None;
             }
-            idx = self.entries[idx].previous?;
+            match self.entries[idx].previous {
+                Some(prev) => idx = prev,
+                None => return None,
+            }
         }
 
         path.reverse();
@@ -364,7 +408,6 @@ impl<const L1: usize> Default for AccumulatorStackHalfKP<L1> {
 ///
 /// static版と同じくbiasesをインラインで保持し、ポインタ間接参照を排除。
 #[repr(C, align(64))]
-#[derive(Clone)]
 pub struct FeatureTransformerHalfKP<const L1: usize> {
     /// バイアス [L1]（64バイトアラインメント、インライン）
     pub biases: AlignedI16<L1>,
@@ -373,14 +416,6 @@ pub struct FeatureTransformerHalfKP<const L1: usize> {
 }
 
 impl<const L1: usize> FeatureTransformerHalfKP<L1> {
-    /// 重み配列をプロセス間共有メモリへ移行する（成功時のみ）。
-    ///
-    /// 多プロセス実行時のメモリ常駐・L3 競合を削減する。ネットワーク構築が完全に
-    /// 終わった後に 1 回だけ呼ぶこと。共有後の重み box は read-only になる。
-    pub(crate) fn share_weights(&mut self) {
-        super::shared_weights::try_share(&mut self.weights, "FT weights (HalfKP)");
-    }
-
     /// ファイルから読み込み
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let input_dim = HALFKP_DIMENSIONS;
@@ -500,7 +535,12 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
 
                 acc.accumulation[p].0.copy_from_slice(&prev_acc.accumulation[p].0);
 
-                self.apply_diff_fused(&mut acc.accumulation[p].0, &removed, &added);
+                for index in removed.iter() {
+                    self.sub_weights(&mut acc.accumulation[p].0, index);
+                }
+                for index in added.iter() {
+                    self.add_weights(&mut acc.accumulation[p].0, index);
+                }
             }
         }
 
@@ -519,10 +559,6 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
         prev_acc: &AccumulatorHalfKP<L1>,
         cache: &mut AccumulatorCacheGeneric,
     ) {
-        if !super::finny::halfkx_finny_enabled(L1) {
-            self.update_accumulator(pos, dirty_piece, acc, prev_acc);
-            return;
-        }
         for perspective in [Color::Black, Color::White] {
             let p = perspective as usize;
             let reset = HalfKPFeatureSet::needs_refresh(dirty_piece, perspective);
@@ -549,7 +585,12 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
 
                 acc.accumulation[p].0.copy_from_slice(&prev_acc.accumulation[p].0);
 
-                self.apply_diff_fused(&mut acc.accumulation[p].0, &removed, &added);
+                for index in removed.iter() {
+                    self.sub_weights(&mut acc.accumulation[p].0, index);
+                }
+                for index in added.iter() {
+                    self.add_weights(&mut acc.accumulation[p].0, index);
+                }
             }
         }
 
@@ -563,10 +604,6 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
         acc: &mut AccumulatorHalfKP<L1>,
         cache: &mut AccumulatorCacheGeneric,
     ) {
-        if !super::finny::halfkx_finny_enabled(L1) {
-            self.refresh_accumulator(pos, acc);
-            return;
-        }
         for perspective in [Color::Black, Color::White] {
             let p = perspective as usize;
             self.refresh_perspective_with_cache(
@@ -588,12 +625,38 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
         accumulation: &mut [i16; L1],
         cache: &mut AccumulatorCacheGeneric,
     ) {
-        cache.refresh_or_cache::<L1, super::ls_feature_spec::HalfKpSpec>(
-            pos,
+        let king_sq = pos.king_square(perspective);
+        let active_indices = HalfKPFeatureSet::collect_active_indices(pos, perspective);
+
+        // IndexList を u32 のソート済み配列に変換
+        let mut sorted_buf = [0u32; MAX_ACTIVE_FEATURES];
+        let len = active_indices.len();
+        for (i, idx) in active_indices.iter().enumerate() {
+            sorted_buf[i] = idx as u32;
+        }
+        let sorted = &mut sorted_buf[..len];
+        sorted.sort_unstable();
+
+        cache.refresh_or_cache(
+            king_sq,
             perspective,
+            sorted,
             &self.biases.0,
             accumulation,
-            &self.weights,
+            |acc, idx| {
+                debug_assert_eq!(acc.len(), L1);
+                // SAFETY: acc は呼び出し元で &mut [i16; L1] から作られたスライス。
+                // キャッシュ生成時も同じ L1 サイズで初期化されており、長さは常に一致する。
+                // 固定サイズ配列への変換により SIMD ループの L1/16 がコンパイル時定数になる。
+                let arr: &mut [i16; L1] = unsafe { &mut *(acc.as_mut_ptr() as *mut [i16; L1]) };
+                self.add_weights(arr, idx);
+            },
+            |acc, idx| {
+                debug_assert_eq!(acc.len(), L1);
+                // SAFETY: 上記と同じ理由で安全
+                let arr: &mut [i16; L1] = unsafe { &mut *(acc.as_mut_ptr() as *mut [i16; L1]) };
+                self.sub_weights(arr, idx);
+            },
         );
     }
 
@@ -641,7 +704,12 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
                 let accumulation =
                     &mut stack.entry_at_mut(current_idx).accumulator.accumulation[p].0;
 
-                self.apply_diff_fused(accumulation, &removed, &added);
+                for index in removed.iter() {
+                    self.sub_weights(accumulation, index);
+                }
+                for index in added.iter() {
+                    self.add_weights(accumulation, index);
+                }
             }
         }
 
@@ -659,36 +727,7 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
         let offset = index * L1;
         let weights = &self.weights[offset..offset + L1];
 
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            // SAFETY:
-            // - accumulation / weight 行はいずれも 64 バイト境界（accumulation は
-            //   AlignedI16<L1> または AlignedBox の cache entry 由来、weight 行は
-            //   AlignedBox 先頭 + 行番号×L1×2 バイト。L1 は 32 の倍数）。
-            // - L1 要素を 32 要素ずつ L1/32 回で完全に走査する。
-            unsafe {
-                use std::arch::x86_64::*;
-                let acc_ptr = accumulation.as_mut_ptr();
-                let weight_ptr = weights.as_ptr();
-                for i in 0..(L1 / 32) {
-                    let acc_vec = _mm512_load_si512(acc_ptr.add(i * 32) as *const __m512i);
-                    let weight_vec = _mm512_load_si512(weight_ptr.add(i * 32) as *const __m512i);
-                    let result = _mm512_add_epi16(acc_vec, weight_vec);
-                    _mm512_store_si512(acc_ptr.add(i * 32) as *mut __m512i, result);
-                }
-            }
-            return;
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512bw")
-        ))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             unsafe {
                 use std::arch::x86_64::*;
@@ -743,36 +782,7 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
         let offset = index * L1;
         let weights = &self.weights[offset..offset + L1];
 
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            // SAFETY:
-            // - accumulation / weight 行はいずれも 64 バイト境界（accumulation は
-            //   AlignedI16<L1> または AlignedBox の cache entry 由来、weight 行は
-            //   AlignedBox 先頭 + 行番号×L1×2 バイト。L1 は 32 の倍数）。
-            // - L1 要素を 32 要素ずつ L1/32 回で完全に走査する。
-            unsafe {
-                use std::arch::x86_64::*;
-                let acc_ptr = accumulation.as_mut_ptr();
-                let weight_ptr = weights.as_ptr();
-                for i in 0..(L1 / 32) {
-                    let acc_vec = _mm512_load_si512(acc_ptr.add(i * 32) as *const __m512i);
-                    let weight_vec = _mm512_load_si512(weight_ptr.add(i * 32) as *const __m512i);
-                    let result = _mm512_sub_epi16(acc_vec, weight_vec);
-                    _mm512_store_si512(acc_ptr.add(i * 32) as *mut __m512i, result);
-                }
-            }
-            return;
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512bw")
-        ))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             unsafe {
                 use std::arch::x86_64::*;
@@ -817,276 +827,6 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
         }
     }
 
-    /// index 番目の重み行（L1 要素）を取得
-    #[inline]
-    fn weight_row(&self, index: usize) -> &[i16] {
-        let offset = index * L1;
-        &self.weights[offset..offset + L1]
-    }
-
-    /// removed/added を融合した差分更新（fast path）
-    ///
-    /// `removed`/`added` がともに 1 要素なら sub+add を 1 パスに、ともに 2 要素なら
-    /// 2 組を 1 パスに融合する。それ以外は従来どおり sub ループ → add ループの
-    /// 2 パスにフォールバックする。do_move の大半は quiet（1 sub+1 add）/
-    /// capture（2 sub+2 add）なので fast path に乗る。
-    ///
-    /// i16 の wrapping 加減算は可換群をなすため、融合パスは `sub_weights` ループ
-    /// → `add_weights` ループと bit 単位で一致する。LayerStacks の
-    /// `try_apply_dirty_piece_fast` は DirtyPiece から特徴 index を再計算するが、
-    /// ここでは `append_changed_indices` が生成済みの IndexList を再利用して
-    /// 再計算を避ける。
-    #[inline]
-    fn apply_diff_fused(
-        &self,
-        accumulation: &mut [i16; L1],
-        removed: &IndexList<MAX_CHANGED_FEATURES>,
-        added: &IndexList<MAX_CHANGED_FEATURES>,
-    ) {
-        match (removed.len(), added.len()) {
-            (1, 1) => {
-                self.apply_sub_add_fused(accumulation, removed.get(0), added.get(0));
-            }
-            (2, 2) => {
-                self.apply_double_sub_add_fused(
-                    accumulation,
-                    removed.get(0),
-                    added.get(0),
-                    removed.get(1),
-                    added.get(1),
-                );
-            }
-            _ => {
-                for index in removed.iter() {
-                    self.sub_weights(accumulation, index);
-                }
-                for index in added.iter() {
-                    self.add_weights(accumulation, index);
-                }
-            }
-        }
-    }
-
-    /// `acc = acc - weights[sub_index] + weights[add_index]` を 1 パスで適用
-    #[inline]
-    fn apply_sub_add_fused(
-        &self,
-        accumulation: &mut [i16; L1],
-        sub_index: usize,
-        add_index: usize,
-    ) {
-        let sub_weights = self.weight_row(sub_index);
-        let add_weights = self.weight_row(add_index);
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            // SAFETY: apply_sub_add_fused の AVX2 パスと同様、accumulation /
-            // weight 行は 64 バイト境界。L1 要素を 32 要素ずつ L1/32 回で走査。
-            unsafe {
-                use std::arch::x86_64::*;
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr = sub_weights.as_ptr();
-                let add_ptr = add_weights.as_ptr();
-                for i in 0..(L1 / 32) {
-                    let acc_vec = _mm512_load_si512(acc_ptr.add(i * 32) as *const __m512i);
-                    let sub_vec = _mm512_load_si512(sub_ptr.add(i * 32) as *const __m512i);
-                    let add_vec = _mm512_load_si512(add_ptr.add(i * 32) as *const __m512i);
-                    let result = _mm512_add_epi16(_mm512_sub_epi16(acc_vec, sub_vec), add_vec);
-                    _mm512_store_si512(acc_ptr.add(i * 32) as *mut __m512i, result);
-                }
-            }
-            return;
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512bw")
-        ))]
-        {
-            // SAFETY:
-            // - accumulation は AlignedI16<L1>（#[repr(C, align(64))]）由来で
-            //   32 バイト境界に揃う。weight 行は AlignedBox 先頭が 64 バイト
-            //   アライン、各行は L1×2 バイト（L1 は 16 の倍数）なので全行先頭も
-            //   32 バイト境界に揃い、aligned load/store が安全。
-            // - L1 要素を 16 要素ずつ L1/16 回で完全に走査する。
-            unsafe {
-                use std::arch::x86_64::*;
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr = sub_weights.as_ptr();
-                let add_ptr = add_weights.as_ptr();
-                for i in 0..(L1 / 16) {
-                    let acc_vec = _mm256_load_si256(acc_ptr.add(i * 16) as *const __m256i);
-                    let sub_vec = _mm256_load_si256(sub_ptr.add(i * 16) as *const __m256i);
-                    let add_vec = _mm256_load_si256(add_ptr.add(i * 16) as *const __m256i);
-                    let result = _mm256_add_epi16(_mm256_sub_epi16(acc_vec, sub_vec), add_vec);
-                    _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
-                }
-            }
-            return;
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "sse2",
-            not(target_feature = "avx2")
-        ))]
-        {
-            // SAFETY:
-            // - accumulation / weight 行は 16 バイト境界にある。
-            // - L1 要素を 8 要素ずつ L1/8 回で完全に走査する。
-            unsafe {
-                use std::arch::x86_64::*;
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr = sub_weights.as_ptr();
-                let add_ptr = add_weights.as_ptr();
-                for i in 0..(L1 / 8) {
-                    let acc_vec = _mm_load_si128(acc_ptr.add(i * 8) as *const __m128i);
-                    let sub_vec = _mm_load_si128(sub_ptr.add(i * 8) as *const __m128i);
-                    let add_vec = _mm_load_si128(add_ptr.add(i * 8) as *const __m128i);
-                    let result = _mm_add_epi16(_mm_sub_epi16(acc_vec, sub_vec), add_vec);
-                    _mm_store_si128(acc_ptr.add(i * 8) as *mut __m128i, result);
-                }
-            }
-            return;
-        }
-
-        #[allow(unreachable_code)]
-        for ((acc, &sub_w), &add_w) in
-            accumulation.iter_mut().zip(sub_weights.iter()).zip(add_weights.iter())
-        {
-            *acc = acc.wrapping_sub(sub_w).wrapping_add(add_w);
-        }
-    }
-
-    /// `acc = acc - sub0 + add0 - sub1 + add1` を 1 パスで適用
-    #[inline]
-    fn apply_double_sub_add_fused(
-        &self,
-        accumulation: &mut [i16; L1],
-        sub_index0: usize,
-        add_index0: usize,
-        sub_index1: usize,
-        add_index1: usize,
-    ) {
-        let sub_weights0 = self.weight_row(sub_index0);
-        let add_weights0 = self.weight_row(add_index0);
-        let sub_weights1 = self.weight_row(sub_index1);
-        let add_weights1 = self.weight_row(add_index1);
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            // SAFETY: apply_double_sub_add_fused の AVX2 パスと同様、accumulation /
-            // 4 本の weight 行は 64 バイト境界。L1 要素を 32 要素ずつ L1/32 回で走査。
-            unsafe {
-                use std::arch::x86_64::*;
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr0 = sub_weights0.as_ptr();
-                let add_ptr0 = add_weights0.as_ptr();
-                let sub_ptr1 = sub_weights1.as_ptr();
-                let add_ptr1 = add_weights1.as_ptr();
-                for i in 0..(L1 / 32) {
-                    let acc_vec = _mm512_load_si512(acc_ptr.add(i * 32) as *const __m512i);
-                    let sub_vec0 = _mm512_load_si512(sub_ptr0.add(i * 32) as *const __m512i);
-                    let add_vec0 = _mm512_load_si512(add_ptr0.add(i * 32) as *const __m512i);
-                    let sub_vec1 = _mm512_load_si512(sub_ptr1.add(i * 32) as *const __m512i);
-                    let add_vec1 = _mm512_load_si512(add_ptr1.add(i * 32) as *const __m512i);
-                    let result = _mm512_add_epi16(
-                        _mm512_add_epi16(_mm512_sub_epi16(acc_vec, sub_vec0), add_vec0),
-                        _mm512_sub_epi16(add_vec1, sub_vec1),
-                    );
-                    _mm512_store_si512(acc_ptr.add(i * 32) as *mut __m512i, result);
-                }
-            }
-            return;
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512bw")
-        ))]
-        {
-            // SAFETY: apply_sub_add_fused と同様（accumulation / 4 本の weight 行
-            // はいずれも 32 バイト境界）。L1 要素を 16 要素ずつ L1/16 回で走査。
-            unsafe {
-                use std::arch::x86_64::*;
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr0 = sub_weights0.as_ptr();
-                let add_ptr0 = add_weights0.as_ptr();
-                let sub_ptr1 = sub_weights1.as_ptr();
-                let add_ptr1 = add_weights1.as_ptr();
-                for i in 0..(L1 / 16) {
-                    let acc_vec = _mm256_load_si256(acc_ptr.add(i * 16) as *const __m256i);
-                    let sub_vec0 = _mm256_load_si256(sub_ptr0.add(i * 16) as *const __m256i);
-                    let add_vec0 = _mm256_load_si256(add_ptr0.add(i * 16) as *const __m256i);
-                    let sub_vec1 = _mm256_load_si256(sub_ptr1.add(i * 16) as *const __m256i);
-                    let add_vec1 = _mm256_load_si256(add_ptr1.add(i * 16) as *const __m256i);
-                    let result = _mm256_add_epi16(
-                        _mm256_add_epi16(_mm256_sub_epi16(acc_vec, sub_vec0), add_vec0),
-                        _mm256_sub_epi16(add_vec1, sub_vec1),
-                    );
-                    _mm256_store_si256(acc_ptr.add(i * 16) as *mut __m256i, result);
-                }
-            }
-            return;
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "sse2",
-            not(target_feature = "avx2")
-        ))]
-        {
-            // SAFETY: accumulation / 4 本の weight 行は 16 バイト境界。
-            // L1 要素を 8 要素ずつ L1/8 回で走査。
-            unsafe {
-                use std::arch::x86_64::*;
-                let acc_ptr = accumulation.as_mut_ptr();
-                let sub_ptr0 = sub_weights0.as_ptr();
-                let add_ptr0 = add_weights0.as_ptr();
-                let sub_ptr1 = sub_weights1.as_ptr();
-                let add_ptr1 = add_weights1.as_ptr();
-                for i in 0..(L1 / 8) {
-                    let acc_vec = _mm_load_si128(acc_ptr.add(i * 8) as *const __m128i);
-                    let sub_vec0 = _mm_load_si128(sub_ptr0.add(i * 8) as *const __m128i);
-                    let add_vec0 = _mm_load_si128(add_ptr0.add(i * 8) as *const __m128i);
-                    let sub_vec1 = _mm_load_si128(sub_ptr1.add(i * 8) as *const __m128i);
-                    let add_vec1 = _mm_load_si128(add_ptr1.add(i * 8) as *const __m128i);
-                    let result = _mm_add_epi16(
-                        _mm_add_epi16(_mm_sub_epi16(acc_vec, sub_vec0), add_vec0),
-                        _mm_sub_epi16(add_vec1, sub_vec1),
-                    );
-                    _mm_store_si128(acc_ptr.add(i * 8) as *mut __m128i, result);
-                }
-            }
-            return;
-        }
-
-        #[allow(unreachable_code)]
-        for ((((acc, &sub_w0), &add_w0), &sub_w1), &add_w1) in accumulation
-            .iter_mut()
-            .zip(sub_weights0.iter())
-            .zip(add_weights0.iter())
-            .zip(sub_weights1.iter())
-            .zip(add_weights1.iter())
-        {
-            *acc = acc
-                .wrapping_sub(sub_w0)
-                .wrapping_add(add_w0)
-                .wrapping_sub(sub_w1)
-                .wrapping_add(add_w1);
-        }
-    }
-
     /// 変換（生の i16 出力）
     ///
     /// 活性化関数は呼び出し側で適用する。
@@ -1110,19 +850,15 @@ impl<const L1: usize> FeatureTransformerHalfKP<L1> {
 // AffineTransformHalfKP - const generics 版アフィン変換（ループ逆転最適化版）
 // =============================================================================
 
-/// アフィン変換層（ループ逆転最適化対応）
+/// アフィン変換層（ループ逆転最適化 + スクランブル重み形式）
 ///
-/// SIMD で積和演算を並列化する。
-/// 重みの格納レイアウトは `should_use_scrambled_weights()` で決まる:
-/// x86 AVX2 かつ OUTPUT が 8 の倍数、または x86 SSSE3 かつ OUTPUT が 4 の倍数では
-/// スクランブル形式 `weights[input_chunk][output][4]`、それ以外では行優先
-/// `weights[output][input]`。
-/// スクランブル形式ではループ逆転で入力をブロードキャストして全出力に同時適用する。
-#[derive(Clone)]
+/// YaneuraOu/Stockfish スタイルの SIMD 最適化を実装。
+/// 重みはスクランブル形式 `weights[input_chunk][output][4]` で保持し、
+/// ループ逆転により入力をブロードキャストして全出力に同時適用する。
 pub struct AffineTransformHalfKP<const INPUT: usize, const OUTPUT: usize> {
     /// バイアス [OUTPUT]
     pub biases: [i32; OUTPUT],
-    /// 重み（格納レイアウトは should_use_scrambled_weights() に従う、64バイトアライン）
+    /// 重み（スクランブル形式、64バイトアライン）
     pub weights: AlignedBox<i8>,
 }
 
@@ -1130,21 +866,34 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
     /// パディング済み入力次元（32の倍数）
     const PADDED_INPUT: usize = INPUT.div_ceil(32) * 32;
 
+    // SIMD最適化用の定数・メソッド（AVX2/SSSE3環境でのみコンパイル）
+    #[cfg(any(target_feature = "avx2", target_feature = "ssse3"))]
     /// チャンクサイズ（u8×4 = i32として読む単位）
     const CHUNK_SIZE: usize = 4;
 
+    #[cfg(any(target_feature = "avx2", target_feature = "ssse3"))]
     /// 入力チャンク数
     const NUM_INPUT_CHUNKS: usize = Self::PADDED_INPUT / Self::CHUNK_SIZE;
 
-    /// 重み格納レイアウトの単一判定。read()/propagate() がすべてこれを参照し、
-    /// 格納時と読み出し時のレイアウト不一致を防ぐ。true のとき重みはスクランブル形式
-    /// （input_chunk-major）で格納・参照される。スクランブル経路を持たない target
-    /// （wasm SIMD / スカラー）では常に false。
+    #[cfg(any(target_feature = "avx2", target_feature = "ssse3"))]
+    /// スクランブル形式を使用するかどうか
+    /// AVX2: OUTPUT % 8 == 0、SSSE3: OUTPUT % 4 == 0
     #[inline]
     const fn should_use_scrambled_weights() -> bool {
-        super::layers::uses_scrambled_weights(OUTPUT)
+        if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+            OUTPUT.is_multiple_of(8)
+        } else if cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "ssse3",
+            not(target_feature = "avx2")
+        )) {
+            OUTPUT.is_multiple_of(4)
+        } else {
+            false
+        }
     }
 
+    #[cfg(any(target_feature = "avx2", target_feature = "ssse3"))]
     /// 重みインデックスのスクランブル変換
     ///
     /// 元のレイアウト: weights[output][input]
@@ -1167,19 +916,49 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
             *bias = i32::from_le_bytes(buf4);
         }
 
-        // 重みを読み込み。格納レイアウトは should_use_scrambled_weights() の単一判定に従う。
+        // 重みを読み込み（スクランブル形式で格納）
         let weight_size = OUTPUT * Self::PADDED_INPUT;
         let mut weights = AlignedBox::new_zeroed(weight_size);
 
-        let mut buf1 = [0u8; 1];
-        for i in 0..weight_size {
-            reader.read_exact(&mut buf1)?;
-            let idx = if Self::should_use_scrambled_weights() {
-                Self::get_weight_index_scrambled(i)
-            } else {
-                i
-            };
-            weights[idx] = buf1[0] as i8;
+        // スクランブル形式の場合は変換しながら格納
+        #[cfg(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            all(
+                target_arch = "x86_64",
+                target_feature = "ssse3",
+                not(target_feature = "avx2")
+            )
+        ))]
+        {
+            let mut buf1 = [0u8; 1];
+            for i in 0..weight_size {
+                reader.read_exact(&mut buf1)?;
+                let idx = if Self::should_use_scrambled_weights() {
+                    Self::get_weight_index_scrambled(i)
+                } else {
+                    i
+                };
+                weights[idx] = buf1[0] as i8;
+            }
+        }
+
+        // スカラー環境: 標準形式で格納
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            all(
+                target_arch = "x86_64",
+                target_feature = "ssse3",
+                not(target_feature = "avx2")
+            )
+        )))]
+        {
+            let mut row_buf = vec![0u8; Self::PADDED_INPUT];
+            for o in 0..OUTPUT {
+                reader.read_exact(&mut row_buf)?;
+                for i in 0..Self::PADDED_INPUT {
+                    weights[o * Self::PADDED_INPUT + i] = row_buf[i] as i8;
+                }
+            }
         }
 
         Ok(Self { biases, weights })
@@ -1187,47 +966,11 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
 
     /// 順伝播（SIMD最適化版 - ループ逆転）
     pub fn propagate(&self, input: &[u8], output: &mut [i32; OUTPUT]) {
-        self.propagate_impl::<true>(input, output);
-    }
-
-    // 活性化関数の出力契約が 0..=127 を保証する呼び出し専用。
-    #[inline]
-    fn propagate_7bit(&self, input: &[u8], output: &mut [i32; OUTPUT]) {
-        debug_assert!(input.iter().all(|&x| x <= 127));
-        self.propagate_impl::<false>(input, output);
-    }
-
-    #[inline]
-    fn propagate_impl<const FULL_RANGE: bool>(&self, input: &[u8], output: &mut [i32; OUTPUT]) {
-        assert!(input.len() >= Self::PADDED_INPUT);
-        assert!(self.weights.len() >= OUTPUT * Self::PADDED_INPUT);
-        assert!(!Self::should_use_scrambled_weights() || OUTPUT <= 1024);
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            any(target_feature = "avx512vnni", target_feature = "avx512bw")
-        ))]
-        if Self::should_use_scrambled_weights() && (OUTPUT == 8 || OUTPUT.is_multiple_of(16)) {
-            // SAFETY: readが64バイトアラインのinput_chunk-major配置を構築する。
-            // 入力はPADDED_INPUT以上、重みはOUTPUT * PADDED_INPUT要素を持ち、
-            // cfgが命令セットを保証する。FULL_RANGE=falseの入力は7bitに制限される。
-            unsafe {
-                super::layers::propagate_affine_avx512::<INPUT, OUTPUT, FULL_RANGE>(
-                    input,
-                    &self.weights,
-                    &self.biases,
-                    output,
-                );
-            }
-            return;
-        }
-
         // AVX2: ループ逆転最適化版
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             unsafe {
-                self.propagate_avx2_loop_inverted::<FULL_RANGE>(input, output);
+                self.propagate_avx2_loop_inverted(input, output);
             }
         }
 
@@ -1239,15 +982,13 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
         ))]
         {
             unsafe {
-                self.propagate_ssse3_loop_inverted::<FULL_RANGE>(input, output);
+                self.propagate_ssse3_loop_inverted(input, output);
             }
         }
 
         // WASM SIMD128: 標準形式の重みで内積
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         {
-            // 本経路は重みを行優先で読む。スクランブル格納と共存しないことを単一判定で保証する。
-            const { assert!(!Self::should_use_scrambled_weights()) };
             // SAFETY:
             // - WASM SIMD128 はアライメント不要（v128_load/v128_store は任意アドレスで動作。
             //   biases は [i32; OUTPUT] でアライメント4バイトだが WASM では制約なし）
@@ -1348,8 +1089,6 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
         }
 
         // スカラー fallback（avx2 は ssse3 を暗黙に含むが、意図を明示するため列挙）
-        // スクランブル / 行優先のどちらの格納でも正しく読めるよう、weight index は
-        // should_use_scrambled_weights() の単一判定で解決する。
         #[cfg(not(any(
             all(target_arch = "x86_64", target_feature = "avx2"),
             all(target_arch = "x86_64", target_feature = "ssse3"),
@@ -1358,14 +1097,9 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
         {
             output.copy_from_slice(&self.biases);
             for (j, out) in output.iter_mut().enumerate() {
+                let weight_offset = j * Self::PADDED_INPUT;
                 for (i, &in_val) in input.iter().enumerate().take(INPUT) {
-                    let logical = j * Self::PADDED_INPUT + i;
-                    let weight_idx = if Self::should_use_scrambled_weights() {
-                        Self::get_weight_index_scrambled(logical)
-                    } else {
-                        logical
-                    };
-                    *out += self.weights[weight_idx] as i32 * in_val as i32;
+                    *out += self.weights[weight_offset + i] as i32 * in_val as i32;
                 }
             }
         }
@@ -1378,17 +1112,13 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[inline]
     #[allow(clippy::needless_range_loop)]
-    unsafe fn propagate_avx2_loop_inverted<const FULL_RANGE: bool>(
-        &self,
-        input: &[u8],
-        output: &mut [i32; OUTPUT],
-    ) {
+    unsafe fn propagate_avx2_loop_inverted(&self, input: &[u8], output: &mut [i32; OUTPUT]) {
         // SAFETY: 呼び出し側が avx2 フィーチャを保証する
         unsafe {
             use std::arch::x86_64::*;
 
-            // スクランブル格納時（AVX2 では OUTPUT % 8 == 0）のみループ逆転を使用
-            if Self::should_use_scrambled_weights() {
+            // OUTPUT % 8 == 0 の場合のみループ逆転を使用
+            if OUTPUT.is_multiple_of(8) {
                 const MAX_REGS: usize = 128; // 最大 1024 出力まで対応
                 let num_regs = OUTPUT / 8;
                 debug_assert!(num_regs <= MAX_REGS);
@@ -1406,7 +1136,7 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
                 // 外側ループ: 入力チャンク
                 for i in 0..Self::NUM_INPUT_CHUNKS {
                     // 入力4バイトを全レーンにブロードキャスト
-                    let in_val = _mm256_set1_epi32(input32.add(i).read_unaligned());
+                    let in_val = _mm256_set1_epi32(*input32.add(i));
 
                     // この入力チャンクに対応する重みの開始位置
                     // スクランブル形式: weights[input_chunk][output][4]
@@ -1414,11 +1144,7 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
 
                     // 内側ループ: 全出力レジスタに積和演算
                     for k in 0..num_regs {
-                        m256_add_dpbusd_epi32::<FULL_RANGE>(
-                            &mut acc[k],
-                            in_val,
-                            _mm256_load_si256(col.add(k)),
-                        );
+                        m256_add_dpbusd_epi32(&mut acc[k], in_val, _mm256_load_si256(col.add(k)));
                     }
                 }
 
@@ -1444,7 +1170,7 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
                         let w_vec = _mm256_load_si256(
                             weight_ptr.add(row_offset + chunk * 32) as *const __m256i
                         );
-                        m256_add_dpbusd_epi32::<FULL_RANGE>(&mut acc_simd, in_vec, w_vec);
+                        m256_add_dpbusd_epi32(&mut acc_simd, in_vec, w_vec);
                     }
 
                     *out += hsum_i32_avx2(acc_simd);
@@ -1464,17 +1190,13 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
     // iterator 化すると raw pointer 側のオフセットを別途 track する必要があり、
     // SIMD intrinsic の autovectorization を阻害し得る。range ループのまま保つ。
     #[allow(clippy::needless_range_loop)]
-    unsafe fn propagate_ssse3_loop_inverted<const FULL_RANGE: bool>(
-        &self,
-        input: &[u8],
-        output: &mut [i32; OUTPUT],
-    ) {
+    unsafe fn propagate_ssse3_loop_inverted(&self, input: &[u8], output: &mut [i32; OUTPUT]) {
         // SAFETY: 呼び出し側が ssse3 フィーチャを保証する
         unsafe {
             use std::arch::x86_64::*;
 
-            // スクランブル格納時（SSSE3 では OUTPUT % 4 == 0 ∧ 非ゼロ）のみループ逆転を使用
-            if Self::should_use_scrambled_weights() {
+            // OUTPUT が 4 の倍数 ∧ 非ゼロの場合のみループ逆転を使用
+            if OUTPUT.is_multiple_of(4) && OUTPUT > 0 {
                 const MAX_REGS: usize = 256; // 最大 1024 出力まで対応
                 let num_regs = OUTPUT / 4;
                 debug_assert!(num_regs <= MAX_REGS);
@@ -1491,15 +1213,11 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
 
                 // 外側ループ: 入力チャンク
                 for i in 0..Self::NUM_INPUT_CHUNKS {
-                    let in_val = _mm_set1_epi32(input32.add(i).read_unaligned());
+                    let in_val = _mm_set1_epi32(*input32.add(i));
                     let col = weights_ptr.add(i * OUTPUT * Self::CHUNK_SIZE) as *const __m128i;
 
                     for k in 0..num_regs {
-                        m128_add_dpbusd_epi32::<FULL_RANGE>(
-                            &mut acc[k],
-                            in_val,
-                            _mm_load_si128(col.add(k)),
-                        );
+                        m128_add_dpbusd_epi32(&mut acc[k], in_val, _mm_load_si128(col.add(k)));
                     }
                 }
 
@@ -1523,7 +1241,7 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
                         let w_vec = _mm_load_si128(
                             weight_ptr.add(row_offset + chunk * 16) as *const __m128i
                         );
-                        m128_add_dpbusd_epi32::<FULL_RANGE>(&mut acc_simd, in_vec, w_vec);
+                        m128_add_dpbusd_epi32(&mut acc_simd, in_vec, w_vec);
                     }
 
                     *out += hsum_i32_sse2(acc_simd);
@@ -1548,7 +1266,6 @@ impl<const INPUT: usize, const OUTPUT: usize> AffineTransformHalfKP<INPUT, OUTPU
 /// - `L2`: 隠れ層1の出力次元
 /// - `L3`: 隠れ層2の出力次元
 /// - `A`: 活性化関数（FtActivation trait を実装する型）
-#[derive(Clone)]
 pub struct NetworkHalfKP<
     const L1: usize,
     const FT_OUT: usize,
@@ -1630,15 +1347,14 @@ impl<
         // FV_SCALE 検出
         let fv_scale = parse_fv_scale_from_arch(&arch_str).unwrap_or(FV_SCALE);
 
-        // QA 検出（qa= 明示が無ければ活性化種別から導出: SCReLU=255 / 他=127）
-        let qa = parse_qa_from_arch(&arch_str)
-            .unwrap_or_else(|| super::activation::default_qa_for_arch(&arch_str));
+        // QA 検出（デフォルト 127）
+        let qa = parse_qa_from_arch(&arch_str).unwrap_or(127);
 
         // Feature Transformer ハッシュ
         reader.read_exact(&mut buf4)?;
 
-        // Feature Transformer（末尾の share_weights() で変更するため mut）
-        let mut feature_transformer = FeatureTransformerHalfKP::read(reader)?;
+        // Feature Transformer
+        let feature_transformer = FeatureTransformerHalfKP::read(reader)?;
 
         // FC layers ハッシュ
         reader.read_exact(&mut buf4)?;
@@ -1651,9 +1367,6 @@ impl<
 
         // output: L3 → 1
         let output = AffineTransformHalfKP::read(reader)?;
-
-        // 重みをプロセス間共有メモリへ移行（多プロセス時のメモリ常駐・L3 競合を削減）。
-        feature_transformer.share_weights();
 
         Ok(Self {
             feature_transformer,
@@ -1723,34 +1436,24 @@ impl<
     /// 評価値を計算
     ///
     /// 最適化: スタック配列 + 64バイトアラインメントで SIMD 効率を最大化
+    /// 各配列はMaybeUninitで確保し、直後のtransform/propagateで全要素が上書きされる。
     pub fn evaluate(&self, pos: &Position, acc: &AccumulatorHalfKP<L1>) -> Value {
-        self.evaluate_with_scale(pos, acc, get_fv_scale_override)
-    }
-
-    fn evaluate_with_scale(
-        &self,
-        pos: &Position,
-        acc: &AccumulatorHalfKP<L1>,
-        scale_override: impl FnOnce() -> Option<i32>,
-    ) -> Value {
+        // SAFETY: 各配列は直後のtransform_raw/activate/propagateで全要素が上書きされる
         // Feature Transformer 出力（生のi16値）- 64バイトアライン
         // FT出力は常に FT_OUT（= L1 * 2、両視点の連結）
-        let mut ft_out_i16 = AlignedGeneric([0i16; FT_OUT]);
+        let mut ft_out_i16: AlignedGeneric<[i16; FT_OUT]> = unsafe { AlignedGeneric::new_uninit() };
         self.feature_transformer
             .transform_raw(acc, pos.side_to_move(), &mut ft_out_i16.0);
 
         // 活性化関数適用 (i16 → u8) - 64バイトアライン
         // 活性化後のサイズは L1_INPUT（CReLU: L1*2、Pairwise: L1）
-        let mut transformed = super::layers::PaddedAffineInput::<L1_INPUT>::new();
+        let mut transformed: AlignedGeneric<[u8; L1_INPUT]> =
+            unsafe { AlignedGeneric::new_uninit() };
         A::activate_i16_to_u8(&ft_out_i16.0, &mut transformed.0, self.qa);
 
         // l1 層 - 64バイトアライン
-        let mut l1_out = AlignedGeneric([0i32; L2]);
-        if A::SEVEN_BIT_WHEN_QA127 && self.qa <= 127 {
-            self.l1.propagate_7bit(transformed.as_padded(), &mut l1_out.0);
-        } else {
-            self.l1.propagate(transformed.as_padded(), &mut l1_out.0);
-        }
+        let mut l1_out: AlignedGeneric<[i32; L2]> = unsafe { AlignedGeneric::new_uninit() };
+        self.l1.propagate(&transformed.0, &mut l1_out.0);
 
         // デバッグ: L1出力の範囲チェック
         #[cfg(debug_assertions)]
@@ -1766,16 +1469,12 @@ impl<
         }
 
         // 活性化関数適用 (i32 → u8) - 64バイトアライン
-        let mut l1_relu = super::layers::PaddedAffineInput::<L2>::new();
+        let mut l1_relu: AlignedGeneric<[u8; L2]> = unsafe { AlignedGeneric::new_uninit() };
         A::activate_i32_to_u8(&l1_out.0, &mut l1_relu.0);
 
         // l2 層 - 64バイトアライン
-        let mut l2_out = AlignedGeneric([0i32; L3]);
-        if A::SEVEN_BIT_WHEN_QA127 {
-            self.l2.propagate_7bit(l1_relu.as_padded(), &mut l2_out.0);
-        } else {
-            self.l2.propagate(l1_relu.as_padded(), &mut l2_out.0);
-        }
+        let mut l2_out: AlignedGeneric<[i32; L3]> = unsafe { AlignedGeneric::new_uninit() };
+        self.l2.propagate(&l1_relu.0, &mut l2_out.0);
 
         // デバッグ: L2出力の範囲チェック
         #[cfg(debug_assertions)]
@@ -1791,19 +1490,15 @@ impl<
         }
 
         // 活性化関数適用 (i32 → u8) - 64バイトアライン
-        let mut l2_relu = super::layers::PaddedAffineInput::<L3>::new();
+        let mut l2_relu: AlignedGeneric<[u8; L3]> = unsafe { AlignedGeneric::new_uninit() };
         A::activate_i32_to_u8(&l2_out.0, &mut l2_relu.0);
 
         // output 層（4バイトなのでゼロ初期化のコストは無視可能）
         let mut output = [0i32; 1];
-        if A::SEVEN_BIT_WHEN_QA127 {
-            self.output.propagate_7bit(l2_relu.as_padded(), &mut output);
-        } else {
-            self.output.propagate(l2_relu.as_padded(), &mut output);
-        }
+        self.output.propagate(&l2_relu.0, &mut output);
 
         // スケーリング
-        let fv_scale = scale_override().unwrap_or(self.fv_scale);
+        let fv_scale = get_fv_scale_override().unwrap_or(self.fv_scale);
         let eval = output[0] / fv_scale;
 
         // デバッグ: 最終評価値の範囲チェック
@@ -1857,304 +1552,61 @@ fn parse_qa_from_arch(arch_str: &str) -> Option<i16> {
     }
 }
 
+/// アーキテクチャ文字列から FV_SCALE をパース
+fn parse_fv_scale_from_arch(arch_str: &str) -> Option<i32> {
+    if let Some(start) = arch_str.find("fv_scale=") {
+        let rest = &arch_str[start + 9..];
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    } else {
+        None
+    }
+}
+
 // =============================================================================
 // 型エイリアス
 // =============================================================================
 
-use super::activation::{CReLU, PairwiseCReLU, SCReLU};
+use super::activation::CReLU;
 
 // L1=256, FT_OUT=512
 // CReLU/SCReLU: L1_INPUT=512, Pairwise: L1_INPUT=256
 /// HalfKP 256x2-32-32 CReLU
 pub type HalfKP256CReLU = NetworkHalfKP<256, 512, 512, 32, 32, CReLU>;
-/// HalfKP 256x2-32-32 SCReLU
-pub type HalfKP256SCReLU = NetworkHalfKP<256, 512, 512, 32, 32, SCReLU>;
-/// HalfKP 256x2-32-32 PairwiseCReLU
-pub type HalfKP256Pairwise = NetworkHalfKP<256, 512, 256, 32, 32, PairwiseCReLU>;
 
 // L1=512, FT_OUT=1024
 // CReLU/SCReLU: L1_INPUT=1024, Pairwise: L1_INPUT=512
 /// HalfKP 512x2-8-96 CReLU
 pub type HalfKP512CReLU = NetworkHalfKP<512, 1024, 1024, 8, 96, CReLU>;
-/// HalfKP 512x2-8-96 SCReLU
-pub type HalfKP512SCReLU = NetworkHalfKP<512, 1024, 1024, 8, 96, SCReLU>;
-/// HalfKP 512x2-8-96 PairwiseCReLU
-pub type HalfKP512Pairwise = NetworkHalfKP<512, 1024, 512, 8, 96, PairwiseCReLU>;
 
 // L1=512, FT_OUT=1024, L2=8, L3=64
 /// HalfKP 512x2-8-64 CReLU
 pub type HalfKP512_8_64CReLU = NetworkHalfKP<512, 1024, 1024, 8, 64, CReLU>;
-/// HalfKP 512x2-8-64 SCReLU
-pub type HalfKP512_8_64SCReLU = NetworkHalfKP<512, 1024, 1024, 8, 64, SCReLU>;
-/// HalfKP 512x2-8-64 PairwiseCReLU
-pub type HalfKP512_8_64Pairwise = NetworkHalfKP<512, 1024, 512, 8, 64, PairwiseCReLU>;
 
 // L1=512, FT_OUT=1024, L2=32, L3=32
 /// HalfKP 512x2-32-32 CReLU
 pub type HalfKP512_32_32CReLU = NetworkHalfKP<512, 1024, 1024, 32, 32, CReLU>;
-/// HalfKP 512x2-32-32 SCReLU
-pub type HalfKP512_32_32SCReLU = NetworkHalfKP<512, 1024, 1024, 32, 32, SCReLU>;
-/// HalfKP 512x2-32-32 PairwiseCReLU
-pub type HalfKP512_32_32Pairwise = NetworkHalfKP<512, 1024, 512, 32, 32, PairwiseCReLU>;
 
 // L1=1024, FT_OUT=2048, L2=8, L3=32
 /// HalfKP 1024x2-8-32 CReLU
 pub type HalfKP1024_8_32CReLU = NetworkHalfKP<1024, 2048, 2048, 8, 32, CReLU>;
-/// HalfKP 1024x2-8-32 SCReLU
-pub type HalfKP1024_8_32SCReLU = NetworkHalfKP<1024, 2048, 2048, 8, 32, SCReLU>;
-/// HalfKP 1024x2-8-32 PairwiseCReLU
-pub type HalfKP1024_8_32Pairwise = NetworkHalfKP<1024, 2048, 1024, 8, 32, PairwiseCReLU>;
 
 // L1=1024, FT_OUT=2048, L2=8, L3=64
 /// HalfKP 1024x2-8-64 CReLU
 pub type HalfKP1024_8_64CReLU = NetworkHalfKP<1024, 2048, 2048, 8, 64, CReLU>;
-/// HalfKP 1024x2-8-64 SCReLU
-pub type HalfKP1024_8_64SCReLU = NetworkHalfKP<1024, 2048, 2048, 8, 64, SCReLU>;
-/// HalfKP 1024x2-8-64 PairwiseCReLU
-pub type HalfKP1024_8_64Pairwise = NetworkHalfKP<1024, 2048, 1024, 8, 64, PairwiseCReLU>;
 
 // L1=768, FT_OUT=1536, L2=16, L3=64
 // CReLU/SCReLU: L1_INPUT=1536, Pairwise: L1_INPUT=768
 /// HalfKP 768x2-16-64 CReLU
 pub type HalfKP768CReLU = NetworkHalfKP<768, 1536, 1536, 16, 64, CReLU>;
-/// HalfKP 768x2-16-64 SCReLU
-pub type HalfKP768SCReLU = NetworkHalfKP<768, 1536, 1536, 16, 64, SCReLU>;
-/// HalfKP 768x2-16-64 PairwiseCReLU
-pub type HalfKP768Pairwise = NetworkHalfKP<768, 1536, 768, 16, 64, PairwiseCReLU>;
 
 // =============================================================================
 // テスト
 // =============================================================================
 
-/// loader 回帰用の、両視点と全 dense 層に非ゼロ重みを持つ HalfKP payload。
-#[cfg(test)]
-pub(crate) fn halfkp_loader_fixture(l1: usize, arch: &str) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for value in [NNUE_VERSION, 0, arch.len() as u32] {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    bytes.extend_from_slice(arch.as_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    for _ in 0..l1 {
-        bytes.extend_from_slice(&64i16.to_le_bytes());
-    }
-    for _ in 0..HALFKP_DIMENSIONS * l1 {
-        bytes.extend_from_slice(&1i16.to_le_bytes());
-    }
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    for (input, output, bias) in [(2 * l1, 32, 0i32), (32, 32, 0), (32, 1, 128)] {
-        for _ in 0..output {
-            bytes.extend_from_slice(&bias.to_le_bytes());
-        }
-        bytes.extend(std::iter::repeat_n(1u8, super::layers::padded_input(input) * output));
-    }
-    bytes
-}
-
 #[cfg(test)]
 mod tests {
-    crate::nnue::layers::halfkx_affine_tests::halfkx_affine_tests!(AffineTransformHalfKP);
     use super::*;
-    fn valid_init_forward<
-        A: FtActivation,
-        const L1: usize,
-        const FT: usize,
-        const INPUT: usize,
-        const L2: usize,
-        const L3: usize,
-    >(
-        qa: i16,
-    ) {
-        use crate::nnue::layers::halfkx_affine_tests::{dense_fixture, dense_reference};
-        let network = NetworkHalfKP::<L1, FT, INPUT, L2, L3, A> {
-            feature_transformer: FeatureTransformerHalfKP {
-                biases: AlignedI16::default(),
-                weights: AlignedBox::new_zeroed(1),
-            },
-            l1: AffineTransformHalfKP::read(&mut &dense_fixture(INPUT, L2)[..]).unwrap(),
-            l2: AffineTransformHalfKP::read(&mut &dense_fixture(L2, L3)[..]).unwrap(),
-            output: AffineTransformHalfKP::read(&mut &dense_fixture(L3, 1)[..]).unwrap(),
-            fv_scale: 16,
-            qa,
-            _activation: PhantomData,
-        };
-        let mut acc = AccumulatorHalfKP::<L1>::new();
-        for i in 0..L1 {
-            acc.accumulation[0].0[i] = ((i * 3) % 300) as i16 - 20;
-            acc.accumulation[1].0[i] = ((i * 7) % 280) as i16 - 10;
-        }
-        for side in [Color::Black, Color::White] {
-            let mut pos = Position::new();
-            pos.set_sfen(if side == Color::Black {
-                "4k4/9/9/9/9/9/9/9/4K4 b - 1"
-            } else {
-                "4k4/9/9/9/9/9/9/9/4K4 w - 1"
-            })
-            .unwrap();
-            // 参照側の全バッファは Vec の有効な初期値で構築する。
-            let raw: Vec<i16> = acc.accumulation[side as usize]
-                .0
-                .iter()
-                .chain(acc.accumulation[1 - side as usize].0.iter())
-                .copied()
-                .collect();
-            let mut input = vec![0u8; INPUT];
-            A::activate_i16_to_u8(&raw, &mut input, qa);
-            let l1 = dense_reference(&input, L2);
-            let mut hidden = vec![0u8; L2];
-            A::activate_i32_to_u8(&l1, &mut hidden);
-            let l2 = dense_reference(&hidden, L3);
-            let mut last = vec![0u8; L3];
-            A::activate_i32_to_u8(&l2, &mut last);
-            let expected = dense_reference(&last, 1)[0] / get_fv_scale_override().unwrap_or(16);
-            assert_eq!(network.evaluate(&pos, &acc), Value::new(expected));
-        }
-    }
-
-    #[test]
-    fn valid_init_forward_matches_initialized_reference() {
-        for qa in [127, 255] {
-            valid_init_forward::<CReLU, 32, 64, 64, 32, 32>(qa);
-            valid_init_forward::<SCReLU, 32, 64, 64, 32, 32>(qa);
-            valid_init_forward::<PairwiseCReLU, 32, 64, 32, 32, 32>(qa);
-            // 実forward自身がpaddingを構築し、参照側は論理長だけを扱う。
-            valid_init_forward::<CReLU, 512, 1024, 1024, 8, 96>(qa);
-            valid_init_forward::<SCReLU, 512, 1024, 1024, 8, 64>(qa);
-            valid_init_forward::<PairwiseCReLU, 512, 1024, 512, 8, 64>(qa);
-            valid_init_forward::<CReLU, 1024, 2048, 2048, 8, 64>(qa);
-            valid_init_forward::<SCReLU, 1024, 2048, 2048, 8, 64>(qa);
-            valid_init_forward::<PairwiseCReLU, 1024, 2048, 1024, 8, 64>(qa);
-            valid_init_forward::<CReLU, 768, 1536, 1536, 16, 64>(qa);
-            valid_init_forward::<SCReLU, 768, 1536, 1536, 16, 64>(qa);
-            valid_init_forward::<PairwiseCReLU, 768, 1536, 768, 16, 64>(qa);
-        }
-    }
-
-    #[test]
-    fn valid_init_halfkp_storage_and_pushed_entry() {
-        let mut storage = AccumulatorHalfKP::<32>::new_uninit();
-        let initialized = storage.write(AccumulatorHalfKP::new());
-        assert!(!initialized.computed_accumulation);
-        assert!(initialized.accumulation.iter().all(|a| a.0.iter().all(|&v| v == 0)));
-        let mut stack = AccumulatorStackHalfKP::<32>::new();
-        stack.push(DirtyPiece::new());
-        let entry = &stack.entries[stack.current_idx];
-        assert!(!entry.accumulator.computed_accumulation);
-        assert!(entry.accumulator.accumulation.iter().all(|a| a.0.iter().all(|&v| v == 0)));
-    }
-
-    #[test]
-    fn qa255_affine_reference_matches_integer() {
-        super::super::layers::check_qa255_affine::<32, 32>(|bytes, input, output| {
-            let transform = AffineTransformHalfKP::<32, 32>::read(&mut &bytes[..]).unwrap();
-            transform.propagate(input, output);
-            if input.iter().all(|&x| x <= 127) {
-                let expected = *output;
-                transform.propagate_7bit(input, output);
-                assert_eq!(*output, expected);
-            }
-        });
-        super::super::layers::check_qa255_affine::<512, 8>(|bytes, input, output| {
-            let transform = AffineTransformHalfKP::<512, 8>::read(&mut &bytes[..]).unwrap();
-            transform.propagate(input, output);
-            if input.iter().all(|&x| x <= 127) {
-                let expected = *output;
-                transform.propagate_7bit(input, output);
-                assert_eq!(*output, expected);
-            }
-        });
-        super::super::layers::check_qa255_affine::<32, 4>(|bytes, input, output| {
-            let transform = AffineTransformHalfKP::<32, 4>::read(&mut &bytes[..]).unwrap();
-            transform.propagate(input, output);
-            if input.iter().all(|&x| x <= 127) {
-                let expected = *output;
-                transform.propagate_7bit(input, output);
-                assert_eq!(*output, expected);
-            }
-        });
-        super::super::layers::check_qa255_affine::<32, 1>(|bytes, input, output| {
-            let transform = AffineTransformHalfKP::<32, 1>::read(&mut &bytes[..]).unwrap();
-            transform.propagate(input, output);
-            if input.iter().all(|&x| x <= 127) {
-                let expected = *output;
-                transform.propagate_7bit(input, output);
-                assert_eq!(*output, expected);
-            }
-        });
-        super::super::layers::check_qa255_affine::<760, 8>(|bytes, input, output| {
-            let transform = AffineTransformHalfKP::<760, 8>::read(&mut &bytes[..]).unwrap();
-            transform.propagate(input, output);
-            if input.iter().all(|&x| x <= 127) {
-                let expected = *output;
-                transform.propagate_7bit(input, output);
-                assert_eq!(*output, expected);
-            }
-        });
-    }
-
-    /// read→propagate を、SIMD レイアウト（スクランブル形式
-    /// `weights[input_chunk][output][4]`）に依存しない行優先スカラー参照と bit 一致で
-    /// 照合し、重み格納レイアウトと読み出しのドリフトを検出する。OUTPUT=8/4 は
-    /// スクランブル経路（AVX2 は %8、SSSE3 は %4）、OUTPUT=1 は行優先（出力層）、
-    /// INPUT が 32 の非倍数は PADDED に padding 列が生じる境界を踏む。
-    macro_rules! affine_reference_test {
-        ($name:ident, $in:literal, $out:literal) => {
-            #[test]
-            fn $name() {
-                const INPUT_DIM: usize = $in;
-                const OUTPUT_DIM: usize = $out;
-                const PADDED: usize = crate::nnue::layers::padded_input(INPUT_DIM);
-
-                let mut biases = [0i32; OUTPUT_DIM];
-                let mut logical = vec![0i8; OUTPUT_DIM * PADDED];
-                let mut bytes: Vec<u8> = Vec::new();
-                for o in 0..OUTPUT_DIM {
-                    let b = (o as i32) * 1000 - 3000;
-                    biases[o] = b;
-                    bytes.extend_from_slice(&b.to_le_bytes());
-                }
-                for o in 0..OUTPUT_DIM {
-                    for inp in 0..PADDED {
-                        // padding 列（inp >= INPUT_DIM）は 0、実重みは ±25 程度に散らす
-                        let w = if inp < INPUT_DIM {
-                            (((o * 31 + inp * 7) % 51) as i32 - 25) as i8
-                        } else {
-                            0
-                        };
-                        logical[o * PADDED + inp] = w;
-                        bytes.push(w as u8);
-                    }
-                }
-
-                let transform =
-                    AffineTransformHalfKP::<INPUT_DIM, OUTPUT_DIM>::read(&mut &bytes[..]).unwrap();
-
-                let mut input = crate::nnue::accumulator::Aligned([0u8; PADDED]);
-                for inp in 0..INPUT_DIM {
-                    input.0[inp] = ((inp * 13 + 5) % 128) as u8;
-                }
-
-                let mut expected = [0i32; OUTPUT_DIM];
-                for o in 0..OUTPUT_DIM {
-                    let mut acc = biases[o];
-                    for inp in 0..INPUT_DIM {
-                        acc += logical[o * PADDED + inp] as i32 * input.0[inp] as i32;
-                    }
-                    expected[o] = acc;
-                }
-
-                let mut output = [0i32; OUTPUT_DIM];
-                transform.propagate(&input.0, &mut output);
-
-                assert_eq!(output, expected);
-            }
-        };
-    }
-
-    affine_reference_test!(test_affine_reference_halfkp_256x8, 256, 8);
-    affine_reference_test!(test_affine_reference_halfkp_512x4, 512, 4);
-    affine_reference_test!(test_affine_reference_halfkp_512x1, 512, 1);
-    affine_reference_test!(test_affine_reference_halfkp_760x8, 760, 8);
 
     #[test]
     fn test_accumulator_halfkp_256() {
@@ -2168,6 +1620,12 @@ mod tests {
         let cloned = acc.clone();
         assert_eq!(cloned.accumulation[0].0[0], 100);
         assert!(cloned.computed_accumulation);
+    }
+
+    #[test]
+    fn test_accumulator_halfkp_512() {
+        let acc = AccumulatorHalfKP::<512>::new();
+        assert_eq!(acc.accumulation[0].0.len(), 512);
     }
 
     #[test]
@@ -2203,38 +1661,6 @@ mod tests {
     }
 
     #[test]
-    fn halfkp_scale_metadata_read_and_evaluate() {
-        use std::io::Cursor;
-        type Net = NetworkHalfKP<32, 64, 64, 32, 32, CReLU>;
-        let mut pos = Position::new();
-        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
-            .unwrap();
-        // グローバル値は変更せず、auto/明示上書きの同じ評価経路へ引数で渡す。
-        assert_eq!(get_fv_scale_override(), None);
-        for (metadata, expected_scale) in [
-            ("", FV_SCALE),
-            (",fv_scale=0", FV_SCALE),
-            (",fv_scale=-1", FV_SCALE),
-            (",fv_scale=129", FV_SCALE),
-            (",fv_scale=2147483647", FV_SCALE),
-            (",fv_scale=1", 1),
-            (",fv_scale=16", 16),
-            (",fv_scale=128", 128),
-        ] {
-            let arch = format!("Features=HalfKP(Friend)[125388->32x2],l2=32,l3=32{metadata}");
-            let net = Net::read(&mut Cursor::new(halfkp_loader_fixture(32, &arch))).unwrap();
-            assert_eq!(net.fv_scale, expected_scale, "{metadata}");
-            let mut acc = AccumulatorHalfKP::<32>::new();
-            net.refresh_accumulator(&pos, &mut acc);
-            assert!(acc.accumulation[0].0.iter().all(|v| *v == 102));
-            // 64*102 -> CReLU /64 -> 32*102 -> /64 -> 32*51 +128 =1760。
-            assert_eq!(net.evaluate(&pos, &acc).raw(), 1760 / expected_scale, "{metadata}");
-            assert_eq!(net.evaluate_with_scale(&pos, &acc, || Some(4)).raw(), 440);
-            assert_eq!(net.evaluate_with_scale(&pos, &acc, || None).raw(), 1760 / expected_scale);
-        }
-    }
-
-    #[test]
     fn test_parse_fv_scale_from_arch() {
         // bullet-shogi 形式（fv_scale= を含む）の仮定ケース
         assert_eq!(
@@ -2256,5 +1682,12 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn test_type_aliases() {
+        // 型エイリアスがコンパイルできることを確認
+        fn _check_halfkp_256_crelu(_: HalfKP256CReLU) {}
+        fn _check_halfkp_512_crelu(_: HalfKP512CReLU) {}
     }
 }

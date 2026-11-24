@@ -8,44 +8,46 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-#[cfg(feature = "search-pass-rules")]
+#[cfg(not(feature = "search-no-pass-rules"))]
 use crate::eval::evaluate_pass_rights;
 use crate::eval::{EvalHash, get_scaled_pass_move_bonus};
-use crate::nnue::get_network;
-use crate::nnue::search_evaluator::SearchEvaluator;
+#[cfg(feature = "layerstack-only")]
+use crate::nnue::NNUENetwork;
+use crate::nnue::{
+    AccumulatorStackVariant, LayerStacksAccCache, get_bucket_index_for_pos, get_network,
+};
 use crate::position::Position;
 use crate::search::PieceToHistory;
-use crate::tt::{TTWriter, TranspositionTable};
+use crate::tt::{ProbeResult, TTData, TranspositionTable};
 use crate::types::{
     Bound, Color, DEPTH_QS, Depth, EnteringKingRule, MAX_PLY, Move, Piece, PieceType,
     RepetitionState, Square, Value,
 };
 
 use super::history::{
-    CORRECTION_HISTORY_LIMIT, CorrectionPieceToHistory, HistoryCell, HistoryTables,
-    LOW_PLY_HISTORY_SIZE, continuation_history_bonus_with_offset, continuation_history_weight,
-    low_ply_history_bonus, pawn_history_bonus, stat_bonus, stat_malus,
+    CORRECTION_HISTORY_LIMIT, HistoryCell, HistoryTables, LOW_PLY_HISTORY_SIZE,
+    continuation_history_bonus_with_offset, continuation_history_weight, low_ply_history_bonus,
+    pawn_history_bonus, stat_bonus, stat_malus,
 };
 use super::movepicker::piece_value;
-#[cfg(target_os = "linux")]
-use super::numa::NumaNetwork;
 use super::types::{
     ContHistKey, NodeType, PvTable, RootMoves, SEARCHED_MOVES_CAPACITY, STACK_SIZE,
     SearchedMoveList, StackArray, draw_value, init_stack_array, value_from_tt, value_to_tt,
 };
-use super::{LimitsType, MovePicker, SearchTuneParams, SharedHistories, TimeManagement};
+use super::{LimitsType, MovePicker, SearchTuneParams, TimeManagement};
 
 use super::eval_helpers::{
-    compute_eval_context, correction_value, probe_transposition, update_correction_history,
+    compute_eval_context_with_corr, correction_value, probe_transposition,
+    update_correction_history,
 };
 use super::pruning::{
     step14_pruning, try_futility_pruning, try_null_move_pruning, try_probcut, try_razoring,
 };
 use super::qsearch::qsearch;
 use super::search_helpers::{
-    check_abort, clear_cont_history_for_null, cont_history_keys, cont_history_ptr,
-    do_move_and_push, do_move_and_push_prefetched, nnue_evaluate, nnue_pop, prefetch_child,
-    set_cont_history_for_move, take_prior_reduction,
+    check_abort, clear_cont_history_for_null, cont_history_ptr, cont_history_tables,
+    do_move_and_push, nnue_evaluate, nnue_evaluate_with_pv, nnue_pop, set_cont_history_for_move,
+    take_prior_reduction,
 };
 #[cfg(feature = "tt-trace")]
 use super::tt_sanity::{TtWriteTrace, helper_tt_write_enabled_for_depth, maybe_trace_tt_write};
@@ -54,9 +56,9 @@ use super::tt_sanity::{TtWriteTrace, helper_tt_write_enabled_for_depth, maybe_tr
 // 定数
 // =============================================================================
 
-/// USI オプション `DrawValueBlack` のデフォルト値。
+/// YaneuraOuオプション `DrawValueBlack` のデフォルト値。
 pub const DEFAULT_DRAW_VALUE_BLACK: i32 = -2;
-/// USI オプション `DrawValueWhite` のデフォルト値。
+/// YaneuraOuオプション `DrawValueWhite` のデフォルト値。
 pub const DEFAULT_DRAW_VALUE_WHITE: i32 = -2;
 
 #[inline]
@@ -64,36 +66,6 @@ pub(super) fn draw_jitter(nodes: u64, tune_params: &SearchTuneParams) -> i32 {
     // 千日手盲点を避けるため、VALUE_DRAW(0) を ±1 にばらつかせる。
     let mask = tune_params.draw_jitter_mask.max(0) as u64;
     ((nodes & mask) as i32) + tune_params.draw_jitter_offset
-}
-
-/// 1回の root search 内で remaining depth が減らない edge が連鎖したとき、
-/// 探索の進行性を回復する guard を発火させるか判定する。
-#[inline]
-pub(crate) fn should_activate_depth_liveness(
-    nodes: u64,
-    root_search_start_nodes: u64,
-    nondecreasing_depth_run: i32,
-    node_threshold: i32,
-    run_threshold: i32,
-) -> bool {
-    node_threshold > 0
-        && run_threshold > 0
-        && nodes.saturating_sub(root_search_start_nodes) >= node_threshold as u64
-        && nondecreasing_depth_run >= run_threshold
-}
-
-/// guard 発火後は、実際に指し手を進めた子探索の remaining depth を必ず1以上減らす。
-#[inline]
-pub(crate) fn enforce_decreasing_depth(
-    depth: Depth,
-    parent_depth: Depth,
-    depth_liveness_active: bool,
-) -> Depth {
-    if depth_liveness_active {
-        depth.min(parent_depth - 1)
-    } else {
-        depth
-    }
 }
 
 #[inline]
@@ -129,13 +101,12 @@ fn update_continuation_histories(
         }
         let weight = continuation_history_weight(tune_params, ply_back);
         let target_ply = base_ply - ply_back as i32;
-        if target_ply >= 0
-            && let Some(key) = stack[target_ply as usize].cont_hist_key
-        {
-            // null move ply はスキップ
+        if target_ply >= 0 {
+            let key = stack[target_ply as usize].cont_hist_key;
+            // null move ply (および未設定) はスキップ
             // if (((ss - i)->currentMove).is_ok())
             // null move では cont_hist_key.piece == NONE（sentinel）
-            if key.piece.is_none() {
+            if key.is_null() {
                 continue;
             }
             let in_check_idx = key.in_check as usize;
@@ -162,7 +133,6 @@ fn update_continuation_histories(
 #[inline]
 fn update_quiet_histories(
     h: &mut HistoryTables,
-    shared: &SharedHistories,
     stack: &StackArray,
     tune_params: &SearchTuneParams,
     pos: &Position,
@@ -191,8 +161,9 @@ fn update_quiet_histories(
     let cont_bonus = bonus * tune_params.continuation_history_multiplier / 1024;
     update_continuation_histories(h, stack, tune_params, ply, in_check, cont_pc, to, cont_bonus);
 
-    let pawn_key_idx = shared.pawn_history_index(pos.pawn_key());
-    shared.update_pawn_history(pawn_key_idx, cont_pc, to, pawn_history_bonus(bonus, tune_params));
+    let pawn_key_idx = pos.pawn_history_index();
+    h.pawn_history
+        .update(pawn_key_idx, cont_pc, to, pawn_history_bonus(bonus, tune_params));
 }
 
 /// LMR用のreduction配列
@@ -238,10 +209,12 @@ pub(crate) fn reduction(
     let delta = delta.max(0);
 
     // 1024倍スケールで返す。ttPv加算は呼び出し側で行う。
-    reduction_scale - delta * tune_params.lmr_reduction_delta_scale / root_delta
-        + (!imp as i32) * reduction_scale * tune_params.lmr_reduction_non_improving_mult
-            / tune_params.lmr_reduction_non_improving_div.max(1)
-        + tune_params.lmr_reduction_base_offset
+    let mut r = reduction_scale - delta * tune_params.lmr_reduction_delta_scale / root_delta;
+    if !imp {
+        r += reduction_scale * tune_params.lmr_reduction_non_improving_mult
+            / tune_params.lmr_reduction_non_improving_div.max(1);
+    }
+    r + tune_params.lmr_reduction_base_offset
 }
 
 // stats モジュールからマクロをインポート
@@ -252,14 +225,10 @@ use super::stats::{inc_stat, inc_stat_by_depth};
 /// 置換表プローブの結果をまとめたコンテキスト
 ///
 /// TTプローブ後の即時カットオフ判定や、後続の枝刈りロジックで使用される。
-/// probe が個別に書いたフィールドを幅の広いコピーで読み直さないよう、
-/// 書き込み先と後続処理で使う値だけを保持する。
-pub(super) struct TTContext<'a> {
+pub(super) struct TTContext {
     pub(super) key: u64,
-    pub(super) writer: TTWriter<'a>,
-    pub(super) depth: Depth,
-    pub(super) bound: Bound,
-    pub(super) eval: Value,
+    pub(super) result: ProbeResult,
+    pub(super) data: TTData,
     pub(super) hit: bool,
     pub(super) mv: Move,
     pub(super) value: Value,
@@ -267,9 +236,9 @@ pub(super) struct TTContext<'a> {
 }
 
 /// 置換表プローブの結果（続行 or カットオフ）
-pub(super) enum ProbeOutcome<'a> {
+pub(super) enum ProbeOutcome {
     /// 探索続行（TTContext付き）
-    Continue(TTContext<'a>),
+    Continue(TTContext),
     /// 即時カットオフ値（ヒストリ更新用情報付き）
     Cutoff {
         value: Value,
@@ -280,51 +249,16 @@ pub(super) enum ProbeOutcome<'a> {
 
 /// 静的評価まわりの情報をまとめたコンテキスト
 pub(super) struct EvalContext {
-    /// TT境界情報で補正済みの評価値
+    /// TT境界情報で補正済みの評価値（YOの `eval` 相当）
     pub(super) eval: Value,
-    /// 局面の静的評価
+    /// 局面の静的評価（YOの `ss->staticEval` 相当）
     pub(super) static_eval: Value,
     pub(super) unadjusted_static_eval: Value,
     pub(super) correction_value: i32,
-    // 個別の bool store をまたぐ load を避けるため、両フラグを同じ u32 に保持する。
-    flags: u32,
-}
-
-impl EvalContext {
-    const IMPROVING: u32 = 1;
-    const OPPONENT_WORSENING: u32 = 2;
-
-    /// 評価値と局面の改善・悪化の判定をまとめる。
-    #[inline]
-    pub(super) fn new(
-        eval: Value,
-        static_eval: Value,
-        unadjusted_static_eval: Value,
-        correction_value: i32,
-        improving: bool,
-        opponent_worsening: bool,
-    ) -> Self {
-        Self {
-            eval,
-            static_eval,
-            unadjusted_static_eval,
-            correction_value,
-            flags: (u32::from(improving) * Self::IMPROVING)
-                | (u32::from(opponent_worsening) * Self::OPPONENT_WORSENING),
-        }
-    }
-
-    /// 2手前と比較して局面が改善しているか。
-    #[inline]
-    pub(super) fn improving(&self) -> bool {
-        self.flags & Self::IMPROVING != 0
-    }
-
-    /// 相手側の局面が悪化しているか。
-    #[inline]
-    pub(super) fn opponent_worsening(&self) -> bool {
-        self.flags & Self::OPPONENT_WORSENING != 0
-    }
+    /// 2手前と比較して局面が改善しているか
+    pub(super) improving: bool,
+    /// 相手側の局面が悪化しているか
+    pub(super) opponent_worsening: bool,
 }
 
 /// Step14の枝刈り判定結果
@@ -388,8 +322,6 @@ pub struct SearchContext<'a> {
     pub eval_hash: &'a EvalHash,
     /// 履歴テーブルへの参照（HistoryCell 経由でアクセス）
     pub history: &'a HistoryCell,
-    /// スレッド間で共有する履歴
-    pub shared: &'a SharedHistories,
     /// ContinuationHistoryのsentinel
     pub cont_history_sentinel: NonNull<PieceToHistory>,
     /// 全合法手生成フラグ
@@ -404,121 +336,12 @@ pub struct SearchContext<'a> {
     pub tune_params: &'a SearchTuneParams,
     /// LMR Reduction テーブルへの参照
     pub reductions: &'a Reductions,
-    /// 千日手評価値テーブル（DrawValueBlack/DrawValueWhite）
+    /// 千日手評価値テーブル (YaneuraOu DrawValueBlack/DrawValueWhite 準拠)
+    /// drawValueTable[REPETITION_DRAW][Color] に相当
     pub draw_value_table: [Value; 2],
-    /// 入玉宣言勝ちルール（探索内の宣言勝ち判定に使う）
-    pub entering_king_rule: EnteringKingRule,
-}
-
-/// Path tracking used only when the dynamic depth-liveness guard is enabled.
-///
-/// Keep this out of [`Stack`] so the existing hot stack layout is unchanged when the guard is
-/// disabled. The state is allocated once per `go` only for a search without an interrupt budget
-/// and with both thresholds non-zero.
-pub(crate) struct DepthLivenessState {
-    root_search_start_nodes: u64,
-    active: bool,
-    /// 次に entry する node を same-ply verification root として扱い、run 判定と
-    /// enforcement から外す一回性マーク。NMP verification は excluded_move を
-    /// 立てずに同一 ply を再探索するため、このマークが無いと実手 child と誤認され、
-    /// 偽の非減少 edge カウントや verification depth への clamp が起きる。
-    same_ply_verification_root: bool,
-    search_entry_depth: [Depth; STACK_SIZE],
-    nondecreasing_depth_run: [i32; STACK_SIZE],
-}
-
-impl DepthLivenessState {
-    pub(crate) fn new() -> Self {
-        Self {
-            root_search_start_nodes: 0,
-            active: false,
-            same_ply_verification_root: false,
-            search_entry_depth: [0; STACK_SIZE],
-            nondecreasing_depth_run: [0; STACK_SIZE],
-        }
-    }
-
-    /// Keep the tracking implementation out of the normal search hot path. Searches with an
-    /// interrupt budget never allocate this state, so their per-node cost remains a single
-    /// predictable `Option::None` branch in `search_node`.
-    #[inline(never)]
-    pub(crate) fn update_depth(
-        &mut self,
-        nodes: u64,
-        mut depth: Depth,
-        ply: i32,
-        excluded_search: bool,
-        node_threshold: i32,
-        run_threshold: i32,
-    ) -> Depth {
-        // A legal move normally consumes one ply and therefore remaining depth must eventually
-        // decrease. Multi-extension, negative LMR and full-depth re-search can all produce a
-        // child depth >= its parent's depth. A long consecutive run of such edges is the common
-        // liveness failure during search.
-        //
-        // Singular verification recurses at the same ply without making a move. It is a separate
-        // search root for this purpose and must not be linked to the outer move path. NMP
-        // verification does the same without setting excluded_move, so it is marked via
-        // `same_ply_verification_root` instead (consumed exactly by this entry).
-        let verification_root = std::mem::take(&mut self.same_ply_verification_root);
-        let raw_depth = depth;
-        let real_child = ply > 0 && !excluded_search && !verification_root;
-        let parent_depth = if real_child {
-            self.search_entry_depth[(ply - 1) as usize]
-        } else {
-            raw_depth
-        };
-        let raw_nondecreasing_depth_run = if real_child && raw_depth >= parent_depth {
-            self.nondecreasing_depth_run[(ply - 1) as usize] + 1
-        } else {
-            0
-        };
-
-        if !self.active
-            && should_activate_depth_liveness(
-                nodes,
-                self.root_search_start_nodes,
-                raw_nondecreasing_depth_run,
-                node_threshold,
-                run_threshold,
-            )
-        {
-            self.active = true;
-        }
-
-        if real_child {
-            depth = enforce_decreasing_depth(depth, parent_depth, self.active);
-        }
-
-        let nondecreasing_depth_run = if real_child && depth >= parent_depth {
-            self.nondecreasing_depth_run[(ply - 1) as usize] + 1
-        } else {
-            0
-        };
-        self.search_entry_depth[ply as usize] = depth;
-        self.nondecreasing_depth_run[ply as usize] = nondecreasing_depth_run;
-        depth
-    }
-
-    /// 直後の update_depth 1回だけを same-ply verification root として扱わせる。
-    pub(crate) fn mark_same_ply_verification_root(&mut self) {
-        self.same_ply_verification_root = true;
-    }
-
-    /// 同一 ply で再帰する verification search (SE / NMP) は当該 ply の追跡フィールドを
-    /// 上書きするため、外側の move path に戻る前に snapshot を取り復元する。
-    pub(crate) fn snapshot_ply(&self, ply: i32) -> (Depth, i32) {
-        (
-            self.search_entry_depth[ply as usize],
-            self.nondecreasing_depth_run[ply as usize],
-        )
-    }
-
-    pub(crate) fn restore_ply(&mut self, ply: i32, snapshot: (Depth, i32)) {
-        let (search_entry_depth, nondecreasing_depth_run) = snapshot;
-        self.search_entry_depth[ply as usize] = search_entry_depth;
-        self.nondecreasing_depth_run[ply as usize] = nondecreasing_depth_run;
-    }
+    /// bucket 別 eval スケール (%)。default [100; 8] で無変化。
+    /// `LS_BUCKET_EVAL_SCALE` USI オプションで bucket 0..7 ごとに調整する。
+    pub bucket_eval_scale: [i32; 8],
 }
 
 /// 探索中に変化する状態
@@ -537,8 +360,6 @@ pub struct SearchState {
     pub sel_depth: i32,
     /// ルート深さ
     pub root_depth: Depth,
-    /// 動的depth-liveness guardのpath追跡。停止予算あり、または閾値0なら未確保。
-    depth_liveness: Option<Box<DepthLivenessState>>,
     /// 完了済み深さ
     pub completed_depth: Depth,
     /// 最善手
@@ -549,21 +370,32 @@ pub struct SearchState {
     pub nmp_min_ply: i32,
     /// ルート手
     pub root_moves: RootMoves,
-    /// PV 三角配列（`Vec<Move>` のヒープ割り当て回避）
+    /// PV 三角配列（Reckless 由来、Vec<Move> のヒープ割り当て回避）
     pub pv_table: PvTable,
     /// 前回 iteration の PV ライン
     pub previous_pv: Vec<Move>,
-    /// 探索中に使う重みと差分評価状態。
-    pub(crate) evaluator: SearchEvaluator,
-
+    /// NNUE ネットワークへの raw pointer（探索中の get_network() RwLock 回避用）
+    ///
+    /// `reset()` 時に `Arc::as_ptr()` で設定する。対応する Arc は NETWORK の
+    /// RwLock 内に保持されており、探索中に drop されることはない。
+    #[cfg(feature = "layerstack-only")]
+    pub network_ptr: *const NNUENetwork,
+    /// NNUE Accumulator スタック
+    pub nnue_stack: AccumulatorStackVariant,
+    /// LayerStacks 用 AccumulatorCaches（Finny Tables）
+    /// LayerStacks アーキテクチャ以外では None
+    pub acc_cache: Option<LayerStacksAccCache>,
     /// check_abort呼び出しカウンター
     pub calls_cnt: i32,
     /// 探索統計（search-stats feature有効時のみ）
     #[cfg(feature = "search-stats")]
     pub stats: SearchStats,
-    /// 探索中の局面の書き出し。main thread の探索中だけ `Search` から預かる。
-    #[cfg(feature = "search-tree-sample")]
-    pub(crate) tree_sampler: Option<Box<super::tree_sample::TreeSampler>>,
+    /// YO 風 alpha_beta 内 df-pn engine (= mate dfpn probe 用、 lazy 構築)
+    ///
+    /// alpha_beta の `moves_loop` 直前で発火条件 (= !in_check && pv_node
+    /// && depth >= 8 && game_ply >= 25 等) を満たした場合に new 割り当て→ probe。
+    /// search 内 mate solver の re-entrant 性確保のため per-thread (= SearchState 内) で保持。
+    pub mate_dfpn_engine: Option<super::mate_dfpn::MateDfpnEngine>,
 }
 
 impl SearchState {
@@ -576,7 +408,6 @@ impl SearchState {
             abort: false,
             sel_depth: 0,
             root_depth: 0,
-            depth_liveness: None,
             completed_depth: 0,
             best_move: Move::NONE,
             best_move_changes: 0.0,
@@ -584,12 +415,14 @@ impl SearchState {
             root_moves: RootMoves::new(),
             pv_table: PvTable::new(),
             previous_pv: Vec::new(),
-            evaluator: SearchEvaluator::Uninitialized,
+            #[cfg(feature = "layerstack-only")]
+            network_ptr: std::ptr::null(),
+            nnue_stack: AccumulatorStackVariant::new_default(),
+            acc_cache: None,
             calls_cnt: 0,
             #[cfg(feature = "search-stats")]
             stats: SearchStats::default(),
-            #[cfg(feature = "search-tree-sample")]
-            tree_sampler: None,
+            mate_dfpn_engine: None,
         }
     }
 }
@@ -601,73 +434,10 @@ impl Default for SearchState {
 }
 
 impl SearchState {
-    pub(crate) fn begin_depth_liveness_attempt(&mut self) {
-        if let Some(liveness) = self.depth_liveness.as_mut() {
-            liveness.root_search_start_nodes = self.nodes;
-        }
-    }
-
-    pub(crate) fn depth_liveness_snapshot(&self, ply: i32) -> Option<(Depth, i32)> {
-        self.depth_liveness.as_ref().map(|liveness| liveness.snapshot_ply(ply))
-    }
-
-    /// 直後に entry する same-ply verification search (NMP) を depth-liveness の
-    /// run 判定・enforcement から外す。
-    pub(crate) fn depth_liveness_mark_verification_root(&mut self) {
-        if let Some(liveness) = self.depth_liveness.as_mut() {
-            liveness.mark_same_ply_verification_root();
-        }
-    }
-
-    pub(crate) fn depth_liveness_restore(&mut self, ply: i32, snapshot: Option<(Depth, i32)>) {
-        if let (Some(liveness), Some(snapshot)) = (self.depth_liveness.as_mut(), snapshot) {
-            liveness.restore_ply(ply, snapshot);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn depth_liveness_is_enabled(&self) -> bool {
-        self.depth_liveness.is_some()
-    }
-
-    /// search_node が node 入口で行う depth-liveness 追跡更新を、実手 child として
-    /// テストから再現する (verification search の production 配線を検証する用途)。
-    #[cfg(test)]
-    pub(crate) fn depth_liveness_update_for_test(
-        &mut self,
-        depth: Depth,
-        ply: i32,
-        node_threshold: i32,
-        run_threshold: i32,
-    ) -> Depth {
-        let nodes = self.nodes;
-        self.depth_liveness
-            .as_mut()
-            .expect("depth liveness must be enabled")
-            .update_depth(nodes, depth, ply, false, node_threshold, run_threshold)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_depth_liveness_active_for_test(&mut self, active: bool) {
-        self.depth_liveness.as_mut().expect("depth liveness must be enabled").active = active;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn depth_liveness_is_active_for_test(&self) -> bool {
-        self.depth_liveness.as_ref().is_some_and(|liveness| liveness.active)
-    }
-
-    /// 前回PVを更新し、確保済みの領域を再利用する。
     #[inline]
     pub fn set_previous_pv(&mut self, pv: &[Move]) {
         self.previous_pv.clear();
         self.previous_pv.extend_from_slice(pv);
-    }
-
-    /// 指定したroot候補のPVを、前回PVの確保領域を再利用して保存する。
-    #[inline]
-    fn set_previous_pv_from_root(&mut self, pv_idx: usize) {
-        self.previous_pv.clone_from(&self.root_moves[pv_idx].pv);
     }
 
     #[inline]
@@ -710,14 +480,8 @@ pub struct SearchWorker {
     /// 履歴/統計テーブル群（HistoryCell 経由でアクセス）
     pub history: Box<HistoryCell>,
 
-    /// スレッド間で共有する履歴
-    pub(super) shared_histories: Arc<SharedHistories>,
-
     /// ContinuationHistoryのsentinel
     pub cont_history_sentinel: NonNull<PieceToHistory>,
-
-    /// ContinuationCorrectionHistoryのsentinel
-    pub cont_correction_sentinel: NonNull<CorrectionPieceToHistory>,
 
     /// 全合法手生成フラグ
     pub generate_all_legal_moves: bool,
@@ -737,22 +501,23 @@ pub struct SearchWorker {
     /// LMR Reduction テーブル（per-worker）
     pub reductions: Box<Reductions>,
 
-    /// USI オプション `DrawValueBlack`。
+    /// YaneuraOuオプション `DrawValueBlack`。
     pub draw_value_black: i32,
 
-    /// USI オプション `DrawValueWhite`。
+    /// YaneuraOuオプション `DrawValueWhite`。
     pub draw_value_white: i32,
 
-    /// 千日手評価値テーブル（DrawValueBlack/DrawValueWhite）
+    /// 千日手評価値テーブル (YaneuraOu DrawValueBlack/DrawValueWhite 準拠)
+    /// drawValueTable[REPETITION_DRAW][Color] に相当。
     /// Color::Black = 0, Color::White = 1
     pub draw_value_table: [Value; 2],
 
+    /// bucket 別 eval スケール (%)。default [100; 8] で無変化。
+    /// `LS_BUCKET_EVAL_SCALE` USI オプションで bucket 0..7 ごとに調整する。
+    pub bucket_eval_scale: [i32; 8],
+
     /// 入玉宣言勝ちルール
     pub entering_king_rule: EnteringKingRule,
-
-    /// `NumaPolicy=auto` のとき、このスレッドの node に置いた重みの写し。
-    #[cfg(target_os = "linux")]
-    pub(super) numa_network: Option<NumaNetwork>,
 
     // =========================================================================
     // 探索状態（SearchState）
@@ -762,9 +527,11 @@ pub struct SearchWorker {
 }
 
 impl SearchWorker {
-    /// root quiet手の statScore を計算する。
+    /// root quiet手の statScore を計算する（YO Step16 準拠）。
     ///
-    /// root には直前の指し手がないため、継続履歴には番兵の値を2回加える。
+    /// YO の root では `contHist[0/1]` が sentinel を指すため、
+    /// `2 * mainHistory + contHist0 + contHist1` は
+    /// `2 * mainHistory + 2 * sentinel_contHistory` と等価になる。
     #[inline]
     fn root_quiet_stat_score(&self, mover: Color, mv: Move) -> i32 {
         let moved_piece = mv.moved_piece_after();
@@ -783,7 +550,7 @@ impl SearchWorker {
 
     /// 新しいSearchWorkerを作成（isreadyまたは最初のgo時）
     ///
-    /// 共有履歴はこの worker 専用 (1 スレッド分) のものを作る。
+    /// Box化してヒープに配置し、スタックオーバーフローを防ぐ。
     pub fn new(
         tt: Arc<TranspositionTable>,
         eval_hash: Arc<EvalHash>,
@@ -791,39 +558,12 @@ impl SearchWorker {
         thread_id: usize,
         search_tune_params: SearchTuneParams,
     ) -> Box<Self> {
-        Self::new_with_shared(
-            tt,
-            eval_hash,
-            Arc::new(SharedHistories::new_with_pawn_history_init(
-                1,
-                search_tune_params.pawn_history_init as i16,
-            )),
-            max_moves_to_draw,
-            thread_id,
-            search_tune_params,
-        )
-    }
-
-    /// 共有履歴を指定して SearchWorker を作成する
-    ///
-    /// Box化してヒープに配置し、スタックオーバーフローを防ぐ。
-    pub fn new_with_shared(
-        tt: Arc<TranspositionTable>,
-        eval_hash: Arc<EvalHash>,
-        shared_histories: Arc<SharedHistories>,
-        max_moves_to_draw: i32,
-        thread_id: usize,
-        search_tune_params: SearchTuneParams,
-    ) -> Box<Self> {
-        let history = HistoryCell::new_boxed_with_params(&search_tune_params);
+        let history = HistoryCell::new_boxed();
         // HistoryCell経由でsentinelポインタを取得
         // SAFETY: 初期化時のみ使用、他の参照と同時保持しない
-        let (cont_history_sentinel, cont_correction_sentinel) = {
+        let cont_history_sentinel = {
             let h = unsafe { history.as_ref_unchecked() };
-            (
-                NonNull::from(h.continuation_history[0][0].get_table(Piece::NONE, Square::SQ_11)),
-                NonNull::from(h.correction_history.continuation_table(Piece::NONE, Square::SQ_11)),
-            )
+            NonNull::from(h.continuation_history[0][0].get_table(Piece::NONE, Square::SQ_11))
         };
 
         let reductions = build_reductions(search_tune_params.lmr_table_coeff);
@@ -831,9 +571,7 @@ impl SearchWorker {
             tt,
             eval_hash,
             history,
-            shared_histories,
             cont_history_sentinel,
-            cont_correction_sentinel,
             generate_all_legal_moves: false,
             max_moves_to_draw,
             thread_id,
@@ -843,9 +581,8 @@ impl SearchWorker {
             draw_value_black: DEFAULT_DRAW_VALUE_BLACK,
             draw_value_white: DEFAULT_DRAW_VALUE_WHITE,
             draw_value_table: [Value::ZERO; 2],
+            bucket_eval_scale: [100; 8],
             entering_king_rule: EnteringKingRule::default(),
-            #[cfg(target_os = "linux")]
-            numa_network: None,
             state: SearchState::new(),
         });
         worker.reset_cont_history_ptrs();
@@ -861,7 +598,6 @@ impl SearchWorker {
             tt: &self.tt,
             eval_hash: &self.eval_hash,
             history: &self.history,
-            shared: &self.shared_histories,
             cont_history_sentinel: self.cont_history_sentinel,
             generate_all_legal_moves: self.generate_all_legal_moves,
             max_moves_to_draw: self.max_moves_to_draw,
@@ -870,18 +606,18 @@ impl SearchWorker {
             tune_params: &self.search_tune_params,
             reductions: &self.reductions,
             draw_value_table: self.draw_value_table,
-            entering_king_rule: self.entering_king_rule,
+            bucket_eval_scale: self.bucket_eval_scale,
         }
     }
 
     /// ルート局面の static_eval を初期化し、未補正評価値を返す。
     ///
-    /// in-check ノードで参照される 2手前の static_evalを安定化するため、
+    /// in-check ノードで参照される `(ss-2)->staticEval` 相当を安定化するため、
     /// root 探索開始前に `stack[0].static_eval` を埋めておく。
     #[inline]
     /// ルート局面の static_eval を初期化し、(未補正評価値, correction_value) を返す。
-    fn init_root_static_eval(&mut self, pos: &Position, root_in_check: bool) -> (Value, i32) {
-        let unadjusted_static_eval = if root_in_check {
+    fn init_root_static_eval(&mut self, pos: &mut Position, root_in_check: bool) -> (Value, i32) {
+        let mut unadjusted_static_eval = if root_in_check {
             Value::NONE
         } else {
             nnue_evaluate(&mut self.state, pos)
@@ -892,12 +628,27 @@ impl SearchWorker {
         let ctx = self.create_context();
         let corr = correction_value(&self.state, &ctx, pos, 0);
 
+        // bucket eval scale 適用: mate 域 (|eval| >= 30000) は除外
+        if !root_in_check
+            && unadjusted_static_eval != Value::NONE
+            && self.bucket_eval_scale != [100i32; 8]
+        {
+            let bucket = get_bucket_index_for_pos(pos);
+            let scale = self.bucket_eval_scale[bucket];
+            if scale != 100 {
+                let raw = unadjusted_static_eval.raw();
+                if raw.abs() < 30000 {
+                    unadjusted_static_eval = Value::new(raw * scale / 100);
+                }
+            }
+        }
+
         let static_eval = if root_in_check || unadjusted_static_eval == Value::NONE {
             Value::NONE
         } else {
-            #[cfg(not(feature = "search-pass-rules"))]
+            #[cfg(feature = "search-no-pass-rules")]
             let pass_rights_eval = Value::ZERO;
-            #[cfg(feature = "search-pass-rules")]
+            #[cfg(not(feature = "search-no-pass-rules"))]
             let pass_rights_eval = evaluate_pass_rights(pos, pos.game_ply() as u16);
 
             to_corrected_static_eval(unadjusted_static_eval, corr) + pass_rights_eval
@@ -960,10 +711,8 @@ impl SearchWorker {
 
     fn reset_cont_history_ptrs(&mut self) {
         let sentinel = self.cont_history_sentinel;
-        let correction_sentinel = self.cont_correction_sentinel;
         for stack in self.state.stack.iter_mut() {
             stack.cont_history_ptr = sentinel;
-            stack.cont_correction_ptr = correction_sentinel;
         }
     }
 
@@ -980,50 +729,22 @@ impl SearchWorker {
         let in_check_idx = in_check as usize;
         let capture_idx = capture as usize;
         // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない
-        let (table, correction_table) = {
+        let table = {
             let h = unsafe { self.history.as_ref_unchecked() };
-            (
-                NonNull::from(
-                    h.continuation_history[in_check_idx][capture_idx].get_table(piece, to),
-                ),
-                NonNull::from(h.correction_history.continuation_table(piece, to)),
-            )
+            NonNull::from(h.continuation_history[in_check_idx][capture_idx].get_table(piece, to))
         };
         self.state.stack[ply as usize].cont_history_ptr = table;
-        self.state.stack[ply as usize].cont_correction_ptr = correction_table;
         self.state.stack[ply as usize].cont_hist_key =
-            Some(ContHistKey::new(in_check, capture, piece, to));
+            ContHistKey::new(in_check, capture, piece, to);
     }
 
     #[inline]
     pub(super) fn clear_cont_history_for_null(&mut self, ply: i32) {
         self.state.stack[ply as usize].cont_history_ptr = self.cont_history_sentinel;
-        self.state.stack[ply as usize].cont_correction_ptr = self.cont_correction_sentinel;
-        self.state.stack[ply as usize].cont_hist_key = Some(ContHistKey::null_sentinel());
+        self.state.stack[ply as usize].cont_hist_key = ContHistKey::null_sentinel();
     }
 
-    /// 読む重みの写しを差し替える。前の写しを持つ評価器の状態も捨て、古い写しを手放す。
-    #[cfg(target_os = "linux")]
-    pub(super) fn set_numa_network(&mut self, network: Option<NumaNetwork>) {
-        let unchanged = match (&self.numa_network, &network) {
-            (Some(a), Some(b)) => Arc::ptr_eq(&a.local, &b.local),
-            (None, None) => true,
-            _ => false,
-        };
-        if !unchanged {
-            self.numa_network = network;
-            self.state.evaluator = SearchEvaluator::Uninitialized;
-        }
-    }
-
-    pub(super) fn update_search_tune_params(&mut self, params: SearchTuneParams) {
-        if self.search_tune_params.lmr_table_coeff != params.lmr_table_coeff {
-            self.reductions = build_reductions(params.lmr_table_coeff);
-        }
-        self.search_tune_params = params;
-    }
-
-    /// usinewgameで呼び出し：全履歴をクリア
+    /// usinewgameで呼び出し：全履歴をクリア（YaneuraOu Worker::clear()相当）
     pub fn clear(&mut self) {
         // SAFETY: 探索開始前の初期化、他の参照と同時保持しない
         unsafe { self.history.as_mut_unchecked() }.clear_with_params(&self.search_tune_params);
@@ -1031,45 +752,77 @@ impl SearchWorker {
     }
 
     /// goで呼び出し：探索状態のリセット（履歴はクリアしない）
-    pub fn prepare_search(&mut self, limits: &LimitsType) {
+    pub fn prepare_search(&mut self) {
         self.state.nodes = 0;
         self.state.sel_depth = 0;
         self.state.root_depth = 0;
-        self.state.depth_liveness = (!limits.has_interrupt_budget()
-            && self.search_tune_params.depth_liveness_node_threshold > 0
-            && self.search_tune_params.depth_liveness_run_threshold > 0)
-            .then(|| Box::new(DepthLivenessState::new()));
         self.state.root_delta = 1;
-        let resume = limits.analysis.as_ref().is_some_and(|run| run.resume);
-        if !resume {
-            self.state.completed_depth = 0;
-            self.state.best_move = Move::NONE;
-        }
+        self.state.completed_depth = 0;
+        self.state.best_move = Move::NONE;
         self.state.abort = false;
         self.state.best_move_changes = 0.0;
         self.state.nmp_min_ply = 0;
-        if !resume {
-            self.state.root_moves.clear();
-            // 探索開始時に Stack を初期化し、
-            // continuation history の番兵を入れ直す。持ち越すと、qsearch の 1 手詰めの保存が
-            // 読む stack[ply].tt_pv などに前の探索の値が残り、置換表を通して木が変わる。
-            self.state.stack = init_stack_array();
-            self.reset_cont_history_ptrs();
-        }
+        self.state.root_moves.clear();
         // 探索統計をリセット（1回のgo毎にリセット）
         self.reset_stats();
-        if !resume {
-            // low_ply_historyのみクリア
-            // SAFETY: 探索開始前の初期化、他の参照と同時保持しない
-            unsafe { self.history.as_mut_unchecked() }
-                .low_ply_history
-                .clear_with_init(self.search_tune_params.low_ply_history_init as i16);
+        // low_ply_historyのみクリア
+        // SAFETY: 探索開始前の初期化、他の参照と同時保持しない
+        unsafe { self.history.as_mut_unchecked() }
+            .low_ply_history
+            .clear_with_init(self.search_tune_params.low_ply_history_init as i16);
+        // NNUE AccumulatorStack: ネットワークに応じたバリアントに更新・リセット
+        #[cfg(feature = "layerstack-only")]
+        {
+            self.state.network_ptr = std::ptr::null();
         }
-        #[cfg(target_os = "linux")]
-        let network = NumaNetwork::select(self.numa_network.as_ref(), get_network());
-        #[cfg(not(target_os = "linux"))]
-        let network = get_network();
-        self.state.evaluator.prepare(network);
+        if let Some(network) = get_network() {
+            // 探索中の get_network() RwLock + Arc::clone 回避用に raw pointer をキャッシュ。
+            // Arc は NETWORK (RwLock<Option<Arc<NNUENetwork>>>) 内に保持され、
+            // 次の reset() / clear_nnue() まで drop されない。
+            #[cfg(feature = "layerstack-only")]
+            {
+                self.state.network_ptr = Arc::as_ptr(&network);
+            }
+            // バリアントがネットワークと一致しない場合は再作成
+            if !self.state.nnue_stack.matches_network(&network) {
+                self.state.nnue_stack = AccumulatorStackVariant::from_network(&network);
+            } else {
+                self.state.nnue_stack.reset();
+            }
+            // LayerStacks 用 AccumulatorCaches を初期化
+            if network.is_layer_stacks() {
+                if let crate::nnue::NNUENetwork::LayerStacks(ls_net) = &*network {
+                    // 既存 cache があっても exact architecture が不一致なら破棄。
+                    // 同一プロセスで EvalFile をリロードして LayerStacks 形状が変わった場合、旧 cache
+                    // variant を保持したままだと `LayerStacksNetwork::update_accumulator`
+                    // の cache 経路が pattern match で外れ、Finny-table caching が静かに無効化される。
+                    let need_new_cache = match &self.state.acc_cache {
+                        None => true,
+                        Some(cache) => {
+                            cache.architecture_dims()
+                                != (
+                                    ls_net.architecture_spec().l1,
+                                    ls_net.architecture_spec().l2,
+                                    ls_net.architecture_spec().l3,
+                                )
+                        }
+                    };
+                    if need_new_cache {
+                        self.state.acc_cache = Some(ls_net.new_acc_cache());
+                    }
+                }
+                // 新しいゲーム開始時にキャッシュを無効化（usinewgame 経由で呼ばれる）
+                if let Some(cache) = &mut self.state.acc_cache {
+                    cache.invalidate();
+                }
+            } else {
+                self.state.acc_cache = None;
+            }
+        } else {
+            // NNUE未初期化の場合はデフォルト（HalfKP）でリセット
+            self.state.nnue_stack.reset();
+            self.state.acc_cache = None;
+        }
         // check_abort頻度制御カウンターをリセット
         // これにより新しい探索開始時に即座に停止チェックが行われる
         self.state.calls_cnt = 0;
@@ -1083,19 +836,19 @@ impl SearchWorker {
         self.state.best_move_changes /= 2.0;
     }
 
-    /// 全合法手生成モードの設定
+    /// 全合法手生成モードの設定（YaneuraOu互換）
     pub fn set_generate_all_legal_moves(&mut self, flag: bool) {
         self.generate_all_legal_moves = flag;
     }
 
     // =========================================================================
-    // NNUE ヘルパーメソッド（LayerStacks / HalfKP・HalfKaHmMerged の分岐を隠蔽）
+    // NNUE ヘルパーメソッド（LayerStacks / HalfKP・HalfKA_hm の分岐を隠蔽）
     // =========================================================================
 
     /// NNUE アキュムレータスタックを pop
     #[inline]
     pub(super) fn nnue_pop(&mut self) {
-        self.state.evaluator.pop();
+        self.state.nnue_stack.pop();
     }
 
     /// 中断チェック
@@ -1119,26 +872,26 @@ impl SearchWorker {
             return false;
         }
         // カウンターをリセット
-        self.state.calls_cnt = limits.stop_check_interval();
+        self.state.calls_cnt = if limits.nodes > 0 {
+            std::cmp::min(512, (limits.nodes / 1024) as i32).max(1)
+        } else {
+            512
+        };
 
-        time_manager.publish_nodes(self.state.nodes);
         // 外部からの停止要求
         if time_manager.stop_requested() {
-            if self.thread_id == 0 {
-                time_manager.trace_external_stop();
-            }
             #[cfg(debug_assertions)]
             eprintln!("check_abort: stop requested");
             self.state.abort = true;
             return true;
         }
 
-        if time_manager.node_limit_reached(limits, self.state.nodes) {
+        // ノード数制限チェック
+        if limits.nodes > 0 && self.state.nodes >= limits.nodes {
             #[cfg(debug_assertions)]
             eprintln!(
                 "check_abort: node limit reached nodes={} limit={}",
-                time_manager.budget_nodes(self.state.nodes),
-                limits.nodes
+                self.state.nodes, limits.nodes
             );
             self.state.abort = true;
             return true;
@@ -1156,11 +909,7 @@ impl SearchWorker {
             let elapsed_effective = time_manager.elapsed_from_ponderhit();
 
             // フェーズ1: search_end 設定済み → 即座に停止
-            if !time_manager.is_pondering()
-                && time_manager.search_end() > 0
-                && elapsed >= time_manager.search_end()
-            {
-                time_manager.trace_timing("stop", "deadline", elapsed);
+            if time_manager.search_end() > 0 && elapsed >= time_manager.search_end() {
                 #[cfg(debug_assertions)]
                 eprintln!(
                     "check_abort: search_end reached elapsed={} search_end={}",
@@ -1178,15 +927,6 @@ impl SearchWorker {
                 && limits.use_time_management()
                 && (elapsed_effective > time_manager.maximum() || time_manager.stop_on_ponderhit())
             {
-                time_manager.trace_timing(
-                    "deadline_request",
-                    if time_manager.stop_on_ponderhit() {
-                        "ponderhit"
-                    } else {
-                        "maximum"
-                    },
-                    elapsed,
-                );
                 time_manager.set_search_end(elapsed);
                 // 注: ここでは停止せず、次のチェックで秒境界で停止
             }
@@ -1196,7 +936,8 @@ impl SearchWorker {
     }
 
     /// Step 19: PV search で qsearch に落ちそうな場合、TT手なら newDepth を最低1に引き上げ。
-    /// search_root / search_root_for_pv の各 PV search パスで個別に呼ぶ必要がある。
+    /// YaneuraOu の `search<Root>` テンプレートでは PV search の直前に1箇所だけ存在するが、
+    /// 本エンジン では search_root / search_root_for_pv の各 PV search パスで個別に呼ぶ必要がある。
     fn root_extend_new_depth(
         &self,
         mv: Move,
@@ -1225,14 +966,6 @@ impl SearchWorker {
         limits: &LimitsType,
         time_manager: &mut TimeManagement,
     ) -> Value {
-        #[cfg(feature = "allocation-stats")]
-        let _allocation_scope =
-            crate::allocation_stats::Scope::enter(crate::allocation_stats::Phase::Tree);
-        if let Some(liveness) = self.state.depth_liveness.as_mut() {
-            liveness.search_entry_depth[0] = depth;
-            liveness.nondecreasing_depth_run[0] = 0;
-        }
-
         // 千日手評価値テーブルの初期化
         self.init_draw_value_table(pos.side_to_move());
 
@@ -1243,11 +976,10 @@ impl SearchWorker {
         let root_in_check = pos.in_check();
 
         self.state.stack[0].in_check = root_in_check;
-        self.state.set_previous_pv_from_root(0);
+        self.state.set_previous_pv(&self.state.root_moves[0].pv.clone());
         self.state.set_root_follow_pv();
         self.state.stack[0].cont_history_ptr = self.cont_history_sentinel;
-        self.state.stack[0].cont_correction_ptr = self.cont_correction_sentinel;
-        self.state.stack[0].cont_hist_key = None;
+        self.state.stack[0].cont_hist_key = ContHistKey::null_sentinel();
         // ss->statScore = 0
         self.state.stack[0].stat_score = 0;
         // (ss+2)->cutoffCnt = 0
@@ -1269,8 +1001,7 @@ impl SearchWorker {
 
         // ルートでもTTプローブを行う
         let key = pos.key();
-        let tt = Arc::clone(&self.tt);
-        let tt_result = tt.probe(key, pos);
+        let tt_result = self.tt.probe(key, pos);
         let tt_hit = tt_result.found;
         let tt_data = tt_result.data;
         // rootNode では ttMove = rootMoves[0]
@@ -1286,15 +1017,13 @@ impl SearchWorker {
         // ttCapture (root LMRで使用)
         let tt_capture_root = tt_move_root.is_some() && pos.capture_stage(tt_move_root);
 
-        // Step 11. ProbCut
+        // Step 11. ProbCut（YO search<Root> と同一パス）
         // root でも ProbCut は実行される。search_node と同じ条件・処理を行う。
         let root_static_eval = self.state.stack[0].static_eval;
         let tt_ctx_root = TTContext {
             key,
-            writer: tt_result.writer(),
-            depth: tt_data.depth,
-            bound: tt_data.bound,
-            eval: tt_data.eval,
+            result: tt_result,
+            data: tt_data,
             hit: tt_hit,
             mv: tt_move_root,
             value: tt_value_root,
@@ -1305,7 +1034,6 @@ impl SearchWorker {
                 tt: &self.tt,
                 eval_hash: &self.eval_hash,
                 history: &self.history,
-                shared: &self.shared_histories,
                 cont_history_sentinel: self.cont_history_sentinel,
                 generate_all_legal_moves: self.generate_all_legal_moves,
                 max_moves_to_draw: self.max_moves_to_draw,
@@ -1314,7 +1042,7 @@ impl SearchWorker {
                 tune_params: &self.search_tune_params,
                 reductions: &self.reductions,
                 draw_value_table: self.draw_value_table,
-                entering_king_rule: self.entering_king_rule,
+                bucket_eval_scale: self.bucket_eval_scale,
             };
             if let Some(v) = try_probcut(
                 &mut self.state,
@@ -1338,7 +1066,7 @@ impl SearchWorker {
             }
         }
 
-        // Step 12. A small Probcut idea
+        // Step 12. A small Probcut idea（YO search<Root> と同一パス）
         {
             let small_probcut_beta =
                 beta + Value::new(self.search_tune_params.small_probcut_beta_margin);
@@ -1362,7 +1090,8 @@ impl SearchWorker {
         let mut captures_tried = SearchedMoveList::new();
         // MovePicker でムーブ反復順序を決定
         // ply=0 では全 continuation history が sentinel
-        let cont_tables = [ContHistKey::null_sentinel(); 6];
+        let sentinel_ref: &PieceToHistory = unsafe { self.cont_history_sentinel.as_ref() };
+        let cont_tables = [sentinel_ref; 6];
         let mut mp = MovePicker::new(
             pos,
             tt_move_root,
@@ -1377,17 +1106,14 @@ impl SearchWorker {
         loop {
             let mv = {
                 let h = unsafe { self.history.as_ref_unchecked() };
-                mp.next_move(pos, h, &self.shared_histories)
+                mp.next_move(pos, h)
             };
             if mv == Move::NONE {
                 break;
             }
-            // MovePicker::next_move の契約により、返された手は現局面で pseudo-legal である。
-            debug_assert!(
-                pos.pseudo_legal(mv),
-                "MovePicker yielded non-pseudo-legal move {}",
-                mv.to_usi()
-            );
+            if !pos.pseudo_legal(mv) {
+                continue;
+            }
             if !pos.is_legal(mv) {
                 continue;
             }
@@ -1408,14 +1134,7 @@ impl SearchWorker {
             let is_capture = pos.is_capture(mv);
 
             // 探索
-            do_move_and_push(
-                &mut self.state,
-                pos,
-                mv,
-                gives_check,
-                self.tt.as_ref(),
-                self.eval_hash.as_ref(),
-            );
+            do_move_and_push(&mut self.state, pos, mv, gives_check, self.tt.as_ref());
             // nodes_before は do_move 後に取得
             // (root move 自身の do_move ノードを effort に含めない)
             let nodes_before = self.state.nodes;
@@ -1466,31 +1185,7 @@ impl SearchWorker {
                 self.root_quiet_stat_score(mover, mv)
             };
             self.state.stack[0].stat_score = root_stat_score;
-            let pass_bonus = if mv.is_pass() {
-                get_scaled_pass_move_bonus(pos.game_ply())
-            } else {
-                0
-            };
-            // 非ゼロ PASS は mate を除外する加算のため、狭い窓の bound を流用しない。
-            let value = if pass_bonus != 0 {
-                new_depth = self.root_extend_new_depth(
-                    mv,
-                    tt_move_root,
-                    tt_value_root,
-                    tt_data.depth,
-                    new_depth,
-                );
-                -self.search_node_wrapper::<{ NodeType::PV as u8 }>(
-                    pos,
-                    new_depth,
-                    -Value::INFINITE,
-                    Value::INFINITE,
-                    1,
-                    false,
-                    limits,
-                    time_manager,
-                )
-            } else if move_count == 1 {
+            let value = if move_count == 1 {
                 new_depth = self.root_extend_new_depth(
                     mv,
                     tt_move_root,
@@ -1557,7 +1252,7 @@ impl SearchWorker {
                     let stat_score = self.state.stack[0].stat_score;
                     r -= stat_score * tune.lmr_step16_stat_score_scale_num / 8192;
 
-                    // d計算 (max(1, min(newDepth - r/1024, newDepth + 2)) + PvNode)
+                    // d計算 (YO: max(1, min(newDepth - r/1024, newDepth + 2)) + PvNode)
                     let d =
                         std::cmp::max(1, std::cmp::min(new_depth - r / 1024, new_depth + 2)) + 1; // +1 for PvNode
 
@@ -1710,7 +1405,6 @@ impl SearchWorker {
             if self.state.abort {
                 return Value::ZERO;
             }
-            let value = apply_pass_move_bonus(value, pass_bonus);
 
             // averageScore/meanSquaredScoreは全rootムーブに対して更新
             {
@@ -1723,8 +1417,6 @@ impl SearchWorker {
             if move_count == 1 || value > alpha {
                 let rm = &mut self.state.root_moves[rm_idx];
                 rm.score = value;
-                rm.score_lower_bound = value >= beta;
-                rm.score_upper_bound = value <= alpha;
                 rm.sel_depth = self.state.sel_depth;
                 // PVを更新（第1手はfail lowでも常に更新）
                 rm.pv.truncate(1);
@@ -1807,7 +1499,7 @@ impl SearchWorker {
                 let bonus = stat_bonus(depth, is_tt_move, &tune);
                 let malus = stat_malus(depth, root_move_count, &tune);
                 let us = pos.side_to_move();
-                let pawn_key_idx = self.shared_histories.pawn_history_index(pos.pawn_key());
+                let pawn_key_idx = pos.pawn_history_index();
 
                 let best_moved_pc = pos.moved_piece(best_move_for_stats);
                 let best_cont_pc = if best_move_for_stats.is_promotion() {
@@ -1836,23 +1528,14 @@ impl SearchWorker {
 
                         // PawnHistory
                         let pawn_bonus = pawn_history_bonus(scaled_bonus, &tune);
-                        self.shared_histories.update_pawn_history(
-                            pawn_key_idx,
-                            best_cont_pc,
-                            best_to,
-                            pawn_bonus,
-                        );
+                        h.pawn_history.update(pawn_key_idx, best_cont_pc, best_to, pawn_bonus);
 
                         // quiets_triedはbestMove追加段階で除外済みのため
                         // ペナルティループでの重複チェックは不要
-                        // (適用手ごとに decay_num/1024 で幾何減衰、非rootの経路と同一)
-                        let mut actual_malus = scaled_malus;
                         for &m in quiets_tried.iter() {
-                            actual_malus =
-                                actual_malus * tune.update_all_stats_quiet_malus_decay_num / 1024;
-                            h.main_history.update(us, m, -actual_malus);
+                            h.main_history.update(us, m, -scaled_malus);
 
-                            let low_ply_malus = low_ply_history_bonus(-actual_malus, &tune);
+                            let low_ply_malus = low_ply_history_bonus(-scaled_malus, &tune);
                             h.low_ply_history.update(0, m, low_ply_malus);
 
                             // ContinuationHistory: ply=0ではスキップ
@@ -1865,13 +1548,8 @@ impl SearchWorker {
                             };
                             let to = m.to();
 
-                            let pawn_malus = pawn_history_bonus(-actual_malus, &tune);
-                            self.shared_histories.update_pawn_history(
-                                pawn_key_idx,
-                                cont_pc,
-                                to,
-                                pawn_malus,
-                            );
+                            let pawn_malus = pawn_history_bonus(-scaled_malus, &tune);
+                            h.pawn_history.update(pawn_key_idx, cont_pc, to, pawn_malus);
                         }
                     }
                 } else {
@@ -1934,8 +1612,7 @@ impl SearchWorker {
             } else {
                 (depth + 6).min(MAX_PLY - 1)
             };
-            // root 保存は統計・トレースを伴わないため、格納可否を見ない。
-            let _ = tt_ctx_root.writer.write(
+            tt_ctx_root.result.write(
                 key,
                 value_to_tt(best_value, 0),
                 true, // PvNode
@@ -1961,7 +1638,6 @@ impl SearchWorker {
                     tt: &self.tt,
                     eval_hash: &self.eval_hash,
                     history: &self.history,
-                    shared: &self.shared_histories,
                     cont_history_sentinel: self.cont_history_sentinel,
                     generate_all_legal_moves: self.generate_all_legal_moves,
                     max_moves_to_draw: self.max_moves_to_draw,
@@ -1970,7 +1646,7 @@ impl SearchWorker {
                     tune_params: &self.search_tune_params,
                     reductions: &self.reductions,
                     draw_value_table: self.draw_value_table,
-                    entering_king_rule: self.entering_king_rule,
+                    bucket_eval_scale: self.bucket_eval_scale,
                 };
                 update_correction_history(&self.state, &ctx, pos, 0, bonus);
             }
@@ -1981,6 +1657,7 @@ impl SearchWorker {
 
     /// 特定のPVライン（pv_idx）のみを探索
     ///
+    /// YaneuraOuのMultiPVループに相当。
     /// pv_idx以降の手のみを探索対象とし、0..pv_idxの手は固定とみなす。
     ///
     /// # Arguments
@@ -2001,16 +1678,9 @@ impl SearchWorker {
         limits: &LimitsType,
         time_manager: &mut TimeManagement,
     ) -> Value {
-        #[cfg(feature = "allocation-stats")]
-        let _allocation_scope =
-            crate::allocation_stats::Scope::enter(crate::allocation_stats::Phase::Tree);
         // rootNode && pvIdx の経路のみこの関数が担当する。
         // pv_idx == 0 は search_root() を使い、root TT save はそちらでのみ実行する。
         debug_assert!(pv_idx > 0);
-        if let Some(liveness) = self.state.depth_liveness.as_mut() {
-            liveness.search_entry_depth[0] = depth;
-            liveness.nondecreasing_depth_run[0] = 0;
-        }
 
         // 千日手評価値テーブルの初期化
         self.init_draw_value_table(pos.side_to_move());
@@ -2023,11 +1693,11 @@ impl SearchWorker {
         let root_in_check = pos.in_check();
 
         self.state.stack[0].in_check = root_in_check;
-        self.state.set_previous_pv_from_root(pv_idx);
+        let previous_pv = self.state.root_moves[pv_idx].pv.clone();
+        self.state.set_previous_pv(&previous_pv);
         self.state.set_root_follow_pv();
         self.state.stack[0].cont_history_ptr = self.cont_history_sentinel;
-        self.state.stack[0].cont_correction_ptr = self.cont_correction_sentinel;
-        self.state.stack[0].cont_hist_key = None;
+        self.state.stack[0].cont_hist_key = ContHistKey::null_sentinel();
         // root探索開始時の初期化
         self.state.stack[0].stat_score = 0;
         self.state.stack[2].cutoff_cnt = 0;
@@ -2043,8 +1713,7 @@ impl SearchWorker {
 
         // rootでもTT probeを行い、ttHit/ttPvを更新
         let key = pos.key();
-        let tt = Arc::clone(&self.tt);
-        let tt_result = tt.probe(key, pos);
+        let tt_result = self.tt.probe(key, pos);
         let tt_hit = tt_result.found;
         let tt_data = tt_result.data;
         // rootNode && pvIdx 経路では rootMoves[pv_idx] を ttMove 相当として扱う。
@@ -2073,14 +1742,7 @@ impl SearchWorker {
             let is_capture = pos.is_capture(mv);
 
             // 探索
-            do_move_and_push(
-                &mut self.state,
-                pos,
-                mv,
-                gives_check,
-                self.tt.as_ref(),
-                self.eval_hash.as_ref(),
-            );
+            do_move_and_push(&mut self.state, pos, mv, gives_check, self.tt.as_ref());
             // nodes_before は do_move 後に取得
             // (root move 自身の do_move ノードを effort に含めない)
             let nodes_before = self.state.nodes;
@@ -2128,31 +1790,7 @@ impl SearchWorker {
             let mut new_depth = depth - 1;
 
             // PVS: 最初の手（このPVラインの候補）はPV探索
-            let pass_bonus = if mv.is_pass() {
-                get_scaled_pass_move_bonus(pos.game_ply())
-            } else {
-                0
-            };
-            // 非ゼロ PASS は mate を除外する加算のため、狭い窓の bound を流用しない。
-            let value = if pass_bonus != 0 {
-                new_depth = self.root_extend_new_depth(
-                    mv,
-                    tt_move_root,
-                    tt_value_root,
-                    tt_data.depth,
-                    new_depth,
-                );
-                -self.search_node_wrapper::<{ NodeType::PV as u8 }>(
-                    pos,
-                    new_depth,
-                    -Value::INFINITE,
-                    Value::INFINITE,
-                    1,
-                    false,
-                    limits,
-                    time_manager,
-                )
-            } else if rm_idx == pv_idx {
+            let value = if rm_idx == pv_idx {
                 new_depth = self.root_extend_new_depth(
                     mv,
                     tt_move_root,
@@ -2216,7 +1854,7 @@ impl SearchWorker {
                     let stat_score = self.state.stack[0].stat_score;
                     r -= stat_score * tune.lmr_step16_stat_score_scale_num / 8192;
 
-                    // d計算 (max(1, min(newDepth - r/1024, newDepth + 2)) + PvNode)
+                    // d計算 (YO: max(1, min(newDepth - r/1024, newDepth + 2)) + PvNode)
                     let d =
                         std::cmp::max(1, std::cmp::min(new_depth - r / 1024, new_depth + 2)) + 1; // +1 for PvNode
                     (
@@ -2361,15 +1999,12 @@ impl SearchWorker {
             if self.state.abort {
                 return Value::ZERO;
             }
-            let value = apply_pass_move_bonus(value, pass_bonus);
 
             // スコア更新
             let mut updated_alpha = rm_idx == pv_idx; // PVラインの先頭は維持
             {
                 let rm = &mut self.state.root_moves[rm_idx];
                 rm.score = value;
-                rm.score_lower_bound = value >= beta;
-                rm.score_upper_bound = value <= alpha;
                 rm.sel_depth = self.state.sel_depth;
                 rm.accumulate_score_stats(value);
             }
@@ -2439,7 +2074,6 @@ impl SearchWorker {
             tt: &self.tt,
             eval_hash: &self.eval_hash,
             history: &self.history,
-            shared: &self.shared_histories,
             cont_history_sentinel: self.cont_history_sentinel,
             generate_all_legal_moves: self.generate_all_legal_moves,
             max_moves_to_draw: self.max_moves_to_draw,
@@ -2448,7 +2082,7 @@ impl SearchWorker {
             tune_params: &self.search_tune_params,
             reductions: &self.reductions,
             draw_value_table: self.draw_value_table,
-            entering_king_rule: self.entering_king_rule,
+            bucket_eval_scale: self.bucket_eval_scale,
         };
         Self::search_node::<NT>(
             &mut self.state,
@@ -2468,7 +2102,7 @@ impl SearchWorker {
     ///
     /// NTは NodeType を const genericで受け取る（コンパイル時最適化）
     /// cut_node は「βカットが期待される（ゼロウィンドウの非PVなど）」ときに true を渡す。
-    /// 再探索やPV探索では all_node 扱いにするため false を渡す。
+    /// 再探索やPV探索では all_node 扱いにするため false を渡す（YaneuraOuのcutNode引き渡しと対応）。
     pub(super) fn search_node<const NT: u8>(
         st: &mut SearchState,
         ctx: &SearchContext<'_>,
@@ -2501,32 +2135,9 @@ impl SearchWorker {
             return if in_check {
                 Value::ZERO
             } else {
-                nnue_evaluate(st, pos)
+                // arm 7 Path J: pv_node 状態で dual_cross gating。
+                nnue_evaluate_with_pv(st, pos, pv_node)
             };
-        }
-
-        // 親の PvTable::update はこの ply の行をそのままコピーする。千日手・中断・
-        // Mate Distance Pruning 等の早期 return でも兄弟ノードの行を渡さないよう、
-        // それらより前に空にする。
-        if pv_node {
-            st.pv_table.clear(ply as usize);
-            st.pv_table.clear((ply + 1) as usize);
-        }
-
-        let liveness_nodes = st.nodes;
-        if let Some(liveness) = st.depth_liveness.as_mut() {
-            let excluded_search = st.stack[ply as usize].excluded_move.is_some();
-            depth = liveness.update_depth(
-                liveness_nodes,
-                depth,
-                ply,
-                excluded_search,
-                ctx.tune_params.depth_liveness_node_threshold,
-                ctx.tune_params.depth_liveness_run_threshold,
-            );
-            if depth <= DEPTH_QS {
-                return qsearch::<NT>(st, ctx, pos, alpha, beta, ply, limits, time_manager);
-            }
         }
 
         // 選択的深さを更新
@@ -2592,6 +2203,14 @@ impl SearchWorker {
         // 兄弟ノード間で cutoff_cnt が蓄積されるように ply+2 を初期化する
         unsafe { st.stack.get_unchecked_mut((ply + 2) as usize) }.cutoff_cnt = 0;
 
+        // PVノードの場合、PVをクリアして前回探索の残留を防ぐ
+        // NOTE: YaneuraOuでは (ss+1)->pv = pv でポインタを新配列に向け、ss->pv[0] = Move::none() でクリア
+        //       Vecベースの実装では明示的なclear()で同等の効果を得る
+        if pv_node {
+            st.pv_table.clear(ply as usize);
+            st.pv_table.clear((ply + 1) as usize);
+        }
+
         let prior_reduction = take_prior_reduction(st, ply);
         // SAFETY: ply < MAX_PLY < STACK_SIZE。
         unsafe { st.stack.get_unchecked_mut(ply as usize) }.reduction = 0;
@@ -2600,6 +2219,13 @@ impl SearchWorker {
         let excluded_move = unsafe { st.stack.get_unchecked(ply as usize) }.excluded_move;
         // priorCapture は「1手前が捕獲手か」を局面状態から判定
         let prior_capture = pos.captured_piece().is_some();
+
+        // PATCH-2026-05-31-RANK2-START
+        // SF 91736f7: compute correction_value before TT lookup so the
+        // computation overlaps with the TT prefetch latency that probe
+        // initiates (pure read on history tables that are already hot).
+        let precomputed_corr_value = correction_value(st, ctx, pos, ply);
+        // PATCH-2026-05-31-RANK2-END
 
         // 置換表プローブ（即時カットオフ含む）
         let tt_ctx = match probe_transposition::<NT>(
@@ -2635,7 +2261,6 @@ impl SearchWorker {
                             let h = unsafe { ctx.history.as_mut_unchecked() };
                             update_quiet_histories(
                                 h,
-                                ctx.shared,
                                 &st.stack,
                                 ctx.tune_params,
                                 pos,
@@ -2681,25 +2306,35 @@ impl SearchWorker {
         let tt_move = tt_ctx.mv;
         let tt_value = tt_ctx.value;
         let tt_hit = tt_ctx.hit;
-        let tt_depth = tt_ctx.depth;
-        let tt_bound = tt_ctx.bound;
+        let tt_data = tt_ctx.data;
         let _tt_capture = tt_ctx.capture;
 
         // 静的評価
-        let eval_ctx =
-            compute_eval_context(st, ctx, pos, ply, in_check, pv_node, &tt_ctx, excluded_move);
-        let mut improving = eval_ctx.improving();
-        let opponent_worsening = eval_ctx.opponent_worsening();
+        // PATCH-2026-05-31-RANK2: 事前計算した correction_value を再利用する
+        let eval_ctx = compute_eval_context_with_corr(
+            st,
+            ctx,
+            pos,
+            ply,
+            in_check,
+            pv_node,
+            &tt_ctx,
+            excluded_move,
+            Some(precomputed_corr_value),
+        );
+        let mut improving = eval_ctx.improving;
+        let opponent_worsening = eval_ctx.opponent_worsening;
 
         // evalDiff によるヒストリ更新
         // in_check時はこのブロック自体がスキップされる
+        // （YOではMOVES_LOOPにジャンプするため、ここに到達しない）
         // 条件: !in_check && (ss-1)->currentMove が有効 && !(ss-1)->inCheck && !priorCapture
         if !in_check && ply >= 1 {
             let prev_ply = (ply - 1) as usize;
             let prev_move = st.stack[prev_ply].current_move;
             let prev_in_check = st.stack[prev_ply].in_check;
 
-            // VALUE_NONEチェックは不要
+            // VALUE_NONEチェックは不要（YOは行わない）
             // VALUE_NONEの場合はclampにより-200に制限されるため問題ない
             if prev_move.is_normal() && !prev_in_check && !prior_capture {
                 let prev_eval = st.stack[prev_ply].static_eval.raw();
@@ -2731,8 +2366,8 @@ impl SearchWorker {
                     if !tt_hit {
                         let prev_piece = pos.piece_on(prev_sq);
                         if prev_piece.piece_type() != PieceType::Pawn && !prev_move.is_promotion() {
-                            let pawn_idx = ctx.shared.pawn_history_index(pos.pawn_key());
-                            ctx.shared.update_pawn_history(
+                            let pawn_idx = pos.pawn_history_index();
+                            h.pawn_history.update(
                                 pawn_idx,
                                 prev_piece,
                                 prev_sq,
@@ -2852,8 +2487,9 @@ impl SearchWorker {
             &tt_ctx,
             ply,
             // NMP verification searchが同一plyでsearch_nodeを呼び
-            // stack[ply].static_evalを上書きするため、検証後の値を使う。
-            // eval_ctx.static_eval は検証前のスナップショットなので使わない。
+            // stack[ply].static_evalを上書きする。YOはss->staticEvalをポインタ経由で
+            // 参照するため上書き後の値が見える。eval_ctx.static_eval (snapshot) ではなく
+            // live stack値を使う。
             st.stack[ply as usize].static_eval,
             eval_ctx.unadjusted_static_eval,
             in_check,
@@ -2870,17 +2506,134 @@ impl SearchWorker {
         // Step 12. A small Probcut idea（moves_loop直前）
         // =================================================================
         // TTのLower boundが十分深く、probCutBeta以上の値を持つなら即座にカット。
-        // in_check時もこのステップは実行される。
+        // in_check時もこのステップは実行される（YOではgoto moves_loopの先で実行）。
         {
             let small_probcut_beta = beta + Value::new(ctx.tune_params.small_probcut_beta_margin);
-            if tt_bound.is_lower_or_exact()
-                && tt_depth >= depth - 4
+            if tt_data.bound.is_lower_or_exact()
+                && tt_data.depth >= depth - 4
                 && tt_value != Value::NONE
                 && tt_value >= small_probcut_beta
                 && !beta.is_mate_score()
                 && !tt_value.is_mate_score()
             {
                 return small_probcut_beta;
+            }
+        }
+
+        // =================================================================
+        // Mate-1ply probe (mate engine 中盤統合: Plan B+C)
+        // =================================================================
+        // 中盤以降の PV node で軽量に詰み検知。 既存 qsearch の mate_1ply 経路を
+        // alpha_beta の moves_loop 直前に拡張し、葉まで読まずに即詰を検知する。
+        // 条件 (発動頻度を絞り NPS 退行を抑える):
+        //   - !in_check       (in_check は evasion で mate 検知済)
+        //   - excluded_move.is_none()  (SE 再帰 contamination 回避)
+        //   - pv_node         (NonPV は本来速度優先のため対象外)
+        //   - depth >= 6      (浅い depth は qsearch / 通常探索で十分)
+        //   - pos.game_ply() >= 30  (中盤以降。 序盤は詰み稀で無駄)
+        //   - !tt_hit         (TT に値があれば信頼。 重複 cost 回避)
+        if !in_check
+            && excluded_move.is_none()
+            && pv_node
+            && depth >= 6
+            && pos.game_ply() >= 30
+            && !tt_hit
+        {
+            let mate_move = pos.mate_1ply();
+            if mate_move.is_some() {
+                let mate_value = Value::mate_in(ply + 1);
+                if ctx.allow_tt_write {
+                    tt_ctx.result.write(
+                        tt_ctx.key,
+                        value_to_tt(mate_value, ply),
+                        st.stack[ply as usize].tt_pv,
+                        Bound::Exact,
+                        depth,
+                        mate_move,
+                        eval_ctx.unadjusted_static_eval,
+                        ctx.tt.generation(),
+                    );
+                }
+                return mate_value;
+            }
+        }
+
+        // =================================================================
+        // YO 風 mate dfpn probe (= moves_loop 直前、 PV node 深 depth のみ)
+        // =================================================================
+        // YaneuraOu の search.cpp 内 mate search 統合に倣い、 alpha_beta の
+        // moves_loop 直前で軽量 df-pn を駆動する。 budget は厳しく (= NPS 退行
+        // -3% 以内 boundary 守る) 絞り、 中盤の発動頻度を抑制する。
+        //
+        // condition:
+        //   - !in_check
+        //   - excluded_move.is_none()   (SE 再帰汚染回避)
+        //   - pv_node                   (NonPV は速度優先のため非対象)
+        //   - depth >= 12               (浅い depth は qsearch / mate_1ply で十分。
+        //                                 NPS 退行 -3% boundary 守るため深 depth のみ)
+        //   - pos.game_ply() >= 30 OR EndgameDetector が Endgame phase 判定 (v6B 拡張:
+        //                                 USI go 入口で EndgameDetector が thread-local に
+        //                                 書き込んだ phase index を参照。 序盤の手数稼ぎ手順
+        //                                 (= 持久戦) でも 駒組壊しなく終盤に入った瞬間から発動)
+        //   - !tt_hit                   (TT に値があれば信頼)
+        //   - ply <= 2                  (root に極めて近い PV のみ。
+        //                                 alpha_beta 内 dfpn を控え目に。 NPS 退行回避)
+        //
+        // budget: max_nodes = 128 * depth (depth 12 で 1536 node)、
+        // max_depth = min(depth, 8)
+        //
+        // NOTE: `current_phase_is_endgame()` は thread-local override (= USI go 入口で
+        // `set_current_phase_idx` 経由 write) を参照。 override 未設定なら false で
+        // ply ベース判定 (= game_ply >= 30) に fallback する。
+        // `dual_cross` は `nnue-dual-psqt` feature gate 内のため、 disable build では
+        // false (= ply ベース判定のみ) で動作する。
+        #[cfg(feature = "nnue-dual-psqt")]
+        let v6b_endgame_phase = crate::nnue::dual_cross::current_phase_is_endgame();
+        #[cfg(not(feature = "nnue-dual-psqt"))]
+        let v6b_endgame_phase = false;
+        // 2026-06-05 mate tune v1: 100+ ply 長期戦詰み逃し改善
+        // floodgate 11/11 敗着が ply >= 100 の入玉 + 詰み逃し pattern と判明
+        let endgame_boost = pos.game_ply() >= 100;
+        if !in_check
+            && excluded_move.is_none()
+            && pv_node
+            && (depth >= 12 || endgame_boost)
+            && (pos.game_ply() >= 30 || v6b_endgame_phase)
+            && !tt_hit
+            && ply <= 2
+        {
+            // lazy 構築 (= TT size 4 MB = mate tune v2、 旧 1 MB は budget 増で不足)
+            if st.mate_dfpn_engine.is_none() {
+                st.mate_dfpn_engine = Some(super::mate_dfpn::MateDfpnEngine::new(4));
+            }
+            let engine = st.mate_dfpn_engine.as_mut().unwrap();
+            // tune v2: 4x nodes + 1.5x depth (= 安全側、 v1 8x + 2x で crash)
+            let (mate_nodes_mul, mate_depth_cap) = if endgame_boost {
+                (1024u32, 12u16) // ply 100+ で大 budget
+            } else {
+                (512u32, 12u16) // 4x nodes (= 旧 128 → 512) + 1.5x depth (= 旧 8 → 12)
+            };
+            let effective_depth = (depth as u32).max(8);
+            let max_nodes = mate_nodes_mul.saturating_mul(effective_depth);
+            let max_depth = (depth as u16).min(mate_depth_cap);
+            let dfpn_result = engine.probe(pos, max_nodes, max_depth);
+            if let super::mate_dfpn::MateDfpnResult::Mate { best_move: dfpn_mv } = dfpn_result
+                && dfpn_mv != Move::NONE
+            {
+                let mate_value = Value::mate_in(ply + 1);
+                if ctx.allow_tt_write {
+                    tt_ctx.result.write(
+                        tt_ctx.key,
+                        value_to_tt(mate_value, ply),
+                        st.stack[ply as usize].tt_pv,
+                        Bound::Exact,
+                        depth,
+                        dfpn_mv,
+                        eval_ctx.unadjusted_static_eval,
+                        ctx.tt.generation(),
+                    );
+                }
+                return mate_value;
             }
         }
 
@@ -2893,7 +2646,6 @@ impl SearchWorker {
         let mut quiets_tried = SearchedMoveList::new();
         let mut captures_tried = SearchedMoveList::new();
         let mover = pos.side_to_move();
-        let pawn_history_index = ctx.shared.pawn_history_index(pos.pawn_key());
 
         // qsearch/ProbCut互換: 捕獲フェーズではTT手もcapture_stageで制約
         let tt_move = if depth <= DEPTH_QS
@@ -2906,12 +2658,19 @@ impl SearchWorker {
         };
 
         // MovePickerを作成（lazy generation）
-        let cont_tables = cont_history_keys(st, ply);
+        let cont_tables = cont_history_tables(st, ctx, ply);
         // contHist[0], contHist[1] の参照元はノード先頭で固定する。
         let cont_hist_ptr_1 = cont_history_ptr(st, ctx, ply, 1);
         let cont_hist_ptr_2 = cont_history_ptr(st, ctx, ply, 2);
         let mut mp =
             MovePicker::new(pos, tt_move, depth, ply, cont_tables, ctx.generate_all_legal_moves);
+
+        // Residual Cut Policy (2026-06-06): 既 PolicyGuide / 2187 logits / top-K 経路は
+        // 完全削除。 第一段階計装 (= residual-cut-stats feature) で 12 SFEN × depth 16
+        // 計測した結果、 救済余地 = overall search の 0.5% (Go 基準 5% 大幅下回り)、
+        // rank 0-2 が cutoff の 96% 達成で MovePicker first-cut 既十分。 No-Go 確定で
+        // 計測 logic も AGENTS.md YAGNI 遵守で完全削除。 詳細は memory
+        // `residual_cut_policy_no_go_20260606`。
 
         // Singular Extension用の変数
         let tt_pv = st.stack[ply as usize].tt_pv;
@@ -2925,7 +2684,7 @@ impl SearchWorker {
             // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない
             let mv = {
                 let h = unsafe { ctx.history.as_ref_unchecked() };
-                mp.next_move(pos, h, ctx.shared)
+                mp.next_move(pos, h)
             };
             if mv == Move::NONE {
                 break;
@@ -2934,11 +2693,13 @@ impl SearchWorker {
             if mv == excluded_move {
                 continue;
             }
-            // MovePicker::next_move の契約により、返された手は現局面で pseudo-legal である。
+            // pseudo_legal の runtime check を削除 (C-1 最適化):
+            // MovePicker は TT 手のみ pseudo_legal_with_all で構築時に check 済、
+            // movegen 由来手は構造的に pseudo-legal を満たす。
+            // debug build では assertion で安全性を確認、 release/production では消える。
             debug_assert!(
                 pos.pseudo_legal(mv),
-                "MovePicker yielded non-pseudo-legal move {}",
-                mv.to_usi()
+                "MovePicker returned non-pseudo-legal move: {mv:?}"
             );
             if !pos.is_legal(mv) {
                 continue;
@@ -2949,14 +2710,8 @@ impl SearchWorker {
 
             move_count += 1;
             st.stack[ply as usize].move_count = move_count;
-            // NonPV で探索した手が同点昇格等で best_move になったときに、前の兄弟の行を
-            // 子の続きとしてコピーしないよう、手ごとに子の行を空にしておく。
-            if pv_node {
-                st.pv_table.clear((ply + 1) as usize);
-            }
 
             let is_capture = pos.is_capture(mv);
-            prefetch_child(pos, mv, ctx.tt, ctx.eval_hash);
             let gives_check = pos.gives_check(mv);
 
             let mut new_depth = depth - 1;
@@ -3020,7 +2775,7 @@ impl SearchWorker {
                 static_eval: st.stack[ply as usize].static_eval,
                 alpha,
                 best_move,
-                pawn_history_index,
+                pawn_history_index: pos.pawn_history_index(),
                 // SE 前に取得（SE の再帰 search_node が同一 ply の stack を上書きするため）
                 follow_pv: st.stack[ply as usize].follow_pv,
                 pv_node,
@@ -3054,8 +2809,8 @@ impl SearchWorker {
                         + ctx.tune_params.singular_min_depth_tt_pv_add * tt_pv as i32
                 && tt_value != Value::NONE
                 && !tt_value.is_mate_score()
-                && tt_bound.is_lower_or_exact()
-                && tt_depth >= depth - ctx.tune_params.singular_tt_depth_margin
+                && tt_data.bound.is_lower_or_exact()
+                && tt_data.depth >= depth - ctx.tune_params.singular_tt_depth_margin
             {
                 let singular_beta_margin = (ctx.tune_params.singular_beta_margin_base
                     + ctx.tune_params.singular_beta_margin_tt_pv_non_pv_add
@@ -3073,7 +2828,6 @@ impl SearchWorker {
                 // - move_count: ローカル変数で管理しているため影響なし
                 // - その他: ヒューリスティック用途のため多少の誤差は許容される
 
-                let outer_depth_liveness = st.depth_liveness_snapshot(ply);
                 st.stack[ply as usize].excluded_move = mv;
                 let singular_value = Self::search_node::<{ NodeType::NonPV as u8 }>(
                     st,
@@ -3088,7 +2842,6 @@ impl SearchWorker {
                     time_manager,
                 );
                 st.stack[ply as usize].excluded_move = Move::NONE;
-                st.depth_liveness_restore(ply, outer_depth_liveness);
 
                 // SE再帰呼び出し内の上方伝播により
                 // st.stack[ply].tt_pvが変更される可能性がある。
@@ -3121,9 +2874,20 @@ impl SearchWorker {
                         - (ply * 2 > st.root_depth * 3) as i32
                             * ctx.tune_params.singular_triple_margin_late_ply_penalty;
 
-                    extension = 1
-                        + (singular_value < singular_beta - Value::new(double_margin)) as i32
-                        + (singular_value < singular_beta - Value::new(triple_margin)) as i32;
+                    // YaneuraOu "skip double/triple extensions for capture moves" 相当。
+                    // option ON かつ現在の手が capture の場合、singular の +1 は維持し
+                    // double/triple extension（追加加算）だけを抑止する。
+                    // 非capture は既存挙動を完全維持。
+                    let skip_capture_double_triple =
+                        ctx.tune_params.singular_skip_capture_double_triple != 0 && is_capture;
+                    if skip_capture_double_triple {
+                        inc_stat!(st, singular_capture_double_triple_skipped);
+                        extension = 1;
+                    } else {
+                        extension = 1
+                            + (singular_value < singular_beta - Value::new(double_margin)) as i32
+                            + (singular_value < singular_beta - Value::new(triple_margin)) as i32;
+                    }
 
                     // singular確定時にdepthを+1
                     depth += 1;
@@ -3148,8 +2912,8 @@ impl SearchWorker {
 
             // 指し手を実行
             st.stack[ply as usize].current_move = mv;
-            do_move_and_push_prefetched(st, pos, mv, gives_check, ctx.eval_hash);
-            // ContHistKey/ContinuationHistoryを設定
+            do_move_and_push(st, pos, mv, gives_check, ctx.tt);
+            // YaneuraOu方式: ContHistKey/ContinuationHistoryを設定
             // ⚠ in_checkは親ノードの王手状態を使用（gives_checkではない）
             // PASS は to()/moved_piece_after() が未定義のため、null move と同様に扱う
             if mv.is_pass() {
@@ -3175,9 +2939,9 @@ impl SearchWorker {
             // Late Move Reduction (LMR)
             // =============================================================
             // ttPv大型補正
-            // !ttHit時はtt_value=VALUE_NONE(32002)でほぼtrue、tt_depthはスロット残値
+            // !ttHit時はtt_value=VALUE_NONE(32002)でほぼtrue、tt_data.depthはスロット残値
             let tt_value_higher = tt_value > alpha;
-            let tt_depth_ge = tt_depth >= depth;
+            let tt_depth_ge = tt_data.depth >= depth;
 
             if st.stack[ply as usize].tt_pv {
                 r -= ctx.tune_params.lmr_step16_ttpv_sub_base
@@ -3245,41 +3009,18 @@ impl SearchWorker {
             st.stack[ply as usize].stat_score = stat_score;
             r -= stat_score * ctx.tune_params.lmr_step16_stat_score_scale_num / 8192;
 
-            if all_node {
-                r += r * ctx.tune_params.lmr_all_node_scale_num
-                    / (256 * depth + ctx.tune_params.lmr_all_node_scale_offset);
+            // allNode 比例削減 (YaneuraOu v9.40: r += r * 273 / (256*depth + 260))。
+            // all_node のみ適用。係数 0 (default) では無効で現状動作を維持する。
+            // depth は負になりうるため max(0) でゼロ除算/負の除数を防ぐ。
+            let allnode_coeff = ctx.tune_params.lmr_allnode_reduction_coeff;
+            if all_node && allnode_coeff != 0 {
+                r += r * allnode_coeff / (256 * depth.max(0) + 260);
             }
 
             // =============================================================
             // 探索
             // =============================================================
-            let pass_bonus = if mv.is_pass() {
-                get_scaled_pass_move_bonus(pos.game_ply())
-            } else {
-                0
-            };
-            let mut value = if pass_bonus != 0 {
-                if mv == tt_move
-                    && ((tt_value != Value::NONE && tt_value.is_mate_score() && tt_depth > 0)
-                        || (tt_depth > 1 && st.root_depth > 8))
-                {
-                    new_depth = new_depth.max(1);
-                }
-                st.stack[ply as usize].reduction = 0;
-                st.set_child_follow_pv(ply, mv);
-                -Self::search_node::<{ NodeType::PV as u8 }>(
-                    st,
-                    ctx,
-                    pos,
-                    new_depth,
-                    -Value::INFINITE,
-                    Value::INFINITE,
-                    ply + 1,
-                    false,
-                    limits,
-                    time_manager,
-                )
-            } else if depth >= 2 && move_count > 1 {
+            let mut value = if depth >= 2 && move_count > 1 {
                 inc_stat!(st, lmr_applied);
                 // d = max(1, min(newDepth - r/1024, newDepth + 2)) + PvNode
                 // 内側のmax(1, ...)で1以上が保証され、pv_node(0or1)加算で減ることはない
@@ -3388,11 +3129,11 @@ impl SearchWorker {
                                 break;
                             }
                             // SAFETY: idx >= 0 は上のガードで保証。idx < ply < MAX_PLY < STACK_SIZE。
-                            if let Some(key) =
-                                unsafe { st.stack.get_unchecked(idx as usize) }.cont_hist_key
                             {
-                                // null move ply はスキップ
-                                if key.piece.is_none() {
+                                let key =
+                                    unsafe { st.stack.get_unchecked(idx as usize) }.cont_hist_key;
+                                // null move ply / 未設定はスキップ
+                                if key.is_null() {
                                     continue;
                                 }
                                 let in_check_idx = key.in_check as usize;
@@ -3426,8 +3167,10 @@ impl SearchWorker {
                 if pv_node && (move_count == 1 || value > alpha) {
                     // ttMove由来のnewDepth下限補正
                     if mv == tt_move
-                        && ((tt_value != Value::NONE && tt_value.is_mate_score() && tt_depth > 0)
-                            || (tt_depth > 1 && st.root_depth > 8))
+                        && ((tt_value != Value::NONE
+                            && tt_value.is_mate_score()
+                            && tt_data.depth > 0)
+                            || (tt_data.depth > 1 && st.root_depth > 8))
                     {
                         new_depth = new_depth.max(1);
                     }
@@ -3474,12 +3217,15 @@ impl SearchWorker {
                 );
                 st.stack[ply as usize].reduction = 0;
 
+                // YaneuraOu Step18準拠:
                 // PvNodeでは zero-window で alpha を超えたら full PV再探索する。
                 if pv_node && value > alpha {
                     // ttMove由来のnewDepth下限補正
                     if mv == tt_move
-                        && ((tt_value != Value::NONE && tt_value.is_mate_score() && tt_depth > 0)
-                            || (tt_depth > 1 && st.root_depth > 8))
+                        && ((tt_value != Value::NONE
+                            && tt_value.is_mate_score()
+                            && tt_data.depth > 0)
+                            || (tt_data.depth > 1 && st.root_depth > 8))
                     {
                         new_depth = new_depth.max(1);
                     }
@@ -3505,8 +3251,8 @@ impl SearchWorker {
                 // Full window search
                 // ttMove由来のnewDepth下限補正
                 if mv == tt_move
-                    && ((tt_value != Value::NONE && tt_value.is_mate_score() && tt_depth > 0)
-                        || (tt_depth > 1 && st.root_depth > 8))
+                    && ((tt_value != Value::NONE && tt_value.is_mate_score() && tt_data.depth > 0)
+                        || (tt_data.depth > 1 && st.root_depth > 8))
                 {
                     new_depth = new_depth.max(1);
                 }
@@ -3530,10 +3276,20 @@ impl SearchWorker {
 
             pos.undo_move(mv);
 
+            // パス手評価ボーナス: パス手を実行した場合、評価値にボーナスを加算
+            // スケーリングなし（常に設定値の100%を適用）
+            // 負のボーナスも適用（パス抑制用途）
+            // 注意: 詰みスコアには加算しない（mate距離が壊れるため）
+            if mv.is_pass() && !value.is_mate_score() {
+                let bonus = get_scaled_pass_move_bonus(pos.game_ply());
+                if bonus != 0 {
+                    value += Value::new(bonus);
+                }
+            }
+
             if st.abort {
                 return Value::ZERO;
             }
-            value = apply_pass_move_bonus(value, pass_bonus);
 
             // =============================================================
             // スコア更新
@@ -3553,13 +3309,15 @@ impl SearchWorker {
 
             if value + inc > best_value {
                 best_value = value;
+                // PV更新: best_value 更新時 (alpha 超えでなくても) に PV を構築する
+                // 理由: fail-low 時に PV chain が空になり root.pv が 1 手のみになる
+                // 問題を解消。 best_move 更新は alpha 超え時のみで探索 logic 不変。
+                if pv_node {
+                    st.pv_table.update(ply as usize, mv);
+                }
 
                 if value + inc > alpha {
                     best_move = mv;
-                    // PV更新
-                    if pv_node {
-                        st.pv_table.update(ply as usize, mv);
-                    }
 
                     if value >= beta {
                         // extension < 2 または PvNode の場合のみインクリメント
@@ -3574,6 +3332,13 @@ impl SearchWorker {
                         {
                             let d = (depth as usize).min(STATS_MAX_DEPTH - 1);
                             st.stats.move_count_sum_by_depth[d] += move_count as u64;
+                            // Phase A: stage 別 cutoff 集計
+                            let s_idx =
+                                crate::search::movepicker::stage_to_idx(mp.last_returned_stage());
+                            st.stats.cutoff_by_stage[s_idx] += 1;
+                            if move_count == 1 {
+                                st.stats.first_cutoff_by_stage[s_idx] += 1;
+                            }
                         }
                         break;
                     }
@@ -3606,7 +3371,7 @@ impl SearchWorker {
         }
 
         // =================================================================
-        // 合法手なしの敗北判定 + History更新
+        // 詰み/ステイルメイト判定 + History更新
         // =================================================================
         // if-else チェイン
         // moveCount == 0: bestValue を設定して関数末尾までフォールスルー
@@ -3615,11 +3380,14 @@ impl SearchWorker {
         // else if: prior countermove bonus
         if move_count == 0 {
             // excludedMoveがある場合は単にalphaを返す（詰みとは判定しない）
-            // 将棋では王手の有無にかかわらず合法手なしは負け。
+            // 合法手なし（将棋では in_check == true なら詰み）
             best_value = if excluded_move.is_some() {
                 alpha
-            } else {
+            } else if in_check {
                 Value::mated_in(ply)
+            } else {
+                // ステイルメイト（将棋では通常発生しないがパスがない場合）
+                Value::ZERO
             };
         } else if best_move.is_some() && !best_move.is_pass() {
             // =================================================================
@@ -3630,25 +3398,18 @@ impl SearchWorker {
             let is_best_capture = pos.capture_stage(best_move);
             let is_tt_move = best_move == tt_move;
             // bonus = min(121*depth-77, 1633) + 375*(bestMove==ttMove)
-            //         + parentStatScore * num/8192、非PVではさらに探索済み手数でスケール
-            let parent_stat_score = if ply >= 1 {
-                st.stack[(ply - 1) as usize].stat_score
-            } else {
-                0
-            };
-            let mut bonus = stat_bonus(depth, is_tt_move, ctx.tune_params)
-                + parent_stat_score * ctx.tune_params.stat_bonus_parent_stat_num / 8192;
-            if !pv_node {
-                let searched_count = quiets_tried.len() + captures_tried.len();
-                bonus += ((bonus as i64)
-                    * searched_count as i64
-                    * ctx.tune_params.update_all_stats_searched_count_num as i64
-                    / (256 * 1024)) as i32;
+            let mut bonus = stat_bonus(depth, is_tt_move, ctx.tune_params);
+            // YO/SF: bonus += (ss-1)->statScore / div（前ノードの statScore を加味）
+            // div=0（default）では無効で現状動作を維持する。
+            let prev_div = ctx.tune_params.stat_bonus_prev_statscore_div;
+            if prev_div != 0 && ply >= 1 {
+                let prev_stat_score = st.stack[(ply - 1) as usize].stat_score;
+                bonus += prev_stat_score / prev_div;
             }
             // malus = min(825*depth-196, 2159) - 16*moveCount
             let malus = stat_malus(depth, move_count, ctx.tune_params);
             let us = pos.side_to_move();
-            let pawn_key_idx = ctx.shared.pawn_history_index(pos.pawn_key());
+            let pawn_key_idx = pos.pawn_history_index();
 
             // best_moveの駒情報を取得
             let best_moved_pc = pos.moved_piece(best_move);
@@ -3668,7 +3429,7 @@ impl SearchWorker {
                 let scaled_bonus =
                     bonus * ctx.tune_params.update_all_stats_quiet_bonus_scale_num / 1024;
 
-                // 他のquiet手にはペナルティ (適用手ごとに decay_num/1024 で幾何減衰)
+                // 他のquiet手にはペナルティ
                 // update_quiet_histories(move, -quietMalus * 1083 / 1024)
                 let scaled_malus =
                     malus * ctx.tune_params.update_all_stats_quiet_malus_scale_num / 1024;
@@ -3699,11 +3460,10 @@ impl SearchWorker {
                             let prev_ply = (ply - ply_back as i32) as usize;
                             // SAFETY: prev_ply = ply - ply_back。ply < MAX_PLY かつ ply_back >= 1
                             //         なので prev_ply < MAX_PLY - 1 < STACK_SIZE。
-                            if let Some(key) =
-                                unsafe { st.stack.get_unchecked(prev_ply) }.cont_hist_key
                             {
-                                // null move ply はスキップ
-                                if key.piece.is_none() {
+                                let key = unsafe { st.stack.get_unchecked(prev_ply) }.cont_hist_key;
+                                // null move ply / 未設定はスキップ
+                                if key.is_null() {
                                     continue;
                                 }
                                 let in_check_idx = key.in_check as usize;
@@ -3726,22 +3486,18 @@ impl SearchWorker {
 
                     // PawnHistory: bonus * (pos ? 850 : 550) / 1024
                     let pawn_bonus = pawn_history_bonus(scaled_bonus, ctx.tune_params);
-                    ctx.shared.update_pawn_history(pawn_key_idx, best_cont_pc, best_to, pawn_bonus);
+                    h.pawn_history.update(pawn_key_idx, best_cont_pc, best_to, pawn_bonus);
 
                     // quiets_triedはbestMove追加段階で除外済みのため
                     // ペナルティループでの重複チェックは不要
-                    let mut actual_malus = scaled_malus;
                     for &m in quiets_tried.iter() {
-                        actual_malus = actual_malus
-                            * ctx.tune_params.update_all_stats_quiet_malus_decay_num
-                            / 1024;
                         // MainHistory
-                        h.main_history.update(us, m, -actual_malus);
+                        h.main_history.update(us, m, -scaled_malus);
 
                         // LowPlyHistory
                         if ply < LOW_PLY_HISTORY_SIZE as i32 {
                             let low_ply_malus =
-                                low_ply_history_bonus(-actual_malus, ctx.tune_params);
+                                low_ply_history_bonus(-scaled_malus, ctx.tune_params);
                             h.low_ply_history.update(ply as usize, m, low_ply_malus);
                         }
 
@@ -3755,9 +3511,9 @@ impl SearchWorker {
                         let to = m.to();
 
                         // ContinuationHistoryへのペナルティ
-                        // -actualMalus * 955/1024 * weight/1024 + 88*(i<2) (actualMalus は幾何減衰済み)
+                        // -malus * 1083/1024 * 955/1024 * weight/1024 + 88*(i<2)
                         let cont_scaled_malus =
-                            -actual_malus * ctx.tune_params.continuation_history_multiplier / 1024;
+                            -scaled_malus * ctx.tune_params.continuation_history_multiplier / 1024;
                         for ply_back in 1..=6 {
                             if ply_back > max_ply_back {
                                 continue;
@@ -3766,11 +3522,11 @@ impl SearchWorker {
                             if ply >= ply_back as i32 {
                                 let prev_ply = (ply - ply_back as i32) as usize;
                                 // SAFETY: prev_ply = ply - ply_back < MAX_PLY < STACK_SIZE。
-                                if let Some(key) =
-                                    unsafe { st.stack.get_unchecked(prev_ply) }.cont_hist_key
                                 {
-                                    // null move ply はスキップ
-                                    if key.piece.is_none() {
+                                    let key =
+                                        unsafe { st.stack.get_unchecked(prev_ply) }.cont_hist_key;
+                                    // null move ply / 未設定はスキップ
+                                    if key.is_null() {
                                         continue;
                                     }
                                     let in_check_idx = key.in_check as usize;
@@ -3792,8 +3548,8 @@ impl SearchWorker {
                         }
 
                         // PawnHistoryへのペナルティ
-                        let pawn_malus = pawn_history_bonus(-actual_malus, ctx.tune_params);
-                        ctx.shared.update_pawn_history(pawn_key_idx, cont_pc, to, pawn_malus);
+                        let pawn_malus = pawn_history_bonus(-scaled_malus, ctx.tune_params);
+                        h.pawn_history.update(pawn_key_idx, cont_pc, to, pawn_malus);
                     }
                 }
             } else {
@@ -3846,10 +3602,10 @@ impl SearchWorker {
                 // !pos.captured_piece() = 現在の局面で駒が取られていない
                 if prev_move_count == 1 + (prev_tt_hit as i32)
                     && pos.captured_piece() == Piece::NONE
-                    && let Some(key) = st.stack[prev_ply].cont_hist_key
                 {
-                    // null move ply はスキップ (prevSq != SQ_NONE)
-                    if !key.piece.is_none() {
+                    let key = st.stack[prev_ply].cont_hist_key;
+                    // null move ply / 未設定はスキップ (prevSq != SQ_NONE)
+                    if !key.is_null() {
                         let prev_sq = key.to;
                         let prev_piece = pos.piece_on(prev_sq);
                         // update_continuation_histories(ss - 1, ...)を呼ぶ
@@ -3871,12 +3627,10 @@ impl SearchWorker {
                                 let weight = continuation_history_weight(ctx.tune_params, ply_back);
                                 // ss - 1 からさらに ply_back 手前 = ply - 1 - ply_back
                                 let target_ply = ply - 1 - ply_back as i32;
-                                if target_ply >= 0
-                                    && let Some(target_key) =
-                                        st.stack[target_ply as usize].cont_hist_key
-                                {
-                                    // null move ply はスキップ
-                                    if target_key.piece.is_none() {
+                                if target_ply >= 0 {
+                                    let target_key = st.stack[target_ply as usize].cont_hist_key;
+                                    // null move ply / 未設定はスキップ
+                                    if target_key.is_null() {
                                         continue;
                                     }
                                     let in_check_idx = target_key.in_check as usize;
@@ -3920,9 +3674,10 @@ impl SearchWorker {
         // =================================================================
         else if ply >= 1 {
             let prev_ply = (ply - 1) as usize;
-            if let Some(prev_key) = st.stack[prev_ply].cont_hist_key {
-                // null move ply はスキップ (prevSq != SQ_NONE)
-                if !prev_key.piece.is_none() {
+            {
+                let prev_key = st.stack[prev_ply].cont_hist_key;
+                // null move ply / 未設定はスキップ (prevSq != SQ_NONE)
+                if !prev_key.is_null() {
                     let prior_capture = prev_key.capture;
                     let prev_sq = prev_key.to;
 
@@ -3992,7 +3747,7 @@ impl SearchWorker {
 
                         // pawn history更新（歩以外かつ成りでない場合）
                         // if (type_of(pos.piece_on(prevSq)) != PAWN && ((ss - 1)->currentMove).type_of() != PROMOTION)
-                        let pawn_key_idx = ctx.shared.pawn_history_index(pos.pawn_key());
+                        let pawn_key_idx = pos.pawn_history_index();
                         let pawn_bonus = (scaled_bonus
                             * ctx.tune_params.prior_quiet_countermove_pawn_scale_num as i64
                             / 32768) as i32;
@@ -4009,12 +3764,10 @@ impl SearchWorker {
                                 let weight = continuation_history_weight(ctx.tune_params, ply_back);
                                 // ss - 1 からさらに ply_back 手前 = ply - 1 - ply_back
                                 let target_ply = ply - 1 - ply_back as i32;
-                                if target_ply >= 0
-                                    && let Some(target_key) =
-                                        st.stack[target_ply as usize].cont_hist_key
-                                {
-                                    // null move ply はスキップ
-                                    if target_key.piece.is_none() {
+                                if target_ply >= 0 {
+                                    let target_key = st.stack[target_ply as usize].cont_hist_key;
+                                    // null move ply / 未設定はスキップ
+                                    if target_key.is_null() {
                                         continue;
                                     }
                                     let in_check_idx = target_key.in_check as usize;
@@ -4039,7 +3792,7 @@ impl SearchWorker {
                             h.main_history.update(opponent, prev_move, main_bonus);
 
                             if update_pawn {
-                                ctx.shared.update_pawn_history(
+                                h.pawn_history.update(
                                     pawn_key_idx,
                                     prev_piece,
                                     prev_sq,
@@ -4109,18 +3862,7 @@ impl SearchWorker {
                 && helper_tt_write_enabled_for_depth(ctx.thread_id, bound, stored_depth);
             #[cfg(not(feature = "tt-trace"))]
             let allow_write = ctx.allow_tt_write;
-            if allow_write
-                && tt_ctx.writer.write(
-                    tt_ctx.key,
-                    value_to_tt(best_value, ply),
-                    st.stack[ply as usize].tt_pv,
-                    bound,
-                    stored_depth,
-                    best_move,
-                    eval_ctx.unadjusted_static_eval,
-                    ctx.tt.generation(),
-                )
-            {
+            if allow_write {
                 #[cfg(feature = "tt-trace")]
                 maybe_trace_tt_write(TtWriteTrace {
                     stage: "ab_store",
@@ -4139,6 +3881,16 @@ impl SearchWorker {
                         Move::NONE
                     },
                 });
+                tt_ctx.result.write(
+                    tt_ctx.key,
+                    value_to_tt(best_value, ply),
+                    st.stack[ply as usize].tt_pv,
+                    bound,
+                    stored_depth,
+                    best_move,
+                    eval_ctx.unadjusted_static_eval,
+                    ctx.tt.generation(),
+                );
                 inc_stat_by_depth!(st, tt_write_by_depth, stored_depth);
             }
         }
@@ -4147,7 +3899,7 @@ impl SearchWorker {
         // 条件: !inCheck && !(bestMove && capture(bestMove))
         //        && (bestValue > staticEval) == bool(bestMove)
         // bestMove有無で除数が異なる（有: /10, 無: /8）
-        // ttPv伝播・TT保存の後に更新する。
+        // YOと同順序で、ttPv伝播・TT保存の後に更新する。
         if !(in_check || best_move.is_some() && pos.is_capture(best_move))
             && (best_value > st.stack[ply as usize].static_eval) == best_move.is_some()
         {
@@ -4164,27 +3916,14 @@ impl SearchWorker {
 
 // SAFETY: SearchWorkerは単一スレッドで使用される前提。
 //
-// 1. `cont_history_ptr` / `cont_correction_ptr`（StackArray内の各Stack）:
-//    `self.history`が所有するcontinuation history / correction history内のテーブルへの参照である。
-//    HistoryCell本体はBox allocation内にあり、SearchWorkerがスレッド間でmoveされても再配置されない。
-//    ワーカーは移動先の単一スレッドだけで使用するため、データ競合も発生しない。
+// 1. `cont_history_ptr: NonNull<PieceToHistory>`（StackArray内の各Stack）:
+//    `self.history.continuation_history` 内のテーブルへの参照である。
+//    SearchWorkerがスレッド間でmoveされても、history フィールドも一緒にmoveされるため、
+//    ポインタの参照先は常に有効であり、データ競合も発生しない。
 //
+// 2. `network_ptr: *const NNUENetwork`（SearchState、layerstack-only feature時のみ）:
+//    グローバル NETWORK (RwLock<Option<Arc<NNUENetwork>>>) 内の Arc が指す
+//    NNUENetwork への読み取り専用ポインタ。NNUENetwork は Arc 経由で保持されるため
+//    Sync であり、探索中に重みデータが変更されることはない。
+//    各ワーカーが独立した reset() で設定し、探索中は読み取りのみ行う。
 unsafe impl Send for SearchWorker {}
-
-/// 完了した PASS の有限スコアだけに加算し、詰み領域へ入れない。
-#[inline]
-pub(super) fn apply_pass_move_bonus(value: Value, bonus: i32) -> Value {
-    if bonus == 0 || value.is_mate_score() {
-        return value;
-    }
-    let limit = Value::MATE_IN_MAX_PLY.raw() - 1;
-    Value::new(value.raw().saturating_add(bonus).clamp(-limit, limit))
-}
-
-#[cfg(all(
-    test,
-    feature = "halfkx-arch",
-    not(feature = "nnue-runtime-dimensions")
-))]
-#[path = "finny_search_tests.rs"]
-mod finny_search_tests;

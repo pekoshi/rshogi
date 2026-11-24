@@ -12,77 +12,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-/// 同じエンジン係数を指す重複行を拒否する。net 名は ID の表記ゆれを正規化する。
-/// `seen` は 1 入力（または翻訳先集合）ごとに空の map から使う。
-pub fn register_unique_parameter(
-    seen: &mut HashMap<String, usize>,
-    name: &str,
-    line_no: usize,
-) -> Result<()> {
-    let canonical = rshogi_core::nnue::NetCoefficientId::parse_usi_name(name)
-        .map_or_else(|| name.to_string(), |id| id.usi_name());
-    if let Some(previous) = seen.insert(canonical.clone(), line_no) {
-        bail!(
-            "line {line_no}: duplicate parameter {name} (canonical {canonical}, first at line {previous})"
-        );
-    }
-    Ok(())
-}
-
 pub const NOT_USED_MARKER: &str = "[[NOT USED]]";
-
-/// 列6を終端摂動幅、列7を終端学習率係数とする `.params` の形式宣言。
-pub const SPSA_PARAMS_FORMAT_HEADER: &str = "# spsa-format: c-end-r-end-v1";
-
-/// 探索パラメータ生成時の終端学習率係数。
-pub const DEFAULT_SPSA_R_END: f64 = 0.002;
-
-/// 探索パラメータの範囲から終端摂動幅を求める。
-pub fn default_spsa_c_end(min: i32, max: i32) -> f64 {
-    ((f64::from(max) - f64::from(min)) / 20.0).round().max(1.0)
-}
-
-/// 形式宣言を検査する。未宣言の入力だけは呼出側の明示確認で受理できる。
-pub fn validate_spsa_params_format(path: &Path, assume_c_end_r_end: bool) -> Result<()> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut declared = false;
-    let mut saw_parameter = false;
-    for (idx, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
-        let trimmed = line.trim();
-        if let Some(format) = trimmed
-            .strip_prefix('#')
-            .map(str::trim)
-            .and_then(|comment| comment.strip_prefix("spsa-format:"))
-        {
-            if declared || saw_parameter {
-                bail!(
-                    "{}: line {}: SPSA format must be declared once, before parameter rows",
-                    path.display(),
-                    idx + 1
-                );
-            }
-            if format.trim() != "c-end-r-end-v1" {
-                bail!(
-                    "{}: line {}: unsupported SPSA format '{}'; convert the schedule columns explicitly",
-                    path.display(),
-                    idx + 1,
-                    format.trim()
-                );
-            }
-            declared = true;
-        } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            saw_parameter = true;
-        }
-    }
-    if !declared && !assume_c_end_r_end {
-        bail!(
-            "{}: missing SPSA format declaration '{SPSA_PARAMS_FORMAT_HEADER}'; legacy step/delta cannot be inferred from numeric values. For verified c_end/r_end files only, use --assume-c-end-r-end; otherwise regenerate the schedule columns before tuning",
-            path.display()
-        );
-    }
-    Ok(())
-}
 
 /// `.params` ファイルの 1 行を文字列のまま保持する低レベル表現。
 ///
@@ -97,9 +27,9 @@ pub struct RawParamRow {
     pub value_text: String,
     pub min_text: String,
     pub max_text: String,
-    /// 6 番目の列。現行SPSAでは `c_end`。未宣言の外部入力では意味を推定しない。
+    /// 6 番目の列。YO/rshogi `.params` では `step`、Fishtest 派生では `c_end`。
     pub col5_text: String,
-    /// 7 番目の列。現行SPSAでは `r_end`。未宣言の外部入力では意味を推定しない。
+    /// 7 番目の列。YO/rshogi `.params` では `alpha`、Fishtest 派生では `r_end`。
     pub col6_text: String,
     /// `//` 以降の文字列（先頭の `//` を含まずトリム済み、空なら "")
     pub comment: String,
@@ -188,12 +118,8 @@ pub fn parse_value_i32(text: &str) -> Result<i32> {
     if let Ok(v) = text.parse::<i32>() {
         return Ok(v);
     }
-    let value = text.parse::<f64>().with_context(|| format!("invalid numeric value: {text}"))?;
-    let rounded = value.round();
-    if !rounded.is_finite() || rounded < i32::MIN as f64 || rounded > i32::MAX as f64 {
-        bail!("numeric value is not a finite i32: {text}");
-    }
-    Ok(rounded as i32)
+    let v = text.parse::<f64>().with_context(|| format!("invalid numeric value: {text}"))?;
+    Ok(v.round() as i32)
 }
 
 fn parse_f64(text: &str) -> Result<f64> {
@@ -234,29 +160,11 @@ pub fn load_params(path: &Path) -> Result<Vec<ParamRow>> {
     Ok(rows)
 }
 
-/// 形式を確認した `c_end/r_end` ファイルを整数値ベースで読み込む。
-pub fn load_spsa_params(path: &Path, assume_c_end_r_end: bool) -> Result<Vec<ParamRow>> {
-    validate_spsa_params_format(path, assume_c_end_r_end)?;
-    load_params(path)
-}
-
 /// `.params` を書き出す（YO/rshogi 共通フォーマット）
 pub fn write_params(path: &Path, rows: &[ParamRow]) -> Result<()> {
-    write_params_with_header(path, rows, None)
-}
-
-/// `c_end/r_end` の形式宣言付きで `.params` を書き出す。
-pub fn write_spsa_params(path: &Path, rows: &[ParamRow]) -> Result<()> {
-    write_params_with_header(path, rows, Some(SPSA_PARAMS_FORMAT_HEADER))
-}
-
-fn write_params_with_header(path: &Path, rows: &[ParamRow], header: Option<&str>) -> Result<()> {
     let file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     let mut w = BufWriter::new(file);
-    if let Some(header) = header {
-        writeln!(w, "{header}")?;
-    }
     for r in rows {
         write!(
             w,
@@ -379,20 +287,22 @@ impl<'a> MappingIndex<'a> {
     }
 }
 
-/// 値変換: YO → rshogi。符号反転した値を i32 で表せない場合はエラー。
+/// 値変換: YO → rshogi
 ///
 /// 内部実装は `rshogi_to_yo_value` と同一（involution）だが、両関数を別名で公開する
 /// ことで呼び出し元の方向性（どちらの名前空間にいるのか）を明示する目的で残している。
-pub fn yo_to_rshogi_value(yo_value: i32, sign_flip: bool) -> Result<i32> {
-    rshogi_to_yo_value(yo_value, sign_flip)
+pub fn yo_to_rshogi_value(yo_value: i32, sign_flip: bool) -> i32 {
+    if sign_flip { -yo_value } else { yo_value }
 }
 
-/// 値変換: rshogi → YO。符号反転した値を i32 で表せない場合はエラー。
-pub fn rshogi_to_yo_value(rshogi_value: i32, sign_flip: bool) -> Result<i32> {
+/// 値変換: rshogi → YO（YO 側は元の符号慣用に戻る）
+///
+/// `yo_to_rshogi_value` と実装は同じ。意図表現（どちら方向の変換か）を保つために両方公開。
+pub fn rshogi_to_yo_value(rshogi_value: i32, sign_flip: bool) -> i32 {
     if sign_flip {
-        rshogi_value.checked_neg().context("sign-flipped value does not fit i32")
+        -rshogi_value
     } else {
-        Ok(rshogi_value)
+        rshogi_value
     }
 }
 
@@ -400,85 +310,14 @@ pub fn rshogi_to_yo_value(rshogi_value: i32, sign_flip: bool) -> Result<i32> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn numeric_values_must_be_finite_and_fit_i32_after_rounding() {
-        for text in [
-            "NaN",
-            "inf",
-            "-inf",
-            "2147483647.5",
-            "-2147483648.5",
-            "1e100",
-        ] {
-            assert!(parse_value_i32(text).is_err(), "{text}");
-        }
-        assert_eq!(parse_value_i32("2147483647.4").unwrap(), i32::MAX);
-        assert_eq!(parse_value_i32("-2147483648.4").unwrap(), i32::MIN);
-    }
-
-    #[test]
-    fn unmarked_schedule_requires_confirmation_even_for_small_ranges() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("small.params");
-        let legacy = "small,int,0,0,1,1,0.05\n";
-        std::fs::write(&path, legacy).unwrap();
-        let error = validate_spsa_params_format(&path, false).unwrap_err().to_string();
-        assert!(error.contains("missing SPSA format declaration"), "{error}");
-        validate_spsa_params_format(&path, true).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
-    }
-
-    #[test]
-    fn format_confirmation_does_not_override_declared_or_misplaced_formats() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("input.params");
-        for text in [
-            "# spsa-format: legacy-step-delta\nsmall,int,0,0,1,1,0.05\n".to_string(),
-            "# spsa-format: c-end-r-end-v2\nsmall,int,0,0,1,1,0.002\n".to_string(),
-            format!("{SPSA_PARAMS_FORMAT_HEADER}\n{SPSA_PARAMS_FORMAT_HEADER}\n"),
-            format!("small,int,0,0,1,1,0.002\n{SPSA_PARAMS_FORMAT_HEADER}\n"),
-        ] {
-            std::fs::write(&path, &text).unwrap();
-            for assume in [false, true] {
-                assert!(validate_spsa_params_format(&path, assume).is_err(), "{text}");
-            }
-        }
-    }
-
-    #[test]
-    fn declared_schedule_accepts_metadata_and_preserves_columns() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("input.params");
-        let text =
-            format!("# net metadata\n{SPSA_PARAMS_FORMAT_HEADER}\nsmall,int,0,0,1,0.1,0.003\n");
-        std::fs::write(&path, text).unwrap();
-        let rows = load_spsa_params(&path, false).unwrap();
-        assert_eq!(rows[0].step, 0.1);
-        assert_eq!(rows[0].alpha, 0.003);
-        write_spsa_params(&path, &rows).unwrap();
-        let rows = load_spsa_params(&path, false).unwrap();
-        assert_eq!(rows[0].step, 0.1);
-        assert_eq!(rows[0].alpha, 0.003);
-    }
-
     /// YO ↔ rshogi の値変換は involution（2 回適用で元に戻る）
     #[test]
     fn value_translation_is_involution() {
         for &v in &[-10000_i32, -1, 0, 1, 100, 12345] {
             for &flip in &[false, true] {
-                let r = yo_to_rshogi_value(v, flip).unwrap();
-                assert_eq!(rshogi_to_yo_value(r, flip).unwrap(), v, "v={v} flip={flip}");
+                let r = yo_to_rshogi_value(v, flip);
+                assert_eq!(rshogi_to_yo_value(r, flip), v, "v={v} flip={flip}");
             }
-        }
-    }
-
-    #[test]
-    fn sign_translation_checks_i32_minimum() {
-        for translate in [yo_to_rshogi_value, rshogi_to_yo_value] {
-            assert_eq!(translate(i32::MIN, false).unwrap(), i32::MIN);
-            assert!(translate(i32::MIN, true).is_err());
-            assert_eq!(translate(i32::MAX, true).unwrap(), -i32::MAX);
-            assert_eq!(translate(-i32::MAX, true).unwrap(), i32::MAX);
         }
     }
 
@@ -615,13 +454,13 @@ mod tests {
             else {
                 continue;
             };
-            let to_r = yo_to_rshogi_value(yo_row.value, m.sign_flip).unwrap();
+            let to_r = yo_to_rshogi_value(yo_row.value, m.sign_flip);
             assert_eq!(
                 to_r, r_row.value,
                 "{} -> {}: YO={} sign_flip={} 期待 rshogi={} 実際={}",
                 m.yo, m.rshogi, yo_row.value, m.sign_flip, to_r, r_row.value
             );
-            let back_to_yo = rshogi_to_yo_value(r_row.value, m.sign_flip).unwrap();
+            let back_to_yo = rshogi_to_yo_value(r_row.value, m.sign_flip);
             assert_eq!(
                 back_to_yo, yo_row.value,
                 "{} -> {}: rshogi={} sign_flip={} 期待 YO={} 実際={}",

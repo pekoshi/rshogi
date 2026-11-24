@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use tools::output_path::{ensure_distinct_output_paths, ensure_safe_output_path};
 
 /// PackedSfenValueのサイズ（バイト）
 const RECORD_SIZE: usize = 40;
@@ -99,7 +98,7 @@ fn main() -> Result<()> {
             if sfen_match { "一致" } else { "変更" },
             orig_score,
             prep_score,
-            i32::from(prep_score) - i32::from(orig_score)
+            prep_score - orig_score
         );
     }
     eprintln!();
@@ -112,13 +111,6 @@ fn main() -> Result<()> {
     // 出力先決定
     let output_path = cli.output.unwrap_or_else(|| cli.preprocessed.clone());
     let in_place = output_path == cli.preprocessed;
-
-    if in_place {
-        ensure_distinct_output_paths(&output_path, &cli.original)?;
-    } else {
-        ensure_safe_output_path(&output_path, &cli.original)?;
-        ensure_safe_output_path(&output_path, &cli.preprocessed)?;
-    }
 
     if in_place {
         eprintln!("インプレース更新: {}", cli.preprocessed.display());

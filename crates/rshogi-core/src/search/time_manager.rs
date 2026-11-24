@@ -9,13 +9,13 @@ use crate::types::Color;
 use log::debug;
 use rand::Rng;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // =============================================================================
 // 定数
 // =============================================================================
 
-/// デフォルトの最小思考時間（ミリ秒）
+/// デフォルトの最小思考時間（ミリ秒） - YaneuraOu準拠
 const DEFAULT_MINIMUM_THINKING_TIME: TimePoint = 2000;
 
 /// デフォルトのネットワーク遅延（ミリ秒）
@@ -27,17 +27,18 @@ const DEFAULT_NETWORK_DELAY2: TimePoint = 1120;
 /// デフォルトのSlowMover（百分率）
 const DEFAULT_SLOW_MOVER: i32 = 100;
 
-/// 秒境界に切り上げるときの MinimumThinkingTime と最小思考時間の下限（ミリ秒）
+/// MinimumThinkingTime の下限（ミリ秒）
 const MIN_MINIMUM_THINKING_TIME: TimePoint = 1000;
 
 /// 引き分けまでの最大手数のデフォルト値
 pub const DEFAULT_MAX_MOVES_TO_DRAW: i32 = 100000;
 
-/// 合法手1つの場合の時間上限（ミリ秒）
+/// 合法手1つの場合の時間上限（ミリ秒）- YaneuraOu準拠
 const SINGLE_MOVE_TIME_LIMIT: TimePoint = 500;
 
-/// 最善手不安定性係数の定数
+/// 最善手不安定性係数の定数 - YaneuraOu準拠
 /// bestMoveInstability = BASE + FACTOR * totBestMoveChanges / threads.size()
+/// 注: クランプなし（YaneuraOu準拠）
 const BEST_MOVE_INSTABILITY_BASE: f64 = 0.9929;
 const BEST_MOVE_INSTABILITY_FACTOR: f64 = 1.8519;
 
@@ -45,11 +46,11 @@ const BEST_MOVE_INSTABILITY_FACTOR: f64 = 1.8519;
 // 公開関数
 // =============================================================================
 
-/// MoveHorizon（残り手数見積もり）を計算
+/// MoveHorizon（残り手数見積もり）を計算（YaneuraOu準拠）
 ///
 /// # Arguments
 /// * `time_forfeit` - 切れ負けルールか（inc=0かつbyoyomi=0）
-/// * `ply` - 現在の手数 (負の値は 0 として扱う)
+/// * `ply` - 現在の手数
 ///
 /// # Returns
 /// 残り手数の見積もり
@@ -57,17 +58,17 @@ pub fn calculate_move_horizon(time_forfeit: bool, ply: i32) -> i32 {
     const MOVE_HORIZON: i32 = 160;
 
     if time_forfeit {
-        // 切れ負けルール: MoveHorizon + 40 - clamp(ply, 0, 40)
-        MOVE_HORIZON + 40 - ply.clamp(0, 40)
+        // 切れ負けルール: MoveHorizon + 40 - min(ply, 40)
+        MOVE_HORIZON + 40 - ply.min(40)
     } else {
-        // フィッシャールール: MoveHorizon + 20 - clamp(ply, 0, 80)
-        MOVE_HORIZON + 20 - ply.clamp(0, 80)
+        // フィッシャールール: MoveHorizon + 20 - min(ply, 80)
+        MOVE_HORIZON + 20 - ply.min(80)
     }
 }
 
-/// 最善手不安定性係数を計算
+/// 最善手不安定性係数を計算（YaneuraOu準拠、クランプなし）
 ///
-/// bestMoveInstability = 0.9929 + 1.8519 * totBestMoveChanges / threads.size()
+/// YaneuraOu: bestMoveInstability = 0.9929 + 1.8519 * totBestMoveChanges / threads.size()
 ///
 /// # Arguments
 /// * `tot_best_move_changes` - 最善手変更の累積カウント
@@ -77,7 +78,7 @@ pub fn calculate_best_move_instability(tot_best_move_changes: f64, thread_count:
         + BEST_MOVE_INSTABILITY_FACTOR * tot_best_move_changes / thread_count.max(1) as f64
 }
 
-/// fallingEvalを計算
+/// fallingEvalを計算（YaneuraOu準拠）
 ///
 /// fallingEval = (11.396 + 2.035 * (best_prev_avg - best) + 0.968 * (iter_value - best)) / 100
 /// を [0.5786, 1.6752] にクランプする。
@@ -89,7 +90,7 @@ pub fn calculate_falling_eval(best_prev_avg: i32, iter_value: i32, best_value: i
     eval.clamp(0.5786, 1.6752)
 }
 
-/// timeReductionを計算
+/// timeReductionを計算（YaneuraOu準拠）
 ///
 /// timeReduction = 0.8 + 0.84 / (1.077 + exp(-0.527 * (depth - (last_best_move_depth + 11))))
 /// を返す。
@@ -100,7 +101,7 @@ pub fn calculate_time_reduction(completed_depth: i32, last_best_move_depth: i32)
     0.8 + 0.84 / (1.077 + (-k * (completed_depth as f64 - center)).exp())
 }
 
-/// nodesEffort を正規化する
+/// nodesEffort を正規化する（YaneuraOu準拠）
 #[inline]
 pub fn normalize_nodes_effort(effort: f64, nodes_total: u64) -> f64 {
     effort * 100000.0 / nodes_total.max(1) as f64
@@ -114,9 +115,6 @@ pub fn normalize_nodes_effort(effort: f64, nodes_total: u64) -> f64 {
 ///
 /// 探索の思考時間を計算し、停止判定を行う。
 pub struct TimeManagement {
-    analysis: Option<super::analysis::AnalysisRun>,
-    searched_nodes: Option<Arc<AtomicU64>>,
-    published_nodes: u64,
     /// 探索開始時刻
     start_time: Instant,
 
@@ -162,17 +160,14 @@ pub struct TimeManagement {
     /// 合法手が1つだった場合に500ms上限を再適用するためのフラグ
     single_move_limit: bool,
 
-    /// 前回のtime_reductionを保持（reduction 計算に使用）
+    /// 前回のtime_reductionを保持（YaneuraOu準拠のreduction計算に使用）
     previous_time_reduction: f64,
 
-    /// Ponderオプション
+    /// Ponderオプション（YaneuraOu準拠）
     usi_ponder: bool,
     stochastic_ponder: bool,
 
-    /// 思考時間を秒境界に切り上げるか (`TimeOptions::round_up_to_full_second`)
-    round_up_to_full_second: bool,
-
-    /// Ponder中に時間を使い切ったフラグ
+    /// Ponder中に時間を使い切ったフラグ（stopOnPonderhit相当）
     stop_on_ponderhit: bool,
 
     /// 動的な ponder 状態
@@ -190,9 +185,6 @@ impl TimeManagement {
     pub fn new(stop: Arc<AtomicBool>, ponderhit: Arc<AtomicBool>) -> Self {
         let now = Instant::now();
         Self {
-            analysis: None,
-            searched_nodes: None,
-            published_nodes: 0,
             start_time: now,
             optimum_time: 0,
             maximum_time: 0,
@@ -211,7 +203,6 @@ impl TimeManagement {
             previous_time_reduction: 0.85,
             usi_ponder: false,
             stochastic_ponder: false,
-            round_up_to_full_second: true,
             stop_on_ponderhit: false,
             is_pondering: false,
             last_stop_threshold: None,
@@ -222,15 +213,13 @@ impl TimeManagement {
     pub fn set_options(&mut self, opts: &TimeOptions) {
         self.network_delay = opts.network_delay.max(0);
         self.network_delay2 = opts.network_delay2.max(0);
-        self.round_up_to_full_second = opts.round_up_to_full_second;
-        self.minimum_thinking_time =
-            opts.minimum_thinking_time.max(self.second_floor(MIN_MINIMUM_THINKING_TIME));
+        self.minimum_thinking_time = opts.minimum_thinking_time.max(MIN_MINIMUM_THINKING_TIME);
         self.slow_mover = opts.slow_mover.clamp(1, 1000);
         self.usi_ponder = opts.usi_ponder;
         self.stochastic_ponder = opts.stochastic_ponder;
     }
 
-    /// 前回の time_reduction をセット
+    /// 前回の time_reduction をセット（YO準拠の持ち回り用）
     pub fn set_previous_time_reduction(&mut self, value: f64) {
         self.previous_time_reduction = value;
     }
@@ -256,25 +245,11 @@ impl TimeManagement {
         self.remain_time
     }
 
-    /// 秒境界に切り上げるときだけ `floor` を返し、切り上げないときは 0 を返す
-    fn second_floor(&self, floor: TimePoint) -> TimePoint {
-        if self.round_up_to_full_second {
-            floor
-        } else {
-            0
-        }
-    }
-
-    /// round_up処理
+    /// round_up処理（YaneuraOu準拠）
     ///
     /// 1秒単位で繰り上げてdelayを引く。
     /// ただし、remain_timeよりは小さくなるように制限する。
-    /// `round_up_to_full_second` が false なら切り上げず、remain_time による制限だけを掛ける。
     pub fn round_up(&self, t0: TimePoint) -> TimePoint {
-        if !self.round_up_to_full_second {
-            return t0.min(self.remain_time).max(0);
-        }
-
         // 1000で繰り上げる。minimum_thinking_timeが最低値。
         let mut t = ((t0 + 999) / 1000 * 1000).max(self.minimum_thinking_time);
 
@@ -293,22 +268,18 @@ impl TimeManagement {
 
     /// 今回の思考時間を決定する
     ///
-    /// 共有通知は変更しない。stop / ponderhit のリセットは探索起動前に呼び出し元が行う。
-    ///
     /// # Arguments
     /// * `limits` - 探索制限
     /// * `us` - 自分の手番
     /// * `ply` - 現在の手数
     /// * `max_moves_to_draw` - 引き分けまでの最大手数
     pub fn init(&mut self, limits: &LimitsType, us: Color, ply: i32, max_moves_to_draw: i32) {
-        self.analysis = limits.analysis.clone();
-        self.searched_nodes = limits.searched_nodes.clone();
-        self.published_nodes = 0;
         self.start_time = limits.start_time.unwrap_or_else(Instant::now);
         self.ponderhit_time = self.start_time;
         self.search_end = 0;
         self.is_final_push = false;
         self.is_pondering = limits.ponder;
+        self.ponderhit.store(false, Ordering::Relaxed);
         self.single_move_limit = false;
         self.stop_on_ponderhit = false;
         self.last_stop_threshold = None;
@@ -387,11 +358,8 @@ impl TimeManagement {
         // move_horizon の近似 (MoveHorizon = 160 をベースに補正)
         let move_horizon = calculate_move_horizon(time_forfeit, ply);
 
-        // 残り手数 (MTG)。MaxMovesToDraw は setoption で i32 の最大値まで入るので、
-        // `max_moves - ply + 2` は TimePoint (i64) で計算して桁あふれを避ける。
-        let mtg = (TimePoint::from(max_moves) - TimePoint::from(ply) + 2)
-            .min(TimePoint::from(move_horizon))
-            / 2;
+        // 残り手数 (MTG)
+        let mtg = (max_moves - ply + 2).min(move_horizon) / 2;
         if mtg <= 0 {
             self.minimum_time = 500;
             self.optimum_time = 500;
@@ -406,25 +374,24 @@ impl TimeManagement {
         }
 
         // 最小思考時間 (network_delay を差し引く)
-        self.minimum_time = (self.minimum_thinking_time - self.network_delay)
-            .max(self.second_floor(MIN_MINIMUM_THINKING_TIME));
+        self.minimum_time = (self.minimum_thinking_time - self.network_delay).max(1000);
 
         // 初期値は残り時間
         self.optimum_time = self.remain_time;
         self.maximum_time = self.remain_time;
 
         // remain_estimate = time + inc*mtg + byoyomi*mtg - (mtg+1)*1000
-        // 1 手 1000ms は秒境界への切り上げで失う時間の見込みなので、切り上げないときは引かない
+        let mtg_i64 = mtg as TimePoint;
         let mut remain_estimate = time_left
-            .saturating_add(increment.saturating_mul(mtg))
-            .saturating_add(byoyomi.saturating_mul(mtg));
-        remain_estimate = remain_estimate.saturating_sub((mtg + 1) * self.second_floor(1000));
+            .saturating_add(increment.saturating_mul(mtg_i64))
+            .saturating_add(byoyomi.saturating_mul(mtg_i64));
+        remain_estimate = remain_estimate.saturating_sub((mtg_i64 + 1) * 1000);
         if remain_estimate < 0 {
             remain_estimate = 0;
         }
 
         // optimum: minimum + remain_estimate/mtg
-        let t1 = self.minimum_time + remain_estimate / mtg;
+        let t1 = self.minimum_time + remain_estimate / mtg_i64;
 
         // maximum: minimum + remain_estimate * max_ratio / mtg
         let mut max_ratio: f64 = 5.0;
@@ -433,7 +400,7 @@ impl TimeManagement {
             max_ratio = max_ratio.min(ratio.max(1.0));
         }
         let mut t2 =
-            self.minimum_time + (remain_estimate as f64 * max_ratio / mtg as f64) as TimePoint;
+            self.minimum_time + (remain_estimate as f64 * max_ratio / mtg_i64 as f64) as TimePoint;
         // maximum は残り時間の30%を上限
         let max_cap = (remain_estimate as f64 * 0.3) as TimePoint;
         t2 = t2.min(max_cap);
@@ -441,10 +408,10 @@ impl TimeManagement {
         self.optimum_time = t1.min(self.optimum_time);
         self.maximum_time = t2.min(self.maximum_time);
 
-        // SlowMover は optimum のみスケールする（秒読みの最終局面は除外）
+        // SlowMover は YaneuraOu 同様 optimum のみスケールする（秒読みの最終局面は除外）
         self.optimum_time = self.optimum_time * self.slow_mover as i64 / 100;
 
-        // Ponder時調整
+        // Ponder時調整（YaneuraOu準拠）
         // Ponderが有効でStochastic_Ponderが無効の場合、optimumTimeを25%増やす
         if self.usi_ponder && !self.stochastic_ponder {
             self.optimum_time += self.optimum_time / 4;
@@ -457,6 +424,43 @@ impl TimeManagement {
             self.optimum_time = byoyomi + time_left;
             self.maximum_time = byoyomi + time_left;
             self.is_final_push = true;
+        }
+
+        // Fischer ルール 滑らか時間配分 (2026-06-15 改訂、 旧 低残 safety を一般化)
+        //
+        // 旧実装は「残り時間 < 増秒*10」でのみ optimum を increment*0.8 に抑える hard
+        // safety だった。 これは閾値 (= 10F で残 100s) の崖で optimum が 16s↔8s に
+        // 振動し、 かつ閾値以上 (= 中盤) では mtg 楽観見積りで毎手 ~16s 消費して base を
+        // 急速に枯渇させていた (= floodgate 棋譜で確認: 中盤 T16 連発 → 終盤の温存ゼロ)。
+        //
+        // 改訂: Fischer (= increment > 0, byoyomi == 0) 全域で optimum を
+        //   increment*0.8 + time_left*0.013
+        // で滑らかに上限化する (= 10F で 残300s≈11.9s, 残100s≈9.3s, 残50s≈8.7s)。
+        // 残が増秒を下回ったら increment*0.5 と time_left*0.4 の小さい方まで更に圧縮。
+        // 元の optimum との min を取るため上振れはしない。 これにより
+        //   ① 8↔16s の崖を排し滑らかに
+        //   ② 中盤の過剰消費を抑え base を終盤に温存 (= シミュレーションで終局時残
+        //      100s → 207s に倍増)
+        // を実現する。 maximum は温存分を重要局面 (= bestMoveInstability 延長) で投入
+        // できるよう optimum より広く取る (= 残の半分 と 増秒*3 の小さい方、 10F で最大 30s)。
+        let is_fischer = increment > 0 && byoyomi == 0;
+        if is_fischer && !self.is_final_push {
+            let opt_cap = if time_left >= increment {
+                (increment as f64 * 0.8 + time_left as f64 * 0.013) as TimePoint
+            } else {
+                ((increment as f64 * 0.5) as TimePoint).min((time_left as f64 * 0.4) as TimePoint)
+            }
+            .max(1);
+
+            // maximum は optimum の 1.6 倍を上限とし (= 重要局面で +60% 延長余地)、
+            // 残の半分も超えない。 旧 low-time safety (inc*1.5) より緩まないよう全帯で締める。
+            // (10F: 残300s≈19s, 残60s≈14s, 残25s≈12.5s ── いずれも旧 maximum 以下)
+            let max_cap = ((opt_cap as f64 * 1.6) as TimePoint)
+                .min((time_left as f64 * 0.5) as TimePoint)
+                .max(opt_cap);
+
+            self.optimum_time = self.optimum_time.min(opt_cap).max(1);
+            self.maximum_time = self.maximum_time.min(max_cap).max(self.optimum_time);
         }
 
         // round_up は NetworkDelay・minimum_thinking_time・remain_time を考慮する
@@ -473,9 +477,7 @@ impl TimeManagement {
         }
     }
 
-    /// 今回の思考時間を決定する
-    ///
-    /// 共有通知は変更しない。stop / ponderhit のリセットは探索起動前に呼び出し元が行う。（合法手数を考慮）
+    /// 今回の思考時間を決定する（合法手数を考慮）
     ///
     /// # Arguments
     /// * `limits` - 探索制限
@@ -505,7 +507,7 @@ impl TimeManagement {
 
     /// 合法手1つの場合の時間制限適用
     ///
-    /// 視聴者体験を向上させるため、合法手が1つだけの場合に
+    /// YaneuraOu準拠: 視聴者体験を向上させるため、合法手が1つだけの場合に
     /// 使用時間を500ms以下に制限する（実際の制限はtotal_time計算後に適用）
     pub fn apply_single_move_limit(&mut self) {
         self.single_move_limit = true;
@@ -513,7 +515,7 @@ impl TimeManagement {
 
     /// 最善手不安定性係数を適用して optimum_time を調整
     ///
-    /// bestMoveInstability = 0.9929 + 1.8519 * totBestMoveChanges / threads.size()
+    /// YaneuraOu準拠: bestMoveInstability = 0.9929 + 1.8519 * totBestMoveChanges / threads.size()
     ///
     /// # Arguments
     /// * `tot_best_move_changes` - 最善手変更の累積カウント
@@ -536,7 +538,7 @@ impl TimeManagement {
         tot_best_move_changes: f64,
         thread_count: usize,
     ) -> f64 {
-        // byoyomiモード (is_final_push=true) では時間を変更しない
+        // YaneuraOu準拠: byoyomiモード (is_final_push=true) では時間を変更しない
         // byoyomiは固定時間なので、動的な調整は適用しない
         if self.is_final_push {
             return 1.0;
@@ -545,18 +547,12 @@ impl TimeManagement {
         let instability = calculate_best_move_instability(tot_best_move_changes, thread_count);
         let reduction =
             (1.4540 + self.previous_time_reduction) / (2.1593 * time_reduction.max(0.0001));
-        log::trace!(
-            target: "rshogi_core::search::time",
-            "event=factors falling_eval={:.6} stability={:.6} previous_stability={:.6} reduction={:.6} instability={:.6} changes={:.6} threads={}",
-            falling_eval, time_reduction, self.previous_time_reduction, reduction,
-            instability, tot_best_move_changes, thread_count,
-        );
         self.previous_time_reduction = time_reduction;
 
         falling_eval * reduction * instability
     }
 
-    /// 1イテレーションで使うべき totalTime を計算
+    /// 1イテレーションで使うべき totalTime（YaneuraOu準拠）を計算
     pub fn total_time_for_iteration(
         &mut self,
         falling_eval: f64,
@@ -584,13 +580,12 @@ impl TimeManagement {
         let is_pondering = self.is_pondering;
         let effective_elapsed = self.effective_elapsed(elapsed);
 
-        // completedDepth>=10 && nodesEffort>=97056 && elapsed > totalTime*0.6540 なら search_end 設定
+        // YaneuraOu: completedDepth>=10 && nodesEffort>=97056 && elapsed > totalTime*0.6540 なら search_end 設定
         if completed_depth >= 10
             && nodes_effort >= 97056.0
             && (effective_elapsed as f64) > total_time * 0.6540
             && !is_pondering
         {
-            self.trace_timing("deadline_request", "nodes_effort", elapsed);
             self.set_search_end(elapsed);
         }
 
@@ -604,15 +599,6 @@ impl TimeManagement {
 
         // total_time超過時の処理
         if (effective_elapsed as f64) > total_time.min(self.maximum_time as f64) {
-            self.trace_timing(
-                "deadline_request",
-                if total_time <= self.maximum_time as f64 {
-                    "target"
-                } else {
-                    "maximum"
-                },
-                elapsed,
-            );
             if is_pondering {
                 // ponder中は stop_on_ponderhit を立て、次のチェックで秒切り上げ終了時刻を設定
                 self.stop_on_ponderhit = true;
@@ -620,15 +606,6 @@ impl TimeManagement {
                 self.set_search_end(elapsed);
             }
         }
-
-        log::trace!(
-            target: "rshogi_core::search::time",
-            "event=iteration_budget depth={} elapsed_ms={} effective_elapsed_ms={} target_ms={:.3} optimum_ms={} maximum_ms={} minimum_ms={} threshold_ms={} deadline_ms={} nodes_effort={:.3} ponder={} final_push={} single_move={} stop_on_hit={}",
-            completed_depth, elapsed, effective_elapsed, total_time, self.optimum_time,
-            self.maximum_time, self.minimum_time, stop_threshold, self.search_end,
-            nodes_effort, is_pondering, self.is_final_push, self.single_move_limit,
-            self.stop_on_ponderhit,
-        );
 
         debug!(
             target: "rshogi_core::search",
@@ -652,12 +629,6 @@ impl TimeManagement {
     #[inline]
     pub fn optimum(&self) -> TimePoint {
         self.optimum_time
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn maximum_deadline(&self) -> Option<Instant> {
-        let ms = u64::try_from(self.maximum_time).ok()?;
-        self.start_time.checked_add(std::time::Duration::from_millis(ms))
     }
 
     /// 最大思考時間を取得
@@ -686,7 +657,7 @@ impl TimeManagement {
         self.last_stop_threshold = None;
     }
 
-    /// ponderhit 時に停止するフラグを取得
+    /// stopOnPonderhit相当のフラグ取得
     #[inline]
     pub fn stop_on_ponderhit(&self) -> bool {
         self.stop_on_ponderhit
@@ -698,7 +669,7 @@ impl TimeManagement {
         self.is_pondering
     }
 
-    /// stop_on_ponderhit フラグをクリア
+    /// stop_on_ponderhit フラグをクリア（YOのfail-low時相当）
     pub fn reset_stop_on_ponderhit(&mut self) {
         self.stop_on_ponderhit = false;
     }
@@ -722,13 +693,13 @@ impl TimeManagement {
 
     /// 探索を停止すべきか判定（反復深化の境目で呼び出す）
     ///
-    /// ノード単位のチェックでは best_move_stable は使わない。
+    /// YaneuraOu準拠: ノード単位のチェックでは best_move_stable は使わない。
     /// best_move_changes は反復深化の境目での時間計算（apply_best_move_instability）にのみ影響する。
     ///
     /// # Arguments
     /// * `depth` - 現在の探索深さ
     pub fn should_stop(&mut self, depth: i32) -> bool {
-        let _ = depth;
+        let _ = depth; // 深さ条件はYaneuraOuでは使用しない
         let elapsed = self.elapsed();
         self.should_stop_internal(elapsed)
     }
@@ -747,7 +718,6 @@ impl TimeManagement {
 
         // 外部からの停止要求
         if self.stop.load(Ordering::Relaxed) {
-            self.trace_timing("stop", "external", elapsed);
             debug!(
                 target: "rshogi_core::search",
                 "stop check: external stop elapsed={} effective_elapsed={} search_end={} last_stop_threshold={:?} max_time={}",
@@ -760,21 +730,19 @@ impl TimeManagement {
             return true;
         }
 
-        // ponder中は時間による停止判定を行わない（USI/UCI仕様）
+        // ponder中は時間による停止判定を行わない（USI/UCI仕様、YO準拠）
         if self.is_pondering {
             return false;
         }
 
-        // stop_on_ponderhitが立っていて search_end 未設定ならここで設定する
+        // stop_on_ponderhitが立っていて search_end 未設定ならここで設定する（YO準拠）
         if self.search_end == 0 && self.stop_on_ponderhit {
-            self.trace_timing("deadline_request", "ponderhit", elapsed);
             self.set_search_end(elapsed);
         }
 
-        // search_end が設定されている場合は、それを最優先に使う
+        // search_end が設定されている場合は、それを最優先に使う（YO準拠）
         if self.search_end > 0 {
             if elapsed >= self.search_end {
-                self.trace_timing("stop", "deadline", elapsed);
                 debug!(
                     target: "rshogi_core::search",
                     "stop check: search_end reached elapsed={} search_end={}",
@@ -790,7 +758,6 @@ impl TimeManagement {
         if let Some(threshold) = self.last_stop_threshold
             && effective_elapsed >= threshold
         {
-            self.trace_timing("stop", "iteration_threshold", elapsed);
             debug!(
                 target: "rshogi_core::search",
                 "stop check: last_stop_threshold reached effective_elapsed={} threshold={}",
@@ -802,7 +769,6 @@ impl TimeManagement {
 
         // 最大時間を超えた（セーフティ）
         if effective_elapsed >= self.maximum_time {
-            self.trace_timing("stop", "maximum", elapsed);
             debug!(
                 target: "rshogi_core::search",
                 "stop check: maximum_time reached effective_elapsed={} max_time={}",
@@ -834,10 +800,9 @@ impl TimeManagement {
         elapsed_raw.saturating_sub(self.ponderhit_offset()).max(0)
     }
 
-    /// ponderhitを検出した際の処理
+    /// ponderhitを検出した際の処理（YO準拠）
     ///
     /// - `ponderhit_time` を更新し、以後の `set_search_end()` の秒境界切り上げ計算に反映する。
-    /// - movetime/rtimeの固定期限が設定済みなら、hitまでの時間を加算して予算を移す。
     /// - ponder状態を解除して通常探索へ移行する（`is_pondering=false`）。
     /// - ponder中に時間を使い切っていた場合（`stop_on_ponderhit=true`）のみ、停止時刻を確定させる。
     pub fn on_ponderhit(&mut self) {
@@ -848,26 +813,20 @@ impl TimeManagement {
         }
 
         self.set_ponderhit();
-        // movetime/rtimeで既に決めた予算を、hit後から使う開始時刻基準の期限へ移す。
-        if self.search_end > 0 {
-            self.search_end = self.search_end.saturating_add(self.ponderhit_offset());
-        }
         self.is_pondering = false;
         self.last_stop_threshold = None;
-        if log::log_enabled!(target: "rshogi_core::search::time", log::Level::Trace) {
-            self.trace_timing("ponderhit", "notification", self.elapsed());
-        }
 
-        // ponder中に時間を使い切っていた場合のみ、終了時刻を確定させる
+        // ponder中に時間を使い切っていた場合のみ、終了時刻を確定させる（YOの stopOnPonderhit 相当）
         if self.search_end == 0 && self.stop_on_ponderhit {
             let elapsed = self.elapsed();
-            self.trace_timing("deadline_request", "ponderhit", elapsed);
             self.set_search_end(elapsed);
         }
         self.ponderhit.store(false, Ordering::Relaxed);
     }
 
-    /// 探索終了時刻を設定（秒境界に切り上げ）
+    /// 探索終了時刻を設定（YaneuraOu準拠、秒境界に切り上げ）
+    ///
+    /// YaneuraOu timeman.cpp:314-341 の実装を再現
     ///
     /// # Arguments
     /// * `elapsed_ms` - 探索開始からの経過時間（ミリ秒）
@@ -881,9 +840,12 @@ impl TimeManagement {
         // ponderhit_time は init() で start_time に設定されるため、通常の探索では duration = 0
         let duration_start_to_ponderhit = self.ponderhit_offset();
 
+        // YaneuraOuのロジックを完全再現
+        // TimePoint t1 = e + startTime - ponderhitTime;
         // elapsed_ms は start_time からの経過なので、ponderhit調整が必要
         let t1 = elapsed_ms.saturating_sub(duration_start_to_ponderhit);
 
+        // TimePoint t2 = isFinalPush ? minimum() : minimum() + startTime - ponderhitTime;
         let t2 = if self.is_final_push {
             self.minimum_time
         } else {
@@ -893,26 +855,8 @@ impl TimeManagement {
         let max_time = std::cmp::max(t1, t2);
         let rounded = self.round_up(max_time);
 
+        // search_end = round_up(std::max(t1, t2)) + ponderhitTime - startTime;
         self.search_end = rounded.saturating_add(duration_start_to_ponderhit);
-        self.trace_timing("deadline", "rounded", elapsed_ms);
-    }
-
-    pub(crate) fn trace_timing(&self, event: &str, reason: &str, elapsed: TimePoint) {
-        log::trace!(
-            target: "rshogi_core::search::time",
-            "event={} reason={} elapsed_ms={} effective_elapsed_ms={} optimum_ms={} maximum_ms={} minimum_ms={} available_ms={} threshold_ms={:?} deadline_ms={} ponder={} stop_on_hit={}",
-            event, reason, elapsed, self.effective_elapsed(elapsed), self.optimum_time,
-            self.maximum_time, self.minimum_time, self.remain_time, self.last_stop_threshold,
-            self.search_end, self.is_pondering, self.stop_on_ponderhit,
-        );
-    }
-
-    pub(crate) fn trace_external_stop(&self) {
-        if log::log_enabled!(target: "rshogi_core::search::time", log::Level::Trace)
-            && self.stop_requested()
-        {
-            self.trace_timing("stop", "external", self.elapsed());
-        }
     }
 
     /// 外部から停止を要求
@@ -925,43 +869,10 @@ impl TimeManagement {
         self.stop.store(false, Ordering::Relaxed);
     }
 
-    // 各 worker のローカル増分だけを共有予算へ加算する。
-    pub(crate) fn publish_nodes(&mut self, nodes: u64) {
-        if self.analysis.is_none() && self.searched_nodes.is_none() {
-            return;
-        }
-        let delta = nodes.saturating_sub(self.published_nodes);
-        self.published_nodes = nodes;
-        if let Some(run) = &self.analysis {
-            run.publish_nodes(delta);
-        }
-        if let Some(total) = &self.searched_nodes {
-            total.fetch_add(delta, Ordering::Relaxed);
-        }
-    }
-
-    /// `go nodes` の予算に達したか。共有カウンタがあれば全 worker の合計で判定する。
-    ///
-    /// 合計は各 worker が `publish_nodes` した分だけなので、呼び出し前に自分の分を publish すること。
-    /// ponder 中は予算を使い切っても、GUI の通知まで探索を継続する。
-    #[inline]
-    pub(crate) fn node_limit_reached(&self, limits: &LimitsType, own_nodes: u64) -> bool {
-        limits.nodes > 0 && !self.is_pondering && self.budget_nodes(own_nodes) >= limits.nodes
-    }
-
-    /// nodes 予算と比べるノード数。共有カウンタがあれば全 worker の合計。
-    #[inline]
-    pub(crate) fn budget_nodes(&self, own_nodes: u64) -> u64 {
-        match &self.searched_nodes {
-            Some(total) => total.load(Ordering::Relaxed),
-            None => own_nodes,
-        }
-    }
-
     /// 停止要求が出ているか
     #[inline]
     pub fn stop_requested(&self) -> bool {
-        self.stop.load(Ordering::Relaxed) || self.analysis.as_ref().is_some_and(|run| run.stopped())
+        self.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -982,54 +893,6 @@ mod tests {
 
     fn create_time_manager() -> TimeManagement {
         TimeManagement::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)))
-    }
-
-    #[test]
-    fn test_init_preserves_ponderhit_before_main_and_helper_init() {
-        for helper_init in [false, true] {
-            let stop = Arc::new(AtomicBool::new(false));
-            let ponderhit = Arc::new(AtomicBool::new(false));
-            let limits = LimitsType {
-                ponder: true,
-                depth: 1,
-                ..LimitsType::default()
-            };
-            let mut main = TimeManagement::new(Arc::clone(&stop), Arc::clone(&ponderhit));
-            if helper_init {
-                main.init(&limits, Color::Black, 1, DEFAULT_MAX_MOVES_TO_DRAW);
-            }
-
-            let barrier = Arc::new(std::sync::Barrier::new(2));
-            let init_barrier = Arc::clone(&barrier);
-            let init_stop = Arc::clone(&stop);
-            let init_ponderhit = Arc::clone(&ponderhit);
-            let worker = std::thread::spawn(move || {
-                let mut tm = TimeManagement::new(init_stop, init_ponderhit);
-                init_barrier.wait();
-                tm.init(&limits, Color::Black, 1, DEFAULT_MAX_MOVES_TO_DRAW);
-                tm
-            });
-            // 通知を初期化より前に固定する。helper 側の場合は main の初期化後。
-            ponderhit.store(true, Ordering::SeqCst);
-            barrier.wait();
-            let initialized = worker.join().unwrap();
-            if !helper_init {
-                main = initialized;
-            }
-            assert!(main.take_ponderhit(), "init must preserve pending notification");
-            assert!(!main.take_ponderhit(), "notification is consumed exactly once");
-            main.on_ponderhit();
-            assert!(!main.is_pondering());
-        }
-    }
-
-    #[test]
-    fn test_init_counts_elapsed_from_given_start_time() {
-        let mut tm = create_time_manager();
-        let mut limits = LimitsType::new();
-        limits.set_start_time_at(Instant::now() - Duration::from_millis(300));
-        tm.init(&limits, Color::Black, 1, DEFAULT_MAX_MOVES_TO_DRAW);
-        assert!(tm.elapsed() >= 300, "elapsed={}", tm.elapsed());
     }
 
     #[test]
@@ -1101,6 +964,13 @@ mod tests {
     }
 
     #[test]
+    fn test_previous_time_reduction_roundtrip() {
+        let mut tm = create_time_manager();
+        tm.set_previous_time_reduction(0.42);
+        assert!((tm.previous_time_reduction() - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
     fn test_previous_time_reduction_is_preserved_through_init() {
         let mut tm = create_time_manager();
         tm.set_previous_time_reduction(0.42);
@@ -1115,6 +985,20 @@ mod tests {
             (tm.previous_time_reduction() - 0.42).abs() < 1e-9,
             "init() で previous_time_reduction がリセットされないことを保証する"
         );
+    }
+
+    #[test]
+    fn test_apply_iteration_timing_sets_search_end_on_effort() {
+        let mut tm = create_time_manager();
+        tm.optimum_time = 1000;
+        tm.maximum_time = 2000;
+        tm.remain_time = 5000;
+        tm.minimum_time = 500;
+        tm.search_end = 0;
+
+        tm.apply_iteration_timing(1200, 1000.0, 98000.0, 12);
+
+        assert!(tm.search_end() > 0, "search_end should be set when nodes_effort threshold hit");
     }
 
     #[test]
@@ -1158,34 +1042,20 @@ mod tests {
     }
 
     #[test]
-    fn test_time_manager_init_extreme_max_moves_and_ply() {
+    fn test_time_manager_elapsed() {
+        let mut tm = create_time_manager();
         let mut limits = LimitsType::new();
         limits.time[Color::Black.index()] = 60000;
         limits.set_start_time();
 
-        // MaxMovesToDraw は setoption で i32 の最大値まで受け付ける。残り手数は
-        // move_horizon で頭打ちになるので、既定の引き分け手数と同じ配分になる。
-        let mut tm = create_time_manager();
-        tm.init(&limits, Color::Black, 1, i32::MAX);
-        let mut expected = create_time_manager();
-        expected.init(&limits, Color::Black, 1, DEFAULT_MAX_MOVES_TO_DRAW);
-        assert_eq!((tm.optimum(), tm.maximum()), (expected.optimum(), expected.maximum()));
+        tm.init(&limits, Color::Black, 0, 256);
 
-        // 引き分けの手数を大きく越えた局面は最小の思考時間に落とす
-        let mut tm = create_time_manager();
-        tm.init(&limits, Color::Black, crate::position::MAX_GAME_PLY, 256);
-        assert_eq!(tm.optimum(), 500);
-        assert_eq!(tm.maximum(), 500);
-    }
+        // 少し待つ
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
-    #[test]
-    fn test_calculate_move_horizon_treats_negative_ply_as_zero() {
-        for time_forfeit in [false, true] {
-            assert_eq!(
-                calculate_move_horizon(time_forfeit, i32::MIN),
-                calculate_move_horizon(time_forfeit, 0)
-            );
-        }
+        let elapsed = tm.elapsed();
+        assert!(elapsed >= 10);
+        assert!(elapsed < 1000);
     }
 
     #[test]
@@ -1231,35 +1101,6 @@ mod tests {
         assert!(!should_stop || tm.elapsed() >= tm.search_end());
     }
 
-    /// 秒境界に切り上げないとき、ponder 中に時間を使い切っていれば hit 直後に止まる
-    #[test]
-    fn test_ponderhit_without_round_up_stops_right_after_hit() {
-        let mut tm = create_time_manager();
-        tm.set_options(&TimeOptions {
-            network_delay: 0,
-            network_delay2: 0,
-            minimum_thinking_time: 300,
-            round_up_to_full_second: false,
-            ..TimeOptions::default()
-        });
-
-        let mut limits = LimitsType::new();
-        limits.time[Color::Black.index()] = 60_000;
-        limits.ponder = true;
-        limits.start_time = Some(Instant::now() - Duration::from_millis(5_000));
-        tm.init(&limits, Color::Black, 0, DEFAULT_MAX_MOVES_TO_DRAW);
-        assert_eq!(tm.minimum(), 300);
-
-        tm.stop_on_ponderhit = true;
-        tm.on_ponderhit();
-
-        let offset = tm.ponderhit_offset();
-        assert!(offset >= 5_000);
-        assert!(tm.search_end() >= offset);
-        assert!(tm.search_end() <= tm.elapsed(), "search_end={}", tm.search_end());
-        assert!(tm.should_stop_immediately());
-    }
-
     #[test]
     fn test_last_stop_threshold_is_used() {
         let mut tm = create_time_manager();
@@ -1275,6 +1116,37 @@ mod tests {
         tm.start_time = Instant::now() - Duration::from_millis(500);
         tm.ponderhit_time = tm.start_time;
         assert!(!tm.should_stop(5), "elapsed below threshold should continue");
+    }
+
+    #[test]
+    fn test_time_manager_round_up() {
+        let tm = create_time_manager();
+
+        // minimum_thinking_time=2000, network_delay=120, remain_timeは十分に大きい
+        let result = tm.round_up(1);
+        assert_eq!(result, 1880);
+
+        // 500ms -> minimum_thinking_time に引き上げた上で network_delay を差し引く
+        let result = tm.round_up(500);
+        assert_eq!(result, 1880);
+
+        // 1001ms -> 2秒を切り上げるが minimum_thinking_time が優先
+        let result = tm.round_up(1001);
+        assert_eq!(result, 1880);
+    }
+
+    #[test]
+    fn test_round_up_respects_minimum_lower_bound() {
+        let mut tm = create_time_manager();
+        tm.set_options(&TimeOptions {
+            network_delay: 120,
+            network_delay2: 1120,
+            minimum_thinking_time: 1000,
+            slow_mover: 100,
+            ..TimeOptions::default()
+        });
+
+        assert_eq!(tm.round_up(1), 880);
     }
 
     #[test]
@@ -1322,38 +1194,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_fixed_time_ponder_budget_starts_at_hit() {
-        for rtime in [false, true] {
-            let mut tm = create_time_manager();
-            let mut limits = LimitsType::new();
-            if rtime {
-                limits.rtime = 1000;
-            } else {
-                limits.movetime = 1000;
-            }
-            limits.ponder = true;
-            limits.start_time = Some(Instant::now() - Duration::from_secs(20));
-            // ply=0でrtimeの乱数加算をなくし、期限の境界を正確に確認する。
-            tm.init(&limits, Color::Black, 0, DEFAULT_MAX_MOVES_TO_DRAW);
-            assert_eq!(tm.search_end(), 1000);
-            assert!(!tm.should_stop_immediately());
-            tm.on_ponderhit();
-            let offset = tm.ponderhit_offset();
-            assert_eq!(tm.search_end(), offset + 1000);
-            assert!(!tm.should_stop_internal(offset + 999));
-            assert!(tm.should_stop_internal(offset + 1000));
-            let deadline = tm.search_end();
-            tm.on_ponderhit();
-            assert_eq!(tm.search_end(), deadline, "重複hitで予算を延長しない");
-
-            limits.ponder = false;
-            tm.init(&limits, Color::Black, 0, DEFAULT_MAX_MOVES_TO_DRAW);
-            tm.on_ponderhit();
-            assert_eq!(tm.search_end(), 1000, "通常goの固定期限は変更しない");
-            assert!(tm.should_stop_immediately());
-        }
-    }
     #[test]
     fn test_on_ponderhit_ignored_when_not_pondering() {
         let stop = Arc::new(AtomicBool::new(false));
@@ -1425,7 +1265,6 @@ mod tests {
             slow_mover: 100,
             usi_ponder: false,
             stochastic_ponder: false,
-            round_up_to_full_second: true,
         });
 
         let mut limits = LimitsType::new();
@@ -1450,7 +1289,6 @@ mod tests {
             slow_mover: 100,
             usi_ponder: false,
             stochastic_ponder: false,
-            round_up_to_full_second: true,
         });
 
         let mut tm_delay = create_time_manager();
@@ -1461,7 +1299,6 @@ mod tests {
             slow_mover: 100,
             usi_ponder: false,
             stochastic_ponder: false,
-            round_up_to_full_second: true,
         });
 
         let mut limits = LimitsType::new();
@@ -1497,7 +1334,6 @@ mod tests {
             slow_mover: 200, // 2倍
             usi_ponder: false,
             stochastic_ponder: false,
-            round_up_to_full_second: true,
         });
         tm_slow.init(&limits, Color::Black, 0, 256);
 
@@ -1507,5 +1343,111 @@ mod tests {
             tm_base.optimum(),
             tm_slow.optimum()
         );
+    }
+
+    #[test]
+    fn test_fischer_low_time_safety_caps_optimum() {
+        // floodgate 5:00+10F の終盤想定: time_left=25s, inc=10s, ply=73
+        // 旧 logic: mtg=53 で楽観的に 11s 程度 optimum、 12-24s maximum →
+        // 残り時間 25s の半分以上を一手で使う恐れ
+        let mut tm = create_time_manager();
+        let mut limits = LimitsType::new();
+        limits.time[Color::Black.index()] = 25_000;
+        limits.inc[Color::Black.index()] = 10_000;
+        limits.set_start_time();
+
+        tm.init(&limits, Color::Black, 73, DEFAULT_MAX_MOVES_TO_DRAW);
+
+        // safe_optimum = 10000 * 0.8 = 8000ms。 round_up で 1000 単位繰り上げ +
+        // network_delay 減算で最終的に 8000 前後に着地
+        assert!(
+            tm.optimum() <= 9000,
+            "Fischer low-time optimum should be capped near 8s, got {}",
+            tm.optimum()
+        );
+        // safe_maximum = min(15000, 12500) = 12500ms 程度
+        assert!(
+            tm.maximum() <= 13000,
+            "Fischer low-time maximum should be capped near 12.5s, got {}",
+            tm.maximum()
+        );
+    }
+
+    #[test]
+    fn test_fischer_smooth_cap_applied_in_midgame() {
+        // 改訂 (2026-06-15): Fischer では序盤・中盤でも滑らか上限
+        // (= increment*0.8 + time_left*0.013) を適用し、 旧実装の楽観的 ~16s 消費を
+        // 抑える。 5:00+10F 序盤 (残 300s) では optimum ≈ 11.9s に上限化される。
+        let mut tm = create_time_manager();
+        let mut limits = LimitsType::new();
+        limits.time[Color::Black.index()] = 300_000; // 5 分
+        limits.inc[Color::Black.index()] = 10_000;
+        limits.set_start_time();
+
+        tm.init(&limits, Color::Black, 0, DEFAULT_MAX_MOVES_TO_DRAW);
+
+        // opt_cap = 10000*0.8 + 300000*0.013 = 8000 + 3900 = 11900ms 付近に着地。
+        // 旧実装の ~16.5s (ponder boost 込み) より明確に小さい。
+        assert!(
+            (11_000..=12_500).contains(&tm.optimum()),
+            "Fischer 序盤 optimum は滑らか上限 ~11.9s に収まるべき, got {}",
+            tm.optimum()
+        );
+        // 依然として十分な思考時間 (= 増秒以上) を確保
+        assert!(tm.optimum() >= 10_000);
+        // maximum は重要局面の延長用に optimum より広い (= 残の半分 と 増秒*3 の小さい方)
+        assert!(
+            tm.maximum() >= tm.optimum(),
+            "maximum {} should be >= optimum {} for instability extension",
+            tm.maximum(),
+            tm.optimum()
+        );
+        assert!(
+            tm.maximum() <= 32_000,
+            "maximum should be capped near 30s, got {}",
+            tm.maximum()
+        );
+    }
+
+    #[test]
+    fn test_fischer_extreme_low_time_clamped() {
+        // 残り時間が増秒未満 (= 5s rem, 10s inc) では更に厳しい factor (0.5) を適用
+        let mut tm = create_time_manager();
+        let mut limits = LimitsType::new();
+        limits.time[Color::Black.index()] = 5_000;
+        limits.inc[Color::Black.index()] = 10_000;
+        limits.set_start_time();
+
+        tm.init(&limits, Color::Black, 100, DEFAULT_MAX_MOVES_TO_DRAW);
+
+        // safe_optimum_raw = 5000, ただし time_left*0.4 = 2000 で clamp
+        // round_up で minimum_thinking_time 2000 floor + network_delay 減算
+        // → 最終 optimum は minimum_thinking_time に張り付く可能性
+        assert!(
+            tm.optimum() <= tm.minimum_thinking_time,
+            "extreme low-time optimum should not exceed minimum_thinking_time, got optimum={} min_thinking={}",
+            tm.optimum(),
+            tm.minimum_thinking_time
+        );
+        // maximum も残り時間の半分相当に圧縮
+        assert!(
+            tm.maximum() <= 5_000,
+            "extreme low-time maximum should not exceed remaining time, got {}",
+            tm.maximum()
+        );
+    }
+
+    #[test]
+    fn test_fischer_safety_not_applied_to_byoyomi() {
+        // 純 byoyomi モード (inc=0, byoyomi>0) では Fischer safety は無関係
+        let mut tm = create_time_manager();
+        let mut limits = LimitsType::new();
+        limits.byoyomi[Color::Black.index()] = 5_000;
+        limits.set_start_time();
+
+        tm.init(&limits, Color::Black, 0, DEFAULT_MAX_MOVES_TO_DRAW);
+
+        // byoyomi mode は full push (= 5000 - network_delay)
+        assert!(tm.optimum() >= 4_000, "byoyomi mode should use most of byoyomi time");
     }
 }

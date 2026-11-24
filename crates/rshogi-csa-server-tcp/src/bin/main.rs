@@ -72,14 +72,6 @@ struct Cli {
     /// を複数指定できる。指定すると当該 `game_name` の対局が SFEN 開始になる。
     #[arg(long, value_name = "PATH")]
     handicap_toml: Option<PathBuf>,
-    /// 持ち時間プリセット TOML のパス。`[[preset]]` 配列で `game_name` と
-    /// `kind` (`countdown` / `countdown_msec` / `fischer` / `stopwatch`) と
-    /// 各方式のパラメータを宣言する。指定するとサーバーは strict mode となり、
-    /// 未登録 `game_name` での LOGIN は `LOGIN:incorrect unknown_game_name` で
-    /// 拒否される。未指定時は `--clock-kind` / `--total-time-*` で指定した
-    /// global clock を全 `game_name` で使用する（後方互換）。
-    #[arg(long, value_name = "PATH")]
-    clock_presets_toml: Option<PathBuf>,
     /// 同名ログイン重複時に旧セッションを evict する（既定は新接続を拒否）。
     /// `--allow-floodgate-features` opt-in が必須。`AgreeWaiting` 以降の
     /// 対局進行中セッションは evict されず新接続を拒否する。
@@ -88,24 +80,12 @@ struct Cli {
     /// 秒読み方式 / Fischer 方式で使う持ち時間 (秒)。
     #[arg(long, default_value_t = 600)]
     total_time_sec: u32,
-    /// 先手の秒読み・Fischer の総持ち時間（秒）。省略時は共通値。
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-    black_total_time_sec: Option<u32>,
-    /// 後手の秒読み・Fischer の総持ち時間（秒）。省略時は共通値。
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-    white_total_time_sec: Option<u32>,
     /// 秒読み方式の秒読み、または Fischer 方式の増分 (秒)。
     #[arg(long, default_value_t = 10)]
     byoyomi_sec: u32,
     /// StopWatch 方式で使う持ち時間 (分)。
     #[arg(long, default_value_t = 10)]
     total_time_min: u32,
-    /// 先手の StopWatch の総持ち時間（分）。省略時は共通値。
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-    black_total_time_min: Option<u32>,
-    /// 後手の StopWatch の総持ち時間（分）。省略時は共通値。
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-    white_total_time_min: Option<u32>,
     /// StopWatch 方式の秒読み (分)。
     #[arg(long, default_value_t = 1)]
     byoyomi_min: u32,
@@ -118,10 +98,6 @@ struct Cli {
     /// 最大手数。
     #[arg(long, default_value_t = 256)]
     max_moves: u32,
-    /// `%KACHI` 判定の入玉ルール (USI トークン)。`CSARule27` (27点法・既定) /
-    /// `CSARule24` (24点法) 等。電竜戦・従来 WCSC・floodgate は 27点法、WCSC 2028 は 24点法。
-    #[arg(long, value_enum, default_value_t = EnteringKingRuleArg::CsaRule27)]
-    entering_king_rule: EnteringKingRuleArg,
     /// AGREE 受信の最大待機時間（秒）。GUI/エンジンの起動待ちを許容するため長めの既定値。
     #[arg(long, default_value_t = 300)]
     agree_timeout_sec: u64,
@@ -144,11 +120,6 @@ struct Cli {
     /// ためのバッファ。
     #[arg(long, default_value_t = 60)]
     shutdown_grace_sec: u64,
-    /// 私的対局 (`%%CHALLENGE`) で発行する token の TTL (秒)。期限超過した
-    /// 未消費の challenge は `purge_expired` で自然枯死する。https://github.com/SH11235/rshogi/issues/582 受入
-    /// 基準: TCP / Workers 両方とも既定 3600 秒。
-    #[arg(long, default_value_t = 3600)]
-    challenge_ttl_sec: u64,
     /// Prometheus 互換メトリクスを expose する HTTP listener の bind 先（例:
     /// `127.0.0.1:9090`）。未指定時はメトリクス recorder を install せず、
     /// `metrics::counter!` 等は NoOp として実行される（軽量な atomic 1 回程度の
@@ -164,80 +135,26 @@ enum ClockKindArg {
     Stopwatch,
 }
 
-/// `--entering-king-rule` の CLI バリアント。`EnteringKingRule` の core enum へ写す。
-/// value 名は Workers の `ENTERING_KING_RULE` env と同じ USI トークンに揃える
-/// (両配備で綴りを 1 つにし、`EnteringKingRule::to_usi`/`from_usi` と一致させる)。
-#[derive(clap::ValueEnum, Debug, Clone, Copy)]
-enum EnteringKingRuleArg {
-    /// 27点法 (先手28点/後手27点、電竜戦・従来 WCSC・floodgate 標準)。
-    #[value(name = "CSARule27")]
-    CsaRule27,
-    /// 24点法 (先後共 31点、WCSC 2028)。
-    #[value(name = "CSARule24")]
-    CsaRule24,
-    /// 27点法 (駒落ち対応)。
-    #[value(name = "CSARule27H")]
-    CsaRule27H,
-    /// 24点法 (駒落ち対応)。
-    #[value(name = "CSARule24H")]
-    CsaRule24H,
-    /// 宣言勝ち無効。
-    #[value(name = "NoEnteringKing")]
-    NoEnteringKing,
-    /// トライルール。
-    #[value(name = "TryRule")]
-    TryRule,
-}
-
-impl EnteringKingRuleArg {
-    fn to_rule(self) -> rshogi_core::types::EnteringKingRule {
-        use rshogi_core::types::EnteringKingRule as R;
-        match self {
-            Self::CsaRule27 => R::Point27,
-            Self::CsaRule24 => R::Point24,
-            Self::CsaRule27H => R::Point27H,
-            Self::CsaRule24H => R::Point24H,
-            Self::NoEnteringKing => R::None,
-            Self::TryRule => R::TryRule,
-        }
-    }
-}
-
-fn validate_color_time_cli(cli: &Cli) -> anyhow::Result<()> {
-    if matches!(cli.clock_kind, ClockKindArg::Stopwatch) {
-        anyhow::ensure!(
-            cli.black_total_time_sec.is_none() && cli.white_total_time_sec.is_none(),
-            "stopwatch does not support --black-total-time-sec / --white-total-time-sec"
-        );
-    } else {
-        anyhow::ensure!(
-            cli.black_total_time_min.is_none() && cli.white_total_time_min.is_none(),
-            "countdown/fischer do not support --black-total-time-min / --white-total-time-min"
-        );
-    }
-    Ok(())
-}
-
 impl ClockKindArg {
-    fn to_clock_spec(self, cli: &Cli) -> ClockSpec {
+    fn to_clock_spec(
+        self,
+        total_time_sec: u32,
+        byoyomi_sec: u32,
+        total_time_min: u32,
+        byoyomi_min: u32,
+    ) -> ClockSpec {
         match self {
             Self::Countdown => ClockSpec::Countdown {
-                total_time_sec: cli.total_time_sec,
-                byoyomi_sec: cli.byoyomi_sec,
-                black_total_time_sec: cli.black_total_time_sec,
-                white_total_time_sec: cli.white_total_time_sec,
+                total_time_sec,
+                byoyomi_sec,
             },
             Self::Fischer => ClockSpec::Fischer {
-                total_time_sec: cli.total_time_sec,
-                increment_sec: cli.byoyomi_sec,
-                black_total_time_sec: cli.black_total_time_sec,
-                white_total_time_sec: cli.white_total_time_sec,
+                total_time_sec,
+                increment_sec: byoyomi_sec,
             },
             Self::Stopwatch => ClockSpec::StopWatch {
-                total_time_min: cli.total_time_min,
-                byoyomi_min: cli.byoyomi_min,
-                black_total_time_min: cli.black_total_time_min,
-                white_total_time_min: cli.white_total_time_min,
+                total_time_min,
+                byoyomi_min,
             },
         }
     }
@@ -301,30 +218,22 @@ fn main() -> anyhow::Result<()> {
         HashMap::new()
     };
 
-    // 持ち時間プリセット TOML を読み込む（指定時のみ）。空 HashMap は「プリセット
-    // 未宣言」で fallback global clock 動作。
-    let clock_presets: HashMap<rshogi_csa_server::types::GameName, ClockSpec> =
-        if let Some(path) = cli.clock_presets_toml.as_ref() {
-            load_clock_presets_toml(path)
-                .with_context(|| format!("failed to load clock presets TOML at {path:?}"))?
-        } else {
-            HashMap::new()
-        };
-
-    validate_color_time_cli(&cli)?;
-    let global_clock = cli.clock_kind.to_clock_spec(&cli);
-
     // 2. ServerConfig を構築。
     let config = ServerConfig {
         bind_addr,
         kifu_topdir: cli.kifu_dir,
-        clock: global_clock,
+        clock: cli.clock_kind.to_clock_spec(
+            cli.total_time_sec,
+            cli.byoyomi_sec,
+            cli.total_time_min,
+            cli.byoyomi_min,
+        ),
         time_margin_ms: cli.margin_ms,
         max_moves: cli.max_moves,
         login_timeout: std::time::Duration::from_secs(30),
         agree_timeout: std::time::Duration::from_secs(cli.agree_timeout_sec),
         x1_reply_write_timeout: std::time::Duration::from_secs(5),
-        entering_king_rule: cli.entering_king_rule.to_rule(),
+        entering_king_rule: rshogi_core::types::EnteringKingRule::Point24,
         initial_sfen: None,
         admin_handles: cli.admin_handle.clone(),
         allow_floodgate_features: cli.allow_floodgate_features,
@@ -335,7 +244,6 @@ fn main() -> anyhow::Result<()> {
         floodgate_schedules,
         floodgate_history_path: cli.floodgate_history_jsonl.clone(),
         handicap_initial_sfens: handicap_map,
-        clock_presets,
         duplicate_login_policy: if cli.duplicate_login_evict_old {
             DuplicateLoginPolicy::EvictOld
         } else {
@@ -347,11 +255,6 @@ fn main() -> anyhow::Result<()> {
         // `#ABNORMAL` 経路のまま)。再接続を有効化したい運用ではここで 60 秒等を
         // 直接設定するか、後続の CLI / 設定経路で上書きする。
         reconnect_grace_duration: std::time::Duration::ZERO,
-        challenge_ttl: std::time::Duration::from_secs(cli.challenge_ttl_sec),
-        // `purge_expired` を回す軽量 task の周期。LOGIN-time の都度 purge と
-        // 組み合わせて十分な expire 検出が得られるため、CLI 露出は YAGNI で
-        // 固定 60 秒に閉じる。
-        challenge_purge_interval: std::time::Duration::from_secs(60),
     };
     // Floodgate 系機能の opt-in ゲートを起動前に評価する。`players_yaml_path` が
     // `Some` の状態は `enable_persistent_player_rates` 要求として intent に乗るため、
@@ -677,95 +580,22 @@ fn validate_handicap_sfen(game_name: &str, sfen: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 持ち時間プリセット TOML を読む。
-///
-/// 期待する形式（`ClockSpec` の `#[serde(tag = "kind")]` をフラット展開する）:
-/// ```toml
-/// [[preset]]
-/// game_name = "byoyomi-600-10"
-/// kind = "countdown"
-/// total_time_sec = 600
-/// byoyomi_sec = 10
-///
-/// [[preset]]
-/// game_name = "fischer-300-10F"
-/// kind = "fischer"
-/// total_time_sec = 300
-/// increment_sec = 10
-/// ```
-///
-/// バリデーション:
-/// - `game_name` 重複は起動時 Err。
-/// - `total_time_*` が 0 の preset は Err（少なくとも 1 ms 以上の本体時間を要求）。
-///   `byoyomi_*` / `increment_sec` の 0 は sudden death として許容。
-fn load_clock_presets_toml(
-    path: &std::path::Path,
-) -> anyhow::Result<HashMap<rshogi_csa_server::types::GameName, ClockSpec>> {
-    let raw = std::fs::read_to_string(path)?;
-    parse_clock_presets_toml_str(&raw)
-}
-
-/// `load_clock_presets_toml` の入力 TOML 文字列パース部分。テストから直接呼べる
-/// よう disk IO を切り離している。
-fn parse_clock_presets_toml_str(
-    raw: &str,
-) -> anyhow::Result<HashMap<rshogi_csa_server::types::GameName, ClockSpec>> {
-    use serde::Deserialize;
-    #[derive(Debug, Deserialize)]
-    struct Entry {
-        game_name: String,
-        #[serde(flatten)]
-        spec: ClockSpec,
-    }
-    #[derive(Debug, Deserialize)]
-    struct Root {
-        #[serde(default)]
-        preset: Vec<toml::Table>,
-    }
-    let root: Root = toml::from_str(raw)?;
-    let mut out: HashMap<rshogi_csa_server::types::GameName, ClockSpec> =
-        HashMap::with_capacity(root.preset.len());
-    for table in root.preset {
-        let entry: Entry = toml::Value::Table(table.clone()).try_into()?;
-        entry
-            .spec
-            .validate_color_total_fields(table.keys().map(String::as_str))
-            .map_err(|field| {
-                anyhow::anyhow!(
-                    "clock preset {:?}: {field} is not supported by this clock kind",
-                    entry.game_name
-                )
-            })?;
-        entry.spec.validate_total_time_nonzero().map_err(|field| {
-            anyhow::anyhow!("clock preset {:?}: {field} must be > 0", entry.game_name)
-        })?;
-        let key = rshogi_csa_server::types::GameName::new(&entry.game_name);
-        anyhow::ensure!(
-            !out.contains_key(&key),
-            "duplicate clock preset entry for game_name {:?}",
-            entry.game_name
-        );
-        out.insert(key, entry.spec);
-    }
-    Ok(out)
-}
-
 /// Floodgate スケジュール TOML を読む。
 ///
 /// 期待する形式:
 /// ```toml
 /// [[schedules]]
-/// game_name = "byoyomi-600-10"
+/// game_name = "floodgate-600-10"
 /// weekday = "Mon"
 /// hour = 13
 /// minute = 0
 /// pairing_strategy = "direct"
-/// ```
 ///
-/// 各スケジュールが使う持ち時間は `--clock-presets-toml` で `game_name` 別に
-/// 宣言する（per-game_name）。同 `game_name` で曜日別に時計を変える運用は
-/// 意図的に非対応 — 同じ持ち時間を複数曜日で出したい場合は同一 `game_name` を
-/// 参照する複数 `[[schedules]]` を並べる。
+/// [schedules.clock]
+/// kind = "countdown"
+/// total_time_sec = 600
+/// byoyomi_sec = 10
+/// ```
 fn load_floodgate_schedule_toml(
     path: &std::path::Path,
 ) -> anyhow::Result<Vec<rshogi_csa_server::FloodgateSchedule>> {
@@ -817,7 +647,7 @@ mod tests {
 
     /// `ALLOW_FLOODGATE_FEATURES_FLAG` 定数と clap が生成する CLI フラグ名が
     /// 一致することを固定する。`Cli::allow_floodgate_features` のフィールド名を
-    /// リネームすると test が落ち、エラーメッセージ生成側との同期忘れを検知する。
+    /// リネームしたら本テストが落ち、エラーメッセージ生成側との同期忘れを検知する。
     #[test]
     fn allow_floodgate_features_flag_matches_clap_long() {
         let cmd = Cli::command();
@@ -831,38 +661,6 @@ mod tests {
             ALLOW_FLOODGATE_FEATURES_FLAG,
             "ALLOW_FLOODGATE_FEATURES_FLAG must stay in sync with clap-generated flag",
         );
-    }
-
-    /// `--entering-king-rule` の各バリアントが core enum に正しく写ることを固定する。
-    #[test]
-    fn entering_king_rule_arg_maps_to_core_enum() {
-        use rshogi_core::types::EnteringKingRule as R;
-        assert_eq!(EnteringKingRuleArg::CsaRule27.to_rule(), R::Point27);
-        assert_eq!(EnteringKingRuleArg::CsaRule24.to_rule(), R::Point24);
-        assert_eq!(EnteringKingRuleArg::CsaRule27H.to_rule(), R::Point27H);
-        assert_eq!(EnteringKingRuleArg::CsaRule24H.to_rule(), R::Point24H);
-        assert_eq!(EnteringKingRuleArg::NoEnteringKing.to_rule(), R::None);
-        assert_eq!(EnteringKingRuleArg::TryRule.to_rule(), R::TryRule);
-    }
-
-    /// `--entering-king-rule` 未指定時の既定は 27点法。
-    #[test]
-    fn entering_king_rule_defaults_to_point27() {
-        let cli = Cli::parse_from(["prog", "--players", "players.yaml"]);
-        assert_eq!(cli.entering_king_rule.to_rule(), rshogi_core::types::EnteringKingRule::Point27);
-    }
-
-    /// CLI の value 名が USI トークンと同じ綴りで受理される (Workers env と統一)。
-    #[test]
-    fn entering_king_rule_accepts_usi_token_spelling() {
-        let cli = Cli::parse_from([
-            "prog",
-            "--players",
-            "players.yaml",
-            "--entering-king-rule",
-            "CSARule24",
-        ]);
-        assert_eq!(cli.entering_king_rule.to_rule(), rshogi_core::types::EnteringKingRule::Point24);
     }
 
     /// `validate_handicap_sfen` がフィールド数不足を弾く契約。
@@ -901,259 +699,5 @@ mod tests {
             "lnsgkgsnl/7b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL w - 1",
         )
         .unwrap();
-    }
-
-    /// `parse_clock_presets_toml_str` が 3 種類の preset を全て正しく逆シリアライズ
-    /// する。`#[serde(flatten)]` で `kind = "..."` が `ClockSpec` enum の正しい
-    /// variant に落ちることを明示確認する（タグ付き enum の flatten 経由展開の
-    /// 回帰検知）。
-    #[test]
-    fn load_clock_presets_accepts_three_variants() {
-        let raw = r#"
-[[preset]]
-game_name = "byoyomi-600-10"
-kind = "countdown"
-total_time_sec = 600
-byoyomi_sec = 10
-
-[[preset]]
-game_name = "byoyomi-60-5"
-kind = "countdown"
-total_time_sec = 60
-byoyomi_sec = 5
-
-[[preset]]
-game_name = "fischer-300-10F"
-kind = "fischer"
-total_time_sec = 300
-increment_sec = 10
-"#;
-        let map = parse_clock_presets_toml_str(raw).unwrap();
-        assert_eq!(map.len(), 3);
-        assert!(matches!(
-            map.get(&rshogi_csa_server::types::GameName::new("byoyomi-600-10")),
-            Some(ClockSpec::Countdown {
-                total_time_sec: 600,
-                byoyomi_sec: 10,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
-            })
-        ));
-        assert!(matches!(
-            map.get(&rshogi_csa_server::types::GameName::new("byoyomi-60-5")),
-            Some(ClockSpec::Countdown {
-                total_time_sec: 60,
-                byoyomi_sec: 5,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
-            })
-        ));
-        assert!(matches!(
-            map.get(&rshogi_csa_server::types::GameName::new("fischer-300-10F")),
-            Some(ClockSpec::Fischer {
-                total_time_sec: 300,
-                increment_sec: 10,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
-            })
-        ));
-    }
-
-    /// プリセット宣言なし (= 空 TOML) は空 HashMap が返る (= fallback モード)。
-    #[test]
-    fn load_clock_presets_empty_file_returns_empty_map() {
-        let map = parse_clock_presets_toml_str("").unwrap();
-        assert!(map.is_empty());
-    }
-
-    /// 同一 `game_name` を 2 度宣言した TOML は起動時に弾く。
-    #[test]
-    fn load_clock_presets_rejects_duplicate_game_name() {
-        let raw = r#"
-[[preset]]
-game_name = "byoyomi-600-10"
-kind = "countdown"
-total_time_sec = 600
-byoyomi_sec = 10
-
-[[preset]]
-game_name = "byoyomi-600-10"
-kind = "fischer"
-total_time_sec = 60
-increment_sec = 5
-"#;
-        let err = parse_clock_presets_toml_str(raw).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("duplicate"), "error must mention duplicate: {msg}");
-        assert!(msg.contains("byoyomi-600-10"), "error must mention game_name: {msg}");
-    }
-
-    /// `total_time_sec = 0` を loader 経由で弾き、ラッパーが組み立てるメッセージ
-    /// (`clock preset "x": <field> must be > 0`) が崩れないことを回帰防止する
-    /// E2E 1 件。`ClockSpec` 全 variant は core 側 table テストでカバー。
-    #[test]
-    fn load_clock_presets_rejects_zero_total_time() {
-        let raw = r#"
-[[preset]]
-game_name = "broken"
-kind = "countdown"
-total_time_sec = 0
-byoyomi_sec = 10
-"#;
-        let err = parse_clock_presets_toml_str(raw).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("total_time_sec"), "error must mention field: {msg}");
-        assert!(msg.contains("broken"), "error must mention game_name: {msg}");
-        assert!(msg.contains("must be > 0"), "error must include comparison phrase: {msg}");
-    }
-
-    /// 未知の `kind` を持つ preset は serde の untagged で Err になる。
-    #[test]
-    fn load_clock_presets_rejects_unknown_kind() {
-        let raw = r#"
-[[preset]]
-game_name = "broken"
-kind = "exotic-kind"
-total_time_sec = 60
-"#;
-        let err = parse_clock_presets_toml_str(raw).unwrap_err();
-        let msg = format!("{err:#}");
-        // toml/serde からのエラーメッセージは実装依存のためキーワードだけ確認
-        assert!(
-            msg.contains("kind") || msg.contains("variant"),
-            "error must reference invalid kind: {msg}"
-        );
-    }
-
-    /// `byoyomi_sec = 0` (sudden death) は許容する。
-    #[test]
-    fn load_clock_presets_allows_zero_byoyomi() {
-        let raw = r#"
-[[preset]]
-game_name = "byoyomi-600-0"
-kind = "countdown"
-total_time_sec = 600
-byoyomi_sec = 0
-"#;
-        let map = parse_clock_presets_toml_str(raw).unwrap();
-        assert_eq!(map.len(), 1);
-    }
-
-    #[test]
-    fn color_time_cli_rejects_incompatible_units() {
-        for (kind, forbidden_unit) in [
-            ("countdown", "min"),
-            ("fischer", "min"),
-            ("stopwatch", "sec"),
-        ] {
-            for side in ["black", "white"] {
-                let flag = format!("--{side}-total-time-{forbidden_unit}");
-                let cli = Cli::try_parse_from([
-                    "server",
-                    "--players",
-                    "players.toml",
-                    "--clock-kind",
-                    kind,
-                    &flag,
-                    "3",
-                ])
-                .unwrap();
-                let error = validate_color_time_cli(&cli).unwrap_err().to_string();
-                assert!(error.contains(&flag), "{error}");
-                assert!(error.contains("support"), "{error}");
-            }
-        }
-    }
-
-    #[test]
-    fn presets_reject_incompatible_color_fields_only() {
-        for (kind, unit, extra) in [
-            ("countdown", "sec", "byoyomi_sec"),
-            ("fischer", "sec", "increment_sec"),
-            ("countdown_msec", "ms", "byoyomi_ms"),
-            ("stopwatch", "min", "byoyomi_min"),
-            ("stop_watch", "min", "byoyomi_min"),
-        ] {
-            let base = format!(
-                "[[preset]]\ngame_name='test'\nkind='{kind}'\ntotal_time_{unit}=10\n{extra}=2\nunknown_option=42\n"
-            );
-            assert!(parse_clock_presets_toml_str(&base).is_ok());
-            for side in ["black", "white"] {
-                for other_unit in ["sec", "ms", "min", "minutes"] {
-                    let field = format!("{side}_total_time_{other_unit}");
-                    let result = parse_clock_presets_toml_str(&format!("{base}{field}=3\n"));
-                    if other_unit == unit {
-                        assert!(result.is_ok());
-                    } else {
-                        let error = result.unwrap_err().to_string();
-                        assert!(error.contains(&field), "{error}");
-                        assert!(error.contains("test"), "{error}");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn color_totals_cli_and_presets() {
-        for (kind, unit) in [
-            ("countdown", "sec"),
-            ("fischer", "sec"),
-            ("stopwatch", "min"),
-        ] {
-            let black = format!("--black-total-time-{unit}");
-            let white = format!("--white-total-time-{unit}");
-            for sides in [
-                vec![],
-                vec![black.as_str(), "3"],
-                vec![white.as_str(), "8"],
-                vec![black.as_str(), "3", white.as_str(), "8"],
-            ] {
-                let mut args = vec!["server", "--players", "players.toml", "--clock-kind", kind];
-                args.extend(sides);
-                let cli = Cli::try_parse_from(args).unwrap();
-                validate_color_time_cli(&cli).unwrap();
-                let spec = cli.clock_kind.to_clock_spec(&cli);
-                let value = toml::Value::try_from(spec).unwrap();
-                assert_eq!(
-                    value.get(format!("black_total_time_{unit}")),
-                    cli.black_total_time_sec
-                        .or(cli.black_total_time_min)
-                        .map(|n| toml::Value::Integer(i64::from(n)))
-                        .as_ref()
-                );
-                assert_eq!(
-                    value.get(format!("white_total_time_{unit}")),
-                    cli.white_total_time_sec
-                        .or(cli.white_total_time_min)
-                        .map(|n| toml::Value::Integer(i64::from(n)))
-                        .as_ref()
-                );
-            }
-            assert!(
-                Cli::try_parse_from(["server", "--players", "players.toml", &black, "0"]).is_err()
-            );
-        }
-        for (kind, unit, extra) in [
-            ("countdown", "sec", "byoyomi_sec"),
-            ("fischer", "sec", "increment_sec"),
-            ("countdown_msec", "ms", "byoyomi_ms"),
-            ("stopwatch", "min", "byoyomi_min"),
-        ] {
-            let text = format!(
-                "[[preset]]\ngame_name='unequal'\nkind='{kind}'\ntotal_time_{unit}=10\nblack_total_time_{unit}=3\nwhite_total_time_{unit}=8\n{extra}=2\n"
-            );
-            let presets = parse_clock_presets_toml_str(&text).unwrap();
-            let spec = presets.values().next().unwrap();
-            assert!(spec.format_time_section().contains("BEGIN Time+\n"));
-            assert!(spec.format_time_section().contains("Total_Time:8\n"));
-            assert!(
-                parse_clock_presets_toml_str(&text.replace(
-                    &format!("black_total_time_{unit}=3"),
-                    &format!("black_total_time_{unit}=0")
-                ))
-                .is_err()
-            );
-        }
     }
 }

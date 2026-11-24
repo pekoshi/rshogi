@@ -8,9 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
-use std::time::Duration;
 
-use rshogi_csa_server::types::{Color, ReconnectToken};
+use rshogi_csa_server::types::Color;
 
 /// `Color` を `MoveRow.color` と整合する文字列形式 (`"black"` / `"white"`)
 /// に変換する。永続化スキーマは serde 文字列形式で安定化している。
@@ -73,6 +72,15 @@ pub struct PendingReconnect {
     /// 切断側宛の Game_Summary 文字列 (`Reconnect_Token:` 拡張行を含む完全形、
     /// `position_section` は切断時点の現在局面で再構築済み)。
     pub game_summary_for_disconnected: String,
+    /// 切断時点で予約されていた turn alarm の発火時刻 (UNIX epoch ms)。
+    /// 再接続成功時に新しい turn alarm を貼り直す際、本値と「再接続時刻 + 残時間
+    /// budget」のうち**早い方**を採用することで、悪意あるクライアントが切断 →
+    /// grace 直前再接続を繰り返して相手手番の deadline を wall-clock 上で延長
+    /// する経路を防ぐ (元 deadline は壊さない)。`None` なら turn alarm 未予約
+    /// 時点での切断 (例: AGREE 直後の対局未開始) で、上書きせず素直に新規予約。
+    /// `#[serde(default)]` で旧 schema からの cold-start 互換も維持する。
+    #[serde(default)]
+    pub original_turn_alarm_epoch_ms: Option<u64>,
 }
 
 /// `PendingReconnect::match_request` の判定結果。
@@ -102,29 +110,14 @@ impl PendingReconnect {
         if now_ms > self.deadline_ms {
             return ReconnectMatchOutcome::Expired;
         }
-        // handle / color は CSA LOGIN 行から自明に観測可能なため short-circuit
-        // 比較で問題ない。token は攻撃者が当てにいく対象 (128bit hex) のため、
-        // 比較は短絡なしの constant-time にする。
-        if self.disconnected_handle != handle || self.disconnected_color != color_to_str(color) {
-            return ReconnectMatchOutcome::Rejected;
-        }
-        if !ct_str_eq(self.expected_token.as_bytes(), token.as_bytes()) {
+        if self.disconnected_handle != handle
+            || self.disconnected_color != color_to_str(color)
+            || self.expected_token != token
+        {
             return ReconnectMatchOutcome::Rejected;
         }
         ReconnectMatchOutcome::Accepted
     }
-}
-
-/// 同長の byte 列を constant-time で比較する。長さの不一致は `len()` 自身が
-/// 公開情報なので即 false にしてよい (timing leak しない)。同長時は `subtle`
-/// の `ConstantTimeEq` で 1 byte ごと xor を畳み込み、`Choice` の bool 化まで
-/// 定数時間で完了する。
-fn ct_str_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).into()
 }
 
 /// 再接続成立時にクライアントへ送出する状態再送メッセージを組み立てる。
@@ -137,7 +130,6 @@ fn ct_str_eq(a: &[u8], b: &[u8]) -> bool {
 pub fn build_resume_message(
     game_summary_for_disconnected: &str,
     snapshot: &ReconnectSnapshot,
-    clock: rshogi_csa_server::protocol::reconnect::ReconnectClock,
 ) -> String {
     let mut out = game_summary_for_disconnected.to_owned();
     out.push_str("BEGIN Reconnect_State\n");
@@ -155,7 +147,6 @@ pub fn build_resume_message(
     let _ = writeln!(out, "Current_Turn:{turn_char}");
     let _ = writeln!(out, "Black_Time_Remaining_Ms:{}", snapshot.black_remaining_ms);
     let _ = writeln!(out, "White_Time_Remaining_Ms:{}", snapshot.white_remaining_ms);
-    let _ = writeln!(out, "{}", clock.to_line());
     if let Some(last) = &snapshot.last_move {
         let _ = writeln!(out, "Last_Move:{last}");
     }
@@ -173,107 +164,6 @@ pub enum PendingAlarmKind {
     /// grace 期間満了。grace registry を読み取り、切断側を `force_abnormal` で
     /// 敗北として確定させる経路を駆動する。
     GraceExpired,
-    /// AGREE 待ち TTL 満了。`start_match` 直後に予約し、両者 AGREE による
-    /// `HandleOutcome::GameStarted` で cancel される。発火時は対局成立前
-    /// (= `play_started_at_ms` 未確定 / `KEY_FINISHED` 未設定 / live-games-index
-    /// 未 put) のため、`force_abnormal` ではなく `abort_pending_match_with_error`
-    /// + `KEY_FINISHED` セット相当の経路で部屋を解放する (https://github.com/SH11235/rshogi/issues/600)。
-    AgreeTimeout,
-    /// R2 棋譜 export PUT 失敗の retry。`KEY_FINISHED` 確定後の
-    /// alarm 経路。終局時に PUT 失敗したオブジェクトキーを `KEY_EXPORT_PENDING`
-    /// に保存しておき、このタグで `handle_export_retry_alarm` を駆動して再 PUT する。
-    /// 終局後発火の特殊性から `alarm()` 入口で `KEY_FINISHED` ガード**より前**に
-    /// 分岐させる必要がある (他種別と異なり「終局済 DO」での発火が正常経路)。
-    ExportRetry,
-}
-
-/// 再接続 grace が有効化されている (`grace > 0`) のときのみ対局者ごとの
-/// `Reconnect_Token` を発行する。`grace == Duration::ZERO` のときは
-/// `(None, None)` を返し、`Game_Summary` 末尾拡張行への配布も
-/// `PersistedConfig` への保存もスキップする。
-///
-/// production の保守的既定 (`RECONNECT_GRACE_SECONDS=0`) では本関数は常に
-/// `(None, None)` を返し、https://github.com/SH11235/rshogi/issues/591 の `LOGIN:incorrect reconnect_rejected`
-/// 経路に client が到達しなくなる (`csa_client::run_one_game` の reconnect
-/// skip 判定で `summary.reconnect_token == None` のため reconnect 試行自体を
-/// skip する)。
-pub(crate) fn issue_tokens_if_enabled(
-    grace: Duration,
-) -> (Option<ReconnectToken>, Option<ReconnectToken>) {
-    if grace.is_zero() {
-        (None, None)
-    } else {
-        (Some(ReconnectToken::generate()), Some(ReconnectToken::generate()))
-    }
-}
-
-/// grace 登録時に次回 alarm が表す意味と、alarm 本体を grace deadline に
-/// 上書きするかを決める。
-///
-/// 既存 turn alarm が grace deadline 以前に発火するなら、alarm 本体はそのまま
-/// `TimeUp` として扱う。そうでなければ tag/body ともに `GraceExpired` に揃える。
-pub(crate) fn classify_alarm_after_enter_grace(
-    existing_alarm_epoch_ms: Option<i64>,
-    grace_deadline_ms: u64,
-) -> (PendingAlarmKind, bool) {
-    match existing_alarm_epoch_ms.and_then(|epoch_ms| u64::try_from(epoch_ms).ok()) {
-        Some(epoch_ms) if epoch_ms <= grace_deadline_ms => (PendingAlarmKind::TimeUp, false),
-        _ => (PendingAlarmKind::GraceExpired, true),
-    }
-}
-
-/// `start_match` 入口の防御ガード判定結果 (https://github.com/SH11235/rshogi/issues/626)。
-///
-/// `start_match` は副作用 (`KEY_CONFIG` put / buoy reservation / `set_alarm`) の
-/// 前にこの関数の判定で early return する。本 enum を介して入口判定を純粋関数
-/// として固定することで、cold start race (`KEY_CONFIG` read transient err 等) で
-/// `active_game_id` ガードが誤通過した場合に `AgreeTimeout` の `set_alarm` で
-/// 既存 `GraceExpired` alarm を上書きしないことを unit test で固定する。
-///
-/// `game_room::start_match` 側の実処理は逐次 early return で書かれているが、
-/// 判定の優先度・条件はこの関数とまったく同一であり、仕様の一意な参照点として
-/// 本関数を扱う (Codex review round 3 の方針)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartMatchGuard {
-    /// 副作用なしで `start_match` 本体を続行してよい。
-    Proceed,
-    /// `KEY_FINISHED` 既存 → 既に終局済みの DO で start_match を踏んだ。
-    AlreadyFinished,
-    /// `KEY_CONFIG` 既存 → 既に対局成立済 (`active_game_id` ガードを race で
-    /// すり抜けた cold start 復元経路想定)。
-    AlreadyMatched,
-    /// `KEY_PENDING_ALARM_KIND` 既存 → 別種別の alarm (典型的には
-    /// `GraceExpired`) が予約済。`AgreeTimeout` で上書きすると合意済み対局を
-    /// `agree_timeout` で abort してしまう経路。`AgreeTimeout` 残留も含めて
-    /// reject する (前回 start_match の古い alarm 本体が新 match を巻き込む
-    /// race を防ぐため)。
-    AlarmPending(PendingAlarmKind),
-}
-
-/// `start_match` 入口の三段ガードを純粋関数として表現する (https://github.com/SH11235/rshogi/issues/626)。
-///
-/// 引数は永続化キー (`KEY_FINISHED` / `KEY_CONFIG` / `KEY_PENDING_ALARM_KIND`)
-/// の存在 / 値を直接取り、内部参照型に依存しない (`PersistedConfig` /
-/// `FinishedState` の中身は判定に使わないため bool で十分)。
-///
-/// 判定優先度は `finished_present` > `cfg_present` > `alarm_kind` の順で、より
-/// 強い既存状態を優先する。実処理 (`start_match`) 側は read を逐次 early return
-/// で行うが、判定ロジック自体はここで固定し unit test でカバレッジを担保する。
-pub(crate) fn classify_start_match_guard(
-    finished_present: bool,
-    cfg_present: bool,
-    alarm_kind: Option<PendingAlarmKind>,
-) -> StartMatchGuard {
-    if finished_present {
-        return StartMatchGuard::AlreadyFinished;
-    }
-    if cfg_present {
-        return StartMatchGuard::AlreadyMatched;
-    }
-    if let Some(kind) = alarm_kind {
-        return StartMatchGuard::AlarmPending(kind);
-    }
-    StartMatchGuard::Proceed
 }
 
 #[cfg(test)]
@@ -300,6 +190,7 @@ mod tests {
             game_summary_for_disconnected:
                 "BEGIN Game_Summary\nGame_ID:g1\nReconnect_Token:abcd\nEND Game_Summary\n"
                     .to_owned(),
+            original_turn_alarm_epoch_ms: None,
         }
     }
 
@@ -359,14 +250,18 @@ mod tests {
     }
 
     #[test]
+    fn pending_reconnect_round_trips_through_serde_json() {
+        let original = sample_pending(12_345);
+        let s = serde_json::to_string(&original).expect("serialize");
+        let restored: PendingReconnect = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(restored, original);
+    }
+
+    #[test]
     fn build_resume_message_appends_reconnect_state_block() {
         let snap = sample_snapshot();
         let summary = "BEGIN Game_Summary\nGame_ID:g1\nReconnect_Token:abcd\nEND Game_Summary\n";
-        let out = build_resume_message(
-            summary,
-            &snap,
-            rshogi_csa_server::protocol::reconnect::ReconnectClock { remaining_ms: 1234 },
-        );
+        let out = build_resume_message(summary, &snap);
         let end_summary = out.find("END Game_Summary\n").expect("END Game_Summary");
         let begin_state = out.find("BEGIN Reconnect_State\n").expect("BEGIN Reconnect_State");
         let end_state = out.find("END Reconnect_State\n").expect("END Reconnect_State");
@@ -375,7 +270,6 @@ mod tests {
         assert!(out.contains("\nCurrent_Turn:-\n"));
         assert!(out.contains("\nBlack_Time_Remaining_Ms:599500\n"));
         assert!(out.contains("\nWhite_Time_Remaining_Ms:600000\n"));
-        assert!(out.contains("\nCurrent_Turn_Remaining_Ms:1234\n"));
         assert!(out.contains("\nLast_Move:+7776FU\n"));
     }
 
@@ -383,11 +277,7 @@ mod tests {
     fn build_resume_message_emits_plus_for_black_turn() {
         let mut snap = sample_snapshot();
         snap.current_turn = "black".to_owned();
-        let out = build_resume_message(
-            "BEGIN Game_Summary\nEND Game_Summary\n",
-            &snap,
-            rshogi_csa_server::protocol::reconnect::ReconnectClock { remaining_ms: 1234 },
-        );
+        let out = build_resume_message("BEGIN Game_Summary\nEND Game_Summary\n", &snap);
         assert!(out.contains("\nCurrent_Turn:+\n"));
     }
 
@@ -395,12 +285,20 @@ mod tests {
     fn build_resume_message_omits_last_move_line_when_none() {
         let mut snap = sample_snapshot();
         snap.last_move = None;
-        let out = build_resume_message(
-            "BEGIN Game_Summary\nEND Game_Summary\n",
-            &snap,
-            rshogi_csa_server::protocol::reconnect::ReconnectClock { remaining_ms: 1234 },
-        );
+        let out = build_resume_message("BEGIN Game_Summary\nEND Game_Summary\n", &snap);
         assert!(!out.contains("Last_Move:"), "must omit Last_Move when no move played: {out}");
+    }
+
+    #[test]
+    fn pending_alarm_kind_serde_round_trip() {
+        let s = serde_json::to_string(&PendingAlarmKind::TimeUp).expect("serialize TimeUp");
+        let restored: PendingAlarmKind = serde_json::from_str(&s).expect("deserialize TimeUp");
+        assert_eq!(restored, PendingAlarmKind::TimeUp);
+        let s =
+            serde_json::to_string(&PendingAlarmKind::GraceExpired).expect("serialize GraceExpired");
+        let restored: PendingAlarmKind =
+            serde_json::from_str(&s).expect("deserialize GraceExpired");
+        assert_eq!(restored, PendingAlarmKind::GraceExpired);
     }
 
     #[test]
@@ -410,79 +308,5 @@ mod tests {
         assert_eq!(color_from_str("black").unwrap(), Color::Black);
         assert_eq!(color_from_str("white").unwrap(), Color::White);
         assert!(color_from_str("rainbow").is_err());
-    }
-
-    /// production の保守的既定 (`grace=0`) では token を発行しない。
-    /// `Reconnect_Token:` 拡張行も `PersistedConfig` への保存も skip される。
-    #[test]
-    fn issue_tokens_if_enabled_returns_none_when_grace_is_zero() {
-        let (black, white) = issue_tokens_if_enabled(Duration::ZERO);
-        assert!(black.is_none(), "black token must be None when grace=0");
-        assert!(white.is_none(), "white token must be None when grace=0");
-    }
-
-    /// `grace > 0` で発行した 2 つの token は一意でなければならない (相手色の
-    /// token を盗用すれば対局を奪える脆弱性を防ぐため、`ReconnectToken::generate`
-    /// は 32 文字 hex の十分なエントロピを持つ実装を契約する)。
-    #[test]
-    fn issue_tokens_if_enabled_yields_distinct_tokens() {
-        let (black, white) = issue_tokens_if_enabled(Duration::from_secs(30));
-        let black = black.expect("grace>0 で black token は Some");
-        let white = white.expect("grace>0 で white token は Some");
-        assert_ne!(black.as_str(), white.as_str(), "黒/白 token は互いに異なるべき (盗用防止)");
-    }
-
-    #[test]
-    fn classify_alarm_after_enter_grace_keeps_earlier_turn_alarm_as_time_up() {
-        let (kind, should_set_grace) = classify_alarm_after_enter_grace(Some(1_000), 2_000);
-        assert_eq!(kind, PendingAlarmKind::TimeUp);
-        assert!(!should_set_grace);
-    }
-
-    #[test]
-    fn classify_alarm_after_enter_grace_uses_grace_when_deadline_is_earlier() {
-        let (kind, should_set_grace) = classify_alarm_after_enter_grace(Some(3_000), 2_000);
-        assert_eq!(kind, PendingAlarmKind::GraceExpired);
-        assert!(should_set_grace);
-    }
-
-    #[test]
-    fn classify_alarm_after_enter_grace_uses_grace_when_no_alarm_exists() {
-        let (kind, should_set_grace) = classify_alarm_after_enter_grace(None, 2_000);
-        assert_eq!(kind, PendingAlarmKind::GraceExpired);
-        assert!(should_set_grace);
-    }
-
-    #[test]
-    fn start_match_guard_priority() {
-        for (finished, config, alarm, expected) in [
-            (false, false, None, StartMatchGuard::Proceed),
-            (true, false, None, StartMatchGuard::AlreadyFinished),
-            (false, true, None, StartMatchGuard::AlreadyMatched),
-            (
-                true,
-                true,
-                Some(PendingAlarmKind::GraceExpired),
-                StartMatchGuard::AlreadyFinished,
-            ),
-            (
-                false,
-                true,
-                Some(PendingAlarmKind::GraceExpired),
-                StartMatchGuard::AlreadyMatched,
-            ),
-        ] {
-            assert_eq!(classify_start_match_guard(finished, config, alarm), expected);
-        }
-        for alarm in [
-            PendingAlarmKind::GraceExpired,
-            PendingAlarmKind::TimeUp,
-            PendingAlarmKind::AgreeTimeout,
-        ] {
-            assert_eq!(
-                classify_start_match_guard(false, false, Some(alarm)),
-                StartMatchGuard::AlarmPending(alarm)
-            );
-        }
     }
 }

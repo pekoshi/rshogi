@@ -1,32 +1,29 @@
 [package]
 name = "rshogi-core"
-version = "0.9.1"
+version = "0.2.4"
 edition = "2024"
-rust-version = "1.92"
 authors = ["SH11235"]
 description = "A high-performance shogi engine core library with NNUE evaluation"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 repository = "https://github.com/sh11235/rshogi"
 keywords = ["shogi", "japanese-chess", "game", "engine", "nnue"]
 categories = ["games", "game-engines"]
 readme = "README.md"
-build = "build.rs"
 
 [dependencies]
 # Workspace dependencies
+anyhow.workspace = true
 log.workspace = true
 rand.workspace = true
 rand_xoshiro.workspace = true
 serde.workspace = true
-sha2 = { version = "0.10.9", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.186"
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# clap 系の推移依存や tools と同じ windows-sys に揃え、0.60 系の併存を避ける。
-# 0.52 系は rustix 0.38 と quinn-udp (windows-sys <=0.60 を要求) が使うため lockfile に残る。
-windows-sys = { version = "0.61.2", features = [
+# Keep in sync with clap's transitive windows-sys (0.60.x) to avoid duplicate versions on Windows.
+windows-sys = { version = "0.60.2", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_System_Memory",
@@ -40,335 +37,272 @@ getrandom = { workspace = true }
 rayon = { version = "1.10", optional = true }
 
 [dev-dependencies]
-tracking-allocator = { version = "=0.4.0", default-features = false }
+# Test dependencies
+serde_json.workspace = true
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 web-time = "1"
 
 [features]
-# default は universal edition (NNUE の次元と variant をモデル header から runtime 構成)。
-# 探索経路の pass_rights / PASS NMP は既定で無効。使う場合は `search-pass-rules` を明示する。
-default = ["edition-universal"]
-
-# === 開発・診断・横断系 (Edition 軸非対象) ===
+# 探索経路では pass_rights / PASS NMP を無効化
+# Web/WASM で pass ルールを使う場合は default-features=false で無効化する。
+default = ["search-no-pass-rules", "layerstacks-1536x16x32"]
+# デバッグ機能
 debug = []
-prepacked-nnue = ["dep:sha2"]
 # 探索統計収集（枝刈り発生回数等のカウント）
 search-stats = []
-# 探索が静的評価した静かな局面を確率で書き出す（教師データ生成用）。無効の build には書き出しのコードを含めない。
-search-tree-sample = []
 # NNUE統計収集（refresh/update比率等のカウント）
 nnue-stats = []
-# Bitboard256 の AVX2 経路は target_feature に応じて自動選択する。
-# この feature は非推奨の互換用として残しており、何もしない。
+# SIMD最適化（AVX2）
 simd_avx2 = []
+# 診断ログ
 diagnostics = []
-allocation-stats = []
-tt-write-stats = []
-# WebAssembly スレッドビルド (wasm-bindgen-rayon + rayon で LazySMP)。
+# WebAssembly スレッドビルド用フラグ
+# wasm-bindgen-rayon + rayon を使用した LazySMP 並列探索を有効化
 # 詳細は docs/wasm-multithreading-investigation.md を参照。
 wasm-threads = ["rayon"]
 # アプリ向け指し手特徴量抽出（解説生成等で使用）
 move-features = []
-# TT trace / helper TT write 制御（並列探索デバッグ用）。
+# TT trace / helper TT write 制御（並列探索デバッグ用）
 # 有効時は環境変数で制御: RSHOGI_DEBUG_TT_TRACE, RSHOGI_DEBUG_TT_SANITY,
-# RSHOGI_DISABLE_HELPER_TT_WRITE, RSHOGI_TT_TRACE_ROOT_MOVE 等。
+# RSHOGI_DISABLE_HELPER_TT_WRITE, RSHOGI_TT_TRACE_ROOT_MOVE 等
 tt-trace = []
-# TT hit時の非PVノードで TT eval を再利用する。
-# 無効時は常に NNUE 再評価する。
+# TT hit時の非PVノードで TT eval を再利用する（USE_LAZY_EVALUATE相当）
+# 無効時は YO 現行ビルド整合のため常に NNUE 再評価する
 use-lazy-evaluate = []
-# GPU/ネットワーク待ち向けのデフォルト遅延設定 (遅延マージン 400/1400ms)。
+# type-1 (key16) 衝突ガード: tt_move 擬似合法チェック通過時のみ TT eval 再利用する
+# use-lazy-evaluate と組み合わせて使用する（単独では無効）
+lazy-eval-guard = []
+# YaneuraOu DEEP相当のデフォルト遅延設定を使う
+# GPU/ネットワーク待ちが長い環境向けの遅延マージン(400/1400ms)プリセットを有効化する
 deep = []
-# 探索経路で有限パス権を扱う（静的評価へのパス権の加算、NMP で null move の代わりに PASS を使う処理）。
-# 無効でも Position / MoveGen の pass 機能と探索中の pass 手の扱いは残るが、探索はパス権を評価しない。
-# 指定し忘れで有効になることがないよう、否定形ではなく明示指定で有効にする。
-search-pass-rules = []
-# 廃止予定の互換用。以前は既定で有効な否定形 feature だった。現在は何もしない。
-# 既存の `features = ["search-no-pass-rules", ...]` 指定をビルドエラーにしないために残す。
+# 探索経路限定で pass_rights を無効化（Position/MoveGen の pass 機能は保持）
 search-no-pass-rules = []
-# Threat exclusion profiles (mutually exclusive)。除外 pair で Threat 次元を削減し NPS を改善。
+# LayerStack 専用ビルド（大会向け production 用）
+# HalfKP/HalfKA/HalfKA_hm のコードを除去し、evaluate_dispatch の icache footprint を削減
+layerstack-only = []
+# LayerStacks 1536x16x32 バリアント（従来アーキテクチャ）
+layerstacks-1536x16x32 = []
+# LayerStacks 1536x32x32 バリアント
+layerstacks-1536x32x32 = []
+# LayerStacks 768x16x32 バリアント
+layerstacks-768x16x32 = []
+# LayerStacks 768x8x32 バリアント (FT768/L1_8/L2_32、 2026-06 設計)
+# nodchip 2026-06 実験で L1_OUT 16→8 (MAIN_DIM 15→7) でレーティング維持 + NPS 向上、
+# 特に 768_7_32 が最適と判明したため追加。 1536x16x32 (default) より軽量で速い。
+# L1=8, L2_IN=14 (=7+7), L2_PADDED=32, L3=32。 本機 VNNI 無し環境の NPS レバー。
+layerstacks-768x8x32 = []
+# LayerStacks 512x16x32 バリアント
+layerstacks-512x16x32 = []
+# LayerStacks 1536x8x96 バリアント (HalfKAv2_hm 1536-8-96、 2026-05-12 設計)
+# nodchip bullet-shogi で訓練、 ユーザー指定 architecture (L0=1536, L1=8, L2=96)
+layerstacks-1536x8x96 = []
+# LayerStacks 1536x16x96 バリアント (L1=16 拡張版、 2026-05-14 設計)
+# 1536-8-96 の L1=8 ボトルネックを緩和するため L1=16 へ拡張。 L2=30 (=15+15)、 L3=96。
+# 既存 1536-8-96 重みは convert_layerstack_l1_8_to_16 で変換可能。
+layerstacks-1536x16x96 = []
+# LayerStacks 1536x32x96 バリアント (L1=32 拡張版、 2026-05-15 設計)
+# 1536-16-96 の L1=16 を更に拡張して表現力を上げる。 L2=62 (=31+31)、 L2_padded=64、 L3=96。
+layerstacks-1536x32x96 = []
+# LayerStacks 1536x16x48 バリアント (NPS 回復版、 2026-05-16 設計)
+# 1536-32-96 の評価器が重く探索 depth が伸びないため、 hidden1=16 hidden2=48 に縮小して
+# NPS と探索深さを優先する。 L2=30 (=15+15)、 L2_padded=32、 L3=48。
+# 旧 1536-32-96 の重みは nnue-convert の shrink-layerstacks サブコマンドで縮小初期化変換できる。
+layerstacks-1536x16x48 = []
+# LayerStacks 1536x48x96 バリアント (P4 密度拡張版、 2026-05-17 設計)
+# 1536-32-96 の L1=32 をさらに 1.5x 拡張 (32 → 48) で effective rank を 48 へ。
+# L2_in = 96 (=48+48 dual perspective)、 L2_padded = 128、 L3 = 96。
+# 旧 1536-32-96 の重みは nnue-convert の convert_layerstack_l1_32_to_48 で拡張変換できる。
+layerstacks-1536x48x96 = []
+# LayerStacks 768x32x96 バリアント (FT 半減 NPS 倍化版、 2026-05-17 設計)
+# 1536-32-96 の FT を半減 (FT=768) し、 NPS を ~2x に向上させる。 L1=32, L2=96 は 1536x32x96 と同設定。
+# L2_in = 62 (=31+31 dual perspective)、 L2_padded = 64、 L3 = 96。
+layerstacks-768x32x96 = []
+# LayerStacks 1024x16x48 バリアント (Plan P 1024 FT 対応版、 2026-05-23 設計)
+# tatara 1024 accumulator 実証 (= 水匠5 やや上回る) を参考に、 1536→1024 FT 圧縮 + L1=16/L2=48 small
+# 構成。 NPS 1:1 (= tatara 同等) target、 表現力差は LMAS bit 補完で迫る仮説。
+# L2_in = 30 (=15+15 dual perspective)、 L2_padded = 32、 L3 = 48。
+# 詳細: memory [[distill-16x48-plan-20260523]]、 [[sfnnwop1536-origin-20260523]]
+layerstacks-1024x16x48 = []
+# LayerStacks 1024x8x64 バリアント (= q_kda10_A_1024.bin 用、 L0=1024 L1=8 L2=64、
+# HalfKA_hm + heads。 評価関数 R&D 用、 vs Suisho11 同ノード検証)。
+# L2_in = 14 (=7+7 dual perspective、 1536x8x96 と同じ)、 L2_padded = 32、 L3 = 64。
+layerstacks-1024x8x64 = []
+# LayerStacks 1536x64x96 バリアント (P5 密度 2x 拡張版、 2026-05-17 設計)
+# 1536-32-96 の L1=32 をさらに 2x 拡張 (32 → 64) で effective rank を 64 へ。
+# L2_in = 126 (=63+63 dual perspective)、 L2_padded = 128 (16 byte alignment)、 L3 = 96。
+layerstacks-1536x64x96 = []
+# HalfKAv2_hm 入力 (Stockfish 14 PR #3506 準拠、 2026-05-17 設計)
+# HalfKA_hm の friend_king feature (K bucket と完全相関で常に無情報) を削除する。
+# - per-position active feature: 40 → 39 (盤上駒 38 + enemy_king 1)
+# - PIECE_INPUTS は 1629 のまま (内部 layout は friend_king/enemy_king が dim [1548,1629) を共有)
+# - 期待 Elo +1.8 (SF14 SPRT)、 NPS 影響 -1% 程度 (active feature 微減)
+# 詳細: docs/design/halfkav2_hm_migration_plan.md
+halfkav2-hm = []
+# NNUE FT weights を runtime で i8 に再量子化して memory 半減 (2026-05-12 実装)
+# ckpt format は変更しない (i16 LEB128 を load 時に i8 に clamp)。
+# Memory 帯域半減 → +30-50% NPS 期待。 量子化精度 (i16→i8) で評価値変動の可能性あり。
+# 既定 (feature 無効) は i16 weights (現行互換)。
+nnue-int8-runtime = []
+# NNUE FT full INT8 (2026-05-17 実装): nnue-int8-runtime を継承し、
+# 加えて fused sub-add hot path (apply_sub_add_fused / apply_double_sub_add_fused) も i8 経由に
+# 切り替えて memory 帯域を fused path でも半減する。 AVX2-only 環境では sign-extend cost を
+# unpack-shift 方式 (1 load + 2 unpack で 32 i8 → 32 i16) で port 5 圧迫を緩和する。
+# 既存 nnue-int8-runtime (refresh/full update のみ i8) との差分は fused path の i8 化。
+nnue-int8-full = ["nnue-int8-runtime"]
+# L3 cache friendly weight ordering: features を king index 順に並べ替えて配置 (2026-05-12 skeleton)
+# 1 局面で active な ~38 features が同じ king square 内 → 同 layout で memory が連続
+# → cache line 効率向上で +5-15% NPS 期待。 ckpt の re-export が必須 (nodchip 改修要)。
+# **現状は feature 宣言のみ、 実装は別 session で完成予定**。
+nnue-king-index-major = []
+# MatryoshkaNN: 2026-05-12 仕様変更で αβ 側は使用しない方針に確定。
+# PUCT 側 (Transformer / P2NNUE) の sub-network 切替に転用 (別 crate で実装、
+# docs/design/matryoshka_nn_training_plan.md 参照)。
+# αβ rshogi-core からは feature を削除。
+# NNUE PSQT ショートカット対応
+# 無効時: AccumulatorLayerStacks から psqt_accumulation を除去、PSQT モデル読み込み不可
+nnue-psqt = []
+# NNUE Threat 特徴量対応
+# 無効時: AccumulatorLayerStacks から threat_accumulation を除去 (-6KB/entry)、Threat モデル読み込み不可
+nnue-threat = []
+# Full Threat index を 8 bucket の scalar residual として使う軽量 head。
+# 独立 feature のため、OFF にすれば既存 Dual Cross 経路へ戻る。
+nnue-scalar-threat = []
+nnue-scalar-threat-coexist = ["nnue-scalar-threat"]
+nnue-dual-cross-geometry = ["nnue-dual-psqt"]
+# Threat exclusion profiles (mutually exclusive)
+# 除外 pair で Threat 次元を削減し、NPS を改善する。
 # 詳細は crates/rshogi-core/src/nnue/threat_exclusion.rs の module doc 参照。
 threat-profile-same-class = []               # profile 1: 同種ペア全除外
 threat-profile-same-class-major-pawn = []   # profile 2: 同種 + 大駒→歩除外
-threat-profile-step-attacker = []           # profile 3: occupancy 依存 slider (香角飛馬竜) を attacker 除外
-threat-profile-full-symdedup = []           # profile 4: pair 除外なし、emit で canonical-dead 対称 edge を drop (dims は profile 0 と同一)
-threat-profile-cross-side = []               # profile 10: 同 side / 同種を除外、敵味方跨ぎ異種のみ
-
-# === Edition 軸 atomic feature 群 ===
-# 命名規則は docs/build.md を参照。
-# atomic feature は実装詳細扱いで、user は基本的に preset edition (後述 `edition-*`)
-# 経由で触る想定。
-
-# Architecture 経路 slot (include-only 意味論)。
-# - layerstack-arch:     LayerStack network 経路を含める
-# - halfkx-arch: HalfKX family (HalfKP / HalfKa*) 経路を含める
-# 固定/family edition では両者を同時に立てることも可。
-layerstack-arch     = []
-halfkx-arch = []
-
-# LayerStack network L1 サイズ slot
-layerstacks-1536x16x32 = []
-layerstacks-1536x32x32 = []
-layerstacks-768x16x32  = []
-layerstacks-768x8x32   = []
-layerstacks-512x16x32  = []
-layerstacks-1024x16x32 = []
-layerstacks-3072x16x32 = []
-layerstacks-1024x16x64 = []
-layerstacks-2304x16x64 = []
-layerstacks-2304-sparse-l1 = []
-layerstacks-3072x16x64 = []
-layerstacks-1536x16x64 = []
-
-# LayerStack 拡張 slot (psqt / threat)
-# - nnue-psqt:   AccumulatorLayerStacks に psqt_accumulation を含める。PSQT モデル読み込み可。
-# - nnue-threat: AccumulatorLayerStacks に threat_accumulation を含める (4*T bytes/entry)。Threat モデル読み込み可。
-# - nnue-effect-bucket: HalfKaHmMerged の FT 入力を EffectBucket modifier 付きに差し替える。
-nnue-psqt   = []
-threat-width-512 = ["nnue-threat"]
-threat-width-768 = ["nnue-threat"]
-nnue-threat = []
-nnue-effect-bucket = []
-# universal edition 用の runtime 次元 NNUE 実装。
-# 固定 edition は const-generic 実装を使い続ける。
-nnue-runtime-dimensions = []
-
-effect-bucket-2x2-kingfixed = []
-effect-bucket-2x2-kingbucketed = []
-effect-bucket-3x3-kingfixed = []
-effect-bucket-3x3-kingbucketed = []
-
-# FT (Feature Transformer) 種別 slot (5 variant)。
-# LS / HalfKX どちらの family でも 5 variant 全対応。mode-specific では 1 個固定、
-# family では複数 OR を許容して const-generic variant を runtime dispatch。
-# universal はこれらの slot を立てず、nnue-runtime-dimensions を使う。
-ft-halfkp           = []
-ft-halfka_split     = []
-ft-halfka_merged    = []
-ft-halfka_hm_split  = []
-ft-halfka_hm_merged = []
-
-# HalfKX activation slot
-halfkx-activation-crelu    = []
-halfkx-activation-screlu   = []
-halfkx-activation-pairwise = []
-
-# Build mode sentinel (preset edition がセット、build.rs 整合性チェック用)。
-# user が直接指定するものではなく、preset edition 経由でのみ有効化される想定。
-# - mode-universal: header 駆動の runtime-dimension 構成、static slot check 緩和
-# - mode-family:    family dispatch、check 部分緩和
-# - mode-specific:  単一構成 build、check 厳格 (size/activation/ft 1 個固定)
-mode-universal = []
-mode-family    = []
-mode-specific  = []
-
-# NNUE progresskpabs バケットの差分更新最適化
+# NNUE Pin-aware 補助特徴量 (2026-05-24 追加)
+# 盤上の駒の pin/skewer 状態を 81 × 14 × 2 = 2268 dim per perspective の
+# sparse feature として encode、 per-bucket affine head で評価値補正。
+# LMAS 廃止に伴う代替 (= 軽量、 mate_probe 不要、 NPS 影響 < 1% 目標)。
+# 詳細は crates/rshogi-core/src/nnue/pin_features.rs module doc 参照。
+nnue-pin-aware = []
+# NNUE Dual PSQT (= attack/defend 別 weight head、 Plan C iter 2 用領域確保、 2026-05-24 追加)
+# iter 1 では section 読み込み path のみ通し、 weight は Zeroed init で eval 寄与 0。
+# iter 2 で head-only fine-tune を行う。 詳細は crates/rshogi-core/src/nnue/dual_psqt.rs 参照。
+nnue-dual-psqt = []
+# NNUE KingRing Threat PSQT scalar head (arm 11、 2026-05-28 追加)
+# 玉周辺 24sq × 13 piece × 4 state × 8 bucket × 2 perspective = 4992 i16 weight
+# (= ~10 KB)。 PSQT scalar head として加算、 NPS 低下 5% 以内目標。
+# 詳細は crates/rshogi-core/src/nnue/kingring.rs 参照。
+nnue-kingring-psqt = []
+# NNUE Piece-Pair Shape Table scalar head (arm 12、 2026-05-29 追加)
+# 12 pair_type × 16 shape × 8 bucket × 2 perspective = 3,072 i16 weight (~6 KB)。
+# PSQT が捕捉できない「自軍駒の連結形」 を軽量 scalar table で捕捉。
+# 利き計算なし (= file/rank/abs diff のみ)、 NPS 低下 5% 以内目標。
+# 詳細は crates/rshogi-core/src/nnue/pairshape.rs 参照。
+nnue-pairshape-psqt = []
+# Activity-Risk Interaction Head (= 2026-06-06、 中盤楽観バイアス補正)。
+# `[perspective 2][bucket 8][major_activity 8][king_pressure 8][shield 4]` =
+# 4,096 i16 weight (~8 KB) の PSQT scalar head。 仮説 = p2 が中盤局面で「自玉
+# 圧力 vs 大駒可動性」 trade-off を過大評価 (= 敗局 +49cp 楽観、 max +557cp)
+# を補正。 各 perspective で 1 weight lookup、 black 寄与 - white 寄与で
+# PSQT scalar 値へ加算、 fv_scale 適用前統合。 PairShape 同 pattern。
+# 詳細は `crates/rshogi-core/src/nnue/activity_risk.rs` 参照。
+nnue-activity-risk-psqt = []
+# King Escape Direction (KED) PSQT scalar head (2026-06-09)
+# 玉の forward 方向 (= 入玉方向、 先手=上 / 後手=下) で同一 file 1-3 マス先の
+# 自軍利き本数を 0..=3 にクランプし、 4 class × 8 bucket × 2 persp = 64 weight
+# の軽量 scalar table で eval 加算。 入玉局面の表現強化 + 玉前進路の評価。
+# 詳細は `crates/rshogi-core/src/nnue/king_escape.rs` 参照。
+nnue-king-escape-psqt = []
+# King Danger (KDGR) PSQT scalar head (2026-06-15)
+# 自玉中心 3x3 (= 9 マス、 玉自身含む) に居る敵駒の重み付き数
+# (= 重駒×3 + 軽駒×1) を min(7) で 8 class 化し、 8 class × 8 bucket × 2 persp
+# = 128 i16 weight の軽量 scalar table で eval 加算。 自玉危険の過小評価
+# (= 残差解析 -50cp、 t=14.8) を補正する。 magic P2KDGR / version 1。
+# 詳細は `crates/rshogi-core/src/nnue/king_danger.rs` 参照。
+nnue-king-danger-psqt = []
+# Attack Development (ADEV) PSQT scalar head (2026-06-16)
+# 自玉に対する敵 slider の「照準」 (= 飛/竜が筋or段、 角/馬が斜め線上、 香が
+# 前方同筋、 block 越し可) を 飛角×2 + 香×1 で重み付けし min(7) で 8 class 化、
+# 8 class × 8 bucket × 2 persp = 128 i16 weight の軽量 scalar table で eval 加算。
+# 「相手の発展中の攻め (= 玉を狙う遠方駒) を過小評価」 を補正 (= move-66 対策)。
+# magic P2ADEV / version 1。 既存 head (= king_danger 含む) と独立共存。
+# 詳細は `crates/rshogi-core/src/nnue/attack_dev.rs` 参照。
+nnue-attack-dev-psqt = []
+# Slider X-ray (SXRY) PSQT scalar head (2026-06-28)
+# 自玉に対する敵 slider の「X-ray (= 潜在) 照準」 (= slider と玉の間に駒が
+# ちょうど 1 枚 = block が 1 枚どけば直射になる遠方脅威) を 重 slider(飛/竜)×3
+# + 軽 slider(角/馬/香)×1 で重み付けし min(7) で 8 class 化、 8 class × 8 bucket
+# × 2 persp = 128 i16 weight の軽量 scalar table で eval 加算。 直射(0枚)は ADEV、
+# 2 枚以上は非計上。 magic P2SXRY / version 1。 既存 head と独立共存。
+# 詳細は `crates/rshogi-core/src/nnue/slider_xray.rs` 参照。
+nnue-slider-xray-psqt = []
+# King Zone Threat (KZT) sparse PSQT-like head (2026-06-30、 骨組み v0)
+# 敵玉周辺の条件付き脅威 (= 持駒打ち込み脅威 KZT_HAND) を大重み数 / 少 active feature
+# の sparse head で補完。 section magic P2KZT / version 1。 既存 head と独立 on/off。
+# v0 骨組みは feature gather 未実装 (= 空集合 → eval 0、 既存 bit-exact)。
+# 詳細は `crates/rshogi-core/src/nnue/kzt.rs` 参照。
+nnue-kzt-psqt = []
+# King Zone Threat FT 入力版 (KZT-FT、 2026-07-03)
+# KZT_HAND sparse feature を eval に scalar 加算 (= nnue-kzt-psqt) するのではなく、
+# FT 入力として L1 accumulator へ流し SCReLU→L1→L2 で piece features と非線形に
+# co-adapt させる版。 threat_accumulation と同機構 (= per-perspective [[i16; L1]; 2]、
+# SCReLU 前加算、 i8 weight)。 次元 = 9,440 (= factored core+region+persp+bias、
+# W_bucket 除外)。 section magic P2KZTF / version 1。 nnue-kzt-psqt とは相互排他
+# (同時 ON は compile_error、 KZT 寄与の二重計上防止)。 OFF で既存 bit-exact。
+# 詳細は crates/rshogi-core/src/nnue/kzt.rs の KZT-FT section 参照。
+nnue-kzt-ft = []
+# Optimism Damp Head (ODH) v0 (2026-07-02、 解析注入 hand-set 版)
+# main NNUE の合算 raw eval が正側 (= 優勢) に大きく振れているが局面条件的に
+# 信用しにくい (= 攻め無し高評価 / 自玉危険な高評価) 時、 eval 絶対値を縮める
+# calibration / damp head。 符号反転は狙わず final_raw = main_raw - odh。
+# class 軸 = force_class[4] (主軸、 敵玉5x5内自駒 + 自手駒種数) × own_king_risk[4]
+# (自玉3x3敵駒重み) × bucket[8] = 128 class の解析注入 damp table (const)。
+# ODH_OUTPUT_SCALE (= 既定 0 = 無効 = bit-exact) で damp 全体を runtime scale。
+# 学習 graph 不要 (= section save 無し、 engine 内 const table)。
+# 詳細は `crates/rshogi-core/src/nnue/odh.rs` 参照。
+nnue-odh = []
+# Eval Bias Correction (EBC) = correction-history 型の静的評価補正 (2026-07-03)
+# bias miner が測った search_score - static_eval の系統ズレ (= bias) を局面クラス別に補正。
+# class = advantage_bucket[7] (補正前 raw_total の cp 符号/magnitude、 中央±150 と |cp|>1200 は
+# 非補正) × phase_bucket[5] (game_ply 手数) = 35 class の const table (初期全ゼロ)。
+# 適用は raw_total 合算後 (ODH の後) に符号込み加算。 EVAL_BIAS_CORR_SCALE (= 既定 0 = bit-exact)
+# で runtime scale、 EVAL_BIAS_CORR_CLAMP で 1 手上限、 EVAL_BIAS_CORR_FILE で table 注入。
+# 学習 graph 不要 (= section save 無し、 engine 内 table)。
+# 詳細は `crates/rshogi-core/src/nnue/eval_bias_corr.rs` 参照。
+nnue-eval-bias-corr = []
+# King Mobility (KMOB) PSQT scalar head (2026-06-16)
+# 自玉の「安全な逃げ場マス数」 (= 8 近傍のうち 自駒不在 かつ 敵利き無し) を
+# 0..=8 の 9 class 化、 9 class × 8 bucket × 2 persp = 144 i16 weight の軽量
+# scalar table で eval 加算。 守備系特徴 (= ARS1 / attack_dev と直交)。
+# magic P2KMOB / version 1。 既存 head と独立共存。
+# 詳細は `crates/rshogi-core/src/nnue/king_mobility.rs` 参照。
+nnue-king-mobility-psqt = []
+# Drop Pressure (DROP) PSQT scalar head (2026-06-16)
+# 相手の持駒 (in-hand) を弾とした自玉近傍 5x5 への投下脅威 (= 投下した駒が玉 or
+# 玉近傍に利く空升数 × 駒重み、 飛角金銀×2 + 歩香桂×1) を min(7) で 8 class 化、
+# 8 class × 8 bucket × 2 persp = 128 i16 weight の軽量 scalar table で eval 加算。
+# 負け棋譜分析 (9/9 局) 由来の最頻負け筋 = 相手持駒投下脅威の過小評価を補正。
+# 既存 head (= 盤上駒のみ) と直交 (= 持駒が唯一の入力源)。
+# magic P2DROP / version 1。 既存 head と独立共存。
+# 詳細は `crates/rshogi-core/src/nnue/drop_pressure.rs` 参照。
+nnue-drop-pressure-psqt = []
+# Attack Relay Head (ARH) scalar head (2026-06-09)
+# 敵玉中心 5x5 を inner (= 3x3) + outer ring に分け、
+# 攻撃側 perspective の (contact, reserve, relay) 3 軸を 4x4x4 = 64 cell に
+# 量子化、 8 bucket × 2 persp で 1024 i16 weight (= 2 KiB)。 波状攻撃の
+# 接触層 / 後続層 / 支援関係を捕捉する軽量 scalar table。
+# 詳細は `docs/attack_relay_head_design.md` + `crates/rshogi-core/src/nnue/attack_relay.rs`。
+nnue-attack-relay = []
+# Attack Relay Head v2 (= A5 仕様、 2026-06-10)
+# attackers × overlap × supported 軸定義、 ARH v1 が中盤無効 (= 100 SFEN mean 0)
+# を受けた仕様変更。 dim 1024 i16 維持、 magic P2AREL2 / version 2。
+# 詳細は `docs/attack_relay_head_v2_a5_design.md`。
+nnue-attack-relay-v2 = []
+# NNUE progress8kpabs バケットの差分更新最適化
 # - 有効時: StackEntry に progress_sum/computed_progress フィールド追加、
 #   ensure_progress_bucket で DirtyPiece 差分から O(1) 更新
-# - 実測: L2=32 の L0=1536 系 / L0=3072 で性能向上、2304x16x64 は命令数/node が減り
-#   cycles/node は中立、L0=768/512 で退行する trade-off
-# - 適用条件: build.rs で mode-specific + layerstacks-1536x16x32 / layerstacks-1536x32x32 /
-#   layerstacks-3072x16x32 / layerstacks-2304x16x64 / layerstacks-3072x16x64 /
-#   layerstacks-1536x16x64 に限定
-#   (mode-* が未指定の互換 build では check 緩和、user 責任で組合せ可)
+# - Threat なし環境: +3〜4% NPS（有効）
+# - Threat あり環境: -2% NPS（cache 圧迫で退行）
+# default では無効。運用モデルの特性に応じてビルド時に明示指定する。
 nnue-progress-diff = []
-
-# === preset edition (user-facing canonical API) ===
-# 命名規則・slot 意味論は docs/build.md 参照。各 preset は mode sentinel + 必要な atomic feature 群を bundle する。
-# 主要な build target をここで整備し、残りは需要に応じて追加する。
-
-# 全 architecture × 任意次元を header から runtime 構成 (default)。
-# 固定 edition の const-generic / SIMD 経路は変更しない。
-edition-universal = [
-  "mode-universal",
-  "nnue-runtime-dimensions",
-  "halfkx-arch",
-  "nnue-psqt", "nnue-threat",
-]
-
-# HalfKX family (全 FT / activation dispatch)。
-edition-halfkx     = ["edition-halfkx-any"]
-edition-halfkx-any = [
-  "mode-family", "halfkx-arch",
-  "ft-halfkp", "ft-halfka_split", "ft-halfka_merged", "ft-halfka_hm_split", "ft-halfka_hm_merged",
-  "halfkx-activation-crelu", "halfkx-activation-screlu", "halfkx-activation-pairwise",
-]
-
-# LayerStack family (全 size / 全 FT / 全 ext dispatch)。
-edition-layerstacks             = ["edition-layerstacks-any-any-any"]
-edition-layerstacks-any-any-any = [
-  "mode-family", "layerstack-arch",
-  "ft-halfkp", "ft-halfka_split", "ft-halfka_merged", "ft-halfka_hm_split", "ft-halfka_hm_merged",
-  "layerstacks-1536x16x32", "layerstacks-1536x32x32", "layerstacks-768x16x32", "layerstacks-768x8x32", "layerstacks-512x16x32", "layerstacks-1024x16x32", "layerstacks-3072x16x32", "layerstacks-1024x16x64", "layerstacks-2304x16x64", "layerstacks-3072x16x64", "layerstacks-1536x16x64",
-  "nnue-psqt", "nnue-threat",
-]
-
-# HalfKP specific (suisho5 等)。
-# `AccumulatorStackVariant::LayerStacks` / `NNUENetwork::LayerStacks` の enum variant
-# と LS 実行時 state (acc_cache field) は `layerstack-arch` で cfg gate されるため、HalfKX
-# specific edition には含めない。`LayerStacksAccCache` 型と `evaluate_dispatch` の
-# シグネチャは public API 互換のため非 layerstack-arch build にも残るが、HalfKX-only run では
-# `Option<LayerStacksAccCache>` は常に `None` を取る。
-edition-halfkp-crelu = [
-  "mode-specific", "halfkx-arch",
-  "ft-halfkp", "halfkx-activation-crelu",
-]
-
-# HalfKaHmMerged HalfKX specific。
-edition-halfka_hm_merged-screlu = [
-  "mode-specific", "halfkx-arch",
-  "ft-halfka_hm_merged", "halfkx-activation-screlu",
-]
-
-# LayerStack specific (1536x16x32、全 ext 組合せ)。L0=1536 系は progress-diff 同梱。
-edition-layerstacks-halfka_hm_merged-1536x16x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x16x32",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfka_hm_merged-1536x16x32-psqt = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x16x32", "nnue-psqt",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfka_hm_merged-1536x16x32-threat512 = ["edition-layerstacks-halfka_hm_merged-1536x16x32-threat", "threat-width-512"]
-edition-layerstacks-halfka_hm_merged-1536x16x32-threat = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x16x32", "nnue-threat",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfka_hm_merged-1536x16x32-psqt_threat = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x16x32",
-  "nnue-psqt", "nnue-threat",
-  "nnue-progress-diff",
-]
-# threat 版に full-symdedup profile を束ねた変種 (dims は -threat と同一、canonical-dead
-# 対称 edge を列挙時に drop)。engine と net の profile 一致は EvalFile load 時の
-# THREAT_PROFILE_ID 照合で reject される。
-edition-layerstacks-halfka_hm_merged-1536x16x32-threat_symdedup = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x16x32", "nnue-threat",
-  "threat-profile-full-symdedup",
-  "nnue-progress-diff",
-]
-
-# LayerStack specific (1536x32x32、none 1 構成のみ最初に整備)。L0=1536 系。
-edition-layerstacks-halfka_hm_merged-1536x32x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x32x32",
-  "nnue-progress-diff",
-]
-
-# LayerStack specific (1024x16x32 / 768x16x32 / 768x8x32 / 512x16x32、none のみ)。L0=1024/768/512 系は progress-diff 不可。
-edition-layerstacks-halfka_hm_merged-1024x16x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32",
-]
-edition-layerstacks-halfka_hm_merged-1024x16x32-threat = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32", "nnue-threat",
-]
-# 1024 threat の削減 profile 版 (nnue-threat に threat-profile-* を 1 つ束ねた変種)。
-# L0=1024 系のため nnue-progress-diff は含めない (build.rs ポリシー)。
-# engine と学習 net の threat profile id 一致は EvalFile load 時に dims mismatch で reject される。
-edition-layerstacks-halfka_hm_merged-1024x16x32-threat_same_class = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32", "nnue-threat",
-  "threat-profile-same-class",
-]
-edition-layerstacks-halfka_hm_merged-1024x16x32-threat_same_class_major_pawn = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32", "nnue-threat",
-  "threat-profile-same-class-major-pawn",
-]
-edition-layerstacks-halfka_hm_merged-1024x16x32-threat_step_attacker = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32", "nnue-threat",
-  "threat-profile-step-attacker",
-]
-edition-layerstacks-halfka_hm_merged-768x16x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-768x16x32",
-]
-edition-layerstacks-halfka_hm_merged-768x16x32-threat = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-768x16x32", "nnue-threat",
-]
-edition-layerstacks-halfka_hm_merged-768x8x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-768x8x32",
-]
-edition-layerstacks-halfka_hm_merged-512x16x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-512x16x32",
-]
-edition-layerstacks-halfka_hm_merged_effect_bucket-512x16x32-2x2_kingfixed = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-512x16x32",
-  "nnue-effect-bucket", "effect-bucket-2x2-kingfixed",
-]
-edition-layerstacks-halfka_hm_merged_effect_bucket-1024x16x32-2x2_kingfixed = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32",
-  "nnue-effect-bucket", "effect-bucket-2x2-kingfixed",
-]
-edition-layerstacks-halfka_hm_merged_effect_bucket-1024x16x32-3x3_kingfixed = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x32",
-  "nnue-effect-bucket", "effect-bucket-3x3-kingfixed",
-]
-# LayerStack specific (3072x16x32、none のみ)。FT_OUT=3072 の大型 FT。
-# L0=3072 も progress-diff の NPS 改善を実測で確認済みのため 1536 系と同様に同梱する。
-edition-layerstacks-halfka_hm_merged-3072x16x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-3072x16x32",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfka_hm_merged-1024x16x64-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x64",
-]
-edition-layerstacks-halfka_hm_merged-1024x16x64-threat = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1024x16x64", "nnue-threat",
-]
-edition-layerstacks-halfka_hm_merged-1024x16x64-threat512 = ["edition-layerstacks-halfka_hm_merged-1024x16x64-threat", "threat-width-512"]
-edition-layerstacks-halfka_hm_merged-1024x16x64-threat768 = ["edition-layerstacks-halfka_hm_merged-1024x16x64-threat", "threat-width-768"]
-edition-layerstacks-halfka_hm_merged-2304x16x64-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-2304x16x64",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfka_hm_merged-2304x16x64-threat = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-2304x16x64", "nnue-threat",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfka_hm_merged-2304x16x64-threat512 = ["edition-layerstacks-halfka_hm_merged-2304x16x64-threat", "threat-width-512"]
-edition-layerstacks-halfka_hm_merged-2304x16x64-threat768 = ["edition-layerstacks-halfka_hm_merged-2304x16x64-threat", "threat-width-768"]
-edition-layerstacks-halfka_hm_merged-3072x16x64-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-3072x16x64",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfka_hm_merged-1536x16x64-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x16x64",
-  "nnue-progress-diff",
-]
-
-edition-layerstacks-halfka_hm_merged-1536x16x64-threat512 = ["edition-layerstacks-halfka_hm_merged-1536x16x64-threat", "threat-width-512"]
-edition-layerstacks-halfka_hm_merged-1536x16x64-threat768 = ["edition-layerstacks-halfka_hm_merged-1536x16x64-threat", "threat-width-768"]
-edition-layerstacks-halfka_hm_merged-1536x16x64-threat = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_merged", "layerstacks-1536x16x64", "nnue-threat",
-  "nnue-progress-diff",
-]
-
-# LS specific preset (halfka_hm_merged 以外の 4 FT、1536x16x32-none で代表整備)。
-# 残りの (size × ext) 組合せは需要発生時に同パターンで追加する。
-edition-layerstacks-halfka_hm_split-1536x16x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_hm_split", "layerstacks-1536x16x32",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfka_merged-1536x16x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_merged", "layerstacks-1536x16x32",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfka_split-1536x16x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfka_split", "layerstacks-1536x16x32",
-  "nnue-progress-diff",
-]
-edition-layerstacks-halfkp-1536x16x32-none = [
-  "mode-specific", "layerstack-arch", "ft-halfkp", "layerstacks-1536x16x32",
-  "nnue-progress-diff",
-]
 
 [lib]
 name = "rshogi_core"
 path = "src/lib.rs"
-
-# PSQT 統計ダンプツール。
-# static `NetworkLayerStacks1536x16x32` のロードに必要な architecture / FT / PSQT を
-# `required-features` で明示する。default universal の dynamic 経路には依存しない。
-[[bin]]
-name = "dump_psqt_stats"
-path = "src/bin/dump_psqt_stats.rs"
-required-features = [
-  "layerstack-arch", "nnue-psqt", "layerstacks-1536x16x32", "ft-halfka_hm_merged",
-]

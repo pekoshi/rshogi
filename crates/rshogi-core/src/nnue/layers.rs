@@ -4,7 +4,7 @@
 //! - `ClippedReLU`: 整数スケーリング付きのクリップ付き ReLU 層
 //! - `SCReLU`: Squared Clipped ReLU 層（bullet-shogi SCReLUモデル用）
 
-use super::accumulator::{AlignedBox, WeightBox};
+use super::accumulator::AlignedBox;
 use super::constants::WEIGHT_SCALE_BITS;
 use std::io::{self, Read};
 
@@ -13,209 +13,15 @@ pub(crate) const fn padded_input(input_dim: usize) -> usize {
     input_dim.div_ceil(32) * 32
 }
 
-/// 論理入力に最大31バイトのゼロ埋めを付けた、64バイト境界のスタックバッファ。
-/// 活性化関数には論理領域だけを渡し、affineにはパディング込みの領域を渡す。
-#[repr(C, align(64))]
-pub(crate) struct PaddedAffineInput<const N: usize>(pub [u8; N], [u8; 31]);
-
-impl<const N: usize> PaddedAffineInput<N> {
-    pub(crate) fn new() -> Self {
-        Self([0; N], [0; 31])
-    }
-
-    pub(crate) fn as_padded(&self) -> &[u8] {
-        // SAFETY: repr(C)のu8配列は隙間なく並び、先頭は64バイト境界にある。
-        // padded_input(N) <= N + 31なので、末尾の構造体paddingには触れない。
-        // 両配列は初期化済みで、非公開の第2フィールドは常にゼロを保つ。
-        unsafe { std::slice::from_raw_parts(std::ptr::from_ref(self).cast(), padded_input(N)) }
-    }
-}
-
-/// 入力チャンクを分ける組数を返す（組数 × 出力レジスタ数が独立な積和チェーン数になる）。
-/// 値を変えるときは小出力用カーネルの容量に関するconst検査を満たすこと。
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    any(target_feature = "avx512vnni", target_feature = "avx512bw")
-))]
-const fn avx512_accumulator_groups(num_regs: usize) -> usize {
-    match num_regs {
-        1 => 8,
-        2 => 4,
-        3 => 3,
-        _ => 1,
-    }
-}
-
-/// input_chunk-major配置のaffine積和。小出力では入力を独立な組に分ける。
-///
-/// # Safety
-/// 入力は`padded_input(INPUT)`以上、重みは`OUTPUT * padded_input(INPUT)`以上。
-/// 重みは64バイトアラインで、`weights[input_chunk][output][4]`の配置とする。
-/// OUTPUTは8または16の正の倍数かつ1024以下。FULL_RANGE=falseでは入力は0..=127。
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    any(target_feature = "avx512vnni", target_feature = "avx512bw")
-))]
-#[inline]
-pub(crate) unsafe fn propagate_affine_avx512<
-    const INPUT: usize,
-    const OUTPUT: usize,
-    const FULL_RANGE: bool,
->(
-    input: &[u8],
-    weights: &[i8],
-    biases: &[i32; OUTPUT],
-    output: &mut [i32; OUTPUT],
-) {
-    // 出力ごとのレジスタ数と組数は単相化時に確定する。小出力用の配列を
-    // 分けることで、大出力用の最大容量を小出力のスタックに持ち込まない。
-    #[inline]
-    unsafe fn kernel<
-        const INPUT: usize,
-        const OUTPUT: usize,
-        const FULL_RANGE: bool,
-        const CAPACITY: usize,
-    >(
-        input: &[u8],
-        weights: &[i8],
-        biases: &[i32; OUTPUT],
-        output: &mut [i32; OUTPUT],
-    ) {
-        let num_regs = OUTPUT / 16;
-        let groups = const { avx512_accumulator_groups(OUTPUT / 16) };
-        const {
-            assert!(
-                avx512_accumulator_groups(OUTPUT / 16) == 1
-                    || OUTPUT / 16 * avx512_accumulator_groups(OUTPUT / 16) <= CAPACITY
-            );
-        }
-        debug_assert!(OUTPUT > 0 && OUTPUT.is_multiple_of(16));
-        debug_assert!(num_regs * groups <= CAPACITY);
-        // SAFETY: 外側の関数の契約により全ポインタは有効範囲内にある。
-        // 重みの各チャンクはOUTPUT * 4バイトなので64バイト境界を保つ。
-        // 入力・bias・出力はunaligned操作を使う。cfgが必要な命令セットを保証し、
-        // 小出力の組数はconst検査済みで、大出力は契約のOUTPUT<=1024により収容できる。
-        unsafe {
-            use std::arch::x86_64::*;
-            let mut acc = [_mm512_setzero_si512(); CAPACITY];
-            // バイアスは組0だけに含める。
-            for (k, a) in acc.iter_mut().take(num_regs).enumerate() {
-                *a = _mm512_loadu_si512(biases.as_ptr().add(k * 16).cast());
-            }
-            let chunks = padded_input(INPUT) / 4;
-            let full_chunks = chunks / groups * groups;
-            for base in (0..full_chunks).step_by(groups) {
-                for (s, group) in acc.chunks_exact_mut(num_regs).take(groups).enumerate() {
-                    let i = base + s;
-                    let in_val =
-                        _mm512_set1_epi32(input.as_ptr().add(i * 4).cast::<i32>().read_unaligned());
-                    let col = weights.as_ptr().add(i * OUTPUT * 4).cast::<__m512i>();
-                    for (k, a) in group.iter_mut().enumerate() {
-                        m512_add_dpbusd_epi32::<FULL_RANGE>(
-                            a,
-                            in_val,
-                            _mm512_load_si512(col.add(k)),
-                        );
-                    }
-                }
-            }
-            // 3組など、入力チャンク数を割り切れない組数の端数を先頭から配分する。
-            for (s, group) in acc.chunks_exact_mut(num_regs).take(chunks - full_chunks).enumerate()
-            {
-                let i = full_chunks + s;
-                let in_val =
-                    _mm512_set1_epi32(input.as_ptr().add(i * 4).cast::<i32>().read_unaligned());
-                let col = weights.as_ptr().add(i * OUTPUT * 4).cast::<__m512i>();
-                for (k, a) in group.iter_mut().enumerate() {
-                    m512_add_dpbusd_epi32::<FULL_RANGE>(a, in_val, _mm512_load_si512(col.add(k)));
-                }
-            }
-            // i32加算は2^32を法として結合的・可換なので加算木でもbit一致する。
-            // 組数が2の冪でない場合、相手のない組は次の段へ持ち越す。
-            let mut stride = 1;
-            while stride < groups {
-                for s in (0..groups - stride).step_by(2 * stride) {
-                    let (left, right) = acc.split_at_mut((s + stride) * num_regs);
-                    for (a, b) in left[s * num_regs..].iter_mut().zip(&right[..num_regs]) {
-                        *a = _mm512_add_epi32(*a, *b);
-                    }
-                }
-                stride *= 2;
-            }
-            for (k, a) in acc.iter().take(num_regs).enumerate() {
-                _mm512_storeu_si512(output.as_mut_ptr().add(k * 16).cast(), *a);
-            }
-        }
-    }
-    debug_assert!(input.len() >= padded_input(INPUT));
-    debug_assert!(weights.len() >= OUTPUT * padded_input(INPUT));
-    debug_assert!(OUTPUT == 8 || (OUTPUT > 0 && OUTPUT.is_multiple_of(16) && OUTPUT <= 1024));
-    // SAFETY: 呼び出し側が入力範囲・重み配置・7bit契約を満たす。
-    // 小出力の組数×レジスタ数はconst検査済み。単一組は最大64レジスタを使う。
-    unsafe {
-        if OUTPUT == 8 {
-            use std::arch::x86_64::*;
-            // 連続する2チャンクは64バイト境界にあり、下位/上位8出力へ対応する。
-            // padded_input(INPUT)は32の倍数なので、8バイトずつの読み込みに端数はない。
-            let mut acc = [_mm512_setzero_si512(); 8];
-            let pairs = padded_input(INPUT) / 8;
-            for base in (0..pairs).step_by(8) {
-                for (s, a) in acc.iter_mut().take((pairs - base).min(8)).enumerate() {
-                    let offset = (base + s) * 8;
-                    let lo = input.as_ptr().add(offset).cast::<i32>().read_unaligned();
-                    let hi = input.as_ptr().add(offset + 4).cast::<i32>().read_unaligned();
-                    let values = _mm512_mask_blend_epi32(
-                        0xff00,
-                        _mm512_set1_epi32(lo),
-                        _mm512_set1_epi32(hi),
-                    );
-                    m512_add_dpbusd_epi32::<FULL_RANGE>(
-                        a,
-                        values,
-                        _mm512_load_si512(weights.as_ptr().add(offset * 8).cast()),
-                    );
-                }
-            }
-            // i32の周回加算は結合的。バイアスは上下のレーンを合算した後に一度足す。
-            for stride in [1, 2, 4] {
-                for s in (0..8).step_by(stride * 2) {
-                    acc[s] = _mm512_add_epi32(acc[s], acc[s + stride]);
-                }
-            }
-            // shuffle_i32x4はAVX-512Fだけで使え、DQ/VLを追加で要求しない。
-            let sum = _mm512_add_epi32(acc[0], _mm512_shuffle_i32x4::<0x4e>(acc[0], acc[0]));
-            let bias = _mm512_maskz_loadu_epi32(0x00ff, biases.as_ptr());
-            _mm512_mask_storeu_epi32(output.as_mut_ptr(), 0x00ff, _mm512_add_epi32(sum, bias));
-        } else if const { avx512_accumulator_groups(OUTPUT / 16) > 1 } {
-            kernel::<INPUT, OUTPUT, FULL_RANGE, 9>(input, weights, biases, output);
-        } else {
-            kernel::<INPUT, OUTPUT, FULL_RANGE, 64>(input, weights, biases, output);
-        }
-    }
-}
-
-/// static affine kernel が入力4byte chunk単位の配置を使うか。
-pub(crate) const fn uses_scrambled_weights(output: usize) -> bool {
-    if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
-        output.is_multiple_of(8) && output > 0
-    } else if cfg!(all(
-        target_arch = "x86_64",
-        target_feature = "ssse3",
-        not(target_feature = "avx2")
-    )) {
-        output.is_multiple_of(4) && output > 0
-    } else {
-        false
-    }
-}
-
 /// AVX2での水平加算（i32×8 → i32）
-///
-/// AVX-512 ビルドでも propagate の AVX2 フォールスルー経路から参照されるため
-/// compile-in する（_mm256 命令のみで avx512 ビルドでも利用可能）。
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(all(
+        target_feature = "avx512f",
+        any(target_feature = "avx512vnni", target_feature = "avx512bw")
+    ))
+))]
 #[inline]
 unsafe fn hsum_i32_avx2(v: std::arch::x86_64::__m256i) -> i32 {
     // SAFETY: 呼び出し側が avx2 フィーチャを保証する
@@ -246,7 +52,7 @@ unsafe fn hsum_i32_avx2(v: std::arch::x86_64::__m256i) -> i32 {
 /// 512bit = 64バイト = 16 x i32 を一度に処理。
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni"))]
 #[inline]
-unsafe fn m512_add_dpbusd_epi32<const FULL_RANGE: bool>(
+unsafe fn m512_add_dpbusd_epi32(
     acc: &mut std::arch::x86_64::__m512i,
     a: std::arch::x86_64::__m512i,
     b: std::arch::x86_64::__m512i,
@@ -267,7 +73,7 @@ unsafe fn m512_add_dpbusd_epi32<const FULL_RANGE: bool>(
     not(target_feature = "avx512vnni")
 ))]
 #[inline]
-unsafe fn m512_add_dpbusd_epi32<const FULL_RANGE: bool>(
+unsafe fn m512_add_dpbusd_epi32(
     acc: &mut std::arch::x86_64::__m512i,
     a: std::arch::x86_64::__m512i,
     b: std::arch::x86_64::__m512i,
@@ -275,33 +81,27 @@ unsafe fn m512_add_dpbusd_epi32<const FULL_RANGE: bool>(
     // SAFETY: 呼び出し側が avx512bw フィーチャを保証する
     unsafe {
         use std::arch::x86_64::*;
-        if FULL_RANGE {
-            // 7bit 部分と最上位 bit を別々に積和する。各隣接和は i16 内に
-            // 収まり（最小 -32768）、i32 化してから合算すれば qa255 も飽和しない。
-            let low = _mm512_and_si512(a, _mm512_set1_epi8(127));
-            let high = _mm512_andnot_si512(_mm512_set1_epi8(127), a);
-            let product = _mm512_maddubs_epi16(low, b);
-            let high_product = _mm512_maddubs_epi16(high, b);
-            let high32 = _mm512_madd_epi16(high_product, _mm512_set1_epi16(1));
-            // madd: i16×i16 → i32 (隣接ペアの積和)
-            let product32 = _mm512_madd_epi16(product, _mm512_set1_epi16(1));
-            *acc = _mm512_add_epi32(*acc, _mm512_add_epi32(product32, high32));
-        } else {
-            let product = _mm512_maddubs_epi16(a, b);
-            let product32 = _mm512_madd_epi16(product, _mm512_set1_epi16(1));
-            *acc = _mm512_add_epi32(*acc, product32);
-        }
+        // maddubs: u8×i8 → i16 (飽和加算)
+        let product = _mm512_maddubs_epi16(a, b);
+        // madd: i16×i16 → i32 (隣接ペアの積和)
+        let product32 = _mm512_madd_epi16(product, _mm512_set1_epi16(1));
+        *acc = _mm512_add_epi32(*acc, product32);
     }
 }
 
 /// AVX2用 DPBUSD エミュレーション（u8×i8→i32積和演算）
 ///
-/// VNNI非対応CPU向け。入力を分割した `maddubs` + `madd` で飽和なしの積和演算を実行。
-/// AVX-512 ビルドでも propagate の AVX2 フォールスルー経路から参照されるため
-/// compile-in する。
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+/// VNNI非対応CPU向け。`maddubs` + `madd` の2命令で積和演算を実行。
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(all(
+        target_feature = "avx512f",
+        any(target_feature = "avx512vnni", target_feature = "avx512bw")
+    ))
+))]
 #[inline]
-pub(crate) unsafe fn m256_add_dpbusd_epi32<const FULL_RANGE: bool>(
+unsafe fn m256_add_dpbusd_epi32(
     acc: &mut std::arch::x86_64::__m256i,
     a: std::arch::x86_64::__m256i,
     b: std::arch::x86_64::__m256i,
@@ -309,21 +109,9 @@ pub(crate) unsafe fn m256_add_dpbusd_epi32<const FULL_RANGE: bool>(
     // SAFETY: 呼び出し側が avx2 フィーチャを保証する
     unsafe {
         use std::arch::x86_64::*;
-        if FULL_RANGE {
-            // 7bit 部分と最上位 bit を別々に積和する。各隣接和は i16 内に
-            // 収まり（最小 -32768）、i32 化してから合算すれば qa255 も飽和しない。
-            let low = _mm256_and_si256(a, _mm256_set1_epi8(127));
-            let high = _mm256_andnot_si256(_mm256_set1_epi8(127), a);
-            let product = _mm256_maddubs_epi16(low, b);
-            let high_product = _mm256_maddubs_epi16(high, b);
-            let high32 = _mm256_madd_epi16(high_product, _mm256_set1_epi16(1));
-            let product32 = _mm256_madd_epi16(product, _mm256_set1_epi16(1));
-            *acc = _mm256_add_epi32(*acc, _mm256_add_epi32(product32, high32));
-        } else {
-            let product = _mm256_maddubs_epi16(a, b);
-            let product32 = _mm256_madd_epi16(product, _mm256_set1_epi16(1));
-            *acc = _mm256_add_epi32(*acc, product32);
-        }
+        let product = _mm256_maddubs_epi16(a, b);
+        let product32 = _mm256_madd_epi16(product, _mm256_set1_epi16(1));
+        *acc = _mm256_add_epi32(*acc, product32);
     }
 }
 
@@ -359,7 +147,7 @@ unsafe fn hsum_i32_sse2(v: std::arch::x86_64::__m128i) -> i32 {
     not(target_feature = "avx2")
 ))]
 #[inline]
-pub(crate) unsafe fn m128_add_dpbusd_epi32<const FULL_RANGE: bool>(
+unsafe fn m128_add_dpbusd_epi32(
     acc: &mut std::arch::x86_64::__m128i,
     a: std::arch::x86_64::__m128i,
     b: std::arch::x86_64::__m128i,
@@ -367,21 +155,9 @@ pub(crate) unsafe fn m128_add_dpbusd_epi32<const FULL_RANGE: bool>(
     // SAFETY: 呼び出し側が ssse3 フィーチャを保証する
     unsafe {
         use std::arch::x86_64::*;
-        if FULL_RANGE {
-            // 7bit 部分と最上位 bit を別々に積和する。各隣接和は i16 内に
-            // 収まり（最小 -32768）、i32 化してから合算すれば qa255 も飽和しない。
-            let low = _mm_and_si128(a, _mm_set1_epi8(127));
-            let high = _mm_andnot_si128(_mm_set1_epi8(127), a);
-            let product = _mm_maddubs_epi16(low, b);
-            let high_product = _mm_maddubs_epi16(high, b);
-            let high32 = _mm_madd_epi16(high_product, _mm_set1_epi16(1));
-            let product32 = _mm_madd_epi16(product, _mm_set1_epi16(1));
-            *acc = _mm_add_epi32(*acc, _mm_add_epi32(product32, high32));
-        } else {
-            let product = _mm_maddubs_epi16(a, b);
-            let product32 = _mm_madd_epi16(product, _mm_set1_epi16(1));
-            *acc = _mm_add_epi32(*acc, product32);
-        }
+        let product = _mm_maddubs_epi16(a, b); // SSSE3命令
+        let product32 = _mm_madd_epi16(product, _mm_set1_epi16(1));
+        *acc = _mm_add_epi32(*acc, product32);
     }
 }
 
@@ -393,21 +169,24 @@ pub(crate) unsafe fn dot_i8x16_u8i8_preexpanded(
     in_hi: std::arch::wasm32::v128,
     w_vec: std::arch::wasm32::v128,
 ) -> std::arch::wasm32::v128 {
-    use std::arch::wasm32::*;
-    let w_lo = i16x8_extend_low_i8x16(w_vec);
-    let w_hi = i16x8_extend_high_i8x16(w_vec);
+    // SAFETY: 呼び出し側が wasm32 simd128 フィーチャを保証する
+    unsafe {
+        use std::arch::wasm32::*;
+        let w_lo = i16x8_extend_low_i8x16(w_vec);
+        let w_hi = i16x8_extend_high_i8x16(w_vec);
 
-    let prod_lo = i16x8_mul(in_lo, w_lo);
-    let prod_hi = i16x8_mul(in_hi, w_hi);
+        let prod_lo = i16x8_mul(in_lo, w_lo);
+        let prod_hi = i16x8_mul(in_hi, w_hi);
 
-    let sum32_lo_lo = i32x4_extend_low_i16x8(prod_lo);
-    let sum32_lo_hi = i32x4_extend_high_i16x8(prod_lo);
-    let sum32_hi_lo = i32x4_extend_low_i16x8(prod_hi);
-    let sum32_hi_hi = i32x4_extend_high_i16x8(prod_hi);
+        let sum32_lo_lo = i32x4_extend_low_i16x8(prod_lo);
+        let sum32_lo_hi = i32x4_extend_high_i16x8(prod_lo);
+        let sum32_hi_lo = i32x4_extend_low_i16x8(prod_hi);
+        let sum32_hi_hi = i32x4_extend_high_i16x8(prod_hi);
 
-    let mut acc = i32x4_add(sum32_lo_lo, sum32_lo_hi);
-    acc = i32x4_add(acc, sum32_hi_lo);
-    i32x4_add(acc, sum32_hi_hi)
+        let mut acc = i32x4_add(sum32_lo_lo, sum32_lo_hi);
+        acc = i32x4_add(acc, sum32_hi_lo);
+        i32x4_add(acc, sum32_hi_hi)
+    }
 }
 
 /// WASM SIMD128: 入力ベクトルをu16拡張して内積を計算
@@ -430,11 +209,14 @@ pub(crate) unsafe fn dot_i8x16_u8i8(
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 pub(crate) unsafe fn hsum_i32x4(v: std::arch::wasm32::v128) -> i32 {
-    use std::arch::wasm32::*;
-    i32x4_extract_lane::<0>(v)
-        + i32x4_extract_lane::<1>(v)
-        + i32x4_extract_lane::<2>(v)
-        + i32x4_extract_lane::<3>(v)
+    // SAFETY: 呼び出し側が wasm32 simd128 フィーチャを保証する
+    unsafe {
+        use std::arch::wasm32::*;
+        i32x4_extract_lane::<0>(v)
+            + i32x4_extract_lane::<1>(v)
+            + i32x4_extract_lane::<2>(v)
+            + i32x4_extract_lane::<3>(v)
+    }
 }
 
 /// WASM SIMD128: 2本のi32x4を水平加算（シャッフル + 加算）
@@ -444,8 +226,11 @@ pub(crate) unsafe fn hadd_i32x4(
     x0: std::arch::wasm32::v128,
     x1: std::arch::wasm32::v128,
 ) -> std::arch::wasm32::v128 {
-    use std::arch::wasm32::*;
-    i32x4_add(i32x4_shuffle::<0, 2, 4, 6>(x0, x1), i32x4_shuffle::<1, 3, 5, 7>(x0, x1))
+    // SAFETY: 呼び出し側が wasm32 simd128 フィーチャを保証する
+    unsafe {
+        use std::arch::wasm32::*;
+        i32x4_add(i32x4_shuffle::<0, 2, 4, 6>(x0, x1), i32x4_shuffle::<1, 3, 5, 7>(x0, x1))
+    }
 }
 
 /// WASM SIMD128: 4本のi32x4を水平加算して1本のi32x4に詰める
@@ -462,12 +247,11 @@ pub(crate) unsafe fn haddx4(
 }
 
 /// アフィン変換層
-#[derive(Clone)]
 pub struct AffineTransform<const INPUT_DIM: usize, const OUTPUT_DIM: usize> {
     /// バイアス
     pub biases: [i32; OUTPUT_DIM],
-    /// 重み（格納レイアウトは should_use_scrambled_weights() に従う、64バイトアライン）
-    pub weights: WeightBox<i8>,
+    /// 重み（転置形式で保持、64バイトアライン）
+    pub weights: AlignedBox<i8>,
 }
 
 impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> Default
@@ -483,18 +267,44 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 
     /// チャンクサイズ（u8×4 = i32として読む単位）
     /// スクランブル形式重みとループ逆転最適化用
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "ssse3",
+            not(target_feature = "avx2")
+        )
+    ))]
     const CHUNK_SIZE: usize = 4;
 
     /// 入力チャンク数（ループ逆転最適化用）
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "ssse3",
+            not(target_feature = "avx2")
+        )
+    ))]
     const NUM_INPUT_CHUNKS: usize = Self::PADDED_INPUT / Self::CHUNK_SIZE;
 
-    /// 重み格納レイアウトの単一判定。`read`/`read_leb128`/`propagate` が
-    /// すべてこれを参照し、格納時と読み出し時のレイアウト不一致を防ぐ。
-    /// true のとき重みはスクランブル形式（input_chunk-major）で格納・参照される。
-    /// スクランブル経路を持たない target（wasm SIMD / SSE2 / スカラー）では常に false。
+    /// スクランブル形式のウェイトを使用するかどうか
+    /// AVX2: OUTPUT_DIM % 8 == 0、SSSE3: OUTPUT_DIM % 4 == 0 の場合に使用
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "ssse3",
+            not(target_feature = "avx2")
+        )
+    ))]
     #[inline]
     const fn should_use_scrambled_weights() -> bool {
-        uses_scrambled_weights(OUTPUT_DIM)
+        if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+            OUTPUT_DIM.is_multiple_of(8) && OUTPUT_DIM > 0
+        } else {
+            OUTPUT_DIM.is_multiple_of(4) && OUTPUT_DIM > 0
+        }
     }
 
     /// 重みインデックスのスクランブル変換
@@ -505,50 +315,35 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
     ///
     /// i = output * PADDED_INPUT + input の元インデックスに対して
     /// スクランブル後のインデックスを返す
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "ssse3",
+            not(target_feature = "avx2")
+        )
+    ))]
     #[inline]
     const fn get_weight_index_scrambled(i: usize) -> usize {
         // i = output * PADDED_INPUT + input
-        // output = i / PADDED_INPUT, input = i % PADDED_INPUT
-        // input_chunk = input / CHUNK_SIZE, byte_in_chunk = input % CHUNK_SIZE
+        // output = i / PADDED_INPUT
+        // input = i % PADDED_INPUT
+        // input_chunk = input / CHUNK_SIZE
+        // byte_in_chunk = input % CHUNK_SIZE
+        //
         // 変換後: input_chunk * OUTPUT_DIM * CHUNK_SIZE + output * CHUNK_SIZE + byte_in_chunk
-        (i / Self::CHUNK_SIZE) % Self::NUM_INPUT_CHUNKS * OUTPUT_DIM * Self::CHUNK_SIZE
+        (i / Self::CHUNK_SIZE) % (Self::PADDED_INPUT / Self::CHUNK_SIZE)
+            * OUTPUT_DIM
+            * Self::CHUNK_SIZE
             + i / Self::PADDED_INPUT * Self::CHUNK_SIZE
             + i % Self::CHUNK_SIZE
-    }
-
-    /// `.bin` の row-major flat index を実行時の格納 index に変換する。
-    #[inline]
-    pub(crate) const fn file_weight_index(i: usize) -> usize {
-        if Self::should_use_scrambled_weights() {
-            Self::get_weight_index_scrambled(i)
-        } else {
-            i
-        }
-    }
-
-    /// padding を含むファイル格納上の weight 要素数。
-    pub(crate) const fn weight_len() -> usize {
-        OUTPUT_DIM * Self::PADDED_INPUT
-    }
-
-    #[cfg(any(test, feature = "layerstack-arch"))]
-    pub(crate) fn file_weight(&self, index: usize) -> i8 {
-        self.weights[Self::file_weight_index(index)]
-    }
-
-    #[cfg(any(test, feature = "layerstack-arch"))]
-    pub(crate) fn apply_file_weight_delta(&mut self, index: usize, delta: i32) -> bool {
-        let memory_index = Self::file_weight_index(index);
-        let (value, clamped) = super::net_delta::add_i8_delta(self.weights[memory_index], delta);
-        self.weights.make_mut()[memory_index] = value;
-        clamped
     }
 
     /// ゼロ初期化で新規作成
     pub fn new() -> Self {
         Self {
             biases: [0i32; OUTPUT_DIM],
-            weights: AlignedBox::new_zeroed(OUTPUT_DIM * Self::PADDED_INPUT).into(),
+            weights: AlignedBox::new_zeroed(OUTPUT_DIM * Self::PADDED_INPUT),
         }
     }
 
@@ -563,36 +358,47 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
         }
 
         // 重みを読み込み（64バイトアラインで確保）
-        // 格納レイアウトは should_use_scrambled_weights() の単一判定に従う。
-        let weight_size = Self::weight_len();
+        let weight_size = OUTPUT_DIM * Self::PADDED_INPUT;
         let mut weights = AlignedBox::new_zeroed(weight_size);
         let mut buf1 = [0u8; 1];
 
-        for i in 0..weight_size {
-            reader.read_exact(&mut buf1)?;
-            let idx = Self::file_weight_index(i);
-            weights[idx] = buf1[0] as i8;
+        // AVX2: OUTPUT_DIM % 8 == 0、SSSE3: OUTPUT_DIM % 4 == 0 の場合はスクランブル形式で格納
+        #[cfg(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            all(
+                target_arch = "x86_64",
+                target_feature = "ssse3",
+                not(target_feature = "avx2")
+            )
+        ))]
+        {
+            for i in 0..weight_size {
+                reader.read_exact(&mut buf1)?;
+                let idx = if Self::should_use_scrambled_weights() {
+                    Self::get_weight_index_scrambled(i)
+                } else {
+                    i
+                };
+                weights[idx] = buf1[0] as i8;
+            }
         }
 
-        Ok(Self {
-            biases,
-            weights: weights.into(),
-        })
-    }
-
-    #[cfg(feature = "prepacked-nnue")]
-    pub(super) fn read_packed<R: Read + std::io::Seek>(
-        reader: &mut R,
-        packed: &super::prepacked::PackedModel,
-    ) -> io::Result<Self> {
-        let mut biases = [0i32; OUTPUT_DIM];
-        for bias in &mut biases {
-            let mut bytes = [0; 4];
-            reader.read_exact(&mut bytes)?;
-            *bias = i32::from_le_bytes(bytes);
+        // 非AVX2/非SSSE3環境: 元の順序で格納
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            all(
+                target_arch = "x86_64",
+                target_feature = "ssse3",
+                not(target_feature = "avx2")
+            )
+        )))]
+        {
+            for i in 0..weight_size {
+                reader.read_exact(&mut buf1)?;
+                weights[i] = buf1[0] as i8;
+            }
         }
-        let weights =
-            packed.fc(reader, INPUT_DIM, OUTPUT_DIM, Self::should_use_scrambled_weights())?;
+
         Ok(Self { biases, weights })
     }
 
@@ -608,101 +414,191 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
         }
 
         // 重みを読み込み（64バイトアラインで確保）
-        // 格納レイアウトは should_use_scrambled_weights() の単一判定に従う。
-        let weight_size = Self::weight_len();
+        let weight_size = OUTPUT_DIM * Self::PADDED_INPUT;
         let mut weights = AlignedBox::new_zeroed(weight_size);
 
-        for i in 0..weight_size {
-            let val = read_signed_leb128(reader)?;
-            let idx = Self::file_weight_index(i);
-            weights[idx] = val as i8;
+        // AVX2/SSSE3: スクランブル形式で格納
+        #[cfg(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            all(
+                target_arch = "x86_64",
+                target_feature = "ssse3",
+                not(target_feature = "avx2")
+            )
+        ))]
+        {
+            for i in 0..weight_size {
+                let val = read_signed_leb128(reader)?;
+                let idx = if Self::should_use_scrambled_weights() {
+                    Self::get_weight_index_scrambled(i)
+                } else {
+                    i
+                };
+                weights[idx] = val as i8;
+            }
         }
 
-        Ok(Self {
-            biases,
-            weights: weights.into(),
-        })
+        // 非AVX2/非SSSE3環境: 元の順序で格納
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            all(
+                target_arch = "x86_64",
+                target_feature = "ssse3",
+                not(target_feature = "avx2")
+            )
+        )))]
+        {
+            for i in 0..weight_size {
+                let val = read_signed_leb128(reader)?;
+                weights[i] = val as i8;
+            }
+        }
+
+        Ok(Self { biases, weights })
     }
 
     /// 順伝播
     ///
     /// AVX2/SSE2/WASMのSIMD最適化版。
-    /// 密な行列積方式で実装。
+    /// 密な行列積方式（YaneuraOuスタイル）で実装。
     ///
-    /// 入力は `INPUT_DIM` を32の倍数に切り上げた長さ以上とし、`INPUT_DIM` より後ろは呼び出し側がゼロで埋めておく。
-    /// 入力のアライメントは問わない。
+    /// # アライメント要件
     ///
-    /// # Panics
-    /// 入力または公開フィールドの重み配列が必要な長さに満たない場合。
-    /// SIMD のスクランブル配置を使う場合、出力次元は1024以下でなければならない。
+    /// **重要**: 入力スライスは64バイトアライメントが必要です。
+    ///
+    /// | ターゲット | 必要アライメント | 使用命令 |
+    /// |-----------|-----------------|----------|
+    /// | AVX2 (`x86_64`) | 32バイト以上 | `_mm256_load_si256` |
+    /// | SSE2 (`x86_64`) | 16バイト以上 | `_mm_load_si128` |
+    /// | WASM SIMD128 | 不要 | `v128_load`（任意アドレス対応） |
+    /// | スカラー | 不要 | - |
+    ///
+    /// アライメントを保証するには、[`Aligned`](super::accumulator::Aligned) ラッパーを使用してください:
+    ///
+    /// ```ignore
+    /// use crate::nnue::accumulator::Aligned;
+    ///
+    /// let mut input = Aligned([0u8; 512]);  // 64バイトアライン
+    /// transform.propagate(&input.0, &mut output);
+    /// ```
+    ///
+    /// **警告**: アライメントされていない入力を渡すと、AVX2/SSE2環境で
+    /// 未定義動作（SIGSEGV等）が発生します。
+    ///
+    /// # 入力サイズの契約
+    ///
+    /// 入力スライスは `PADDED_INPUT` バイト以上である必要がある。
+    /// SIMD実装は32バイト（AVX2）または16バイト（SSE2）単位で処理するため、
+    /// `INPUT_DIM` より小さい入力を渡すと境界外アクセスが発生する。
+    ///
+    /// # 入力密度
+    ///
+    /// 実測結果（2025-12-18）: 約40%（39-42%）
+    /// → スパース最適化には高すぎるため、密な行列積方式が正しい選択。
+    /// 詳細は `network.rs` の diagnostics 計測コードを参照。
     pub fn propagate(&self, input: &[u8], output: &mut [i32; OUTPUT_DIM]) {
-        self.propagate_impl::<true>(input, output);
-    }
-
-    /// 入力が `[0, 127]` に収まることを呼び出し側が保証する場合の順伝播。
-    ///
-    /// 隣接 2 項の `u8 * i8` 和は最悪でも `127 * -128 * 2` で i16 に収まるため、
-    /// `maddubs` を分割せずに使える。全 u8 範囲を渡すと i16 飽和で結果が変わる。
-    pub fn propagate_7bit(&self, input: &[u8], output: &mut [i32; OUTPUT_DIM]) {
         debug_assert!(
-            input[..INPUT_DIM].iter().all(|&x| x <= 127),
-            "propagate_7bit received an input above 127"
-        );
-        self.propagate_impl::<false>(input, output);
-    }
-
-    fn propagate_impl<const FULL_RANGE: bool>(&self, input: &[u8], output: &mut [i32; OUTPUT_DIM]) {
-        assert!(
             input.len() >= Self::PADDED_INPUT,
             "input length {} is less than PADDED_INPUT {}",
             input.len(),
             Self::PADDED_INPUT
         );
-        assert!(self.weights.len() >= OUTPUT_DIM * Self::PADDED_INPUT);
-        assert!(!Self::should_use_scrambled_weights() || OUTPUT_DIM <= 1024);
 
+        // AVX-512: 512bit = 64 x u8/i8 または 16 x i32
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
             any(target_feature = "avx512vnni", target_feature = "avx512bw")
         ))]
-        if Self::should_use_scrambled_weights() && OUTPUT_DIM.is_multiple_of(16) {
-            // SAFETY: 重みは64バイト境界のinput_chunk-major配置で、入力は
-            // PADDED_INPUT以上、重みはOUTPUT_DIM * PADDED_INPUT要素を持つ。
-            // cfgが命令セットを保証し、FULL_RANGE=falseの入力は7bitに制限される。
-            unsafe {
-                propagate_affine_avx512::<INPUT_DIM, OUTPUT_DIM, FULL_RANGE>(
-                    input,
-                    &self.weights,
-                    &self.biases,
-                    output,
-                );
-            }
-            return;
-        }
-
-        // AVX2: 256bit = 32 x u8/i8
-        // AVX-512 ビルドでも compile-in する。AVX-512 経路は OUTPUT_DIM % 16 == 0 のみ
-        // 処理して return するため、それ以外（例 OUTPUT_DIM=8）はここへフォールスルーする。
-        // これを not(avx512) で除外するとフォールスルー先が消え、スクランブル重みを
-        // 行優先で誤読する scalar fallback に落ちて誤った積和になる。
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             // SAFETY:
-            // - 入力・重みの長さは propagate_impl の先頭で検証済み
-            // - 入力は unaligned load、重みは64バイト整列済み
-            // - PADDED_INPUT は32の倍数なので、重みの各オフセットは32バイト境界 (重みの aligned load の前提)
+            // - input.len() >= PADDED_INPUT (debug_assert で検証済み)
+            // - weights.len() >= OUTPUT_DIM * PADDED_INPUT (構造上保証)
+            // - input は Aligned<[u8; N]> で64バイトアライン
+            // - weights は AlignedBox<i8> で64バイトアライン（スクランブル形式）
+            // - PADDED_INPUT は32の倍数なのでオフセットは常に64バイト境界
             // - biases/output はアライン未保証だが、unaligned load/store を使用
             unsafe {
                 use std::arch::x86_64::*;
 
-                // スクランブル格納時（AVX2 では OUTPUT_DIM % 8 == 0）: ループ逆転最適化版。
-                // それ以外（行優先格納）はフォールスルーして下の行優先ループで処理する。
+                // OUTPUT_DIM % 16 == 0 の場合: ループ逆転最適化版（AVX-512）
+                // 入力をブロードキャストして全出力に同時適用
+                #[allow(clippy::needless_range_loop)]
+                if OUTPUT_DIM.is_multiple_of(16) && OUTPUT_DIM > 0 {
+                    // 出力レジスタ数（16出力/レジスタ）
+                    const MAX_REGS: usize = 64; // 最大1024出力まで対応
+                    let num_regs = OUTPUT_DIM / 16;
+                    debug_assert!(num_regs <= MAX_REGS);
+
+                    // アキュムレータをバイアスで初期化
+                    let mut acc = [_mm512_setzero_si512(); MAX_REGS];
+                    let bias_ptr = self.biases.as_ptr() as *const __m512i;
+                    for k in 0..num_regs {
+                        acc[k] = _mm512_loadu_si512(bias_ptr.add(k));
+                    }
+
+                    let input32 = input.as_ptr() as *const i32;
+                    let weights_ptr = self.weights.as_ptr();
+
+                    // 外側: 入力チャンク（入力4バイト = 1 i32）
+                    for i in 0..Self::NUM_INPUT_CHUNKS {
+                        // 入力4バイトを全レーンにブロードキャスト
+                        let in_val = _mm512_set1_epi32(*input32.add(i));
+
+                        // この入力チャンクに対応する重みの開始位置
+                        // スクランブル形式: weights[input_chunk][output][4]
+                        let col =
+                            weights_ptr.add(i * OUTPUT_DIM * Self::CHUNK_SIZE) as *const __m512i;
+
+                        // 内側: 全出力レジスタに積和演算
+                        for k in 0..num_regs {
+                            m512_add_dpbusd_epi32(
+                                &mut acc[k],
+                                in_val,
+                                _mm512_load_si512(col.add(k)),
+                            );
+                        }
+                    }
+
+                    // 結果を出力
+                    let out_ptr = output.as_mut_ptr() as *mut __m512i;
+                    for k in 0..num_regs {
+                        _mm512_storeu_si512(out_ptr.add(k), acc[k]);
+                    }
+                    return;
+                }
+
+                // OUTPUT_DIM % 16 != 0 だが % 8 == 0 の場合: AVX2 にフォールスルー
+            }
+        }
+
+        // AVX2: 256bit = 32 x u8/i8
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(all(
+                target_feature = "avx512f",
+                any(target_feature = "avx512vnni", target_feature = "avx512bw")
+            ))
+        ))]
+        {
+            // SAFETY:
+            // - input.len() >= PADDED_INPUT (debug_assert で検証済み)
+            // - weights.len() >= OUTPUT_DIM * PADDED_INPUT (構造上保証)
+            // - input は Aligned<[u8; N]> で64バイトアライン
+            // - weights は AlignedBox<i8> で64バイトアライン（スクランブル形式）
+            // - PADDED_INPUT は32の倍数なのでオフセットは常に32バイト境界
+            // - biases/output はアライン未保証だが、unaligned load/store を使用
+            unsafe {
+                use std::arch::x86_64::*;
+
+                // OUTPUT_DIM % 8 == 0 の場合: ループ逆転最適化版
+                // 入力をブロードキャストして全出力に同時適用
                 //
                 // 疎入力処理は密度40%では効果なし（find_nnzオーバーヘッドが利点を上回る）
                 // 計測結果: 疎入力版 634K NPS vs 密版 655K NPS
                 #[allow(clippy::needless_range_loop)]
-                if Self::should_use_scrambled_weights() {
+                if OUTPUT_DIM.is_multiple_of(8) && OUTPUT_DIM > 0 {
                     // 出力レジスタ数（8出力/レジスタ）
                     const MAX_REGS: usize = 128; // 最大1024出力まで対応
                     let num_regs = OUTPUT_DIM / 8;
@@ -721,7 +617,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
                     // 外側: 入力チャンク（入力4バイト = 1 i32）
                     for i in 0..Self::NUM_INPUT_CHUNKS {
                         // 入力4バイトを全レーンにブロードキャスト
-                        let in_val = _mm256_set1_epi32(input32.add(i).read_unaligned());
+                        let in_val = _mm256_set1_epi32(*input32.add(i));
 
                         // この入力チャンクに対応する重みの開始位置
                         // スクランブル形式: weights[input_chunk][output][4]
@@ -730,7 +626,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 
                         // 内側: 全出力レジスタに積和演算
                         for k in 0..num_regs {
-                            m256_add_dpbusd_epi32::<FULL_RANGE>(
+                            m256_add_dpbusd_epi32(
                                 &mut acc[k],
                                 in_val,
                                 _mm256_load_si256(col.add(k)),
@@ -748,6 +644,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 
                 // OUTPUT_DIM % 8 != 0 の場合: 従来の実装（出力ごとに処理）
                 let num_chunks = Self::PADDED_INPUT / 32;
+                let one = _mm256_set1_epi16(1);
                 let input_ptr = input.as_ptr();
                 let weights_ptr = self.weights.as_ptr();
 
@@ -757,11 +654,13 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 
                     for k in 0..num_chunks {
                         let offset = k * 32;
-                        let in_vec = _mm256_loadu_si256(input_ptr.add(offset) as *const __m256i);
+                        let in_vec = _mm256_load_si256(input_ptr.add(offset) as *const __m256i);
                         let w_vec = _mm256_load_si256(
                             weights_ptr.add(weight_row_offset + offset) as *const __m256i
                         );
-                        m256_add_dpbusd_epi32::<FULL_RANGE>(&mut acc, in_vec, w_vec);
+                        let prod16 = _mm256_maddubs_epi16(in_vec, w_vec);
+                        let prod32 = _mm256_madd_epi16(prod16, one);
+                        acc = _mm256_add_epi32(acc, prod32);
                     }
 
                     *out = bias + hsum_i32_avx2(acc);
@@ -778,17 +677,19 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
         ))]
         {
             // SAFETY:
-            // - 入力・重みの長さは propagate_impl の先頭で検証済み
-            // - 入力は unaligned load、重みは64バイト整列済み
-            // - PADDED_INPUT は32の倍数なので、重みの各オフセットは16バイト境界 (重みの aligned load の前提)
+            // - input.len() >= PADDED_INPUT (debug_assert で検証済み)
+            // - weights.len() >= OUTPUT_DIM * PADDED_INPUT (構造上保証)
+            // - input は Aligned<[u8; N]> で64バイトアライン（16バイト境界も満たす）
+            // - weights は AlignedBox<i8> で64バイトアライン（スクランブル形式）
+            // - PADDED_INPUT は32の倍数なのでオフセットは常に16バイト境界
             // - biases/output はアライン未保証だが、unaligned load/store を使用
             unsafe {
                 use std::arch::x86_64::*;
 
-                // スクランブル格納時（SSSE3 では OUTPUT_DIM % 4 == 0）: ループ逆転最適化版。
-                // それ以外（行優先格納）はフォールスルーして下の行優先ループで処理する。
+                // OUTPUT_DIM % 4 == 0 の場合: ループ逆転最適化版
+                // 入力をブロードキャストして全出力に同時適用
                 #[allow(clippy::needless_range_loop)]
-                if Self::should_use_scrambled_weights() {
+                if OUTPUT_DIM.is_multiple_of(4) && OUTPUT_DIM > 0 {
                     // 出力レジスタ数（4出力/レジスタ）
                     const MAX_REGS: usize = 256; // 最大1024出力まで対応
                     let num_regs = OUTPUT_DIM / 4;
@@ -807,7 +708,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
                     // 外側: 入力チャンク（入力4バイト = 1 i32）
                     for i in 0..Self::NUM_INPUT_CHUNKS {
                         // 入力4バイトを全レーンにブロードキャスト
-                        let in_val = _mm_set1_epi32(input32.add(i).read_unaligned());
+                        let in_val = _mm_set1_epi32(*input32.add(i));
 
                         // この入力チャンクに対応する重みの開始位置
                         // スクランブル形式: weights[input_chunk][output][4]
@@ -816,11 +717,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 
                         // 内側: 全出力レジスタに積和演算
                         for k in 0..num_regs {
-                            m128_add_dpbusd_epi32::<FULL_RANGE>(
-                                &mut acc[k],
-                                in_val,
-                                _mm_load_si128(col.add(k)),
-                            );
+                            m128_add_dpbusd_epi32(&mut acc[k], in_val, _mm_load_si128(col.add(k)));
                         }
                     }
 
@@ -834,6 +731,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 
                 // OUTPUT_DIM % 4 != 0 の場合: SSSE3の_mm_maddubs_epi16を使う通常版
                 let num_chunks = Self::PADDED_INPUT / 16;
+                let one = _mm_set1_epi16(1);
                 let input_ptr = input.as_ptr();
                 let weights_ptr = self.weights.as_ptr();
 
@@ -843,11 +741,14 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 
                     for k in 0..num_chunks {
                         let offset = k * 16;
-                        let in_vec = _mm_loadu_si128(input_ptr.add(offset) as *const __m128i);
+                        let in_vec = _mm_load_si128(input_ptr.add(offset) as *const __m128i);
                         let w_vec = _mm_load_si128(
                             weights_ptr.add(weight_row_offset + offset) as *const __m128i
                         );
-                        m128_add_dpbusd_epi32::<FULL_RANGE>(&mut acc, in_vec, w_vec);
+                        // SSSE3: _mm_maddubs_epi16
+                        let prod16 = _mm_maddubs_epi16(in_vec, w_vec);
+                        let prod32 = _mm_madd_epi16(prod16, one);
+                        acc = _mm_add_epi32(acc, prod32);
                     }
 
                     *out = bias + hsum_i32_sse2(acc);
@@ -863,12 +764,12 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
             not(target_feature = "ssse3")
         ))]
         {
-            // 本経路は重みを行優先で読む。スクランブル格納と共存しないことを単一判定で保証する。
-            const { assert!(!Self::should_use_scrambled_weights()) };
             // SAFETY:
-            // - 入力・重みの長さは propagate_impl の先頭で検証済み
-            // - 入力は unaligned load、重みは64バイト整列済み
-            // - PADDED_INPUT は32の倍数なので、重みの各オフセットは16バイト境界 (重みの aligned load の前提)
+            // - input.len() >= PADDED_INPUT (debug_assert で検証済み)
+            // - weights.len() >= OUTPUT_DIM * PADDED_INPUT (構造上保証)
+            // - input は Aligned<[u8; N]> で64バイトアライン（16バイト境界も満たす）
+            // - weights は AlignedBox<i8> で64バイトアライン
+            // - PADDED_INPUT は32の倍数なのでオフセットは常に16バイト境界
             unsafe {
                 use std::arch::x86_64::*;
 
@@ -889,7 +790,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
                     // 入力を16バイトずつ処理
                     for k in 0..num_chunks {
                         let offset = k * 16;
-                        let in_vec = _mm_loadu_si128(input_ptr.add(offset) as *const __m128i);
+                        let in_vec = _mm_load_si128(input_ptr.add(offset) as *const __m128i);
                         let w_vec = _mm_load_si128(
                             weights_ptr.add(weight_row_offset + offset) as *const __m128i
                         );
@@ -925,10 +826,9 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
         // WASM SIMD128
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         {
-            // 本経路は重みを行優先で読む。スクランブル格納と共存しないことを単一判定で保証する。
-            const { assert!(!Self::should_use_scrambled_weights()) };
             // SAFETY:
-            // - 入力・重みの長さは propagate_impl の先頭で検証済み
+            // - input.len() >= PADDED_INPUT (debug_assert で検証済み)
+            // - weights.len() >= OUTPUT_DIM * PADDED_INPUT (構造上保証)
             // - WASM SIMD128 はアライメント不要（v128_load/v128_store は任意のアドレスで動作）
             // - biases/output は4出力ずつ（j += 4）でアクセスし、i32配列なので
             //   オフセットは 4 * sizeof(i32) = 16バイトの倍数となり16バイト境界
@@ -941,7 +841,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
                 let input_ptr = input.as_ptr();
                 let weights_ptr = self.weights.as_ptr();
 
-                // 4出力同時処理: 入力ロードを再利用
+                // 4出力同時処理: 入力ロードを再利用（YaneuraOu dot4方式）
                 if OUTPUT_DIM.is_multiple_of(4) && OUTPUT_DIM > 0 {
                     let mut j = 0;
                     while j < OUTPUT_DIM {
@@ -1006,8 +906,6 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
         }
 
         // スカラーフォールバック
-        // スクランブル / 行優先のどちらの格納でも正しく読めるよう、weight index は
-        // should_use_scrambled_weights() の単一判定で解決する（x86 では本経路は到達不能）。
         #[allow(unreachable_code)]
         {
             // バイアスで初期化
@@ -1017,12 +915,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
             for (i, &in_byte) in input.iter().enumerate().take(INPUT_DIM) {
                 let in_val = in_byte as i32;
                 for (j, out) in output.iter_mut().enumerate() {
-                    let logical = j * Self::PADDED_INPUT + i;
-                    let weight_idx = if Self::should_use_scrambled_weights() {
-                        Self::get_weight_index_scrambled(logical)
-                    } else {
-                        logical
-                    };
+                    let weight_idx = j * Self::PADDED_INPUT + i;
                     *out += self.weights[weight_idx] as i32 * in_val;
                 }
             }
@@ -1034,7 +927,7 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 /// 入力: i32、出力: u8（0-127にクランプ）
 ///
 /// SIMD最適化版（AVX2/SSE2/WASM対応）
-/// 入力サイズに応じたフォールスルー構造で実装。
+/// tanuki-/YaneuraOu の clipped_relu.h を参考にフォールスルー構造で実装。
 ///
 /// # パフォーマンス特性
 ///
@@ -1052,8 +945,8 @@ impl<const INPUT_DIM: usize, const OUTPUT_DIM: usize> AffineTransform<INPUT_DIM,
 /// | アーキテクチャ | L1 | NPS | 備考 |
 /// |---------------|-----|-----|------|
 /// | HalfKP 256x2-32-32 | 256 | ~703 kNPS | 本構造体を使用 |
-/// | HalfKaHmMerged 512x2-8-96 | 512 | ~512 kNPS | 動的版使用 |
-/// | HalfKaHmMerged 1024x2-8-96 | 1024 | ~406 kNPS | 動的版使用 |
+/// | HalfKA_hm 512x2-8-96 | 512 | ~512 kNPS | 動的版使用 |
+/// | HalfKA_hm 1024x2-8-96 | 1024 | ~406 kNPS | 動的版使用 |
 pub struct ClippedReLU<const DIM: usize>;
 
 impl<const DIM: usize> ClippedReLU<DIM> {
@@ -1068,22 +961,7 @@ impl<const DIM: usize> ClippedReLU<DIM> {
     /// 3. 残りをSSE2で8要素ずつ処理（DIM=8対応）
     /// 4. 残りをスカラーで処理
     pub fn propagate(input: &[i32; DIM], output: &mut [u8; DIM]) {
-        #[cfg(any(
-            all(
-                target_arch = "x86_64",
-                any(target_feature = "avx2", target_feature = "sse2")
-            ),
-            all(target_arch = "wasm32", target_feature = "simd128")
-        ))]
         let mut processed: usize = 0;
-        #[cfg(not(any(
-            all(
-                target_arch = "x86_64",
-                any(target_feature = "avx2", target_feature = "sse2")
-            ),
-            all(target_arch = "wasm32", target_feature = "simd128")
-        )))]
-        let processed: usize = 0;
 
         // === AVX2: 32要素ずつ処理 ===
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -1217,8 +1095,7 @@ impl<const DIM: usize> ClippedReLU<DIM> {
         {
             let num_chunks = (DIM - processed) / 8;
             if num_chunks > 0 {
-                // SAFETY: cfgがSIMD128を保証し、各chunkの入力8要素・出力8バイトはDIM内。
-                // v128_loadとwrite_unalignedは入出力にSIMD境界の整列を要求しない。
+                // SAFETY: 同上
                 unsafe {
                     use std::arch::wasm32::*;
 
@@ -1237,7 +1114,7 @@ impl<const DIM: usize> ClippedReLU<DIM> {
                         let bytes = i8x16_narrow_i16x8(words, words);
                         let result = i8x16_max(bytes, zero);
 
-                        out_ptr.add(i).write_unaligned(i64x2_extract_lane::<0>(result));
+                        *out_ptr.add(i) = i64x2_extract_lane::<0>(result);
                     }
                 }
                 processed += num_chunks * 8;
@@ -1252,216 +1129,10 @@ impl<const DIM: usize> ClippedReLU<DIM> {
     }
 }
 
-// read 時のレイアウト変換も含め、全 u8 範囲を整数参照と照合する。
-#[cfg(test)]
-pub(crate) fn check_qa255_affine<const INPUT: usize, const OUTPUT: usize>(
-    propagate: impl Fn(&[u8], &[u8], &mut [i32; OUTPUT]),
-) {
-    let padded = padded_input(INPUT);
-    for qa in [127u8, 128, 255] {
-        for pattern in 0..4 {
-            let mut bytes = Vec::new();
-            let biases: Vec<i32> = (0..OUTPUT).map(|o| o as i32 * 73 - 201).collect();
-            for bias in &biases {
-                bytes.extend_from_slice(&bias.to_le_bytes());
-            }
-            let mut weights = vec![0i8; padded * OUTPUT];
-            for o in 0..OUTPUT {
-                for i in 0..INPUT {
-                    weights[o * padded + i] = match pattern {
-                        0 => 127,
-                        1 => -128,
-                        2 => {
-                            if (i / 2 + o) % 2 == 0 {
-                                127
-                            } else {
-                                -128
-                            }
-                        }
-                        _ => ((i * 37 + o * 19) % 256) as u8 as i8,
-                    };
-                }
-            }
-            bytes.extend(weights.iter().map(|w| *w as u8));
-            let mut input = AlignedBox::<u8>::new_zeroed(padded);
-            for (i, x) in input.iter_mut().take(INPUT).enumerate() {
-                *x = if pattern < 3 {
-                    qa
-                } else {
-                    [0, 1, 126, 127, 128, 129, 254, 255][i % 8].min(qa)
-                };
-            }
-            let mut actual = [0i32; OUTPUT];
-            propagate(&bytes, &input, &mut actual);
-            for o in 0..OUTPUT {
-                let expected = biases[o]
-                    + (0..INPUT)
-                        .map(|i| i32::from(input[i]) * i32::from(weights[o * padded + i]))
-                        .sum::<i32>();
-                assert_eq!(actual[o], expected, "qa={qa}, pattern={pattern}, output={o}");
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn affine_accepts_unaligned_input_and_rejects_short_buffers() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        fn check<const OUTPUT: usize>() {
-            let bytes = super::halfkx_affine_tests::dense_fixture(32, OUTPUT);
-            let mut layer = AffineTransform::<32, OUTPUT>::read(&mut &bytes[..]).unwrap();
-            let mut input = AlignedBox::<u8>::new_zeroed(33);
-            input.fill(127);
-            let mut output = [0; OUTPUT];
-            layer.propagate(&input[1..], &mut output);
-            assert_eq!(
-                output.as_slice(),
-                super::halfkx_affine_tests::dense_reference(&input[1..], OUTPUT)
-            );
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| layer.propagate(&input[..31], &mut output)))
-                    .is_err()
-            );
-            layer.weights = AlignedBox::new_zeroed(1).into();
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| layer.propagate(&input[1..], &mut output)))
-                    .is_err()
-            );
-        }
-
-        check::<1>();
-        check::<4>();
-        check::<8>();
-        check::<16>();
-    }
-
-    #[test]
-    fn qa255_affine_reference_matches_integer() {
-        check_qa255_affine::<32, 32>(|bytes, input, output| {
-            AffineTransform::<32, 32>::read(&mut &bytes[..])
-                .unwrap()
-                .propagate(input, output);
-        });
-        check_qa255_affine::<512, 8>(|bytes, input, output| {
-            AffineTransform::<512, 8>::read(&mut &bytes[..])
-                .unwrap()
-                .propagate(input, output);
-        });
-        check_qa255_affine::<32, 4>(|bytes, input, output| {
-            AffineTransform::<32, 4>::read(&mut &bytes[..])
-                .unwrap()
-                .propagate(input, output);
-        });
-        check_qa255_affine::<32, 1>(|bytes, input, output| {
-            AffineTransform::<32, 1>::read(&mut &bytes[..])
-                .unwrap()
-                .propagate(input, output);
-        });
-        check_qa255_affine::<760, 8>(|bytes, input, output| {
-            AffineTransform::<760, 8>::read(&mut &bytes[..])
-                .unwrap()
-                .propagate(input, output);
-        });
-    }
-
-    /// 入力が 7bit に収まる限り、専用経路は全範囲経路と同じ値を返す。
-    #[test]
-    fn propagate_7bit_matches_full_range_for_7bit_input() {
-        fn check<const INPUT: usize, const OUTPUT: usize>() {
-            let padded = padded_input(INPUT);
-            let mut bytes = Vec::new();
-            for o in 0..OUTPUT {
-                bytes.extend_from_slice(&((o as i32) * 91 - 733).to_le_bytes());
-            }
-            let mut state = 0x243f_6a88_85a3_08d3u64;
-            let mut next = move || {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                (state >> 33) as u8
-            };
-            for _ in 0..padded * OUTPUT {
-                bytes.push(next());
-            }
-            let layer = AffineTransform::<INPUT, OUTPUT>::read(&mut &bytes[..]).unwrap();
-
-            let mut input = AlignedBox::<u8>::new_zeroed(padded);
-            for (i, x) in input.iter_mut().take(INPUT).enumerate() {
-                *x = match i % 4 {
-                    0 => 0,
-                    1 => 127,
-                    2 => 126,
-                    _ => next() % 128,
-                };
-            }
-
-            let mut full = [0i32; OUTPUT];
-            let mut seven = [0i32; OUTPUT];
-            layer.propagate(&input, &mut full);
-            layer.propagate_7bit(&input, &mut seven);
-            assert_eq!(full, seven, "INPUT={INPUT}, OUTPUT={OUTPUT}");
-        }
-
-        check::<1536, 16>();
-        check::<32, 32>();
-        check::<32, 1>();
-        check::<512, 8>();
-        check::<760, 8>();
-    }
-
     use crate::nnue::accumulator::Aligned;
-
-    fn affine_file_bytes<const INPUT: usize, const OUTPUT: usize>(weight: i8) -> Vec<u8> {
-        let mut bytes = vec![0; OUTPUT * std::mem::size_of::<i32>()];
-        bytes.extend(std::iter::repeat_n(
-            weight as u8,
-            AffineTransform::<INPUT, OUTPUT>::weight_len(),
-        ));
-        bytes
-    }
-
-    fn assert_file_edit_matches_delta<const INPUT: usize, const OUTPUT: usize>() {
-        let weight_len = AffineTransform::<INPUT, OUTPUT>::weight_len();
-        for (case, file_index) in [4, weight_len / 2 + 4, weight_len - 5].into_iter().enumerate() {
-            let value = 21 + case as u8;
-            let mut edited = affine_file_bytes::<INPUT, OUTPUT>(0);
-            edited[OUTPUT * std::mem::size_of::<i32>() + file_index] = value;
-            let edited = AffineTransform::<INPUT, OUTPUT>::read(&mut std::io::Cursor::new(edited))
-                .expect("edited affine");
-
-            let mut delta = AffineTransform::<INPUT, OUTPUT>::read(&mut std::io::Cursor::new(
-                affine_file_bytes::<INPUT, OUTPUT>(0),
-            ))
-            .expect("base affine");
-            assert!(!delta.apply_file_weight_delta(file_index, i32::from(value)));
-
-            assert_eq!(delta.biases, edited.biases);
-            assert_eq!(&*delta.weights, &*edited.weights);
-        }
-
-        if AffineTransform::<INPUT, OUTPUT>::should_use_scrambled_weights() {
-            assert_ne!(AffineTransform::<INPUT, OUTPUT>::file_weight_index(4), 4);
-        }
-    }
-
-    #[test]
-    fn file_order_delta_matches_affine_read_layouts() {
-        assert_file_edit_matches_delta::<30, 32>();
-        assert_file_edit_matches_delta::<32, 1>();
-    }
-
-    #[test]
-    fn affine_weight_delta_saturates() {
-        let mut affine = AffineTransform::<30, 32>::read(&mut std::io::Cursor::new(
-            affine_file_bytes::<30, 32>(127),
-        ))
-        .expect("affine");
-        assert!(affine.apply_file_weight_delta(17, 1));
-        assert_eq!(affine.file_weight(17), i8::MAX);
-    }
 
     #[test]
     fn test_affine_transform_propagate() {
@@ -1475,9 +1146,11 @@ mod tests {
 
         let transform: AffineTransform<4, 2> = AffineTransform {
             biases: [10, 20],
-            weights: weights.into(),
+            weights,
         };
 
+        // 入力はPADDED_INPUT（32バイト）にパディングする必要がある
+        // SIMD実装は32バイト単位で処理するため、64バイトアライン必須
         let mut input = Aligned([0u8; 32]);
         input.0[0] = 1;
         input.0[1] = 2;
@@ -1507,29 +1180,6 @@ mod tests {
     }
 
     #[test]
-    fn clipped_relu_accepts_unaligned_output_with_simd_tails() {
-        fn check<const DIM: usize>() {
-            let input = std::array::from_fn(|i| {
-                [i32::MIN, -8192, -64, -1, 0, 63, 64, 8191, 8192, i32::MAX][i % 10]
-            });
-            let mut storage = Aligned([0xa5u8; 130]);
-            let output: &mut [u8; DIM] = (&mut storage.0[1..DIM + 1]).try_into().unwrap();
-            assert_eq!(output.as_ptr() as usize % 8, 1);
-            ClippedReLU::propagate(&input, output);
-            for (&value, &actual) in input.iter().zip(output.iter()) {
-                assert_eq!(actual, (value >> WEIGHT_SCALE_BITS).clamp(0, 127) as u8);
-            }
-            assert_eq!(storage.0[0], 0xa5);
-            assert_eq!(storage.0[DIM + 1], 0xa5);
-        }
-        check::<8>();
-        check::<13>();
-        check::<32>();
-        check::<67>();
-        check::<128>();
-    }
-
-    #[test]
     fn test_affine_transform_real_size() {
         // 実際の使用サイズ（512入力→32出力）に近いテスト
         // PADDED_INPUT = padded_input(512) = 512
@@ -1539,19 +1189,37 @@ mod tests {
         // スクランブル形式が有効な場合は変換して設定
         for i in 0..32 {
             let raw_idx = i * 512 + i; // 元のインデックス: weights[output][input]
+            #[cfg(any(
+                all(target_arch = "x86_64", target_feature = "avx2"),
+                all(
+                    target_arch = "x86_64",
+                    target_feature = "ssse3",
+                    not(target_feature = "avx2")
+                )
+            ))]
             let idx = if AffineTransform::<512, 32>::should_use_scrambled_weights() {
                 AffineTransform::<512, 32>::get_weight_index_scrambled(raw_idx)
             } else {
                 raw_idx
             };
+            #[cfg(not(any(
+                all(target_arch = "x86_64", target_feature = "avx2"),
+                all(
+                    target_arch = "x86_64",
+                    target_feature = "ssse3",
+                    not(target_feature = "avx2")
+                )
+            )))]
+            let idx = raw_idx;
             weights[idx] = 1;
         }
 
         let transform: AffineTransform<512, 32> = AffineTransform {
             biases: [10; 32],
-            weights: weights.into(),
+            weights,
         };
 
+        // 入力は64バイトアライン必須
         let mut input = Aligned([0u8; 512]);
         for (i, val) in input.0.iter_mut().take(32).enumerate() {
             *val = (i + 1) as u8; // 1, 2, 3, ..., 32
@@ -1565,94 +1233,4 @@ mod tests {
             assert_eq!(val, 10 + (i + 1) as i32, "mismatch at index {i}");
         }
     }
-
-    /// propagate / propagate_7bit の出力を、SIMD レイアウト（スクランブル形式）に依存しない
-    /// 行優先スカラー参照と bit 一致で照合する。
-    ///
-    /// OUTPUT_DIM が 16 の倍数でない L1（例 768x8）は AVX-512 経路では
-    /// %16==0 分岐に入れず AVX2 経路へフォールスルーする。AVX-512 ビルドで
-    /// その AVX2 経路が compile-out されるとスクランブル重みを行優先で誤読する
-    /// スカラーに落ちるため、その境界を固定する。
-    macro_rules! affine_reference_test {
-        ($name:ident, $in:literal, $out:literal) => {
-            #[test]
-            fn $name() {
-                use rand::{Rng, SeedableRng};
-                use rand_xoshiro::Xoshiro256PlusPlus;
-
-                const INPUT_DIM: usize = $in;
-                const OUTPUT_DIM: usize = $out;
-                const PADDED: usize = padded_input(INPUT_DIM);
-
-                let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xaff1_5120);
-                for trial in 0..8 {
-                    let mut biases = [0i32; OUTPUT_DIM];
-                    let mut logical = vec![0i8; OUTPUT_DIM * PADDED];
-                    let mut bytes: Vec<u8> = Vec::new();
-                    for bias in &mut biases {
-                        *bias = rng.random_range(-1_000_000..=1_000_000);
-                        bytes.extend_from_slice(&bias.to_le_bytes());
-                    }
-                    for o in 0..OUTPUT_DIM {
-                        for inp in 0..PADDED {
-                            // パディング重みは0、実重みはi8全域から生成する。
-                            let w = if inp < INPUT_DIM {
-                                rng.random::<i8>()
-                            } else {
-                                0
-                            };
-                            logical[o * PADDED + inp] = w;
-                            bytes.push(w as u8);
-                        }
-                    }
-
-                    let transform =
-                        AffineTransform::<INPUT_DIM, OUTPUT_DIM>::read(&mut &bytes[..]).unwrap();
-
-                    for max_input in [127u8, 255] {
-                        let mut input = Aligned([0u8; PADDED]);
-                        for value in &mut input.0[..INPUT_DIM] {
-                            *value = rng.random_range(0..=max_input);
-                        }
-
-                        let mut expected = biases;
-                        for o in 0..OUTPUT_DIM {
-                            for inp in 0..INPUT_DIM {
-                                expected[o] = expected[o].wrapping_add(
-                                    i32::from(logical[o * PADDED + inp]) * i32::from(input.0[inp]),
-                                );
-                            }
-                        }
-
-                        let mut output = [0i32; OUTPUT_DIM];
-                        transform.propagate(&input.0, &mut output);
-                        assert_eq!(output, expected, "trial={trial}, max_input={max_input}");
-
-                        if max_input == 127 {
-                            let mut seven_bit_output = [0i32; OUTPUT_DIM];
-                            transform.propagate_7bit(&input.0, &mut seven_bit_output);
-                            assert_eq!(seven_bit_output, expected, "7bit trial={trial}");
-                        }
-                    }
-                }
-            }
-        };
-    }
-
-    affine_reference_test!(test_affine_reference_256x8, 256, 8);
-    affine_reference_test!(test_affine_reference_768x8, 768, 8);
-    affine_reference_test!(test_affine_reference_1536x16, 1536, 16);
-    affine_reference_test!(test_affine_reference_32x32, 32, 32);
-    // AVX-512 経路では8チャンクを3組に分割するため、端数2チャンクと奇数組の加算木を通る。
-    affine_reference_test!(test_affine_reference_32x48, 32, 48);
-    // AVX-512 経路では16チャンクを3組に分割するため、端数1チャンクと入力パディングを照合する。
-    affine_reference_test!(test_affine_reference_60x48, 60, 48);
-    // AVX-512 経路では出力レジスタが4本以上の場合の単一組も照合する。
-    affine_reference_test!(test_affine_reference_32x64, 32, 64);
-    // INPUT_DIM が 32 の倍数でなく PADDED に padding 列が生じる境界も照合する
-    affine_reference_test!(test_affine_reference_760x8, 760, 8);
 }
-
-#[cfg(test)]
-#[path = "halfkx_affine_tests.rs"]
-pub(crate) mod halfkx_affine_tests;

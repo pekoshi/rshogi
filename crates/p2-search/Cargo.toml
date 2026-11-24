@@ -1,0 +1,16 @@
+[package]
+name = "p2-search"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+pv-cuda = ["p2-nnue/pv-cuda"]
+
+[dependencies]
+rshogi-core = { version = "0.2", path = "../rshogi-core", default-features = false }
+p2-nnue = { path = "../p2-nnue" }
+log.workspace = true
+rand.workspace = true
+rand_xoshiro.workspace = true
+crossbeam-queue = { workspace = true }

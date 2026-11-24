@@ -15,24 +15,15 @@ use sysinfo::Disks;
 pub const PSV_SIZE: usize = 40;
 /// PackedSfen 部分のサイズ（バイト）
 pub const SFEN_SIZE: usize = 32;
-pub const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
-
-pub fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-/// バイト列の決定的なFNV-1a 64bitハッシュ。
-pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    fnv1a64_update(FNV1A64_OFFSET, bytes)
-}
 
 /// PackedSfen（32バイト）の FNV-1a 64bit ハッシュ
 pub fn hash_packed_sfen(sfen: &[u8; SFEN_SIZE]) -> u64 {
-    fnv1a64(sfen)
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in sfen.iter() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// PSV レコードから game_ply を取得（offset 36, u16 LE）
@@ -40,9 +31,7 @@ pub fn game_ply_from_record(record: &[u8; PSV_SIZE]) -> u16 {
     u16::from_le_bytes([record[36], record[37]])
 }
 
-/// `--input` (カンマ区切りのファイル / ディレクトリ / glob) または
-/// `--input-dir` + `--pattern` からファイル一覧を収集する。
-/// ディレクトリの列挙エラーは、読めた部分だけを入力と誤認しないよう伝播する。
+/// `--input` (カンマ区切り) または `--input-dir` + `--pattern` からファイル一覧を収集する。
 pub fn collect_input_paths(
     input: Option<&str>,
     input_dir: Option<&PathBuf>,
@@ -57,98 +46,41 @@ pub fn collect_input_paths(
             io::ErrorKind::InvalidInput,
             "--data/--input または --input-dir のいずれかを指定してください",
         )),
-        (Some(data), None) => collect_input_specs(data, pattern),
-        (None, Some(dir)) => collect_input_dir(dir, pattern),
-    }
-}
-
-fn collect_input_specs(input: &str, pattern: &str) -> io::Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for spec in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let path = PathBuf::from(spec);
-        if path.is_file() {
-            paths.push(path);
-        } else if path.is_dir() {
-            paths.extend(collect_input_dir(&path, pattern)?);
-        } else if has_glob_metachar(spec) {
-            paths.extend(collect_input_glob(spec)?);
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("入力ファイルまたはディレクトリが存在しません: {}", path.display()),
-            ));
+        (Some(data), None) => {
+            let paths: Vec<PathBuf> = data.split(',').map(|s| PathBuf::from(s.trim())).collect();
+            for p in &paths {
+                if !p.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("入力ファイルが存在しません: {}", p.display()),
+                    ));
+                }
+            }
+            Ok(paths)
+        }
+        (None, Some(dir)) => {
+            if !dir.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("入力ディレクトリが存在しません: {}", dir.display()),
+                ));
+            }
+            let pat = glob::Pattern::new(pattern).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("無効な glob パターン: {e}"))
+            })?;
+            let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .filter(|e| {
+                    e.path().file_name().and_then(|n| n.to_str()).is_some_and(|n| pat.matches(n))
+                })
+                .map(|e| e.into_path())
+                .collect();
+            paths.sort();
+            Ok(paths)
         }
     }
-
-    if paths.is_empty() && !input.trim().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("入力に一致するファイルが見つかりません: {input}"),
-        ));
-    }
-
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
-}
-
-fn collect_input_dir(dir: &Path, pattern: &str) -> io::Result<Vec<PathBuf>> {
-    if !dir.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("入力ディレクトリが存在しません: {}", dir.display()),
-        ));
-    }
-    let pat = glob::Pattern::new(pattern).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("無効な glob パターン: {e}"))
-    })?;
-    collect_matching_files(walkdir::WalkDir::new(dir), &pat)
-}
-
-fn collect_matching_files(
-    entries: impl IntoIterator<Item = Result<walkdir::DirEntry, walkdir::Error>>,
-    pattern: &glob::Pattern,
-) -> io::Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(io::Error::from)?;
-        if entry.file_type().is_file()
-            && entry
-                .path()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| pattern.matches(n))
-        {
-            paths.push(entry.into_path());
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-fn collect_input_glob(pattern: &str) -> io::Result<Vec<PathBuf>> {
-    let entries = glob::glob(pattern).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("無効な glob パターン: {e}"))
-    })?;
-    let mut paths = Vec::new();
-    for entry in entries {
-        let path = entry.map_err(|e| io::Error::other(format!("glob 展開に失敗しました: {e}")))?;
-        if path.is_file() {
-            paths.push(path);
-        }
-    }
-    if paths.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("glob に一致する入力ファイルが見つかりません: {pattern}"),
-        ));
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-fn has_glob_metachar(spec: &str) -> bool {
-    spec.contains('*') || spec.contains('?') || spec.contains('[')
 }
 
 /// まだ存在しないかもしれないパスを正規化する。
@@ -207,26 +139,18 @@ fn append_components(mut base: PathBuf, components: &[std::path::Component<'_>])
 /// 出力パスが入力パスのいずれかと一致していないか検査する。
 /// 一致していればエラーを返す。出力ファイルがまだ存在しない場合でも正しく検出する。
 pub fn check_output_not_in_inputs(output: &Path, inputs: &[PathBuf]) -> io::Result<()> {
-    let inputs: Vec<_> = inputs.iter().map(PathBuf::as_path).collect();
-    crate::output_path::ensure_safe_output_paths(&[output], &inputs).map_err(io::Error::other)
-}
-
-/// 入力全体の PSV レコード境界を検証し、総レコード数を返す。
-pub fn validate_psv_file_sizes(paths: &[PathBuf]) -> io::Result<u64> {
-    let mut records = 0_u64;
-    for path in paths {
-        let size = std::fs::metadata(path)?.len();
-        if !size.is_multiple_of(PSV_SIZE as u64) {
+    let out_canonical = canonicalize_maybe_new(output)?;
+    for p in inputs {
+        if let Ok(ic) = p.canonicalize()
+            && ic == out_canonical
+        {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} size {size} is not a multiple of {PSV_SIZE} bytes", path.display()),
+                io::ErrorKind::InvalidInput,
+                format!("出力ファイルが入力ファイルと同一です: {}", p.display()),
             ));
         }
-        records = records.checked_add(size / PSV_SIZE as u64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "PSV record count overflow")
-        })?;
     }
-    Ok(records)
+    Ok(())
 }
 
 /// 入力ファイル群のサイズ合計（バイト）を返す。
@@ -236,6 +160,20 @@ pub fn sum_file_sizes(paths: &[PathBuf]) -> io::Result<u64> {
         total += std::fs::metadata(p)?.len();
     }
     Ok(total)
+}
+
+/// /proc/meminfo から MemAvailable をバイト単位で取得する。
+/// 取得できない環境では None を返す。
+pub fn get_mem_available() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb_str = rest.trim().strip_suffix("kB")?.trim();
+            let kb: u64 = kb_str.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
 }
 
 fn disk_probe_path(path: &Path) -> Option<PathBuf> {
@@ -411,52 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn collect_input_paths_accepts_glob_in_input() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.bin");
-        let b = dir.path().join("b.bin");
-        let ignored = dir.path().join("c.txt");
-        fs::write(&a, [0u8; PSV_SIZE]).unwrap();
-        fs::write(&b, [1u8; PSV_SIZE]).unwrap();
-        fs::write(ignored, []).unwrap();
-
-        let pattern = format!("{}/*.bin", dir.path().display());
-        let paths = collect_input_paths(Some(&pattern), None, "*.bin").unwrap();
-
-        assert_eq!(paths, vec![a, b]);
-    }
-
-    #[test]
-    fn collect_input_paths_accepts_directory_in_input() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.bin");
-        let b = dir.path().join("nested/b.bin");
-        fs::create_dir_all(b.parent().unwrap()).unwrap();
-        fs::write(&a, [0u8; PSV_SIZE]).unwrap();
-        fs::write(&b, [1u8; PSV_SIZE]).unwrap();
-
-        let input = dir.path().to_string_lossy();
-        let paths = collect_input_paths(Some(&input), None, "*.bin").unwrap();
-
-        assert_eq!(paths, vec![a, b]);
-    }
-
-    #[test]
-    fn collect_input_paths_propagates_walk_error_after_valid_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("valid.pack");
-        fs::write(&input, []).unwrap();
-        let valid = walkdir::WalkDir::new(&input).into_iter().next().unwrap();
-        assert!(valid.is_ok());
-        let invalid = walkdir::WalkDir::new(dir.path().join("missing")).into_iter().next().unwrap();
-        assert!(invalid.is_err());
-        let error =
-            collect_matching_files([valid, invalid], &glob::Pattern::new("*.pack").unwrap())
-                .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-    }
-
-    #[test]
     fn disk_probe_path_uses_existing_parent_for_new_file() {
         let dir = tempfile::tempdir().unwrap();
         let probe = disk_probe_path(&dir.path().join("out/new.psv")).unwrap();
@@ -482,17 +374,6 @@ mod tests {
         let normalized = normalize_mount_compare_path(original);
 
         assert_eq!(normalized, PathBuf::from(r"C:\work\tmp\dedup"));
-    }
-
-    #[test]
-    fn output_check_rejects_hardlinked_input_without_truncating() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("input.psv");
-        let output = dir.path().join("output.psv");
-        fs::write(&input, [7; PSV_SIZE]).unwrap();
-        fs::hard_link(&input, &output).unwrap();
-        assert!(check_output_not_in_inputs(&output, std::slice::from_ref(&input)).is_err());
-        assert_eq!(fs::read(input).unwrap(), [7; PSV_SIZE]);
     }
 
     #[test]

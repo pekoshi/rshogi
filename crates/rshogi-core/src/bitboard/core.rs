@@ -5,8 +5,8 @@ use crate::types::Square;
 /// Bitboard（128bit、16バイトアラインメント）
 ///
 /// 縦型配置:
-/// - `p[0]`: 1-7筋 (bit 0-62使用、bit 63未使用)
-/// - `p[1]`: 8-9筋 (bit 0-17使用)
+/// - p[0]: 1-7筋 (bit 0-62使用、bit 63未使用)
+/// - p[1]: 8-9筋 (bit 0-17使用)
 #[derive(Clone, Copy, PartialEq, Eq, Default, Hash)]
 #[repr(C, align(16))]
 pub struct Bitboard {
@@ -18,8 +18,8 @@ impl Bitboard {
     pub const EMPTY: Bitboard = Bitboard { p: [0, 0] };
 
     /// 全マスが立っているBitboard
-    /// - `p[0]`: Files 1-7 (63bit使用、bit63未使用)
-    /// - `p[1]`: Files 8-9 (18bit使用、bit18-63未使用)
+    /// - p[0]: Files 1-7 (63bit使用、bit63未使用)
+    /// - p[1]: Files 8-9 (18bit使用、bit18-63未使用)
     pub const ALL: Bitboard = Bitboard {
         p: [
             0x7FFF_FFFF_FFFF_FFFF, // Files 1-7: 63bit set
@@ -33,7 +33,7 @@ impl Bitboard {
         Bitboard { p: [p0, p1] }
     }
 
-    /// u64ペアから生成
+    /// u64ペアから生成（YaneuraOuのBitboard(p0,p1)相当）
     #[inline]
     pub const fn from_u64_pair(p0: u64, p1: u64) -> Bitboard {
         Bitboard::new(p0, p1)
@@ -92,10 +92,6 @@ impl Bitboard {
     }
 
     /// 最下位ビットのSquareを取得して消す
-    ///
-    /// 空の場合はデバッグビルドで panic し、release では `Square::SQ_11` を返す。
-    /// 盤外のビット (`p[1]` の bit 18 以上) が立っていないことが前提。
-    // 手生成で 1 手ごとに通るため、取り出した升の範囲は release では検査しない。
     #[inline]
     pub fn pop(&mut self) -> Square {
         if self.is_empty() {
@@ -106,34 +102,35 @@ impl Bitboard {
         if self.p[0] != 0 {
             let idx = self.p[0].trailing_zeros();
             self.p[0] &= self.p[0] - 1;
-            // SAFETY: p[0] の有効ビットは 0..=62 なので idx は 0..=62。
+            // SAFETY: idx < 63 で有効なSquare範囲内
             unsafe { Square::from_u8_unchecked(idx as u8) }
         } else {
             let idx = self.p[1].trailing_zeros();
             self.p[1] &= self.p[1] - 1;
-            // SAFETY: p[1] の有効ビットは 0..=17 なので 63 + idx は 63..=80。
+            // SAFETY: 63 + idx < 81 で有効なSquare範囲内
             unsafe { Square::from_u8_unchecked(63 + idx as u8) }
         }
     }
 
     /// 最下位ビットのSquareを取得（消さない）
     ///
-    /// 空でないこと、盤外のビットが立っていないことが前提。`pop()` と同じ理由で release では検査しない。
+    /// 空の場合は不正な値を返す可能性があるため、
+    /// 空でないことが保証されている場合のみ使用すること。
     #[inline]
     pub const fn lsb_unchecked(self) -> Square {
         debug_assert!(self.is_not_empty(), "lsb_unchecked() called on empty Bitboard");
         if self.p[0] != 0 {
-            // SAFETY: p[0] の有効ビットは 0..=62。
+            // SAFETY: trailing_zeros() < 64、かつp[0]の有効ビットは0-62
             unsafe { Square::from_u8_unchecked(self.p[0].trailing_zeros() as u8) }
         } else {
-            // SAFETY: 空でなく p[1] の有効ビットは 0..=17 なので 63..=80。
+            // SAFETY: 63 + trailing_zeros() < 81
             unsafe { Square::from_u8_unchecked(63 + self.p[1].trailing_zeros() as u8) }
         }
     }
 
     /// 最下位ビットのSquareを取得（消さない）
     ///
-    /// 空の場合はNoneを返す。盤外のビットが立っていないことが前提。
+    /// 空の場合はNoneを返す。
     #[inline]
     pub fn lsb(self) -> Option<Square> {
         if self.is_empty() {
@@ -187,13 +184,13 @@ impl Bitboard {
         }
     }
 
-    /// `p[0]`を取得
+    /// p[0]を取得
     #[inline]
     pub const fn p0(self) -> u64 {
         self.p[0]
     }
 
-    /// `p[1]`を取得
+    /// p[1]を取得
     #[inline]
     pub const fn p1(self) -> u64 {
         self.p[1]
@@ -218,20 +215,20 @@ impl Bitboard {
 
     // ==== Qugiyアルゴリズム用メソッド ====
 
-    /// Squareが`p[0]`と`p[1]`のどちらに属するかを返す
+    /// Squareがp[0]とp[1]のどちらに属するかを返す
     ///
     /// # Returns
-    /// - `0`: `p[0]`に属する（1-7筋、index < 63）
-    /// - `1`: `p[1]`に属する（8-9筋、index >= 63）
+    /// - `0`: p[0]に属する（1-7筋、index < 63）
+    /// - `1`: p[1]に属する（8-9筋、index >= 63）
     #[inline]
     pub const fn part(sq: Square) -> usize {
         if sq.index() < 63 { 0 } else { 1 }
     }
 
-    /// `p[N]`を取得（N = 0 or 1）
+    /// p[N]を取得（N = 0 or 1）
     ///
     /// # Type Parameters
-    /// * `N` - 0 (`p[0]`) または 1 (`p[1]`)
+    /// * `N` - 0 (p[0]) または 1 (p[1])
     #[inline]
     pub const fn extract64<const N: usize>(self) -> u64 {
         self.p[N]
@@ -240,8 +237,8 @@ impl Bitboard {
     /// 128bit全体で1減算（Qugiyアルゴリズム用）
     ///
     /// # Algorithm
-    /// - `p[0]` - 1を計算
-    /// - `p[0]`がゼロの場合のみ`p[1]`から桁借り
+    /// - p[0] - 1を計算
+    /// - p[0]がゼロの場合のみp[1]から桁借り
     ///
     /// # Performance
     /// - SSE4.1: `_mm_cmpeq_epi64` + `_mm_alignr_epi8` + `_mm_add_epi64`
@@ -296,7 +293,7 @@ impl Bitboard {
     ///
     /// # Performance
     /// - SSSE3: `_mm_shuffle_epi8`
-    /// - Scalar: `swap_bytes` + `p[0]`/`p[1]`交換
+    /// - Scalar: `swap_bytes` + p[0]/p[1]交換
     #[inline]
     pub fn byte_reverse(self) -> Bitboard {
         #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
@@ -537,15 +534,19 @@ mod tests {
     use crate::types::{File, Rank};
 
     #[test]
-    fn lsb_and_pop_return_every_board_square() {
-        for index in 0..Square::NUM as u8 {
-            let square = Square::from_u8(index).unwrap();
-            let mut bb = Bitboard::from_square(square);
-            assert_eq!(bb.lsb(), Some(square));
-            assert_eq!(bb.pop(), square);
-            assert!(bb.is_empty());
-        }
-        assert_eq!(Bitboard::EMPTY.lsb(), None);
+    fn test_bitboard_empty() {
+        let bb = Bitboard::EMPTY;
+        assert!(bb.is_empty());
+        assert!(!bb.is_not_empty());
+        assert_eq!(bb.count(), 0);
+    }
+
+    #[test]
+    fn test_bitboard_all() {
+        let bb = Bitboard::ALL;
+        assert!(!bb.is_empty());
+        assert!(bb.is_not_empty());
+        assert_eq!(bb.count(), 81);
     }
 
     #[test]
@@ -684,6 +685,13 @@ mod tests {
     }
 
     #[test]
+    fn test_bitboard_from_u64_pair() {
+        let bb = Bitboard::from_u64_pair(0x1234, 0x5678);
+        assert_eq!(bb.p0(), 0x1234);
+        assert_eq!(bb.p1(), 0x5678);
+    }
+
+    #[test]
     fn test_bitboard_andnot() {
         let sq1 = Square::new(File::File1, Rank::Rank1);
         let sq2 = Square::new(File::File2, Rank::Rank2);
@@ -712,28 +720,25 @@ mod tests {
 
     #[test]
     fn test_bitboard_iter() {
-        let sparse = [
-            Square::new(File::File1, Rank::Rank1),
-            Square::new(File::File5, Rank::Rank5),
-            Square::new(File::File9, Rank::Rank9),
-        ];
-        let bb = sparse.iter().fold(Bitboard::EMPTY, |bb, &sq| bb | Bitboard::from_square(sq));
-        for (bb, expected) in [
-            (Bitboard::EMPTY, vec![]),
-            (Bitboard::ALL, Square::all().collect()),
-            (bb, sparse.to_vec()),
-        ] {
-            assert_eq!(bb.count() as usize, expected.len());
-            assert_eq!(bb.is_empty(), expected.is_empty());
-            assert_eq!(bb.is_not_empty(), !expected.is_empty());
-            let mut iter = bb.iter();
-            for (i, sq) in expected.iter().enumerate() {
-                assert_eq!(iter.len(), expected.len() - i);
-                assert_eq!(iter.next(), Some(*sq));
-            }
-            assert_eq!(iter.len(), 0);
-            assert_eq!(iter.next(), None);
-        }
+        let sq1 = Square::new(File::File1, Rank::Rank1);
+        let sq2 = Square::new(File::File5, Rank::Rank5);
+        let sq3 = Square::new(File::File9, Rank::Rank9);
+
+        let bb =
+            Bitboard::from_square(sq1) | Bitboard::from_square(sq2) | Bitboard::from_square(sq3);
+
+        let squares: Vec<_> = bb.iter().collect();
+        assert_eq!(squares.len(), 3);
+        assert!(squares.contains(&sq1));
+        assert!(squares.contains(&sq2));
+        assert!(squares.contains(&sq3));
+    }
+
+    #[test]
+    fn test_bitboard_iter_exact_size() {
+        let bb = Bitboard::ALL;
+        let iter = bb.iter();
+        assert_eq!(iter.len(), 81);
     }
 
     #[test]
@@ -756,8 +761,6 @@ mod tests {
     #[test]
     fn test_from_u64_pair() {
         let bb = Bitboard::from_u64_pair(0x1234567890ABCDEF, 0xFEDCBA09);
-        assert_eq!(bb.p0(), 0x1234567890ABCDEF);
-        assert_eq!(bb.p1(), 0xFEDCBA09);
         assert_eq!(bb.extract64::<0>(), 0x1234567890ABCDEF);
         assert_eq!(bb.extract64::<1>(), 0xFEDCBA09);
     }

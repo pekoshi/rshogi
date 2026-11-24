@@ -3,9 +3,6 @@
 ## 前提
 - リポジトリルートで実行する。
 - `rshogi-usi` と `tools/spsa` をローカルビルド可能であること。
-- §3〜§9 は既定の `--dispatch batch` を前提に書いている。`--dispatch async` (pair ごとの非同期更新) の
-  オプション・run-dir・resume・CSV の違いは [§15](#15-非同期-per-pair-更新---dispatch-async) にまとめた。
-  棋譜の記録 (`games.jsonl`) は両方式で共通で、[§16](#16-棋譜の記録と回収) にある。
 
 ## 1. 初回ビルド
 
@@ -14,94 +11,48 @@ cargo build --release -p rshogi-usi
 cargo build --release -p tools --bin generate_spsa_params --bin spsa --bin spsa_stats_to_plot_csv
 ```
 
-## 2. canonical `.params` の準備
-
-`--init-from` に渡す canonical (起点パラメータファイル) を用意する。
-現行形式は `# spsa-format: c-end-r-end-v1` の宣言付きとする。
-旧ファイルの確認・移行と既存runの再開方法は §7 を参照。
-渡せる形式は以下のいずれか:
-
-- **rshogi デフォルト値**: `generate_spsa_params` で生成 (rshogi の `SearchTuneParams::option_specs()` ベース)
-- **rshogi 形式の既存 .params**: 過去のチューニング結果や手作業で調整した値
-- **YaneuraOu 形式の既存 .params**: YO の `tune.py` 系ツールで生成された
-  YO 命名の .params (例: suisho 系の suisho*.params)。YO 駆動時は §10.6 の
-  ケース A、rshogi 駆動時は §10.6 のケース B / `yo_to_rshogi_params` 経由
-
-探索の無指定時の既定値を正本として、USI 宣言と生成 `.params` も同じ値を使います。旧版では 170 項目中 13 項目の宣言値が実際の既定値と異なっていました。既存 `.params` は自動変更されません。比較条件を確認するときは使用したファイルとエンジン版を保存し、再生成した値との差分を確認してください。今回の修正は実エンジンの既定値を変更せず、古い宣言値へ戻すものでもありません。
-
-rshogi デフォルト値から始める場合の生成コマンド:
+## 2. 実行ディレクトリ作成 + `.params` 自動生成
 
 ```bash
+RUN_ID=$(date -u +%Y%m%d_%H%M%S)
+RUN_DIR="runs/spsa/${RUN_ID}"
+mkdir -p "${RUN_DIR}"
 cargo run --release -p tools --bin generate_spsa_params -- \
-  --output spsa_params/canonical.params
+  --output "${RUN_DIR}/tuned.params"
 ```
 
-## 3. SPSA実行
-
-対局 driver は開始局面を含む 4 回同一局面で千日手を自動終局する。
-通常は引分、連続王手の千日手は王手側の反則負けとして評価に算入する。
-SPSA では評価値による投了・勝ち・引分裁定は使えない。`--dispatch async` では両側の評価の一致による裁定
-(`--adjudicate-agreement`、既定 off) だけを使える ([§17.5](#175-両側の評価の一致による裁定---adjudicate-agreement))。
-各探索には対局開始局面と、その局の全指し手を `position sfen ... moves ...` で渡す。
-開始局面ファイルの手順適用後を履歴の基点とし、毎局・再試行時に履歴をリセットする。
-TT 等のキャッシュ保持とは別の処理であり、エンジンが対局中の反復を探索で利用できる。
-履歴を送らない旧 driver と探索条件が異なるため、更新前後の結果を同一 run に混ぜず、
-新しい run-dir を使用して実験記録に driver のコミットを残す。
-詳細は [対局履歴の仕様](tournament.md#エンジンに渡す対局履歴) を参照。
-
-> 以下のコマンド例は **starting point** であり、最適値ではない。
-> `--total-pairs` は対象 param 数 × 50〜500 程度の幅で結果を見ながら増減
-> するのが基本。`--early-stop-*` 三点は閾値の運用実績がまだ無いため、
-> **初回 run では指定せずフルで走らせて挙動を観測** することを推奨する。
+## 3. SPSA実行（更新）
 
 ```bash
-RUN_DIR="runs/spsa/$(date -u +%Y%m%d_%H%M%S)"
-
 cargo run --release -p tools --bin spsa -- \
-  --run-dir "${RUN_DIR}" \
-  --init-from spsa_params/canonical.params \
-  --total-pairs 6400 \
-  --batch-pairs 32 \
+  --params "${RUN_DIR}/tuned.params" \
+  --iterations 200 \
+  --games-per-iteration 64 \
   --concurrency 8 \
   --startpos-file /path/to/openings.txt \
-  --seed 1 \
+  --seeds 1,2,3,4 \
   --active-only-regex '^SPSA_(LMR|FUTILITY|NMP)_' \
   --threads 1 \
   --hash-mb 256 \
   --byoyomi 1000 \
   --max-moves 320 \
-  --timeout-margin-ms 1000
-  # 初回 run では --early-stop-* 系は付けない。
-  # 閾値の運用実績ができてから個別に追加する (§9.3 参照):
-  #   --early-stop-avg-abs-update-threshold <T1>
-  #   --early-stop-result-variance-threshold <T2>
-  #   --early-stop-patience <N>
+  --timeout-margin-ms 1000 \
+  --early-stop-avg-abs-update-threshold 0.02 \
+  --early-stop-result-variance-threshold 0.002 \
+  --early-stop-patience 5
 ```
 
-主要な CLI と推奨レンジ:
+CSV 出力先は既定で `${RUN_DIR}/tuned.params.{stats,stats_aggregate,values}.csv`
+に自動生成される。別パスにしたい場合のみ `--stats-csv` / `--stats-aggregate-csv`
+/ `--param-values-csv` を明示。生成を止めたい場合は `--no-*` フラグを使う。
 
-| フラグ | 推奨レンジ | 意味・備考 |
-|---|---|---|
-| `--total-pairs N` | param 数 × 50〜500 | SPSA 全体の game pair 上限。total_games = 2N。大きいほど収束精度が上がるが対局時間も線形に伸びる |
-| `--batch-pairs B` | 8〜32 (既定 8) | 1 batch あたりの game pair 数。1 batch で `2B` 局を消化し θ を 1 回更新、k は `+= B`。大→低分散・低更新頻度、小→高分散・高更新頻度 |
-| `--byoyomi <ms>` | 100〜1000 ms | 1 手秒読み (既定 1000)。NPS が安定する程度に。短すぎるとエンジンが thinking time を使い切れず評価ノイズが増える |
-| `--seed S` | 任意 | base seed (省略時はランダム)。SPSA の乱数列は seed と batch index から決定論的に生成される |
-| `--max-moves` / `--timeout-margin-ms` | 既定 320 / 1000 ms | 対局打ち切り上限 (開始局面までの手数を含む総手数) と timeout 検出マージン。慣習値で十分なケースが多い |
-| `--early-stop-*` 三点 | 初回 run では **指定しない** | 閾値の運用実績がまだ無く、特に `--early-stop-result-variance-threshold` は `\|raw_result\| / batch_pairs` (0..2 の値) との比較なので、よく考えずに小さい値を入れるとほぼ全 batch で誤発火する。挙動を観測してから設定する (§9.3) |
+集計CSV (`stats_aggregate`) のパス導出規則:
 
-`<run-dir>` には以下が自動生成される:
-
-| ファイル | 内容 |
-|---|---|
-| `state.params` | SPSA の live 状態。batch ごとに上書きされ、resume の入力にも使われる。整数パラメータも小数表記 (`42.000000` 等) で保存される (resume を挟んでも丸め誤差で値がずれないようにするため)。手動編集は非推奨だが、緊急時は同じフォーマットを保つこと |
-| `final.params` | 正常完了時の確定スナップショット。`tune.py apply` の入力に使う (live state である `state.params` ではなくこちらを渡すこと) |
-| `meta.json` | resume 用メタデータ (run の設定・進捗・seed 等)。手動編集は非推奨 |
-| `values.csv` | batch ごとのパラメータ値履歴 (wide 形式)。チャート描画・推移確認に利用 |
-| `stats.csv` | batch ごとの対局統計 (勝敗・raw_result・更新量) を 1 行ずつ追記 |
-| `.lock` | 同 run-dir の二重起動を防ぐ排他 lock (process 終了時に自動削除) |
-
-別パスに置きたい場合は `--meta-file` / `--stats-csv` / `--param-values-csv`
-で個別 override 可能。生成を止めたい場合は対応する `--no-*` フラグを使う。
+- `--stats-aggregate-csv` 明示 → そのパスを使用
+- `--stats-csv <S>` 明示（明示なし）→ 互換性のため従来の派生 `<S>.aggregate.csv`
+  を使う。これにより既存ジョブを `--resume` した時に既定の集計CSV出力先が変わらない
+- どちらも未指定 → 既定の `<params>.stats_aggregate.csv`
+- seeds 指定が単一のときは集計CSV を生成しない
 
 ### 3.1 開始局面ファイル (`--startpos-file`)
 
@@ -113,10 +64,8 @@ startpos moves 2g2f 8c8d 2f2e 8d8e 7g7f 4a3b 8h7g 3c3d ...
 sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1 moves 7g7f
 ```
 
-SPSA は paired antithetic スケジュールで対局を組む。**1 pair (2 局)** ごとに
-1 つの開始局面を抽選し、**先後を入れ替えて 2 局連続** で消化する。これにより
-開局選択ノイズと先手有利バイアスが互いにキャンセルされる。SPSA はノイズに敏感
-なので、**多様で偏りのない局面集** を使うこと (特定戦型のみだと評価が歪む)。
+各反復で `--seeds` ベースに開始局面が抽選される。SPSA はノイズに敏感なので、
+**多様で偏りのない局面集** を使うこと（特定戦型のみだと評価が歪む）。
 
 入手先の例:
 
@@ -129,10 +78,8 @@ SPSA は paired antithetic スケジュールで対局を組む。**1 pair (2 �
 ### 3.2 時間制御の選択
 
 - `--byoyomi <ms>` (既定 1000ms): 1 手あたりの秒読み時間制御。最も単純で SPSA 向き
-- `--btime <ms> --binc <ms>`: Fischer モード（持ち時間 + 加算）。時間管理ごと調整したいときに使う。
-  async では機械の速さで持ち時間を補正できる ([§17](#17-fischer-と-nps-による時計の補正---nps-scaling))
-- `--nodes <N>`: ノード数固定。CPU 性能差に依存しない厳密比較が必要な場合のみ。`--threads` が 2 以上でも N は全スレッドの合計
-  - 1手の探索期限は `--nodes-timeout-ms` で指定する（[§14](#14-engine-プール再試行停止) 参照）。
+- `--btime <ms> --binc <ms>`: Fischer モード（持ち時間 + 加算）。長い対局の挙動を測りたい時のみ
+- `--nodes <N>`: ノード数固定。CPU 性能差に依存しない厳密比較が必要な場合のみ
   （SPSA はノイズ低減のため通常は時間ベースで十分）
 
 ```bash
@@ -140,94 +87,69 @@ SPSA は paired antithetic スケジュールで対局を組む。**1 pair (2 �
 --btime 30000 --binc 1000
 ```
 
-Fischer モードでは、その手に使えるのは「残り時間 + 加算」で、指した後の残り時間は
-「残り時間 + 加算 − 消費時間」になる（下限は 0）。加算分まで使った手の後は残り時間が加算より少なくなる。
-
 `--byoyomi` 使用時は対局相手にも同じ時間ハンデが適用されるよう、SPSA ツールは
 内部で MinimumThinkingTime / NetworkDelay 等を**自動調整しない**（外部エンジンに
 触らない設計）。フェアな対局のためには §10.6 のように `--usi-option` で明示する。
 
-### 3.3 total_pairs / batch_pairs / 並列度の目安
+### 3.3 イテレーション数 / 対局数 / 並列度の目安
 
 経験則ベース。具体値はチューニング対象数とハードウェアで調整:
 
 | 設定 | 目安 | 効くもの |
 |---|---|---|
-| `--total-pairs N` | 数千〜数万 (LMR/枝刈り系の小規模グループなら 5,000〜10,000、全体は 30,000+) | 収束確度。SPSA schedule の k 軸上限 |
-| `--batch-pairs B` | 4〜32 (既定 8) | 1 batch あたりの game pair 数。1 batch で同 flip ベクトルで `2B` 局を消化し θ を 1 回更新する |
-| `--concurrency` | CPU 物理コア数 / `threads` 値、ただし `2 × batch_pairs` 以下 | 壁時計時間。1 batch 内で同時実行できる game 数の上限が `2 × batch_pairs` のため、それ以上盛っても効かない |
+| `--iterations` | 100〜500 (グループ別) / 1000+ (全体) | 収束確度。少なすぎると勾配推定がノイズに埋もれる |
+| `--games-per-iteration` | 8〜64 (偶数) | 1 イテレーションあたりの勾配推定精度。Fishtest 流は 4〜32 |
+| `--concurrency` | CPU 物理コア数 / `threads` 値 | 壁時計時間。`threads=1` ならコア数いっぱいまで |
+| `--seeds` | 3〜5 個 | seed 横断分散の低減（複数 seed の集計で SPSA ノイズの偏りを検出） |
+| `--parallel-seeds` | 多コア環境 (≥64T) で ON | iter 内の seed 群を並列実行。`--concurrency` 上限が `games_per_iteration` で頭打ちになるのを解消 |
 
-総対局数 = `2 × total_pairs`。LMR/futility/NMP 等の枝刈り系を 30 個以下の
-グループでチューニングするなら `--total-pairs 5000 --batch-pairs 16`
-(= 10,000 局, 約 313 batch) 程度が目安。
+総対局数 = iterations × games_per_iteration × seeds。
+合計が**少なすぎると勾配が信頼できず**、多すぎると壁時計時間が伸びる。
+LMR/futility/NMP 等の枝刈り系を 30 個以下のグループでチューニングするなら
+`200 × 64 × 4 = 51,200 局` 程度が目安。
 
-#### batch_pairs と concurrency の関係
+### `--parallel-seeds` 利用時の concurrency 調整
 
-SPSA は **`min(concurrency, 2 × batch_pairs)`** 個の対局を並列実行する。
-`--concurrency` を `2 × batch_pairs` より大きくしても余剰枠は仕事がなく
-無駄になるので、**`--concurrency ≤ 2 × batch_pairs`** に揃えるのが基本。
-多コアを活かしたい場合は `--batch-pairs` を増やすか、**`--seed` を変えた
-独立 run dir を別プロセスで並列実行** する。
+`--parallel-seeds` ON 時は `--concurrency` を seed 数で割って各 seed に配分する。
+さらに 1 seed あたりの worker 数は `games_per_iteration` で頭打ち（worker 1 つが
+1 game を担当するため）。**実効並列度を最大化するには**:
 
-```bash
-# 例: 64 物理コアで 4 run を並列実行 (各 16 worker, batch_pairs=8)
-for s in 1 2 3 4; do
-  spsa --run-dir "runs/spsa/$(date -u +%Y%m%d_%H%M%S)_seed${s}" \
-       --init-from spsa_params/canonical.params \
-       --total-pairs 5000 --batch-pairs 8 \
-       --concurrency 16 --seed $s \
-       --startpos-file /path/to/openings.txt \
-       --threads 1 --hash-mb 256 --byoyomi 1000 &
-done
-wait
+```
+--concurrency = seeds × games_per_iteration   （理想）
 ```
 
-複数 run の比較は `runs/spsa/*seed*/stats.csv` を pandas/awk で concat して
-集計する。
+を満たす設定にする。これを満たさない場合、起動時に以下のような warning が出て
+未使用 CPU の存在を知らせる:
 
-### 3.4 NUMA マシンでの CPU affinity
-
-2 socket CPU や NUMA node が複数ある Linux マシンでは、OS 任せの配置にすると
-1 engine の探索 thread が複数 node に跨ったり、遠い node のメモリへアクセスしたりして
-NPS と局ごとのばらつきが悪化し得る。Linuxでは既定でNUMA affinityが有効になり、SPSAは
-`/proc/self/status` の container 許可 CPU と `/sys/devices/system/node/node*/cpulist`
-を読み、各 worker を `--threads` 個の論理 CPU へ固定する。
-
-```bash
-spsa ... \
-  --threads 8 \
-  --concurrency 48 \
-  --cpu-affinity numa
+```
+warning: --parallel-seeds の実効並列度が --concurrency より低い
+ (concurrency=200, seeds=4, games_per_iteration=64 → per_seed=50 (clamped to 50),
+ 実効合計=200, 未使用=0)
 ```
 
-- 一つの worker に属する plus/minus engine は同じ CPU 集合を使う。対局中に探索するのは
-  手番側だけなので、同じ集合を共有してよい。
-- CPU 集合は一つの NUMA node 内だけから作り、worker は node 間へ round-robin 配置する。
-- container の cpuset 制限を尊重する。必要数の node-local group を作れない場合は、
-  node を跨ぐ配置へ暗黙 fallback せず起動エラーにする。
-- topology が非公開・読み取り不能の場合や、許可 CPU を持つ node がない場合も起動エラーにする。
-  topology を公開するか、配置保証が不要なら `--cpu-affinity off` を明示する。
-  CPU を持たないメモリ専用 node は割り当て対象から除外する。
-- Linuxでは未指定時も`numa`。特殊なcloud quota、意図的なoversubscription、比較診断で
-  OSのschedulerに任せる場合だけ`--cpu-affinity off`を明示する。非Linuxの既定は`off`。
-- 起動ログにworkerごとの論理CPU番号を出すため、Offer・`lscpu -e=CPU,NODE,SOCKET,CORE`
-  と一緒に保存する。
-- この指定が保証するのは探索threadのnode-local配置であり、共有NNUE重みの物理page配置
-  までは変更しない。複数node間で共有するNNUE領域にはremote memory accessが残り得るため、
-  実機ではnode別NPSとばらつきを確認する。
+**典型的な悪い例と直し方**:
+
+| 悪い設定 | 何が起きるか | 直す |
+|---|---|---|
+| `--concurrency 100 --seeds 1,2,3,4 --games-per-iteration 64` | `100 / 4 = 25` worker/seed → 合計 100 で OK だが 64 まで盛れる余地あり | `--concurrency 256` に増やす |
+| `--concurrency 384 --seeds 1,2 --games-per-iteration 64` | `384 / 2 = 192` だが `min(192, 64) = 64` で clamp → 256 worker しか動かず 128 未使用 | seed を増やす (`--seeds 1,2,3,4,5,6`) か `--concurrency 128` に減らす |
+| `--concurrency 10 --seeds 1,2,3,4` | `10 / 4 = 2` worker/seed → 合計 8、2 worker 未使用 | `--concurrency 8` (倍数化) |
+
+vast.ai 等の多コアインスタンスでは `seeds × games_per_iteration` を先に決めてから
+`--concurrency` をその値に合わせるのが事故が少ない。`--parallel-seeds` を付けず
+`--concurrency` を盛るのは、`games_per_iteration` 上限で頭打ちになるので非推奨。
 
 ## 4. 再開実行（resume）
 
 ```bash
 cargo run --release -p tools --bin spsa -- \
-  --run-dir "${RUN_DIR}" \
-  --init-from spsa_params/canonical.params \
+  --params "${RUN_DIR}/tuned.params" \
   --resume \
-  --total-pairs 6400 \
-  --batch-pairs 32 \
+  --iterations 100 \
+  --games-per-iteration 64 \
   --concurrency 8 \
   --startpos-file /path/to/openings.txt \
-  --seed 1 \
+  --seeds 1,2,3,4 \
   --threads 1 \
   --hash-mb 256 \
   --byoyomi 1000 \
@@ -235,153 +157,36 @@ cargo run --release -p tools --bin spsa -- \
   --timeout-margin-ms 1000
 ```
 
-`--init-from` を resume 時にも指定すると、`<run-dir>/state.params` の値が canonical
-からどれだけ動いたかの diagnostic が起動時に出る (`--strict-init-check` で error
-化可能)。`--total-pairs` を当初指定値より大きくして batch を継ぎ足す場合のみ
-`--force-schedule` を付与する (`batch_pairs` を途中変更するのは k 軸の不整合に
-なるため非推奨)。
+スケジュール設定を変更して再開する場合だけ `--force-schedule` を付与する。
 
-resume 時の不変条件チェック (起動時に hard bail):
+### 4.1 `--init-from` と `--resume` の関係
 
-- 進行済み game pair 数が `--total-pairs` の指定値以下であること
-- 中間 batch では「進行済み batch 数 × `--batch-pairs`」と進行済み game pair 数が一致すること
-- 既存 run の `--total-pairs` / `--batch-pairs` 設定が今回の指定値と一致すること
+`--init-from <canonical>` は **`--params` のパスが存在しない時だけ canonical を
+コピー**し、存在する時は何もしない (resume と同じ挙動)。両者を併用しても安全:
 
-これらが破れる場合は新規 run dir で fresh start する。
+| `--params` 状態 | `--init-from` | `--resume` | 結果 |
+|---|---|---|---|
+| 不在 | 指定 | (指定有無不問) | canonical をコピーして新規開始 (resume は無視) |
+| 存在 | 指定 | 指定 | 既存ファイルから resume (canonical はコピーしない) |
+| 存在 | 指定 | 未指定 | 既存ファイルを読んで新規 SPSA 反復開始 |
+| 存在 | 未指定 | 指定 | 既存ファイル + meta.json から resume |
 
-`--dispatch async` の resume は `--dispatch async --resume` で行い、`--batch-pairs` は渡さない。
-meta の seed・param 定義・対局条件を使い、journal を再生して再開する
-([§15.3](#153-run-dir-と-resume))。
-
-どちらの方式も、棋譜の記録の有無 (`--no-game-records`) を開始時と揃える。切り替えると resume を拒否する。
-
-### 4.1 `--run-dir` / `--init-from` / `--resume` / `--force-init` の関係
-
-#### `--run-dir` 配下のファイル構成
-
-`--run-dir <dir>` で指定したディレクトリに以下が配置される:
-
-| ファイル | 役割 | override フラグ |
-|---|---|---|
-| `<run-dir>/state.params` | SPSA の live 状態 (batch ごとに上書き) | (なし) |
-| `<run-dir>/final.params` | 正常完了時の確定スナップショット (`tune.py apply` 用) | (なし) |
-| `<run-dir>/meta.json` | resume 用メタデータ | `--meta-file` |
-| `<run-dir>/values.csv` | batch ごとのパラメータ値履歴 | `--param-values-csv` |
-| `<run-dir>/stats.csv` | batch ごとの対局統計 (1 batch = 1 行) | `--stats-csv` |
-| `<run-dir>/games.jsonl` | 確定した局の棋譜 (1 局 1 行、追記のみ) | (なし) |
-| `<run-dir>/batches.jsonl` | batch ごとの摂動 (1 batch 1 行、追記のみ) | (なし) |
-| `<run-dir>/.lock` | 同 run-dir の二重起動を防ぐ排他 lock | (なし) |
-
-上の表は batch の構成。`--dispatch async` では `journal.jsonl` と `snapshots/` が加わり、
-`batches.jsonl` は作らず、`state.params` は最新 snapshot の表示用になる ([§15.3](#153-run-dir-と-resume))。
-
-通常運用では override は不要。`runs/spsa/<timestamp>_<tag>/` 形式の dir を
-毎回新規に切るのが推奨。
-
-#### 状態遷移マトリクス
-
-`<run-dir>/state.params` の存在有無 × `--init-from` × `--resume` × `--force-init`
-× `--use-existing-state-as-init` の 5 軸で起動時の動作が一意に決まる:
-
-**Pre-flight bail (フラグ間矛盾)**: 以下を最優先で評価し、該当すれば即 bail。
-state.params の有無は問わない:
-
-| 条件 | 結果 |
-|---|---|
-| `--resume` ✓ + `--force-init` ✓ | **bail** (意味が矛盾) |
-| `--force-init` ✓ + `--init-from` 未指定 | **bail** (上書き元が必要) |
-| `--use-existing-state-as-init` ✓ + (`--init-from` ∨ `--resume` ∨ `--force-init`) | **bail** (排他) |
-
-**正常パス**: pre-flight を通過した組み合わせを `state.params` の存在有無で分岐。
-以下の 10 行で 5 軸 32 通り (上記 pre-flight に吸収される行を除いた残り) を網羅する:
-
-| state.params | `--init-from` | `--resume` | `--force-init` | `--use-existing-state-as-init` | 結果 |
-|---|---|---|---|---|---|
-| 不在 | 指定 | - | - | - | canonical を `state.params` に copy して fresh start |
-| 不在 | 指定 | ✓ | - | - | **bail** (resume は既存 state が必須) |
-| 不在 | 未指定 | - | - | - | **bail** (入力なし) |
-| 不在 | 未指定 | ✓ | - | - | **bail** (resume は既存 state が必須) |
-| 不在 | 未指定 | - | - | ✓ | **bail** (state がないと意味がない) |
-| 存在 | 指定 | - | - | - | **bail** (`--resume` か `--force-init` の明示が必要) |
-| 存在 | 指定 | ✓ | - | - | resume + 整合性 diagnostic 出力 |
-| 存在 | 指定 | - | ✓ | - | atomic 上書き (meta/CSV/final.params 削除 → state replace) |
-| 存在 | 未指定 | - | - | - | **bail** (`--use-existing-state-as-init` の明示が必要) |
-| 存在 | 未指定 | ✓ | - | - | 通常 resume (meta hash 検証 + state hash 検証) |
-| 存在 | 未指定 | - | - | ✓ | 既存 state を canonical として fresh start |
-
-`-` は「指定なし」。完全網羅性は単体テストで担保している。
-
-> 重要: 「既存 state がある状態でフラグなし起動」は bail する。canonical を
-> 渡さず既存 state で fresh start したい場合は `--use-existing-state-as-init`
-> を **明示** 指定すること (silent fresh は事故の温床になるため)。
-
-#### 運用パターン
-
-```bash
-RUN_DIR="runs/spsa/$(date -u +%Y%m%d_%H%M%S)"
-CANONICAL=spsa_params/canonical.params
-
-# 1 回目: 新規開始 (run-dir 自動作成 + canonical を state.params に copy)
-spsa --run-dir "${RUN_DIR}" --init-from "${CANONICAL}" ...
-
-# 続き: resume (canonical との整合性 diagnostic 出力)
-spsa --run-dir "${RUN_DIR}" --init-from "${CANONICAL}" --resume ...
-
-# 同 run-dir を破棄して canonical から作り直す
-spsa --run-dir "${RUN_DIR}" --init-from "${CANONICAL}" --force-init ...
-```
-
-#### 関連フラグ
-
-- **`--force-init`**: `<run-dir>/state.params` を atomic 上書きして再初期化。
-  上書き元の形式宣言・全行・engine mappingを先に検証する。数値の構文・範囲不正、
-  非有限値、名前や翻訳先の重複、空の入力では既存成果物を変更せず終了する。
-  run-dir 直下の `meta.json` / `stats.csv` / `values.csv` / `final.params` も
-  削除する。`--resume` と排他。順序保証: meta 削除 (失敗で bail) → 関連
-  CSV 削除 → state.params atomic copy。
-  - `--meta-file` で run-dir 外の meta を override している場合、その override
-    先 **も削除する** (active resume state とみなすため。誤投入された旧 meta
-    での resume を防ぐのが force-init の意図)。
-  - `--stats-csv` / `--param-values-csv` を run-dir 外に override している場合、
-    それらの override 先は **削除しない**。CSV は run の物理進行ログであり、
-    override 経由で外部の集約 CSV に append する運用 (複数 run の比較ログ) を
-    破壊しないため。force-init で完全リセットをしたいなら override 先 CSV は
-    ユーザが手で削除すること。
-- **`--strict-init-check`**: `--resume` + `--init-from` 併用時、整合性が
-  median ≥ 0.5σ または max ≥ 5σ を超えたら bail (デフォルトは warn のみ)。
-  CI 等で「想定外の resume」を早期検知したい場合に使う。
-
-#### 起動時の startup summary
-
-SPSA 起動直後に `=== SPSA Startup Summary ===` ブロックが stderr に出力される。
-init mode、`state.params` / `--init-from` の sha256、active param 数、上位 5
-件の値などを表示するので、**起動 5 秒で「想定どおりの値・モードで始まったか」**
-を目視確認できる。
-
-#### stdout / stderr の分離
-
-SPSA の進行ログ (per-game progress、iter end summary、early-stop trigger 等) は
-すべて stderr に出力される。stdout は CSV writer (ファイル出力) と将来の構造化
-出力に予約されている。stderr もログに残したいときは `2>&1 | tee log.txt`。
-
-#### batch 0 スナップショット
-
-fresh start / force-init / use-existing-fresh 時、`<run-dir>/values.csv` の先頭
-に `0, <初期値>, ...` 行 (batch 0 スナップショット) が記録される。resume 時は
-append のため重複しない。これにより「初期値が何であったか」を CSV だけで
-完全に追える。
+`--init-from` を毎回指定しておけば「初回は canonical から、2 回目以降は前回の続き」
+という運用が 1 コマンドで書ける。
 
 ## 5. 可視化用CSV変換（任意）
 
 ```bash
 cargo run --release -p tools --bin spsa_stats_to_plot_csv -- \
-  "${RUN_DIR}/stats.csv" \
-  --output-csv "${RUN_DIR}/stats.plot.csv" \
+  "${RUN_DIR}/tuned.params.stats.csv" \
+  --output-csv "${RUN_DIR}/tuned.params.stats.plot.csv" \
+  --window 16
+
+cargo run --release -p tools --bin spsa_stats_to_plot_csv -- \
+  "${RUN_DIR}/tuned.params.stats_aggregate.csv" \
+  --output-csv "${RUN_DIR}/tuned.params.stats_aggregate.plot.csv" \
   --window 16
 ```
-
-複数 run (例 `--seed` を変えた独立 run dir 群) の比較は、各 run の `stats.csv`
-を pandas/awk で concat してから集計する。
 
 ## 6. パラメータの絞り方
 
@@ -393,16 +198,6 @@ cargo run --release -p tools --bin spsa_stats_to_plot_csv -- \
 `.params` ファイルを変更せず、実行時に対象を絞る。
 
 マッチしないパラメータは摂動されず `.params` ファイルの現在値で固定される。
-有効な対象外項目も両エンジンへ送信する。整数項目の小数の現在値は、最近接整数
-（同距離は 0 から遠い側）へ丸めて範囲内に収め、両側・全 batch で同じ値を使う。
-実数項目は範囲内の現在値を送る。保存する現在値自体は変更しない。
-`[[NOT USED]]` と、mapping 指定時に対応のない項目は送信・摂動・更新すべての対象外。
-有効な params の設定は各対局前に送るため、同名の初期 USI option より優先する。
-
-旧版の段階的 run では、対象外項目の保存値と実際の engine default / 明示 USI option
-が異なる場合がある。元成果物を保持し、使用 binary・option・baseline を確認して
-影響する比較を再評価する。すべての既存 run が影響したとは限らない。
-
 前回チューニング済みの値をベースに別グループをチューニングする段階的ワークフローに対応。
 
 指定可能な全パターン一覧:
@@ -459,11 +254,10 @@ cargo run --release -p tools --bin spsa_stats_to_plot_csv -- \
 ### 方法2: `.params` ファイルに `[[NOT USED]]` マーカー
 
 永続的に除外したいパラメータに `[[NOT USED]]` を付加する。
-マーカーは 7 番目の値カラムの後、インラインコメント (`//`) の前に置く。
 
 ```
 SPSA_CORR_PCV_WEIGHT,int,9536,0,32768,163,1638.4
-SPSA_LMR_TABLE_COEFF,int,2809,1024,8192,35,358.4 [[NOT USED]] //base=2809
+SPSA_LMR_TABLE_COEFF,int,2809,1024,8192,35,358.4 [[NOT USED]]
 ```
 
 ### 推奨チューニング順序
@@ -542,20 +336,14 @@ SPSA_LMR_TABLE_COEFF,int,2809,1024,8192,35,358.4 [[NOT USED]] //base=2809
 
 | regex | USI名 | default | 説明 |
 |---|---|---|---|
-| CORR | `SPSA_CORR_PCV_WEIGHT` | 13806 | pawn correction weight |
-| CORR | `SPSA_CORR_MICV_WEIGHT` | 9512 | minor piece correction weight |
-| CORR | `SPSA_CORR_NONPAWN_WEIGHT` | 11615 | non-pawn correction weight |
-| CORR | `SPSA_CORR_CNT_WEIGHT` | 7885 | continuation correction (ss-2, ss-4) weight |
-| CORR | `SPSA_CORR_CNT_SS6_WEIGHT` | 6307 | continuation correction (ss-6) weight |
-| CORR | `SPSA_CORR_CNT_NO_MOVE` | 80695 | 前の手が無いとき continuation 項全体の代わりに足す定数 |
-| CORR | `SPSA_CORR_HIST_NONPAWN` | 186 | correction history non-pawn 更新係数 |
-| CORR | `SPSA_CORR_HIST_MINOR` | 150 | correction history minor piece 更新係数 |
-| CORR | `SPSA_CORR_HIST_CONT_SS2` | 130 | correction history cont (ss-2) 更新係数 |
-| CORR | `SPSA_CORR_HIST_CONT_SS4` | 70 | correction history cont (ss-4) 更新係数 |
-| CORR | `SPSA_CORR_HIST_CONT_SS6` | 35 | correction history cont (ss-6) 更新係数 |
-
-`SPSA_CORR_CNT_SS6_WEIGHT=0`・`SPSA_CORR_HIST_CONT_SS6=0`・`SPSA_CORR_CNT_NO_MOVE=8×SPSA_CORR_CNT_WEIGHT` にすると、
-(ss-6) を使わず、前の手が無いときは `8 × cnt` を足す式になる。
+| CORR | `SPSA_CORR_PCV_WEIGHT` | 9536 | pawn correction weight |
+| CORR | `SPSA_CORR_MICV_WEIGHT` | 8494 | minor piece correction weight |
+| CORR | `SPSA_CORR_NONPAWN_WEIGHT` | 10132 | non-pawn correction weight |
+| CORR | `SPSA_CORR_CNT_WEIGHT` | 7156 | continuation correction weight |
+| CORR | `SPSA_CORR_HIST_NONPAWN` | 165 | correction history non-pawn 更新係数 |
+| CORR | `SPSA_CORR_HIST_MINOR` | 156 | correction history minor piece 更新係数 |
+| CORR | `SPSA_CORR_HIST_CONT_SS2` | 137 | correction history cont (ss-2) 更新係数 |
+| CORR | `SPSA_CORR_HIST_CONT_SS4` | 64 | correction history cont (ss-4) 更新係数 |
 
 History 初期値。`--active-only-regex '^SPSA_(MAIN|CAPTURE|CONT|PAWN|LOW_PLY)_HIST_INIT'`
 
@@ -705,180 +493,83 @@ rshogi 式は `+` に統一しているため、YO 式の `-X *` は rshogi 側�
 | TT_MOVE | `SPSA_TT_MOVE_MALUS` | -848 | TT move malus |
 | PRIOR | `SPSA_PRIOR_CAPTURE_CM_BONUS` | 964 | prior capture CM bonus |
 
-## 7. `.params` ファイルの形式と移行
+## 7. `.params` ファイルの step / delta
 
-パラメータ行より前に `# spsa-format: c-end-r-end-v1` を1回だけ置く。
-列は `name,type,value,min,max,c_end,r_end`。`generate_spsa_params` と
-`yo_to_rshogi_params` のbase省略時は、次の同じ既定値を使う。
+`generate_spsa_params` が自動算出する値の意味:
 
 | 列 | 意味 | 算出式 |
 |---|---|---|
-| 列6 `c_end` | run終端の摂動幅 | `max(1, round((max - min) / 20))` |
-| 列7 `r_end` | run終端の学習率係数 | `0.002` |
+| `step` | 勾配推定時の摂動量（SPSAの c_t に対応） | `max(1, round((max - min) / 200))` |
+| `delta` | パラメータ更新の移動量（SPSAの a_t に対応） | `(max - min) / 20` |
 
-- `c_end` は終端でも摂動が意味のある差を作るよう設計する。
-- `r_end` は直接の更新幅ではない。更新量は `R_k × c_k × raw_result × flip × mobility`。
-- 実行時の `--mobility` は更新量を一律に変える。摂動幅は各行の `c_end` で指定する。
-- 旧形式の列6=`max(1,round(range/200))`、列7=`range/20` を現形式として読み替えない。
-  小さいrangeでは列7も小さくなるため、値の閾値では識別できない。
-
-既存canonicalの扱い:
-
-| ファイル | 確認・移行 |
-|---|---|
-| `generate_spsa_params` / `yo_to_rshogi_params` / `generate_net_spsa_params` の現行出力 | 宣言付きのまま `--init-from` に渡す |
-| `tests/golden/spsa/` のcanonicalと4個のstate fixture | 現形式の宣言付き。数値・values/statsの基準は維持 |
-| 過去のv4 canonical・`state.params` | 列6/7が `c_end/r_end` と確認できたものだけ `--assume-c-end-r-end` で受理 |
-| 旧converterのrshogi出力・YO `tune.py` 由来ファイル | 形式を推定しない。名前体系とscheduleの意味を別々に確認する |
-| `tune/*.params` / `spsa_params/*.params` の私用canonical | リポジトリ追跡外のため内容を保証しない。由来・列定義を確認して上記に分類する |
-
-未宣言・未知・重複・途中の宣言は既定でerror。`--assume-c-end-r-end` は未宣言の
-`--init-from` と既存stateにだけ適用し、未知・旧形式の宣言は上書きしない。
-このフラグは数値を補正せず、既存のschedule・ハッシュ検査も解除しない。
-`yo_to_rshogi_params --base` の未宣言v4入力にも同じ明示確認を指定できる。
-
-既知v4のrunを再開するときは、stateやmetaを手編集せず `--resume --assume-c-end-r-end`
-を指定する。stateへヘッダを手で足すと保存済みSHA-256と不一致になる。
-次のcheckpointで宣言とハッシュが通常どおり保存される。未宣言canonicalを再度
-`--init-from` に渡す間は、この確認フラグも必要。
-
-旧 `step,delta` からは、別パスへ現形式のcanonicalを生成し、同じ名前の値列だけを
-転記する。min/maxを確認し、列6/7は `c_end/r_end` として設計し直す。YO名から
-rshogi名へ移す場合は、`yo_to_rshogi_params` のbase省略で値の転記と現行scheduleの
-生成を行える。旧baseの列6/7を引き継がない。旧runの学習率を意味保存で自動変換する
-規則はないため、scheduleを変えたファイルは新runで開始する。
-
-逆方向の `rshogi_to_yo_params` 出力はYOのbase列を保持するため、現形式を宣言しない。
-`tune.py apply` 用の値転記と、`spsa` への入力準備を区別する。
-
-### 7.1 c_end / r_end 選定チェックリスト
-
-`c_end` は **最終摂動幅**。schedule は
-`c_0 = c_end × N^γ` で初期摂動幅を逆算して減衰するため、`.params` に書く値は
-「run 終盤でもこの幅で摂動する」終端の目標値であって初期 c_k ではない
-(k 軸は total-pairs 到達の手前の batch で終わるため、実走の最終 batch の c_k は
-c_end よりわずかに大きい)。`r_end` は **最終学習率係数** であり、
-`a_0 = r_end × c_end² × (A+N)^α` で逆算される。
-
-run 投入前に確認する:
-
-- **摂動が意味のある差を生む大きさか**: θ+c と θ−c を固定した 2 エンジンの
-  短対局 (数百局) では数 nElo 級の差は統計的に検出できない。この確認の目的は
-  粗い sanity check — setoption が効いているか、c が明らかに過大 (勝率が壊れる)
-  でないか — に限る。摂動幅は run 終盤でも使われる `c_end` で試す
-  (c_0 側はこれより大きいので、c_end で信号の見込みがあれば序盤は問題にならない)。
-  c の過小は短対局でも run 中の観測でも断定できない (§9.4)。疑いが立ったら
-  次回 run の `c_end` 設計を見直す材料にする。
-- **整数パラメータの `c_end`**: 本実装は θ±c_k を stochastic rounding
-  (`floor(v + U(0,1))`、期待値保存) で整数化するため、fishtest の「整数は c > 1
-  必須」則とは異なり **c_end ≈ 1 でも摂動は期待値として保たれる**。10 倍スケール
-  表現への変換が要るのは、整数刻みより細かい最適値の分解能が必要な場合に限る。
-- **min/max は clip (安全柵) であって探索範囲の設計変数ではない**:
-  `generate_spsa_params` が出力するエンジンの USI option 範囲内で広めに取り、
-  探索を狭めたいときは range を狭めるのではなく `r_end` (または `--mobility`) を
-  下げる。clip で狭めると境界に張り付いた側の勾配感度が死ぬ。USI option の
-  min/max を越えて `.params` の range だけを広げてはならない。SPSA 内部の値と
-  エンジン側で clamp された実適用値が食い違うため、越える必要がある場合は先に
-  エンジン側の option 範囲を変更・再ビルドし、`.params` を再生成する。
-- **θ の境界張り付きを監視する**: `values.csv` で θ が min/max 境界に張り付き
-  続けていないかを確認する。張り付きが常態化したら、エンジンの USI option
-  範囲内で range を広げられるか確認するか、まず `r_end` / `--mobility` を見直す。
+- `step` が小さすぎると勾配推定がノイズに埋もれる。大きすぎると近似精度が落ちる。
+- `delta` が大きすぎると発散する。小さすぎると収束が遅い。
+- 実行時に `--scale` で摂動量を一律スケール、`--mobility` で移動量を一律スケールできる。
+- 個別調整が必要な場合は `.params` ファイルを直接編集する。
 
 ## 8. よく使う調整項目
 - 開始局面ファイルを固定する: `--startpos-file /path/to/openings.txt`
 - 開始局面ファイルを必須化する: `--require-startpos-file`
 - 単一局面で回す: `--sfen "<sfen>" --random-startpos false`
-- 対局を並列化する: `--concurrency <N>` (既定は `1`、上限は `2 × batch_pairs`)
-- 複数 seed の探索: `--seed` を変えた **独立 run dir** を別プロセスで並列実行する
+- 対局を並列化する: `--concurrency <N>`（既定は `1`）
+- iter 内の seed 群も並列実行する: `--parallel-seeds`（多コア環境向け、§3 の調整ルール参照）
 - 早期停止を有効化する: `--early-stop-avg-abs-update-threshold` / `--early-stop-result-variance-threshold` / `--early-stop-patience`
-- 速度優先の暫定実行: `--total-pairs` を小さくする (例: 100〜500)
+- 速度優先の暫定実行: `--games-per-iteration` と `--iterations` を小さくする
 
 ## 9. 生成物
 
-`--run-dir <dir>` 配下に以下が自動生成される (batch の場合。async の生成物と CSV の列は
-[§15.3](#153-run-dir-と-resume)・[§15.4](#154-statscsv--valuescsv-async)):
+`--params <path>` を基準に、以下が既定で自動生成される（PR #481）:
 
-| 生成物 | 既定パス | override フラグ | opt-out フラグ |
-|---|---|---|---|
-| 更新済みパラメータ | `<run-dir>/state.params` (上書き) | — | — |
-| 確定スナップショット | `<run-dir>/final.params` (正常完了時) | — | — |
-| 再開メタデータ | `<run-dir>/meta.json` | `--meta-file` | — |
-| batch 統計 | `<run-dir>/stats.csv` | `--stats-csv` | `--no-stats-csv` |
-| パラメータ履歴 | `<run-dir>/values.csv` | `--param-values-csv` | `--no-param-values-csv` |
-| 棋譜 | `<run-dir>/games.jsonl` | — | `--no-game-records` |
-| batch の摂動 (batch のみ) | `<run-dir>/batches.jsonl` | — | `--no-game-records` |
-| 可視化CSV (`spsa_stats_to_plot_csv` 出力) | — | `--output-csv` | — |
+| 生成物 | 既定パス | opt-out フラグ |
+|---|---|---|
+| 更新済みパラメータ | `<params>` (上書き) | — |
+| 再開メタデータ | `<params>.meta.json` | — |
+| seed単位統計 | `<params>.stats.csv` | `--no-stats-csv` |
+| seed集計統計 (複数 seed 時のみ) | `<params>.stats_aggregate.csv` | `--no-stats-aggregate-csv` |
+| パラメータ履歴 | `<params>.values.csv` | `--no-param-values-csv` |
+| 可視化CSV (`spsa_stats_to_plot_csv` 出力) | 任意 (`--output-csv`) | — |
 
-override フラグを使うと、対象ファイルだけ任意のパスに置ける (他は run-dir 既定のまま)。
-通常運用では override は不要。
+明示的に `--stats-csv` / `--stats-aggregate-csv` / `--param-values-csv` を指定した場合は
+そのパスが優先される（明示パスが既定パスを上書き）。例えば `--params runs/spsa/<ts>/tuned.params`
+を渡せば、CSV はすべて同ディレクトリに `tuned.params.{stats,stats_aggregate,values}.csv`
+として置かれる。
 
-### 9.1 `stats.csv` (batch 単位統計) の主要列
-
-1 batch = 1 行で出力される。CSV header:
-
-```
-iteration,batch_pairs,plus_wins,minus_wins,draws,raw_result,active_params,
-avg_abs_shift,updated_params,avg_abs_update,max_abs_update,total_games
-```
+### 9.1 `stats.csv` (seed 単位統計) の主要列
 
 | 列 | 意味 |
 |---|---|
-| `iteration` | 1-indexed の batch 番号 |
-| `batch_pairs` | この batch で消化した game pair 数 (= games / 2)。最終 batch のみ端数になり得る |
+| `iteration` | 1-indexed の反復番号 |
+| `seed` | 反復で使った乱数 seed |
+| `games` | 当該反復の対局数 |
 | `plus_wins` / `minus_wins` / `draws` | + 摂動側 / - 摂動側 / 引き分けの局数 |
-| `raw_result` | + 側勝率ベースのスコア (`Σ plus_score`、各 game pair が +1 / 0 / -1) |
-| `active_params` | この batch で perturb 対象となった active パラメータ数 |
-| `avg_abs_shift` | active パラメータの摂動量の平均 (c_k に依存) |
-| `updated_params` | この batch で更新対象になった parameter 数 (active かつ c_end≠0)。clamp 等で更新量 0 でも数えるため「値が動いた数」ではない |
+| `raw_result` | + 側勝率ベースのスコア（+1: + 全勝 / 0: 引き分け / -1: - 全勝） |
+| `active_params` | 当該反復で perturb 対象となった active パラメータ数 |
+| `avg_abs_shift` | active パラメータの摂動量の平均（c_k に依存） |
+| `updated_params` | 当該反復で値が動いた parameter 数 |
 | `avg_abs_update` / `max_abs_update` | 値更新量の平均と最大 |
 | `total_games` | これまでの累積対局数 |
 
-### 9.2 `values.csv` (パラメータ履歴、wide 形式)
+### 9.2 `stats_aggregate.csv` (seed 横断集計、複数 seed 時のみ)
 
-各列が 1 パラメータ、各行が 1 batch。`spsa_stats_to_plot_csv` で window 平均を
-かけてプロットすると個別パラメータの収束軌跡が見やすい。整数パラメータも
-小数表記 (`42.000000` 等) で出力される (resume を挟んでも丸め誤差で値がずれない
-ようにするため)。
+`raw_result_mean` / `raw_result_variance` / `plus_wins_mean` 等。`variance` が
+高い反復は seed 間で結果が揺れているサインで、SPSA の収束判定には
+**aggregate 側の `_variance` を見る**のが基本。
 
-### 9.3 収束判定の目安
+### 9.3 `values.csv` (パラメータ履歴、wide 形式)
+
+各列が 1 パラメータ、各行が 1 反復。`spsa_stats_to_plot_csv` で window 平均をかけて
+プロットすると個別パラメータの収束軌跡が見やすい。
+
+### 9.4 収束判定の目安
 
 `--early-stop-avg-abs-update-threshold` / `--early-stop-result-variance-threshold`
 / `--early-stop-patience` を指定すると条件成立で SPSA が早期終了する。経験則:
 
-- `avg_abs_update < 0.02` 程度 (摂動量比で) が連続 5 batch 続けば「ほぼ動いていない」
-- `|raw_result| / batch_pairs < 0.002` 程度なら +/- 摂動の勝率差がほぼ 0 (= 結果が拮抗)
+- `avg_abs_update < 0.02` 程度（摂動量比で）が連続 5 反復続けば「ほぼ動いていない」
+- `result_variance < 0.002` 程度なら seed 間ばらつきが小さい (= 結果が再現的)
 
-`--early-stop-result-variance-threshold` の比較対象は **`|raw_result| / batch_pairs`**
-(0..2 の値、各 game の +1/-1 が完全に拮抗すると 0 に近づく) であり、
-`raw_result` の絶対値そのものではない点に注意。閾値値はチューニング対象の感度に
-応じて調整する (枝刈り系は感度高、history 初期値は低、等)。
-
-### 9.4 診断 checkpoint の運用
-
-`--early-stop-*` は閾値の運用実績が無いため自動停止の規約にはせず (§3 の注記参照)、
-代わりに **run 開始前に診断 checkpoint (500〜1000 pair 目安) を宣言し、そこで人手観測**
-する。checkpoint は原則**観測のみ**で、run は §3 のとおりフルで走らせる:
-
-- `values.csv` の θ 推移: 値が動いているか。min/max 境界への張り付き (§7.1) が
-  ないか。
-- `stats.csv` の `avg_abs_shift` / `avg_abs_update` / `max_abs_update`: 摂動と更新が
-  設計どおりの規模で起きているか。`updated_params` は active かつ c_end≠0 の
-  パラメータを更新量 0 (clamp 貼り付き等) でも数えるため、「値が動いている」証拠
-  には使えない — active 数の確認にだけ使う。
-- checkpoint で停止してよいのは、**機械的に確認できる異常に限る**: active
-  パラメータが 0 / 対象パラメータの c_end が 0 / setoption が engine に適用されて
-  いない (`usi` 応答の option 一覧と対象名・min/max を事前照合し、必要なら
-  setoption 受信値を出す engine ログで確認) / `values.csv` で全パラメータが
-  完全不動 (浮動小数の θ が 1 batch も変化していない = 更新経路が働いていない)、
-  等。**「勝率差に信号が無い」は停止理由にならない** — 符号付き `raw_result` は
-  ランダムな摂動方向で相殺されるため、無信号は正常な run でも観測され、c 過小
-  との区別が付かない。c 過小の疑いは停止理由ではなく、次回 run の `c_end` 設計を
-  見直す材料として記録する。感触や中間成績を理由にした打ち切りはしない。
-  startup summary は SPSA 内部の active 設定を表示するだけで、setoption の送信・
-  適用結果を保証しないため、この確認には使わない。
-- 更新量が小さいだけの状態を「収束した」と即断しない。checkpoint 時点の
-  値を選別採用する誘惑は winner's curse そのものであり、採否は正常終了した
-  endpoint の SPRT 検証 (§11.5) でのみ判断する。
+両方の閾値を満たす反復が `--early-stop-patience` 回連続したら停止。値はチューニング
+対象の感度で調整 (枝刈り系は感度高、history 初期値は低、等)。
 
 ## 10. YaneuraOu ⇔ rshogi `.params` 変換
 
@@ -900,7 +591,7 @@ cargo build --release -p tools \
 ```bash
 cargo run --release -p tools --bin yo_to_rshogi_params -- \
   --yo-params tune/suisho10.params \
-  --base spsa_params/canonical.params \
+  --base spsa_params/<rshogi_base>.params \   # min/max/step を引き継ぐベース（省略時はデフォルト range）
   --mapping tune/yo_rshogi_mapping.toml \
   --output spsa_params/from_yo_suisho10.params
 ```
@@ -1019,9 +710,8 @@ YO のチューニング対象は素のソースだと `constexpr int param = N;
 
 ##### Step 1. tune.py の入手
 
-`tune.py` と `ParamLib.py` は本リポジトリには含まれない。YaneuraOu-ScriptCollection の
-`SPSA/` ディレクトリから `tune/` 直下にコピーして使う（追跡対象外のローカルファイル。
-入手元と配置するファイルは `tune/README.md` を参照）。以下のコマンドはこの配置を前提とする。
+YaneuraOu-ScriptCollection の `SPSA/` ディレクトリ、もしくは本リポジトリの `tune/` 直下に
+`tune.py` と `ParamLib.py` が同梱されている。
 
 ##### Step 2. `.tune` ファイルを YO ソースに当てる
 
@@ -1089,28 +779,28 @@ YO バイナリは NNUE 評価関数のロード、進行度ファイル、定�
 `.params` の name 列が YO のビルド済み USI option 名と一致していれば、rshogi の `spsa`
 はその name を `setoption` にそのまま流すだけなので、**変換ツール・マッピング表は不要**。
 
-YO名のまま列6/7を `c_end/r_end` として確認・設計し、§7の形式宣言を付けた
-正本 (例: `tune/yo_canonical.params`) を `--init-from` に指定する。
-上流由来の未宣言 `.params` へ宣言だけを加えて学習率を読み替えない。
-反復用ファイル (`<run-dir>/state.params`) は spsa が自動生成・上書きするので、
-正本そのものが書き換えられることはない。
+> **正本ファイルの上書き保護**: `--params` に渡したファイルは反復ごとに上書きされる。
+> 正本（例: `tune/suisho10.params`）を直接渡さず、必ず timestamped run dir の中の
+> `tuned.params` を渡す。`--init-from <canonical>` を使うと、`--params` のパスが存在
+> しない時に限り canonical をコピーしてから開始する（既存なら resume として読み込む）。
 
 ```bash
 RUN_DIR="runs/spsa/$(date -u +%Y%m%d_%H%M%S)_yo_suisho10"
+mkdir -p "${RUN_DIR}"
 
 cargo run --release -p tools --bin spsa -- \
-  --run-dir "${RUN_DIR}" \
-  --init-from tune/yo_canonical.params \
+  --params "${RUN_DIR}/tuned.params" \
+  --init-from tune/suisho10.params \
   --engine-path /path/to/YaneuraOu-tune-patched \
-  --total-pairs 6400 --batch-pairs 32 \
+  --iterations 200 --games-per-iteration 64 \
   --concurrency 8 --threads 1 --hash-mb 256 --byoyomi 1000 \
   --startpos-file /path/to/openings.txt \
-  --seed 1
+  --seeds 1,2,3,4
 ```
 
-`<run-dir>/state.params` はYO名とc_end/r_end形式宣言を保持する。
-`tune.py apply` には§10.6.3の焼き込み用コピーを使う。正本は触られない。
-CSV 出力 (`stats.csv` / `values.csv`) も同 run-dir に自動生成される (§9 参照)。
+書き戻された `${RUN_DIR}/tuned.params` は YO 形式のまま運用に乗る。`tune/suisho10.params`
+（正本）は触られない。CSV 出力 (`tuned.params.{stats,stats_aggregate,values}.csv`) も
+同ディレクトリに自動生成される (§9 参照)。
 
 ##### case A 用の `--active-only-regex` 例 (YO 命名)
 
@@ -1148,16 +838,17 @@ rshogi 側の `.params` フォーマット（`SPSA_*` 命名）のまま YO バ�
 
 ```bash
 RUN_DIR="runs/spsa/$(date -u +%Y%m%d_%H%M%S)_yo_via_rshogi"
+mkdir -p "${RUN_DIR}"
 
 cargo run --release -p tools --bin spsa -- \
-  --run-dir "${RUN_DIR}" \
+  --params "${RUN_DIR}/tuned.params" \
   --init-from spsa_params/suisho10_converted.params \
   --engine-path /path/to/YaneuraOu-tune-patched \
   --engine-param-mapping tune/yo_rshogi_mapping.toml \
-  --total-pairs 6400 --batch-pairs 32 \
+  --iterations 200 --games-per-iteration 64 \
   --concurrency 8 --threads 1 --hash-mb 256 --byoyomi 1000 \
   --startpos-file /path/to/openings.txt \
-  --seed 1
+  --seeds 1,2,3,4
 ```
 
 - `.params` の `SPSA_*` 名は `setoption` 時に YO 名（`correction_value_1` 等）へ翻訳され、
@@ -1180,281 +871,27 @@ SPSA ループで得られた最終値を YO の production バイナリに反�
 でソースに焼き戻し → production ビルドが必要（YO の TUNE() マクロは production リリース
 時には残したくないため、定数として書き戻す）。
 
-SPSA が正常完了すると `<run-dir>/final.params` が atomic に書き出される。
-これは反復が完了した時点の最終確定スナップショットで、live state である
-`<run-dir>/state.params` (反復ごとに上書きされる) とは別ファイルとして保持
-される。`apply` の入力には必ず `final.params` を使う。
-
-`tune.py apply` の引数は `<.tune ファイル> <ソースディレクトリ>` で、params ファイルは
-`.tune` の stem から `<stem>.params` として探される (params を直接は渡せない)。
-導いた path が無いと値を 0 件として黙って続行するので、起動時に表示される
-`params_file :` 行が意図したファイルを指していることを確認する。
-`tune/suisho10.params` (上流の初期値) を上書きしないよう、run ごとの作業ディレクトリに
-同じ stem で `.tune` と `.params` を並べてから apply する:
-
 ```bash
-WORK=/path/to/rshogi/runs/spsa/<RUN>/apply
-mkdir -p "$WORK"
-cp /path/to/rshogi/tune/suisho10.tune "$WORK/tuned.tune"
+# ケース A の場合: tuned.params が YO 形式のままなので直接 apply
+cd /path/to/YaneuraOu
+python3 /path/to/rshogi/tune/tune.py apply \
+  /path/to/rshogi/runs/spsa/<RUN>/tuned.params \
+  source/
 
-# ケース A の場合: YO名の値を保持し、外部reader向けのコピーでは形式宣言を除く
-awk '!/^[[:space:]]*#/' /path/to/rshogi/runs/spsa/<RUN>/final.params > "$WORK/tuned.params"
-
-# ケース B の場合: rshogi 形式 → YO 形式に逆変換して並べる
+# ケース B の場合: rshogi 形式 → YO 形式に逆変換してから apply
 cargo run --release -p tools --bin rshogi_to_yo_params -- \
-  --rshogi-params /path/to/rshogi/runs/spsa/<RUN>/final.params \
+  --rshogi-params /path/to/rshogi/runs/spsa/<RUN>/tuned.params \
   --base /path/to/rshogi/tune/suisho10.params \
   --mapping /path/to/rshogi/tune/yo_rshogi_mapping.toml \
-  --output "$WORK/tuned.params"
-
+  --output /tmp/tuned_yo.params
 cd /path/to/YaneuraOu
-python3 /path/to/rshogi/tune/tune.py apply "$WORK/tuned.tune" source/
+python3 /path/to/rshogi/tune/tune.py apply /tmp/tuned_yo.params source/
 ```
 
 `apply` 後、`%%TUNE_DECLARATION%%` 等のマーカーは消え、注入された `TUNE(...)` も実定数に
 置換される。production ビルドして完了。元の状態に戻したい場合は `git checkout source/`。
 
-> 注意: `<run-dir>/state.params` は SPSA 反復ごとに上書きされる live ファイル
-> なので、apply 入力に渡すべきではない。`final.params` は SPSA 正常完了時に
-> atomic に確定するため、SPSA を裏で再開 (resume) しても apply 値とは独立。
-> SPSA がまだ完了していない場合 (途中で停止した中間状態を apply したい等) は、
-> `cp <run-dir>/state.params /tmp/snapshot.params` で明示的にスナップショット
-> を取ってから apply すること。
-
-### 10.7 旧 run の最終値を起点にして新 run を始める
-
-何らかの理由で resume できなくなった run (meta 形式が古い、ファイル破損、
-schedule を大きく変えたい等) の **最終値だけを取り出して新 run の canonical
-として使う** 手順。**resume ではなく fresh start** であることに注意。
-
-#### できること / できないこと
-
-- **できる**: 旧 run の最終 params 値を新 run の `--init-from` (canonical) として渡す
-- **できない**: 旧 run の進行状態 (完了 batch 数 / 累積 game 数 / SPSA schedule
-  内部状態) の継承。schedule は新 run の `k = 0` から始まる
-
-#### 手順
-
-以下は旧ファイルの列6/7が既にc_end/r_endと確認済みの場合に限る。
-旧step/deltaの場合は§7の移行でscheduleを設計し直し、値列だけを引き継ぐ。
-
-```bash
-# 旧 run の最終 params を新 run の canonical として一旦保管
-OLD_RUN="runs/spsa/20260401_120000_oldrun"
-cp "${OLD_RUN}/final.params" spsa_params/seed_from_oldrun.params
-# `final.params` が無い場合は `${OLD_RUN}/state.params` を使う
-
-# 新 run を fresh start (k 軸は 0 からカウントし直す)
-NEW_RUN="runs/spsa/$(date -u +%Y%m%d_%H%M%S)_seeded_from_oldrun"
-cargo run --release -p tools --bin spsa -- \
-  --run-dir "${NEW_RUN}" \
-  --init-from spsa_params/seed_from_oldrun.params \
-  --assume-c-end-r-end \
-  --total-pairs <total game pair 数> \
-  --batch-pairs 8 \
-  --seed 1 ...
-```
-
-#### 注意点
-
-- 新 run の最初の batch は旧 run の「続き」ではなく「旧最終値を初期値とする
-  独立な SPSA」。schedule (`c_k`) も最初の大きい摂動から始まるため、旧 run
-  末尾と同じ収束領域に戻るには数十 batch 必要なケースがある。
-- 旧 run の `stats.csv` / `values.csv` は新 run には引き継がない。両方の集計が
-  必要なら手動で結合する。
-- **途中再開**が必要な場合は新規 fresh start ではなく `--resume` を使うこと。
-
-## 11. チューン済み params の実戦投入（トーナメント / CSA / 大会）
-
-SPSA で得た `.params`（rshogi 形式）を、再ビルドせずに実戦エンジンへ適用する。
-適用は **すべてランタイム**（USI `setoption`）で行われ、`tune_params.rs` の
-default を書き換える焼き込み（rebuild 必須）とは別経路。
-
-### 前提: rshogi 形式であること
-
-実戦投入できるのは **rshogi 形式**（1 列目が `SPSA_` 接頭辞）のファイルのみ。
-YO 形式（`correction_value_1` 等）は名前が一致せず無視される。YO 駆動 SPSA の
-`final.params` は YO 形式なので、§10.2 `yo_to_rshogi_params` で rshogi 形式へ
-変換してから投入する。
-
-```bash
-# rshogi 形式であることの簡易ガード
-head -1 <file>.params | grep -q '^SPSA_' || echo "NG: rshogi 形式ではない"
-```
-
-### 11.1 エンジン本体 (rshogi-usi) の 3 経路
-
-適用経路は **ファイルロード（経路1・2）** と **個別 setoption（経路3）** の 2 系統で、
-固定の優先度ではなく **後に適用された方が勝つ（last-writer-wins）**（`crates/rshogi-usi/src/main.rs`）。
-
-1. **USI option `SPSAParamsFile`（明示パス・推奨）**
-
-   ```
-   setoption name SPSAParamsFile value /path/to/v99-400-suisho10.rshogi.params
-   ```
-
-   どの params を使ったかが起動ログ・設定に残るためトレーサビリティが高い。
-   大会本番はこれを推奨。
-
-2. **バイナリ同ディレクトリの `spsa.params` 自動ロード（設定不要）**
-
-   エンジンバイナリと同じディレクトリに `spsa.params` という名前で置く（or symlink）と
-   オプション指定なしで自動適用される。配備物に同梱したい場合に便利。
-
-   ```bash
-   ln -snf /path/to/v99-400-suisho10.rshogi.params <engine_dir>/spsa.params
-   ```
-
-   ※ 自動ロードのファイル名は **厳密に `spsa.params`**。配布名のままでは拾われない。
-
-   経路 1・2 はどちらも `maybe_load_spsa_params()` による**同一のファイルロード機構**で、
-   **初回 `isready` 時に 1 回だけ**走る。`SPSAParamsFile` が指定されていればその明示パスを、
-   未指定なら `spsa.params` を読む（= 1 が 2 に優先するのはこの「読むパスの選択」の話）。
-   読み込み時に各値が min/max にクランプされ、
-   `info string SPSA params loaded: N parameters from <path> (clamped: M)` を出力する
-   （`clamped` が 0 以外なら範囲外があった合図）。その場合は `.params` の該当行の値が
-   min/max に収まっているか確認し、必要なら `generate_spsa_params` でレンジを見直す。
-
-3. **個別 `SPSA_*` の setoption（一時上書き）**
-
-   ```
-   setoption name SPSA_FUTILITY_MARGIN_BASE value 89
-   ```
-
-   経路 1・2 とは別機構で、setoption を受けた**その場で即時適用**される
-   （クランプ時は値ごとに `info string Warning: ... clamped to ...` を出力。経路 1・2 の
-   `SPSA params loaded` ログは出さない）。
-
-> **適用順序（last-writer-wins）**: 上記は固定優先度ではなく、同じパラメータに対しては
-> **後に適用された方が最終値になる**。ファイルロード（経路 1・2）は `isready` 時に走るため、
-> それ**より前**に送った個別 `SPSA_*`（経路 3）はファイル値で上書きされる。逆に、初回 `isready`
-> より**後**に送る個別 `SPSA_*` は、ファイルが再ロードされない限り上書きされない
-> （`SPSAParamsFile` を再設定すると次の `isready` で再ロードされる）。トーナメントでの
-> 具体的な落とし穴は §11.2 の注意を参照。
-
-### 11.2 トーナメントツール
-
-`.params` を直接渡せる（内部で個別 `SPSA_*=Value` の setoption に展開）。
-
-```bash
-# 以下は <rshogi> プロジェクトルートから実行する前提（相対パスは cwd 依存。絶対パスも可）
-cargo run --release -p tools --bin tournament -- \
-  --engine ./target/production/rshogi-usi --engine-label tuned \
-  --engine ./target/production/rshogi-usi --engine-label base \
-  --engine-params-file "0:spsa_params/v99-400-suisho10.rshogi.params" \
-  ...
-```
-
-- `--engine-params-file "INDEX:path"` … 指定 INDEX のエンジンへファイル全項目を設定
-- `--engine-usi-option "INDEX:Name=Value"` … 個別指定（`INDEX:SPSAParamsFile=path` も可）
-
-> **注意（自動ロードによる上書き）**: `--engine-params-file` は個別 `SPSA_*` setoption
-> として送るだけで `SPSAParamsFile` をセットしない。一方エンジンは `isready` 時に
-> §11.1-2 の自動ロード（バイナリ同ディレクトリの `spsa.params`）を実行するため、
-> その `spsa.params` が存在すると `--engine-params-file` の値が**後から上書きされる**。
-> §11.1-2 を試した後や、同一バイナリで base/tuned を比較する場合は特に注意。
-> 確実に効かせるには `--engine-usi-option "INDEX:SPSAParamsFile=path"` を使う、
-> もしくはバイナリ横に `spsa.params` を置かない。
-
-### 11.3 CSA クライアント（大会接続）
-
-`.params` の直読みは未対応。`[engine.options]` に **`SPSAParamsFile`** を 1 行書き、
-エンジン本体の自動ロードに委ねる（個別 `SPSA_*` の列挙も可だが非現実的）。
-
-```toml
-[engine.options]
-USI_Hash = 1024
-Threads = 8
-EvalFile = "eval/v99-400.bin"
-SPSAParamsFile = "/path/to/v99-400-suisho10.rshogi.params"
-```
-
-`csa_client` が起動時に各キーを `setoption name <key> value <val>` で送る。
-CLI `--options "K=V,..."` は同名キーを上書きする。
-
-### 11.4 配布と運用
-
-チューン済み params は repo 外の共有 note repo（git 管理）に置き、各環境からは
-`<rshogi>/spsa_params/` への symlink で参照する運用を推奨（rshogi 本体の
-`spsa_params/` は `.gitignore` に登録済みで git 追跡対象外のため、配布は
-`git pull` に一本化できる）。
-
-```bash
-# 前提: rshogi/ と params 管理 repo が同一親ディレクトリ下にあること（相対 symlink のため）
-# 初回のみ: mkdir -p <rshogi>/spsa_params/
-git -C <…>/<params-repo> pull
-ln -snf ../../<params-repo>/spsa/<name>.rshogi.params <rshogi>/spsa_params/
-```
-
-### 11.5 注意
-
-- **未検証の SPSA エンドポイントをそのまま大会投入しない**。本番採用前に
-  selfplay / SPRT で base 比較し、Elo が有意に勝ち越すことを確認する。
-  SPSA は探索であり採用判定ではない (θ の動き・中間成績を根拠に採用しない)。
-  endpoint の採否基準: **正常終了した endpoint** を **独立 seed・SPSA で未使用の
-  局面系列**で標準 gainer bounds `<0, +10>` nElo の SPRT にかけ、`accept_h1` 以外
-  (accept_h0 / inconclusive) は不採用。中間 checkpoint の選別採用は禁止
-  (winner's curse)。複数 SPSA run から最良 endpoint を選んだ場合はその選択も
-  試行記録に残す (選択自体が multiple testing)。独立 seed での再確認は `tournament` が `--seed` を備えていることが
-  前提 (無い版では開始局面選択を再現・独立化できない)。
-- 過去に採用済みの値（例: Phase 1b の Futility/Razoring/NMP）は
-  `tune_params.rs` の default に焼き込み済み（rebuild 経路）。ファイル投入経路で
-  上書きすると二重適用ではなく **ファイル側が勝つ**（setoption は default を上書き）。
-
-## 12. net 重み SPSA (post-training)
-
-LayerStacks 系 NNUE の一部係数は、`.bin` 自体を書き換えず整数 delta として調整できる。
-対象 `.bin` から `generate_net_spsa_params --nnue <net.bin> --output <net.params>` で
-初期 `.params` を作る。係数の絞り込みと範囲設定は
-[`generate_net_spsa_params` の詳細](generate_net_spsa_params.md)を参照する。
-調整対象の `.params` を engine 起動時の spec にも渡す。`--engine-args` は各 argv を
-個別指定するため、先頭が `-` の引数を含めて次の形で渡す。
-
-```bash
-cargo run --release -p tools --bin spsa -- \
-  --run-dir runs/spsa/net-example \
-  --init-from /path/to/net.params \
-  --total-pairs 6400 \
-  --engine-args=--spsa-net-spec \
-  --engine-args=/path/to/net.params \
-  --usi-option EvalFile=/path/to/layerstacks.bin
-```
-
-option 名は FC weight の padding を含む `.bin` 格納順 flat index を使う。bucket ありは
-`SPSA_NET_<kind>_b<bucket>_<index>`、bucket なしは
-`SPSA_NET_ft_b_<index>` とする。
-
-| kind | 対象 | bucket |
-|---|---|---|
-| `out_w` | output 層 weight (`i8`) | あり |
-| `out_b` | output 層 bias (`i32`, index は `0`) | あり |
-| `ft_b` | Feature Transformer bias (`i16`) | なし |
-| `l2_w` | 第 2 FC 層 weight (`i8`) | あり |
-
-`setoption` は delta を保存するだけで、続く `isready` で元の `EvalFile` を再ロードして
-全 delta を 1 回適用する。同じ値の再送では再ロードしない。
-
-SPSA 完了後は `final.params` を元 net へ焼き込み、独立 seed の SPRT で採否を判定する。
-`spsa` は `final.params` へコメント行を保存しないため、generator の初期 `.params` にある
-SHA-256 を控えて `--expected-net-sha256` で渡す。
-
-```bash
-expected_net_sha256="$(sed -n 's/^# .*sha256=\([[:xdigit:]]\{64\}\).*/\1/p' /path/to/net.params)"
-test "${#expected_net_sha256}" -eq 64
-cargo run --release -p tools --bin apply_net_spsa_params -- \
-  --nnue "$SHOGI_DATA/nnue/base.bin" \
-  --params runs/spsa/net-example/final.params \
-  --expected-net-sha256 "$expected_net_sha256" \
-  --output "$SHOGI_DATA/nnue/tuned.bin" \
-  --report runs/spsa/net-example/finalize.json
-```
-
-一連の流れは `generate_net_spsa_params` → SPSA → `apply_net_spsa_params` → SPSA と異なる
-独立 seed の SPRT とする。焼き込み時の SHA-256 照合、読み戻し検証、JSON report は
-[`apply_net_spsa_params` の詳細](apply_net_spsa_params.md)を参照する。焼き込み・SHA-256・
-staged file の読み戻し検証はいずれも net 全体をメモリへ載せずストリーミングで行う。
-
-## 13. トラブルシューティング
+## 11. トラブルシューティング
 
 実機での typical な詰まりどころと対処（症状ベース）。
 
@@ -1482,29 +919,10 @@ staged file の読み戻し検証はいずれも net 全体をメモリへ載せ
 - `--strict-range` を付けるとエラーで止まる。一時的に `--base` の range を広げるか、
   該当 param を `unmapped` に移して翻訳対象から外す
 
-### `init/resume 設定エラー: --init-from が指定されていますが ... は既に存在します`
+### `init-from: ... already exists, leaving as-is` で意図しない値で開始される
 
-`<run-dir>/state.params` が既存の run-dir に存在し、かつ `--init-from` も
-指定されているが `--resume` / `--force-init` が指定されていない時の安全 bail。
-解決策は 3 通り:
-
-- **続行したい** → `--resume` を追加 (canonical との整合性 diagnostic も出力される)
-- **既存を破棄して canonical から作り直したい** → `--force-init` を追加
-- **そもそも指定ミス** → 既存ファイルを `rm` するか、`--run-dir` を新規 timestamped dir にする
-
-推奨運用は **`--run-dir runs/spsa/$(date -u +%Y%m%d_%H%M%S)_<tag>`** のように
-毎回 timestamped dir を切ること。
-
-### `meta format version 不一致` / 旧形式 meta が読めない
-
-`meta.json` が SPSA バイナリの想定と異なる形式の場合に出る。古い run dir で
-resume できないときは、§10.7 の手順で旧 run の最終値だけを新 run の
-`--init-from` として再投入する fresh start に切り替える。
-
-### `param 名集合が meta と不一致です`
-
-- mapping 表に param を追加 / 削除した状態で過去 run を resume しようとした場合に発生
-- 現状 escape hatch なし。新規 run-dir で fresh start すること
+- `--params <path>` のファイルが残っており resume 扱いされた可能性。新規実行なら
+  `--params` を timestamped 新規パスにする
 
 ### `info: N param(s) matched --active-only-regex but are unmapped`
 
@@ -1522,370 +940,6 @@ resume できないときは、§10.7 の手順で旧 run の最終値だけを�
 ### SPSA が収束しない (`avg_abs_update` がいつまでも下がらない)
 
 - 開始局面の多様性不足。`--startpos-file` を増やす or 切り替える
-- `--batch-pairs` が小さすぎて勾配推定がノイズに埋もれる。倍に増やす (例 8 → 16)
-  か、`--total-pairs` を増やして batch 数で稼ぐ
-- 単一 seed のばらつきを確認したい場合は、`--seed` を変えた独立 run dir を
-  数本 (3〜5 本) 走らせて `stats.csv` を比較する
+- `--games-per-iteration` が小さすぎてノイズが大きい。倍に増やす
+- `--seeds` が単一。複数 seed (3〜5) にして集計分散を確認
 - チューニング対象が広すぎる。`--active-only-regex` でグループ別に分割して順次チューニング
-
-## 14. engine プール・再試行・停止
-
-worker は run 開始時に `min(concurrency, 2 × min(batch_pairs, remaining_pairs))` 個生成する。
-`remaining_pairs` は run 開始時の残り pair 数で、0 なら pool を作らず engine も起動しない。各 worker が
-plus/minus の engine 2 本を全 batch で再利用する。batch 末の barrier と更新・保存は従来どおり。
-各対局では全 active パラメータを絶対値で送り、plus 設定＋isready → minus 設定＋isready →
-plus usinewgame＋isready → minus usinewgame＋isready の順で開始する。
-
-| オプション | 既定値 | 意味 |
-|---|---:|---|
-| `--engine-retries N` | 1 | 初回を除く追加試行数。spawn・初期化失敗も予算に含める |
-| `--nodes-timeout-ms MS` | 600000 | `--nodes` 使用時の1探索（1手）の期限。正数のみ。10分は未較正の初期値 |
-
-再試行の対象は engine 異常終了・pipe 切断・usi/isready の read timeout・watchdog。
-その worker の engine 2 本を破棄して再生成し、同じ1局の task（局面・色・game_id・時間制御初期値）と
-batch の確定済み plus/minus 値でやり直す。乱数は引き直さず、成功した結果を一度だけ集計する。
-再試行は stderr に `retry batch=... game_id=... attempt=... cause=...` と1行記録する。
-`attempt=2` は初回失敗後の2回目の試行を表す。CSV/meta の schema は変えない。
-通常の resign / win / illegal_move / no_bestmove / 時計 timeout / max_moves / sennichite / sennichite_perpetual_check と局面構築エラーは再試行しない。
-これは1局単位の再試行であり、`--dispatch async` の pair 単位の指し直し (§15.2) とは別物。
-
-watchdog は「運用上の探索期限超過。hang と低速を区別せず、勝敗には採用しない」。
-期限で `stop` を送り、`timeout-margin-ms` の猶予で応答を回収する。
-stop 後の bestmove も、受信時点で期限を超えた bestmove も正常結果には戻さず、再試行対象にする。
-共有 search API は depth-only にも対応するが、spsa に `--depth` は追加していない。
-tournament / backend は watchdog を有効にせず、既存の動作を維持する。
-
-正常終了・early-stop・致命的エラーでは task channel を閉じて待機 worker を起こし、全 worker を join してから
-run-dir lock を解放する。cancel は task 取得後・再 spawn 前・各手の開始前に確認する。
-初期化途中も含め、最終試行の spawn / initialize 失敗ではローカル engine の破棄前に cancel を通知する。
-再試行可能な初期化失敗は全体 cancel を立てず、engine failure として再試行する。
-panic hook は既定 hook によるメッセージ出力後、unwind 開始前に cancel を通知するため、
-初期化途中のローカル engine の破棄より先に他 worker へ停止を伝える。
-探索中の即時割り込みは行わず、実行中の探索の終了を待つ。usi/isready は無関係な行が来続けても
-usi→usiok と isready→readyok の各段で120秒（初期化は最大240秒）で timeout になる。engine の終了は quit → 300ms 待機 → kill。
-ただし同期 stdin write（quit を含む）の停滞は保証対象外であり、全 hang の有限時間停止を保証するものではない。
-
-fresh 開始では最初の batch 前に completed_pairs=0 の v4 meta を保存する。
-engine failure から通常の Err で戻った場合、state/meta/CSV は直前の batch 境界を保持し、新たな final.params は作らない。
-同じ `--total-pairs`・`--seed` と `--resume` で重複行なく再開できる。
-state→meta 保存途中のクラッシュ耐性や、6桁保存からの f64 軌道の完全復元は保証しない。
-
-決定的な対局応答について values.csv / stats.csv / state.params を固定 SHA `8a740655` と比較する。
-実 engine の定跡乱数や usinewgame で消えないプロセス内状態は、再 spawn の頻度変更により変化しうるため互換性保証の対象外。
-
-### 互換性 golden の再生成
-
-固定 SHA `8a740655` からビルド済みの基準 spsa を `BASELINE` に指定する。
-mock は必ずこの worktree で新しくビルドする。Git Bash / Bash でリポジトリルートから実行:
-
-```bash
-cargo build -p tools --bin spsa_test_engine
-BASELINE=/path/to/baseline/spsa.exe
-MOCK="$PWD/target/debug/spsa_test_engine.exe" # Linux は .exe を外す
-GOLDEN=crates/tools/tests/golden/spsa
-OUT="target/spsa-golden-$(date +%s)"
-for mode in cyclic random; do
-  random=false; [ "$mode" = random ] && random=true
-  for concurrency in 1 3; do
-    run="$OUT/$mode-$concurrency"
-    SPSA_TEST_ENGINE_MODE=value_driven "$BASELINE" \
-      --run-dir "$run" --engine-path "$MOCK" \
-      --init-from "$GOLDEN/canonical.params" --startpos-file "$GOLDEN/startpos.txt" \
-      --total-pairs 4 --batch-pairs 2 --concurrency "$concurrency" \
-      --seed 1 --nodes 1000 --threads 1 --hash-mb 16 --random-startpos "$random" || exit 1
-    mkdir -p "$GOLDEN/$mode-$concurrency"
-    cp "$run/values.csv" "$run/stats.csv" "$GOLDEN/$mode-$concurrency/"
-    {
-      printf '%s\n' '# spsa-format: c-end-r-end-v1'
-      cat "$run/state.params"
-    } > "$GOLDEN/$mode-$concurrency/state.params"
-  done
-done
-cargo test -p tools --test integration spsa_run_dir_integration::value_driven_matches_fixed_sha_golden
-```
-
-基準binaryのstate出力には形式宣言がないため、上記手順で宣言だけを付ける。
-数値行とvalues/statsは基準binaryの出力を保持する。
-
-2026-09-09 の生成時には SPSA 本体の改修前にも同じ条件で現行 HEAD を実行し、4条件×3成果物が基準と
-SHA-256 一致することを確認した。value_driven は SPSA_TEST_INT が6以上なら win、それ以外は resign を返し、
-両 batch の raw_result=+4 の非ゼロ更新を検証する。mock は局面に依存しないため、局面選択 RNG 自体は既存 prep unit test が検証する。
-
-### 重複パラメータの拒否
-
-同じ名前の行、および同じ net 係数 ID を表す行（数値 index の先頭ゼロなど）は、元ファイルの行番号を示して拒否します。`[[NOT USED]]` 行も重複検査の対象です。重複行を後勝ちまたは加算と解釈しません。既存ファイルは自動修正しないため、意図した 1 行へ整理してください。
-エンジン名の mapping を使う場合は、送信対象行の翻訳先も検査します。符号反転の有無にかかわらず同じ係数への衝突は対局開始前に拒否します。
-
-### Schedule の入力検証と停止指標の単位
-
-`alpha` / `gamma` / `a-ratio` / `mobility` と早期停止の閾値は有限値が必要です。既存の正負範囲に加え、対局開始前に schedule の定数、分母の underflow、摂動と最大勝敗和による更新量の保守的な上界を検査します。巨大な有限値でも安全な上界を確認できない組合せは拒否します。通常の schedule 式・既定値・更新係数は変更しません。`c_end=0` による更新停止は維持します。
-
-早期停止の `|raw_result| / batch_pairs` は 0..2 です。1 pair の両局勝ちも両局負けも 2、両局引分または 1 勝 1 敗なら 0、1 勝 1 引分なら 1 です。分散推定値ではなく勝敗和の絶対値の代理指標です。既存の閾値は同じ単位のまま使え、半分への換算は不要です。逐次的な停止規則の較正や棋力保証を意味しません。
-
-## 15. 非同期 per-pair 更新 (`--dispatch async`)
-
-`--dispatch async` は pair ごとに独立な摂動で対局し、結果が届いた順に θ を更新する (fishtest と同じ形)。
-既定は `--dispatch batch` で、batch の動作・成果物は変わらない。
-
-```bash
-spsa --dispatch async --run-dir "$RUN" --init-from canonical.params \
-  --total-pairs 20000 --concurrency 24 --seed 1 --nodes 1000000 \
-  --usi-option EvalFile=/path/to/nn.bin
-```
-
-- worker は `--concurrency` 個 (= 同時に指す pair 数 W、engine は 2W 本)。各 worker が pair の 2 局を同じ設定値・同じ開始局面で
-  先後を入れ替えて順に指す。pair ごとに全適用 param の絶対値を送り、isready → usinewgame → 第 1 局 → usinewgame → 第 2 局。
-- 更新は `θ += mobility × r_k × c_k × R × flip` の後に clamp。k は **dispatch 時**の `completed_pairs` (dispatch_k)、R は 2 局の勝敗和 (−2〜+2)。
-  乱数は batch の `--batch-pairs 1` で batch 番号を pair_id にしたものと同じで、`--concurrency 1` の async は `--batch-pairs 1` の batch と同じ θ になる。
-- `--batch-pairs`・`--games-per-iteration`/`--iterations`・early-stop 系・`--force-schedule`・`--strict-init-check`・`--meta-file`・
-  `--stats-csv`・`--param-values-csv` は拒否する。`--total-pairs` は必須。
-
-| オプション (async 専用) | 既定値 | 意味 |
-|---|---:|---|
-| `--max-lag L` | 4 × `--concurrency` | 適用時の lag (適用時と dispatch 時の completed_pairs の差) の上限。fresh で確定し、resume では変えられない。未較正の初期値 |
-| `--max-pair-attempts N` | 3 | 1 pair の失敗 attempt 数の上限。resume で変えてよい |
-| `--max-timeout-rate R` | 0.005 | 時間切れの局の率の上限 ([§17.4](#174-時間切れと-1-局の上限))。resume で変えてよい |
-| `--timeout-rate-min-games N` | 1000 | 時間切れの率の分母の下限 (局数)。resume で変えてよい |
-| `--snapshot-interval N` | 64 | snapshot を公開する適用数の間隔。resume で変えてよい |
-
-### 15.1 lag の上限と停止
-
-未確定の pair (実行中・結果待ちの保留・再実行待ち) を dispatch_k の昇順に並べ、すべての i で `completed_pairs + i − k_i ≤ L` を保つ。
-これを破る結果の適用は保留し、破る新規 dispatch は出さない。適用時の lag は常に L 以下で、未確定の pair は最大 L+1 個。
-最古の pair はいつでも適用できるので、最古の結果が届けば保留は順に解ける。
-
-予算が残っているのに lag の条件で新規 dispatch できず、空いた worker と保留があり、最古の pair が現在の attempt を出した後に
-L 件以上の結果に追い越されたら、snapshot を残して停止する (`meta.json` の `status` が `stopped`、`stop_reason` に理由)。
-予算の末尾で worker が空くのは正常で止めない。応答しない engine の時間上限は §14 の watchdog と usi/isready の期限による。
-
-### 15.2 失敗した pair の指し直し
-
-engine の異常終了・切断・watchdog・spawn/初期化の失敗は、まず worker 内で `--engine-retries` 回まで pair 全体 (2 局) を指し直す。
-使い切るとその attempt を失敗として記録し、同じ確定値・開始局面・dispatch_k で次の attempt を出す (新しい摂動には置き換えない)。
-第 1 局を終えた後の失敗でも第 1 局だけを使うことはない。1 pair の失敗数が `--max-pair-attempts` に達したら snapshot を残して停止する。
-失敗数は resume でリセットしないので、同じ上限で resume すると指し直さずに止まる。上限を引き上げれば続きを指す。
-
-### 15.3 run-dir と resume
-
-| 生成物 | 内容 |
-|---|---|
-| `journal.jsonl` | 追記専用の記録。`dispatch` (確定値)・`received` (2 局の結果)・`accept` (適用順)・`attempt_failed`・`duplicate`・`calibration` (§17)・`worker_joined` (§18) |
-| `snapshots/snapshot-NNNNNN.json` | θ と照合用の状態。`snapshot-000000.json` は開始時の θ と param 定義で、常に残す。ほかは最新 2 世代 |
-| `meta.json` | format v5。seed・L・schedule・param 定義と対局条件の fingerprint・spsa binary の sha256・最新 snapshot・status |
-| `stats.csv` / `values.csv` | journal から作る派生物 (下) |
-| `games.jsonl` | 確定した局の棋譜。§16 |
-| `state.params` | 最新 snapshot の θ (6 桁表示の view)。resume は読まない (無くても壊れていても再開できる) |
-| `final.params` | 完走時の θ |
-| `remote/w<番号>.log` | `--remote-worker` の各 worker の stderr (追記)。§18 |
-
-`--resume` (lock が残っていれば `--force-unlock` も) で再開する。meta の seed を使い、`--seed` は省略するか同じ値にする。
-param の定義と開始時の θ は gen0 snapshot から読み、`--init-from` は使わない。
-journal を先頭から再生して θ と CSV を作り直し、最新 snapshot と bit 一致することを確かめてから続ける。
-落ちた時点で実行中だった pair は同じ確定値で指し直す (失敗数は増やさない)。受信済みで適用を待っていた結果は失わない。
-journal の末尾の書きかけの行だけを捨て、途中の行が壊れていれば止まる。
-
-`--resume` に `--verify-resume` を足すと、上の照合 (meta と CLI の一致、再生と snapshot の bit 一致) だけを行って終わる。
-worker は起動せず (`--remote-worker` があっても)、journal には書かない (`stats.csv`・`values.csv` は再生から作り直す)。
-動いている run-dir の写しが resume できる組かを確かめるのに使う。写しには `meta.json`・`snapshots/snapshot-000000.json`・
-`snapshots/<meta の snapshot>`・`journal.jsonl` (この順に写す) が要り、resume と同じ引数で、写しを `--run-dir` にして起動する。
-- 照合には meta に記録された spsa binary と同じもの、engine、値がファイルを指す USI option のファイルが要る。
-- run は gen0 と最新 2 世代の snapshot しか残さないので、写している間に世代が進むと meta が指す snapshot が無くなり、写しに失敗する。
-  そのときは写し直す (誤って ok にはならない)。journal の末尾の書きかけの行は resume と同じく捨てる。
-- `--run-dir` は必ず写し先にする。動いている run-dir に `--force-unlock` と一緒に付けると、その run の lock を消し、`stats.csv`・`values.csv` を置き換えてしまう (動いている run はその後の行を置き換え前のファイルに書く)。
-
-resume で一致を要求するもの (不一致は拒否し、上書きの手段はない。変えたいときは新しい run-dir で始める):
-`--total-pairs` と schedule 系の値 (bit 単位で比べる)、`--max-lag`、param の定義 (順序・型・範囲・c_end/r_end・active/適用対象)、
-engine binary の sha256・`--engine-args`・既定値注入後の USI option・値がファイルを指す USI option の内容の sha256、mapping、
-開始局面ファイル (`--startpos-file` の内容 / `--sfen`)、`--random-startpos`、`--nodes`・`--byoyomi`・`--btime`・`--binc`、
-`--threads`・`--hash-mb`・`--max-moves`、`--nodes-timeout-ms`、`--timeout-margin-ms`、`--adjudicate-agreement`、
-`--nps-scaling` の有無と `--reference-nps`・bench の版、そして spsa 自身の binary。
-`--btime` / `--binc` は `--nps-scaling` でも倍率を掛ける前の基準 TC の値で比べる (倍率は resume のたびに測り直す。§17.3)。
-engine が option なしで暗黙に読む評価関数 (rshogi の `eval/nn.bin` など) は識別できないので、`EvalFile` を明示する。
-ファイルを指す option の相対パスは起動したディレクトリ基準で解決するので、resume も同じディレクトリから行う (絶対パスを推奨)。
-
-保証の範囲: process の crash からはどの時点でも再開できる。電源断は Linux のみ (directory の fsync を std で行えるのが Unix だけのため)。
-fresh 開始や `--force-init` の初期化中は旧 run の成果物を先に消すので保証の対象外。
-batch (meta v4 以前) の run を `--dispatch async` で、async の run を batch で再開することはできない。
-
-### 15.4 stats.csv / values.csv (async)
-
-`stats.csv` は適用 1 回 = 1 行で、適用順に並ぶ。
-
-```
-completed_pairs,pair_id,attempt,dispatch_k,lag,result,
-g1_plus_is_black,g1_outcome,g1_reason,g1_plies,g2_plus_is_black,g2_outcome,g2_reason,g2_plies,
-active_params,avg_abs_shift,updated_params,avg_abs_update,max_abs_update
-```
-
-`result` は 2 局の勝敗和 (−2〜+2)。`g*_outcome` は plus 視点の `plus_win` / `minus_win` / `draw` で、
-result=0 の二引分と一勝一敗を区別できる。`values.csv` は `completed_pairs` 列の後に各 param が並び、0 行目が開始時の θ。
-どちらも resume のたびに journal から作り直す。`spsa_stats_to_plot_csv` は async の stats.csv を 1 行 = 1 pair (2 局) として読む。
-
-## 16. 棋譜の記録と回収
-
-spsa は既定で棋譜を `<run-dir>/games.jsonl` (batch では摂動の `batches.jsonl` も) に追記する。schema・書き込みの順序・
-重複の除き方は [spsa.md の棋譜と摂動の記録](spsa.md#棋譜と摂動の記録) にある。運用上の要点:
-
-- `--no-game-records` で書かない。有無は meta に入り、resume で切り替えると拒否する。fresh start は新しい run-dir で行う
-  (同じ run-dir の fresh は `--force-init` が要り、そのとき games.jsonl も空にする)。回収先も run-dir ごとに分ける。
-- 長時間の run を別の機械から定期回収するときは、**meta (・async は snapshots/ と journal.jsonl) を先に、games.jsonl を後に**取る。
-  棋譜は checkpoint・journal の `received` より先に durable になるので、この順なら回収した meta / journal が確定とする局の行は
-  回収した games.jsonl に必ずある。
-- games.jsonl と batches.jsonl は追記だけなので rsync の追記転送で差分を取れる (`--append` は送信側の追加分だけを送る。
-  `--append-verify` は転送のたびに両側でファイル全体の checksum を取るので、数百 MB を短い間隔で回収するなら重くなる)。async の journal.jsonl は
-  resume で末尾の断片を切り詰め、stats.csv / values.csv は作り直すので、通常の同期で取る。
-- async で摂動の名前と係数を復元するには gen0 snapshot (`snapshots/snapshot-000000.json`) と meta も回収する。
-  engine mapping を使う run は mapping も残す。
-- games.jsonl の末尾に確定していない局の行があるのは正常 (棋譜を書いた後、checkpoint / `received` の前に落ちた分)。
-  読む側が journal・meta と照合して捨てる。
-
-## 17. Fischer と NPS による時計の補正 (`--nps-scaling`)
-
-`--dispatch async` の Fischer (`--btime` / `--binc`) 対局で、持ち時間を「基準 NPS で何 ms か」と定義し、
-機械ごとに `倍率 = 基準 NPS ÷ その機械の NPS` を掛けて指す (fishtest の方式)。速い機械では持ち時間が短く、
-遅い機械では長くなり、1 手あたりの探索量が機械によらず揃う。
-
-```bash
-spsa --dispatch async --run-dir "$RUN" --init-from canonical.params   --total-pairs 20000 --concurrency 23 --threads 8 --hash-mb 256 --cpu-affinity numa   --btime 120000 --binc 2000 --nps-scaling   --mobility 0.2 --startpos-file start_sfens_ply24.txt --max-moves 320   --usi-option EvalFile=/path/to/nn.bin
-```
-
-| オプション | 既定値 | 意味 |
-|---|---:|---|
-| `--nps-scaling` | off | 開始時に NPS を測り、`--btime` / `--binc` (基準 TC) に倍率を掛ける。async の Fischer 専用 (`--nodes` とは併用できない) |
-| `--reference-nps N` | 350000 | 基準 NPS (1 thread あたり、全 slot を同時に走らせたときの値)。fingerprint に入り、resume で変えられない |
-| `--min-nps-ratio R` | 0.5 | 実測 NPS が `基準 × R` 未満の機械では起動を拒否する |
-| `--threads N` | 1 | engine の Threads。`--nps-scaling` では `--usi-option Threads=...` を拒否する (bench はこの値で割る) |
-| `--timeout-margin-ms MS` | 1000 | 時間切れ判定の猶予。倍率は**掛けない** (通信・回収のための絶対値)。短い TC に対して大きすぎないかを確かめて決める |
-
-### 17.1 bench の手順 (`spsa-bench-v1`)
-
-- slot 数 = `min(--concurrency, 残りの pair 数)`。全 slot の bench を**同時に**走らせる (本番と同じ負荷)。
-- 各 slot は本番の worker と同じ設定で engine を 2 本 (plus / minus) 起動する: `--threads`・`--hash-mb`・
-  USI option (`EvalFile` など)・`--engine-args`・`--cpu-affinity` の割り当て。NNUE 重みのプロセス間共有の有無も、
-  engine が同じ環境変数で起動されるので本番と同じになる。探索するのは plus 側だけ (対局中も探索するのは手番側だけ)。
-- engine に送る探索定数は **run 開始時の θ₀** (resume でも gen0 snapshot の θ)。摂動や更新で NPS が変わっても倍率は動かない。
-- 局面は benchmark ツールの既定 4 局面。各局面の前に `usinewgame` を送る。
-  warmup として 4 局面を `go depth 12` で 1 周した後、`go depth 16` で 1 周を計測する。
-- slot の NPS = `engine が報告した nodes の合計 ÷ go から bestmove までの時間の合計 ÷ Threads`。倍率に使う NPS は slot 間の平均。
-- 1 局面の探索が 600 s を超える、または engine が nodes を報告しないと bench は失敗する。
-- bench の版 (局面・深さ・集計方法) を変えたら `bench_version` を上げる。版は fingerprint に入る。
-- tournament の `--nps-scaling` も同じ bench を使う ([tournament](tournament.md#機械の速さによる時計の補正---nps-scaling))。
-
-### 17.2 時計の決め方と記録
-
-- `btime = round(基準 btime × 倍率)`、`binc = round(基準 binc × 倍率)` (0 でない値は 1 ms 以上)。先後同じ値。
-- 倍率は run (起動) 中は固定する。対局中の NPS からは出し直さない。
-- 較正 1 回ごとに journal に `calibration` を 1 行書き、meta の `tc_calibrations` に同じ内容を積む
-  (`index`・`bench_version`・`reference_nps`・`measured_nps`・`slot_nps`・`scale`・`reference_btime`・`reference_binc`・
-  `btime`・`binc`・`bench_depth`・`warmup_depth`・`bench_positions`・`threads`・`slots`・`host`・`measured_at_utc`)。
-  meta の履歴は resume のたびに journal から作り直す。
-- 新しい pair の journal の `dispatch` は確定した時計 `clock: {btime, binc, calibration}` を持つ。
-  同じ pair の 2 局、infra error の後の再 attempt、resume 後の指し直しは、すべてこの値で指す。
-  `--remote-worker` の run だけは、再 attempt を指す機械の時計に付け直す ([§18](#18-別の機械の-worker---remote-worker))。
-- 起動時の要約に `clock: btime=... binc=... (reference ... x scale ...)` を出す。
-
-### 17.3 resume (別の機械を含む)
-
-- resume でも bench を測り直し、**新しい倍率は新しい pair から**使う。落ちた時点で実行中だった pair と再 attempt 待ちの pair は、
-  dispatch 時の時計のまま指し直す。機械を移っても同じ pair の条件は変わらない。`--remote-worker` を使った run は例外で、
-  bench は worker ごとに走らせ、指し直しには指す機械の時計を付け直す (§18)。
-- 基準 TC (`--btime` / `--binc`)・`--reference-nps`・bench の版は fingerprint で一致を求める。変えるときは新しい run-dir で始める。
-- bench の slot 数は、resume では journal を再生した後の残りの pair 数で決める (本番の worker 数と同じ)。
-- 足切り (`--min-nps-ratio`) に掛かると、較正を書かずに止まる。fresh では旧 run の journal・snapshot も残る
-  (`--force-init` で先に消える meta・CSV・`final.params` と、`--init-from` で上書きされる `state.params` を除く)。resume では再生で確定する分だけを書いて止まり、別の機械でそのまま再開できる。
-- 完走済みの run の resume では bench を走らせない。
-
-### 17.4 時間切れと 1 局の上限
-
-- 時計の時間切れ (`reason: timeout`) は普通の対局結果として θ の更新に入る (時間管理の失敗も強さの一部)。
-  ただし、受信した局のうち時間切れの局が `--max-timeout-rate × max(局数, --timeout-rate-min-games)` を超えたら、
-  snapshot を残して止める (`meta.json` の `status: stopped`、`stop_reason` が `timeout rate: ...`)。
-  分母の下限は、序盤の 1 局の時間切れで止まらないようにするため (既定では最初の 1000 局の間は 5 局まで)。
-  率は byoyomi の run でも数える。原因を調べてから、上限を上げて resume するか新しい run-dir で始める。
-- meta の `received_games` / `timeout_games` に受信した局と時間切れの局の数を残す (journal から作り直す)。
-- 1 局の壁時計の上限は Fischer の pair ごとに `(持ち時間 × 3 + 加算 × 200) × 2` (fishtest の上限を SPSA と同じく 2 倍)。
-  持ち時間と加算は pair の時計 (補正後) の値。各手の探索の前後に確かめ、超えたら (その探索の結果は使わずに) infra error として扱い、
-  `--engine-retries` → 同じ確定値の次の attempt の順に同じ pair を指し直す (journal の `attempt_failed` の `reason` が
-  `game_time_limit: ...`)。時計が 0 になった後も判定の猶予の内で指し続ける engine を止めるためのもので、勝敗には使わない。
-  1 手の中で応答しなくなった engine は、従来どおり 1 手の期限 (残り時間 + 加算 + 猶予) で時間切れの結果になる。
-  その種の故障は時間切れの率による停止で拾う。
-- 時間切れの率が上限を越えたまま resume すると、残りの pair が無くても完走扱いにせず止まる。
-- 終了理由は journal の `received` の `games[].reason` と games.jsonl の `reason` に残る (`timeout`・`sennichite` 系・`max_moves`・
-  `resign`・`win`・`adjudication_agreement` など)。infra error は結果ではなく journal の `attempt_failed` に残る。
-- journal の `received` の各局は `elapsed_ms` / `nodes` (先手・後手の順の合計) を持つ。手ごとの値は games.jsonl の
-  `elapsed_ms` / `nodes` の列。
-
-### 17.5 両側の評価の一致による裁定 (`--adjudicate-agreement`)
-
-`--adjudicate-agreement "movecount=N,score=X"` で、勝ち側の自己視点の評価が +X 以上、負け側の自己視点の評価が −X 以下の状態が、
-両側とも自分の直近 N 手で続いたら勝敗を決める (既定 off、終了理由 `adjudication_agreement`)。N は各側の手数で、対局全体では 2N 手前後。
-詰みの評価 (距離不明の `score mate +` / `score mate -` を含む) は閾値を越えたものとして扱い、`lowerbound` / `upperbound` 付きの評価・評価値の欠落・条件外の値でその側の連続を切る。
-規則の詳細は [tournament の裁定](tournament.md#ルールによる自動終局) と同じ (同じ実装)。
-
-- async 専用。有無と X・N は fingerprint に入り、resume で一致を求める。採用 SPRT (tournament) も同じ値で指す。
-- X と N は、保存済みの自己対局に `analyze_selfplay --adjudication-sweep` を当てて、裁定が実際の結果と食い違う率と
-  縮む手数の割合から決める ([analyze_selfplay](analyze_selfplay.md#評価値の一致による裁定の後付け集計))。
-
-### 17.6 rshogi の秒単位の時間管理 (`RoundUpToFullSecond`)
-
-rshogi の時間管理は既定で 1 手の思考時間を秒境界に切り上げ、最低思考時間に 1 秒の下限を掛け、
-残り時間の見積もりから 1 手 1 秒を引く。短い時計では 1 手の消費時間が秒単位に張り付き、倍率を掛けても探索量が比例して縮まない。
-`--nps-scaling` で短い TC を使うときは `--usi-option RoundUpToFullSecond=false` を渡してこの 3 つを外す
-(spsa が既定で入れる `MinimumThinkingTime=0` もそのまま 0 ms として効く)。NetworkDelay と残り時間を超えない制約は残る。
-大会・floodgate など秒単位で時間を数える対局では既定 (true) のまま使う。
-
-## 18. 別の機械の worker (`--remote-worker`)
-
-`--dispatch async` の対局を、ssh で入れる別の機械 (借用機など) に任せる。coordinator は θ・journal・snapshot を持ち、
-各 worker を `sh -c <コマンド>` で起動して stdin/stdout の JSON 行で pair を渡す。対局は worker の機械の中で完結するので、
-通信の往復は持ち時間に乗らない。coordinator 自身は engine を起動しない。
-
-```bash
-W="/path/to/spsa --worker-stdio --engine-path /path/to/rshogi-usi --concurrency 15 --threads 1 --hash-mb 256 \
-   --btime 20000 --binc 200 --nps-scaling --startpos-file /path/to/startpos.txt \
-   --usi-option EvalFile=/path/to/nn.bin"
-spsa --dispatch async --run-dir "$RUN" --init-from canonical.params --total-pairs 20000 \
-  --btime 20000 --binc 200 --nps-scaling --startpos-file startpos.txt --threads 1 --hash-mb 256 \
-  --usi-option EvalFile=nn.bin \
-  --remote-worker "ssh -o ServerAliveInterval=30 -p 12345 root@host1 '$W'" \
-  --remote-worker "ssh -o ServerAliveInterval=30 -p 23456 root@host2 '$W'"
-```
-
-| オプション | 既定値 | 意味 |
-|---|---:|---|
-| `--remote-worker CMD` | なし | worker を起動する shell コマンド。複数指定できる。coordinator の `--concurrency`・`--cpu-affinity` は使わない |
-| `--worker-stdio` | off | worker として動く (`CMD` の中で使う)。`--run-dir` は要らない。slot 数は worker の `--concurrency` |
-| `--remote-timeout-sec S` | 300 | この間相手から何も届かなければ切れたとみなす (60 以上)。coordinator と worker は互いに 30 秒ごとに heartbeat を送る |
-| `--allow-worker-engine-sha256 SHA` | なし | coordinator の `--engine-path` と別の build (例: AVX-512 版) を worker に許す。複数指定できる |
-
-- worker には coordinator と同じ対局条件を渡す: engine の引数・USI option・`--threads`・`--hash-mb`・時計・`--nodes`・
-  `--max-moves`・開始局面・`--engine-param-mapping`・`--adjudicate-agreement`・`--nps-scaling` と `--reference-nps`。
-  起動時に worker が fingerprint を送り、違う項目があればその worker を外す (stderr に項目名と両方の値を出す)。
-  ファイルを指す USI option (`EvalFile` など) はパスではなく中身の sha256 で比べるので、機械ごとにパスが違ってよい。
-  ディレクトリを指す option や `--engine-args` の中のパスは文字列のまま比べるので、全ての機械で揃える。
-  engine は sha256 が coordinator の `--engine-path` か `--allow-worker-engine-sha256` と一致すること。
-  coordinator は engine を起動しないが、比べる sha256 を取るため engine と `EvalFile` などの実体を手元にも置く。
-- 摂動の値・開始局面の番号・θ₀ は coordinator が送る。worker は params ファイルを読まない。
-- 全ての worker が `ready` になるか外れるまで待ってから始める。1 台も始められなければ、fresh では旧 run の journal・snapshot を
-  消す前に止まる (§17.3 の足切りと同じく、`--force-init` で先に消える meta・CSV・`final.params` と、
-  `--init-from` で上書きされる `state.params` を除く)。
-- `--max-lag` の既定は、始められた worker の slot の合計の 4 倍。
-- `--nps-scaling` では、worker ごとに自分の slot 数で bench を走らせ、`--min-nps-ratio` を下回る worker を外す。
-  較正は worker ごとに journal の `calibration` に 1 行書き、`host` は `w<番号> <hostname>`。その worker で指す pair には
-  その較正の時計を付ける。切れた worker の pair を指し直すときは、指し直す機械の時計に付け直す
-  (journal の `dispatch` の `clock` が attempt ごとに変わる)。
-- journal の `worker_joined` に、始められた worker の名前 (`w1`, `w2`, ... は `--remote-worker` の順)・hostname・slot 数・
-  engine と worker の spsa binary の sha256・較正の index を残す。spsa binary は照合しないので、worker にも coordinator と同じ build を置く。各 worker の stderr は `<run-dir>/remote/w<番号>.log` に追記する。
-- worker の stdout のうち JSON でない行 (ssh 先の shell の初期化が出す motd など) は、coordinator の stderr に出して読み飛ばす。
-- worker が切れたとき (出力の終わり・壊れた行・`--remote-timeout-sec` の超過・worker の致命的なエラー) は、その worker の
-  process group を止め、実行中だった pair を attempt の失敗 (`reason` が `remote worker w<番号> lost: ...`) として
-  残りの worker で指し直す。失敗の数は `--max-pair-attempts` に数える。全ての worker が切れたら snapshot を残して止まる。
-  切れた worker の再接続や途中参加はしない。同じ run-dir の `--resume` で worker を並べ直して再開する。
-- coordinator が終わると worker の stdin が閉じ、worker は指している対局を止めて終わる。経路が半開きのまま切れて
-  stdin の終わりが届かないときも、worker は coordinator の heartbeat が `--remote-timeout-sec` 途絶えた時点で止まる。
-  `--nps-scaling` の bench の途中でも同じで、探索中の局面を終えた所で bench を止める。`init` が届く前は
-  coordinator の `--remote-timeout-sec` を知らないので、既定の 300 秒で見る。
-  手元の ssh が早く切断に気づくよう `ServerAliveInterval` を付けておく。同じ機械で resume する前には、
-  前の worker が残っていないことを確かめる (残っていると bench と対局が CPU を取り合う)。
-- 完走済みの run を `--resume` したときは worker を起動しない。一度でも `--remote-worker` で回した run を
-  `--remote-worker` なしで resume すると手元の機械で続きを指し、中断した pair もこの機械の時計で指し直す。

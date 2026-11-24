@@ -60,19 +60,17 @@ pub struct Hand {
 }
 
 impl Hand {
-    fn add_demoted(&mut self, pt: PieceType) -> Result<()> {
-        let slot = match pt {
-            PieceType::Pawn => &mut self.p,
-            PieceType::Lance => &mut self.l,
-            PieceType::Knight => &mut self.n,
-            PieceType::Silver => &mut self.s,
-            PieceType::Gold => &mut self.g,
-            PieceType::Bishop => &mut self.b,
-            PieceType::Rook => &mut self.r,
-            PieceType::King => return Ok(()),
-        };
-        *slot = slot.checked_add(1).with_context(|| format!("hand count exceeds 255: {pt:?}"))?;
-        Ok(())
+    fn add_demoted(&mut self, pt: PieceType) {
+        match pt {
+            PieceType::Pawn => self.p += 1,
+            PieceType::Lance => self.l += 1,
+            PieceType::Knight => self.n += 1,
+            PieceType::Silver => self.s += 1,
+            PieceType::Gold => self.g += 1,
+            PieceType::Bishop => self.b += 1,
+            PieceType::Rook => self.r += 1,
+            PieceType::King => {}
+        }
     }
     fn take_one(&mut self, pt: PieceType) -> Result<()> {
         if matches!(pt, PieceType::King) {
@@ -200,27 +198,6 @@ fn sfen_piece_char(p: Piece) -> char {
     }
 }
 
-fn piece_from_sfen_char(c: char) -> Result<(PieceType, Color)> {
-    use PieceType::*;
-    let ty = match c.to_ascii_lowercase() {
-        'p' => Pawn,
-        'l' => Lance,
-        'n' => Knight,
-        's' => Silver,
-        'g' => Gold,
-        'b' => Bishop,
-        'r' => Rook,
-        'k' => King,
-        _ => bail!("unknown SFEN piece: {c}"),
-    };
-    let color = if c.is_ascii_uppercase() {
-        Color::Black
-    } else {
-        Color::White
-    };
-    Ok((ty, color))
-}
-
 fn piece_from_csa_token(token: &str) -> Result<Option<Piece>> {
     if token == "*" {
         return Ok(None);
@@ -276,85 +253,6 @@ fn parse_csa_rank_line(pos: &mut Position, line: &str) -> Result<()> {
 }
 
 impl Position {
-    /// SFEN 文字列（`<盤面> <手番> <持ち駒> [手数]`）から局面を作る。
-    ///
-    /// 手数は省略可能で、省略時は 1 とする。
-    /// 持ち駒の反復表記も合算し、先後・駒種ごとの合計が255枚を超える場合はエラーを返す。
-    pub fn from_sfen(sfen: &str) -> Result<Self> {
-        let mut fields = sfen.split_whitespace();
-        let board = fields.next().context("SFEN が空です")?;
-        let side = fields.next().with_context(|| format!("SFEN に手番がありません: {sfen}"))?;
-        let hands = fields.next().with_context(|| format!("SFEN に持ち駒がありません: {sfen}"))?;
-        let mut pos = Position::default();
-
-        let ranks: Vec<&str> = board.split('/').collect();
-        anyhow::ensure!(ranks.len() == 9, "SFEN の段数が 9 ではありません: {sfen}");
-        for (y, rank) in (1..=9).zip(ranks) {
-            let mut x = 1usize;
-            let mut promoted = false;
-            for c in rank.chars() {
-                if c == '+' {
-                    anyhow::ensure!(!promoted, "SFEN の成り指定が重複しています: {sfen}");
-                    promoted = true;
-                    continue;
-                }
-                if let Some(empty) = c.to_digit(10) {
-                    anyhow::ensure!(!promoted && empty >= 1, "SFEN の空マス指定が不正です: {sfen}");
-                    x += empty as usize;
-                    continue;
-                }
-                anyhow::ensure!(x <= 9, "SFEN の段が 9 マスを超えています: {sfen}");
-                let (ty, color) = piece_from_sfen_char(c)?;
-                anyhow::ensure!(
-                    !promoted || !matches!(ty, PieceType::Gold | PieceType::King),
-                    "成れない駒に成り指定があります: {sfen}"
-                );
-                pos.board[y][x] = Some(Piece::new(ty, color, promoted));
-                promoted = false;
-                x += 1;
-            }
-            anyhow::ensure!(x == 10 && !promoted, "SFEN の段が 9 マスではありません: {sfen}");
-        }
-
-        pos.side_to_move = match side {
-            "b" => Color::Black,
-            "w" => Color::White,
-            _ => bail!("SFEN の手番が不正です: {sfen}"),
-        };
-
-        if hands != "-" {
-            // 1 種類の持ち駒は最大でも歩の 18 枚。
-            const MAX_HAND_COUNT: u32 = 18;
-            let mut count: Option<u32> = None;
-            for c in hands.chars() {
-                if let Some(d) = c.to_digit(10) {
-                    let next = count.unwrap_or(0) * 10 + d;
-                    anyhow::ensure!(
-                        (1..=MAX_HAND_COUNT).contains(&next),
-                        "SFEN の持ち駒の枚数が不正です: {sfen}"
-                    );
-                    count = Some(next);
-                    continue;
-                }
-                let (ty, color) = piece_from_sfen_char(c)?;
-                anyhow::ensure!(ty != PieceType::King, "SFEN の持ち駒に玉があります: {sfen}");
-                let hand = match color {
-                    Color::Black => &mut pos.hand_b,
-                    Color::White => &mut pos.hand_w,
-                };
-                for _ in 0..count.take().unwrap_or(1) {
-                    hand.add_demoted(ty)?;
-                }
-            }
-            anyhow::ensure!(count.is_none(), "SFEN の持ち駒が枚数で終わっています: {sfen}");
-        }
-
-        if let Some(ply) = fields.next() {
-            pos.ply = ply.parse().with_context(|| format!("SFEN の手数が不正です: {sfen}"))?;
-        }
-        Ok(pos)
-    }
-
     pub fn to_sfen(&self) -> String {
         // board strings from rank 1 (top) to 9 (bottom)
         let mut out = String::new();
@@ -459,16 +357,9 @@ impl Position {
         out
     }
 
-    /// CSA指し手（`+7776FU`、`-0055KA`など）を局面に適用する。
-    ///
-    /// 先頭7 byteを解釈し、それ以降の消費時間やコメントは無視する。
-    /// 将棋の完全な合法性検査は行わない。
-    ///
-    /// # Errors
-    /// 構文・座標・手番・移動元・持ち駒が不正、持ち駒が255枚を超える、または手数が
-    /// `u32::MAX`を超える場合はエラーを返し、局面を変更しない。
+    /// Apply a CSA move like "+7776FU" or "-0055KA".
     pub fn apply_csa_move(&mut self, mv: &str) -> Result<()> {
-        validate_csa_move(mv)?;
+        anyhow::ensure!(mv.len() >= 7, "invalid CSA move format: {mv}");
         let bytes = mv.as_bytes();
         let side = match bytes[0] {
             b'+' => Color::Black,
@@ -481,45 +372,48 @@ impl Position {
         let ty = csa_rank_to_y(bytes[4] - b'0')?;
         let code = &mv[5..7];
         let (pty, promoted) = piece_from_csa_code(code)?;
+        // validate turn
         anyhow::ensure!(
             self.side_to_move == side,
             "turn mismatch: mv={mv} side_to_move={:?}",
             self.side_to_move
         );
-        let next_ply = self.ply.checked_add(1).context("CSA ply exceeds u32::MAX")?;
-        let mut next_hand = match side {
-            Color::Black => self.hand_b,
-            Color::White => self.hand_w,
-        };
+
+        // capture if any
         if let Some(dst) = self.board[ty][tx] {
             anyhow::ensure!(dst.color != side, "cannot capture own piece: {mv}");
-            next_hand.add_demoted(dst.ty)?;
+            // captured piece moves to hand of mover, demoted
+            let demoted_ty = dst.ty; // dst.promoted doesn't matter; demote
+            match side {
+                Color::Black => self.hand_b.add_demoted(demoted_ty),
+                Color::White => self.hand_w.add_demoted(demoted_ty),
+            }
         }
 
-        let source = if fx == 0 && fy == 0 {
-            next_hand.take_one(pty)?;
-            None
+        if fx == 0 && fy == 0 {
+            // drop
+            match side {
+                Color::Black => self.hand_b.take_one(pty)?,
+                Color::White => self.hand_w.take_one(pty)?,
+            }
+            self.board[ty][tx] = Some(Piece::new(pty, side, false));
         } else {
+            // normal move
             let fx = csa_file_to_x(fx)?;
             let fy = csa_rank_to_y(fy)?;
             let src = self.board[fy][fx].with_context(|| format!("no piece at source for {mv}"))?;
             anyhow::ensure!(src.color == side, "source piece color mismatch: {mv}");
-            Some((fx, fy))
-        };
-
-        if let Some((fx, fy)) = source {
+            // remove src
             self.board[fy][fx] = None;
+            // place with promoted flag per destination code
+            self.board[ty][tx] = Some(Piece::new(pty, side, promoted));
         }
-        self.board[ty][tx] = Some(Piece::new(pty, side, source.is_some() && promoted));
-        match side {
-            Color::Black => self.hand_b = next_hand,
-            Color::White => self.hand_w = next_hand,
-        }
+
         self.side_to_move = match self.side_to_move {
             Color::Black => Color::White,
             Color::White => Color::Black,
         };
-        self.ply = next_ply;
+        self.ply += 1;
         Ok(())
     }
 }
@@ -534,9 +428,8 @@ fn parse_hand_setup(pos: &mut Position, color: Color, payload: &str) -> Result<(
     );
     let mut i = 0;
     while i + 4 <= bytes.len() {
-        // 数字以外の byte でも underflow させず、後段の範囲チェックで弾く。
-        let file = bytes[i].wrapping_sub(b'0');
-        let rank = bytes[i + 1].wrapping_sub(b'0');
+        let file = bytes[i] - b'0';
+        let rank = bytes[i + 1] - b'0';
         let code = std::str::from_utf8(&bytes[i + 2..i + 4])
             .with_context(|| format!("invalid UTF-8 in P+/P- payload: {payload}"))?;
         let (pt, promoted) = piece_from_csa_code(code)?;
@@ -547,7 +440,7 @@ fn parse_hand_setup(pos: &mut Position, color: Color, payload: &str) -> Result<(
                 Color::Black => &mut pos.hand_b,
                 Color::White => &mut pos.hand_w,
             };
-            hand.add_demoted(pt)?;
+            hand.add_demoted(pt);
         } else {
             // 盤上配置
             let x = csa_file_to_x(file)?;
@@ -629,83 +522,6 @@ pub enum ParsedMove {
     Special(SpecialMove),
 }
 
-/// `parse_csa_full_with_evals` の返り値。
-pub type ParsedCsaWithEvals = (Position, Vec<ParsedMove>, GameInfo, Vec<Option<i32>>);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum EvalCommentStyle {
-    /// `'*` は次の通常手、`'**` は直前の通常手に帰属する標準解釈。
-    #[default]
-    Standard,
-    /// 旧形式のrshogi-csa-server向け。inline T付き通常手直後の`'*`を前手へ帰属する。
-    LegacyServerPost,
-}
-
-/// `'summary:` 行が示す勝敗。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SummaryResult {
-    /// 先手の勝ち。
-    BlackWin,
-    /// 後手の勝ち。
-    WhiteWin,
-    /// 引き分け。
-    Draw,
-}
-
-/// shogi-server (wdoor) 形式の `'summary:<理由>:<先手名> <結果>:<後手名> <結果>` 行。
-///
-/// 終局コマンド（`%TORYO` など）と違い、勝敗を手番に頼らず明示する。wdoor の棋譜は
-/// 反則負けや連続王手の千日手を `%` コマンドなしで終えるため、勝敗はこの行でしか
-/// 分からないことがある。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CsaSummary {
-    /// 終局理由（`toryo` / `time up` / `illegal move` など、wdoor の表記のまま）。
-    pub reason: String,
-    /// 勝敗。
-    pub result: SummaryResult,
-}
-
-impl CsaSummary {
-    /// `'summary:` より後ろの部分を解釈する。勝敗が読めなければ `None`。
-    ///
-    /// 対局者名は見ない（`<名前>+<hash>` 形式で書かれることがある）。先手・後手は
-    /// 並び順で決まる。
-    pub fn parse(rest: &str) -> Option<Self> {
-        let (reason, players) = rest.trim().split_once(':')?;
-        let (black, white) = players.rsplit_once(':')?;
-        let word = |part: &str| part.trim().rsplit(' ').next().map(str::to_owned);
-        let result = match (word(black)?.as_str(), word(white)?.as_str()) {
-            ("win", "lose") => SummaryResult::BlackWin,
-            ("lose", "win") => SummaryResult::WhiteWin,
-            ("draw", "draw") => SummaryResult::Draw,
-            _ => return None,
-        };
-        Some(Self {
-            reason: reason.trim().to_owned(),
-            result,
-        })
-    }
-
-    /// 終局理由を終局コマンド相当の [`SpecialMove`] に直す。未知の理由は `None`。
-    ///
-    /// 反則系（`illegal move` / `oute_kaihimore` / `oute_sennichite` など）は
-    /// [`SpecialMove::IllegalMove`]、`abnormal` は [`SpecialMove::Interrupt`] にまとめる。
-    pub fn special_move(&self) -> Option<SpecialMove> {
-        Some(match self.reason.as_str() {
-            "toryo" => SpecialMove::Resign,
-            "kachi" => SpecialMove::Win,
-            "time up" => SpecialMove::TimeUp,
-            "illegal move" | "uchifuzume" | "oute_kaihimore" | "outori" | "illegal kachi"
-            | "oute_sennichite" => SpecialMove::IllegalMove,
-            "sennichite" => SpecialMove::Sennichite,
-            "jishogi" => SpecialMove::Jishogi,
-            "max_moves" => SpecialMove::MaxMoves,
-            "abnormal" => SpecialMove::Interrupt,
-            _ => return None,
-        })
-    }
-}
-
 /// CSA棋譜から抽出した対局メタデータ
 #[derive(Clone, Debug, Default)]
 pub struct GameInfo {
@@ -713,8 +529,6 @@ pub struct GameInfo {
     pub white_name: Option<String>,
     pub black_rating: Option<f64>,
     pub white_rating: Option<f64>,
-    /// `'summary:` 行（あれば最後のもの）。勝敗の判定では終局コマンドより優先する。
-    pub summary: Option<CsaSummary>,
 }
 
 impl GameInfo {
@@ -728,8 +542,6 @@ impl GameInfo {
 }
 
 /// Parse a CSA text and return initial position, list of move tokens, and game metadata.
-///
-/// 持ち駒の設定は先後・駒種ごとに255枚まで受理し、超過時はエラーを返す。
 pub fn parse_csa(text: &str) -> Result<(Position, Vec<String>, GameInfo)> {
     let (pos, moves, info) = parse_csa_full(text)?;
     let simple_moves = moves
@@ -742,35 +554,15 @@ pub fn parse_csa(text: &str) -> Result<(Position, Vec<String>, GameInfo)> {
     Ok((pos, simple_moves, info))
 }
 
-/// CSA棋譜を完全パース。既存APIとの互換性のため評価コメントは返さない。
+/// CSA棋譜を完全パース。指し手は消費時間・特殊手を含む `ParsedMove` で返す。
 pub fn parse_csa_full(text: &str) -> Result<(Position, Vec<ParsedMove>, GameInfo)> {
-    let (pos, moves, info, _) = parse_csa_full_with_evals(text)?;
-    Ok((pos, moves, info))
-}
-
-/// CSA棋譜を完全パースし、通常手と同じ順序の先手視点評価値も返す。
-///
-/// 旧版 csa_client の `'*` は直後の通常手、wdoor と現行 csa_client の `'**` は直前の通常手に対応する。
-pub fn parse_csa_full_with_evals(text: &str) -> Result<ParsedCsaWithEvals> {
-    parse_csa_full_with_evals_style(text, EvalCommentStyle::Standard)
-}
-
-/// 評価コメント形式を明示してCSA棋譜を完全パースする。
-pub fn parse_csa_full_with_evals_style(
-    text: &str,
-    eval_style: EvalCommentStyle,
-) -> Result<ParsedCsaWithEvals> {
     let mut pos = None;
     let mut moves = Vec::new();
-    let mut evals = Vec::new();
     let mut info = GameInfo::default();
     let mut explicit_board = false;
-    let mut pending_eval_cp_black = None;
-    let mut follows_inline_timed_move = false;
     for line in text.lines() {
-        let comment_follows_inline_timed_move = follows_inline_timed_move;
-        follows_inline_timed_move = false;
-        let s = line.trim();
+        let raw = line.trim_end_matches('\r');
+        let s = raw.trim();
         if s.is_empty() || s.starts_with('V') {
             continue;
         }
@@ -816,32 +608,6 @@ pub fn parse_csa_full_with_evals_style(
             }
             continue;
         }
-        // wdoor / shogi-server: 直前の通常手を探索した先手視点評価値。
-        if let Some(rest) = s.strip_prefix("'**") {
-            if let (Some(cp), Some(last)) = (parse_leading_eval_cp(rest), evals.last_mut()) {
-                *last = Some(cp);
-            }
-            continue;
-        }
-        // rshogi csa_client: 直後の通常手を探索した先手視点評価値。
-        if let Some(rest) = s.strip_prefix("'*") {
-            let cp = parse_leading_eval_cp(rest);
-            if eval_style == EvalCommentStyle::LegacyServerPost && comment_follows_inline_timed_move
-            {
-                if let Some(last) = evals.last_mut() {
-                    *last = cp;
-                }
-            } else {
-                pending_eval_cp_black = cp;
-            }
-            continue;
-        }
-        if let Some(rest) = s.strip_prefix("'summary:") {
-            if let Some(summary) = CsaSummary::parse(rest) {
-                info.summary = Some(summary);
-            }
-            continue;
-        }
         // Skip other comments and headers
         if s.starts_with('\'') || s.starts_with('$') {
             continue;
@@ -865,7 +631,7 @@ pub fn parse_csa_full_with_evals_style(
                 explicit_board = true;
                 pos.insert(Position::default())
             };
-            parse_csa_rank_line(pos_ref, s)?;
+            parse_csa_rank_line(pos_ref, raw)?;
             continue;
         }
         if s == "+" || s == "-" {
@@ -883,48 +649,20 @@ pub fn parse_csa_full_with_evals_style(
             parse_hand_setup(pos_ref, color, &s[2..])?;
             continue;
         }
-        if is_csa_move_line(s) {
-            let mv = s[..7].to_string();
-            // インライン消費時間: +7776FU,T30 / +7776FU,T30,'コメント
-            let time_sec = s
-                .get(7..)
-                .and_then(|rest| rest.strip_prefix(",T"))
-                .and_then(|t| t.split(',').next())
-                .and_then(|t| t.parse::<u32>().ok());
-            moves.push(ParsedMove::Normal(CsaMove { mv, time_sec }));
-            evals.push(pending_eval_cp_black.take());
-            follows_inline_timed_move = time_sec.is_some();
+        if s.starts_with('+') || s.starts_with('-') {
+            if s.len() >= 7 {
+                let mv = s[..7].to_string();
+                // インライン消費時間: +7776FU,T30
+                let time_sec = s
+                    .get(7..)
+                    .and_then(|rest| rest.strip_prefix(",T").and_then(|t| t.parse::<u32>().ok()));
+                moves.push(ParsedMove::Normal(CsaMove { mv, time_sec }));
+            }
             continue;
         }
     }
     let pos = pos.unwrap_or_else(initial_position);
-    Ok((pos, moves, info, evals))
-}
-
-fn parse_leading_eval_cp(rest: &str) -> Option<i32> {
-    rest.split_whitespace().next()?.parse().ok()
-}
-
-fn is_csa_move_line(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    bytes.len() >= 7
-        && matches!(bytes[0], b'+' | b'-')
-        && bytes[1..5].iter().all(u8::is_ascii_digit)
-        && bytes[5..7].iter().all(u8::is_ascii_uppercase)
-}
-
-fn validate_csa_move(mv: &str) -> Result<()> {
-    anyhow::ensure!(is_csa_move_line(mv), "invalid CSA move format: {mv}");
-    let bytes = mv.as_bytes();
-    anyhow::ensure!(
-        &bytes[1..3] == b"00" || bytes[1..3].iter().all(|byte| (b'1'..=b'9').contains(byte)),
-        "invalid CSA move source: {mv}"
-    );
-    anyhow::ensure!(
-        bytes[3..5].iter().all(|byte| (b'1'..=b'9').contains(byte)),
-        "invalid CSA move destination: {mv}"
-    );
-    Ok(())
+    Ok((pos, moves, info))
 }
 
 fn parse_special_move(s: &str) -> Option<SpecialMove> {
@@ -953,9 +691,8 @@ fn parse_pi_removal(pos: &mut Position, payload: &str) -> Result<()> {
     );
     let mut i = 0;
     while i + 4 <= bytes.len() {
-        // 数字以外の byte でも underflow させず、後段の範囲チェックで弾く。
-        let file = bytes[i].wrapping_sub(b'0');
-        let rank = bytes[i + 1].wrapping_sub(b'0');
+        let file = bytes[i] - b'0';
+        let rank = bytes[i + 1] - b'0';
         let x = csa_file_to_x(file)?;
         let y = csa_rank_to_y(rank)?;
         // 対象マスの駒を除去
@@ -973,12 +710,6 @@ fn parse_pi_removal(pos: &mut Position, payload: &str) -> Result<()> {
 /// CSA段番号(1-9) → USIアルファベット(a-i)
 fn rank_to_usi(rank: u8) -> char {
     (b'a' + rank - 1) as char
-}
-
-/// USIの筋(1-9) → 数値
-fn usi_file_to_num(c: u8) -> Result<u8> {
-    anyhow::ensure!((b'1'..=b'9').contains(&c), "invalid USI file char: {}", c as char);
-    Ok(c - b'0')
 }
 
 /// USIアルファベット(a-i) → CSA段番号(1-9)
@@ -1021,12 +752,8 @@ fn usi_drop_to_csa_code(c: u8) -> Result<&'static str> {
 /// 例: `+7776FU` → `7g7f`, `+0076FU` → `P*7f`, `+8822UM` → `8h2b+`
 ///
 /// `pos` は変換前の局面（成り判定に使用）。この関数は局面を変更しない。
-/// 先頭7 byteを解釈し、それ以降の消費時間やコメントは無視する。
-///
-/// # Errors
-/// 指し手の符号・座標・駒種が不正な場合はエラーを返す。
 pub fn csa_move_to_usi(mv: &str, pos: &Position) -> Result<String> {
-    validate_csa_move(mv)?;
+    anyhow::ensure!(mv.len() >= 7, "invalid CSA move: {mv}");
     let bytes = mv.as_bytes();
     let fx = bytes[1] - b'0';
     let fy = bytes[2] - b'0';
@@ -1072,11 +799,7 @@ pub fn csa_move_to_usi(mv: &str, pos: &Position) -> Result<String> {
 /// `pos` は変換前の局面（駒種解決・手番判定に使用）。この関数は局面を変更しない。
 pub fn usi_move_to_csa(mv: &str, pos: &Position) -> Result<String> {
     let bytes = mv.as_bytes();
-    let is_drop = bytes.get(1) == Some(&b'*');
-    anyhow::ensure!(
-        bytes.len() == 4 || (!is_drop && bytes.len() == 5 && bytes[4] == b'+'),
-        "invalid USI move: {mv}"
-    );
+    anyhow::ensure!(bytes.len() >= 4, "invalid USI move: {mv}");
 
     let side_char = match pos.side_to_move {
         Color::Black => '+',
@@ -1086,19 +809,19 @@ pub fn usi_move_to_csa(mv: &str, pos: &Position) -> Result<String> {
     let mut out = String::with_capacity(7);
     out.push(side_char);
 
-    if is_drop {
+    if bytes.len() >= 4 && bytes[1] == b'*' {
         // 駒打ち: P*7f → +0076FU
         let csa_code = usi_drop_to_csa_code(bytes[0])?;
-        let to_file = usi_file_to_num(bytes[2])?;
+        let to_file = bytes[2] - b'0';
         let to_rank = usi_rank_to_num(bytes[3])?;
         write!(out, "00{}{}{}", to_file, to_rank, csa_code).unwrap();
     } else {
         // 通常手: 7g7f → +7776FU
-        let from_file = usi_file_to_num(bytes[0])?;
+        let from_file = bytes[0] - b'0';
         let from_rank = usi_rank_to_num(bytes[1])?;
-        let to_file = usi_file_to_num(bytes[2])?;
+        let to_file = bytes[2] - b'0';
         let to_rank = usi_rank_to_num(bytes[3])?;
-        let promote = bytes.len() == 5;
+        let promote = bytes.len() >= 5 && bytes[4] == b'+';
 
         // 移動元の駒種を盤面から取得
         let src_x = csa_file_to_x(from_file)?;
@@ -1315,7 +1038,7 @@ P-00KA
     #[test]
     fn test_parse_time_inline() {
         let text = "PI\n+7776FU,T5\n-3334FU,T10\n%TORYO\n";
-        let (_, moves, _, _evals) = parse_csa_full_with_evals(text).unwrap();
+        let (_, moves, _) = parse_csa_full(text).unwrap();
         assert_eq!(moves.len(), 3);
         match &moves[0] {
             ParsedMove::Normal(cm) => {
@@ -1335,23 +1058,9 @@ P-00KA
     }
 
     #[test]
-    fn test_parse_time_inline_followed_by_comment() {
-        let text = "PI\n+7776FU,T5,'* 30 -3334FU, +2726FU\n-3334FU,'* -20\n";
-        let (_, moves, _, _evals) = parse_csa_full_with_evals(text).unwrap();
-        let times: Vec<Option<u32>> = moves
-            .iter()
-            .map(|m| match m {
-                ParsedMove::Normal(cm) => cm.time_sec,
-                ParsedMove::Special(_) => None,
-            })
-            .collect();
-        assert_eq!(times, vec![Some(5), None]);
-    }
-
-    #[test]
     fn test_parse_time_standalone_t_line() {
         let text = "PI\n+7776FU\nT5\n-3334FU\nT10\n";
-        let (_, moves, _, _evals) = parse_csa_full_with_evals(text).unwrap();
+        let (_, moves, _) = parse_csa_full(text).unwrap();
         assert_eq!(moves.len(), 2);
         match &moves[0] {
             ParsedMove::Normal(cm) => {
@@ -1365,66 +1074,6 @@ P-00KA
             }
             _ => panic!("expected normal move"),
         }
-    }
-
-    #[test]
-    fn test_parse_eval_comments_for_both_record_styles() {
-        let text = concat!(
-            "V2.2\r\nPI\r\n",
-            "'* 45 -3334FU\r\n",
-            "+7776FU\r\nT5\r\n",
-            "-3334FU,T10\r\n",
-            "'** -30 +2726FU\r\n",
-            "%TORYO\r\n",
-        );
-        let (_, moves, _, evals) = parse_csa_full_with_evals(text).unwrap();
-        let normal: Vec<_> = moves
-            .iter()
-            .filter_map(|m| match m {
-                ParsedMove::Normal(cm) => Some(cm),
-                ParsedMove::Special(_) => None,
-            })
-            .collect();
-        assert_eq!(normal.len(), 2);
-        assert_eq!(evals[0], Some(45));
-        assert_eq!(normal[0].time_sec, Some(5));
-        assert_eq!(evals[1], Some(-30));
-        assert_eq!(normal[1].time_sec, Some(10));
-    }
-
-    #[test]
-    fn test_last_eval_comment_wins_and_invalid_pending_is_cleared() {
-        let text = "PI\n'* 5\n'* invalid\n+7776FU\n'* 10\n-3334FU\n'** invalid\n'** 20 pv\n";
-        let (_, _moves, _, evals) = parse_csa_full_with_evals(text).unwrap();
-        assert_eq!(evals[0], None);
-        assert_eq!(evals[1], Some(20));
-    }
-
-    #[test]
-    fn test_legacy_server_single_star_after_inline_timed_move_belongs_to_previous_move() {
-        let text = "PI\n+7776FU,T1\n'* 100\n-3334FU,T1\n";
-        let (_, _, _, evals) =
-            parse_csa_full_with_evals_style(text, EvalCommentStyle::LegacyServerPost).unwrap();
-        assert_eq!(evals, vec![Some(100), None]);
-    }
-
-    #[test]
-    fn test_standard_single_star_after_inline_move_remains_pre_move() {
-        let text = "$GAME_ID:external\nPI\n+7776FU,T1\n'* 100\n-3334FU,T1\n";
-        let (_, _, _, evals) = parse_csa_full_with_evals(text).unwrap();
-        assert_eq!(evals, vec![None, Some(100)]);
-    }
-
-    #[test]
-    fn test_malformed_signed_line_is_not_a_normal_move() {
-        let text = "PI\n'* 10\n+abcdef\n+7776FU\n";
-        let (_, moves, _, evals) = parse_csa_full_with_evals(text).unwrap();
-        assert_eq!(moves.len(), 1);
-        let ParsedMove::Normal(cm) = &moves[0] else {
-            panic!("expected normal move");
-        };
-        assert_eq!(cm.mv, "+7776FU");
-        assert_eq!(evals, vec![Some(10)]);
     }
 
     #[test]
@@ -1442,124 +1091,6 @@ P-00KA
         let (pos, _, _) = parse_csa(text).unwrap();
         let sfen = pos.to_sfen();
         assert_eq!(sfen, "lnsgkgsnl/9/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1");
-    }
-
-    #[test]
-    fn test_from_sfen_roundtrip() {
-        for sfen in [
-            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
-            "ln1g1g1nl/1ks2r3/1pppp1bpp/p3spp2/9/P1P1SP1PP/1P1PP1P2/1BK1GR3/LNSG3NL w - 20",
-            "4k4/9/9/9/9/9/9/9/4K4 w RB2G2S2N2L9Prb2g2s2n2l9p 101",
-            "+P+L+N+S3k1/9/9/9/9/9/9/9/+p+l+n+s+B+R1K1 b 12P 7",
-        ] {
-            assert_eq!(Position::from_sfen(sfen).unwrap().to_sfen(), sfen);
-        }
-        // 手数省略時は 1。
-        assert_eq!(Position::from_sfen("4k4/9/9/9/9/9/9/9/4K4 b -").unwrap().ply, 1);
-    }
-
-    #[test]
-    fn test_from_sfen_rejects_bad_hand_counts() {
-        for hands in [
-            "256P",
-            "19P",
-            "0P",
-            "4294967296P",
-            "99999999999999999999P",
-            "1",
-            "2",
-        ] {
-            let sfen = format!("4k4/9/9/9/9/9/9/9/4K4 b {hands} 1");
-            assert!(Position::from_sfen(&sfen).is_err(), "should reject: {sfen}");
-        }
-        let pos = Position::from_sfen("4k4/9/9/9/9/9/9/9/4K4 b 18P2r 1").unwrap();
-        assert_eq!(pos.to_sfen(), "4k4/9/9/9/9/9/9/9/4K4 b 18P2r 1");
-    }
-
-    #[test]
-    fn test_usi_move_to_csa_rejects_garbage_without_panicking() {
-        let pos = initial_position();
-        for mv in [
-            "(3c3d)", "/g7f", "7g/f", "P*/f", " g7f", "7g7", "", "resign", "abcd", "7x7f",
-        ] {
-            assert!(usi_move_to_csa(mv, &pos).is_err(), "should reject: {mv:?}");
-        }
-        assert_eq!(usi_move_to_csa("7g7f", &pos).unwrap(), "+7776FU");
-    }
-
-    #[test]
-    fn csa_rank_lines_accept_leading_whitespace() {
-        let text = initial_position().to_csa_board();
-        for prefix in [" ", "  ", "\t", "\u{3000}"] {
-            let indented = text.lines().map(|line| format!("{prefix}{line}\n")).collect::<String>();
-            let (pos, _, _) = parse_csa_full(&indented).unwrap();
-            assert_eq!(pos.to_sfen(), initial_position().to_sfen());
-        }
-    }
-
-    #[test]
-    fn usi_move_conversion_rejects_trailing_garbage() {
-        let pos = initial_position();
-        for mv in [
-            "7g7fx",
-            "7g7f++",
-            "7g7f+tail",
-            "P*7f+",
-            "P*7ftail",
-            "7g7f歩",
-        ] {
-            assert!(usi_move_to_csa(mv, &pos).is_err(), "should reject: {mv:?}");
-        }
-        assert_eq!(usi_move_to_csa("7g7f+", &pos).unwrap(), "+7776TO");
-        assert_eq!(usi_move_to_csa("P*7f", &pos).unwrap(), "+0076FU");
-    }
-
-    #[test]
-    fn test_parse_summary_line() {
-        let parse = |tail: &str| {
-            let text = format!("V2\nN+A\nN-B\nPI\n+\n+7776FU\nT1\n{tail}");
-            parse_csa_full(&text).unwrap().2.summary
-        };
-        let s = parse("%TORYO\n'summary:toryo:A win:B lose\n").unwrap();
-        assert_eq!((s.reason.as_str(), s.result), ("toryo", SummaryResult::BlackWin));
-        assert_eq!(s.special_move(), Some(SpecialMove::Resign));
-        // 名前に `+hash` や空白が入っても、勝敗は並び順と末尾の語で決まる。
-        let s = parse("'summary:time up:A+0123 lose:B x win\n").unwrap();
-        assert_eq!((s.reason.as_str(), s.result), ("time up", SummaryResult::WhiteWin));
-        assert_eq!(s.special_move(), Some(SpecialMove::TimeUp));
-        let s = parse("'summary:sennichite:A draw:B draw\n").unwrap();
-        assert_eq!(s.result, SummaryResult::Draw);
-        for (reason, expected) in [
-            ("illegal move", Some(SpecialMove::IllegalMove)),
-            ("oute_kaihimore", Some(SpecialMove::IllegalMove)),
-            ("oute_sennichite", Some(SpecialMove::IllegalMove)),
-            ("kachi", Some(SpecialMove::Win)),
-            ("max_moves", Some(SpecialMove::MaxMoves)),
-            ("abnormal", Some(SpecialMove::Interrupt)),
-            ("something new", None),
-        ] {
-            let s = parse(&format!("'summary:{reason}:A win:B lose\n")).unwrap();
-            assert_eq!(s.special_move(), expected, "{reason}");
-        }
-        // 勝敗が読めない行・summary のない棋譜は None。
-        assert_eq!(parse("'summary:toryo:A win\n"), None);
-        assert_eq!(parse("'summary:abnormal:A win:B win\n"), None);
-        assert_eq!(parse("%TORYO\n"), None);
-    }
-
-    #[test]
-    fn test_from_sfen_rejects_malformed() {
-        for sfen in [
-            "",
-            "4k4/9/9/9/9/9/9/9 b - 1",
-            "4k5/9/9/9/9/9/9/9/4K4 b - 1",
-            "4k4/9/9/9/9/9/9/9/4K4 x - 1",
-            "4k4/9/9/9/9/9/9/9/4K4 b 2 1",
-            "4+k4/9/9/9/9/9/9/9/4K4 b - 1",
-            "4k4/9/9/9/9/9/9/9/4K4 b K 1",
-        ] {
-            assert!(Position::from_sfen(sfen).is_err(), "should reject: {sfen:?}");
-        }
     }
 
     #[test]
@@ -1597,6 +1128,56 @@ P-00KA
     }
 
     #[test]
+    fn test_csa_to_usi_normal() {
+        let pos = initial_position();
+        assert_eq!(csa_move_to_usi("+7776FU", &pos).unwrap(), "7g7f");
+        assert_eq!(csa_move_to_usi("-3334FU", &pos).unwrap(), "3c3d");
+    }
+
+    #[test]
+    fn test_csa_to_usi_promote() {
+        let pos = initial_position();
+        // 8八角 → 2二角成
+        assert_eq!(csa_move_to_usi("+8822UM", &pos).unwrap(), "8h2b+");
+    }
+
+    #[test]
+    fn test_csa_to_usi_drop() {
+        let pos = initial_position();
+        assert_eq!(csa_move_to_usi("+0055FU", &pos).unwrap(), "P*5e");
+    }
+
+    #[test]
+    fn test_usi_to_csa_normal() {
+        let pos = initial_position();
+        assert_eq!(usi_move_to_csa("7g7f", &pos).unwrap(), "+7776FU");
+    }
+
+    #[test]
+    fn test_usi_to_csa_promote() {
+        let pos = initial_position();
+        assert_eq!(usi_move_to_csa("8h2b+", &pos).unwrap(), "+8822UM");
+    }
+
+    #[test]
+    fn test_usi_to_csa_drop() {
+        // 先手持ち駒ありの局面を作る
+        let text = "P+55OU\nP-51OU\nP+00FU\n+\n";
+        let (pos, _, _) = parse_csa(text).unwrap();
+        assert_eq!(usi_move_to_csa("P*7f", &pos).unwrap(), "+0076FU");
+    }
+
+    #[test]
+    fn test_csa_usi_roundtrip() {
+        let pos = initial_position();
+        // 通常手のラウンドトリップ
+        let csa = "+7776FU";
+        let usi = csa_move_to_usi(csa, &pos).unwrap();
+        let back = usi_move_to_csa(&usi, &pos).unwrap();
+        assert_eq!(back, csa);
+    }
+
+    #[test]
     fn test_parse_hand_setup_board_placement() {
         // P+ で盤上に駒を配置
         let text = "\
@@ -1608,172 +1189,5 @@ P-51OU
         let x5 = csa_file_to_x(5).unwrap();
         assert_eq!(pos.board[5][x5], Some(Piece::new(PieceType::King, Color::Black, false)));
         assert_eq!(pos.board[1][x5], Some(Piece::new(PieceType::King, Color::White, false)));
-    }
-
-    #[test]
-    fn move_notations_match_fixed_vectors() {
-        let pos = initial_position();
-        for (csa, usi) in [("+7776FU", "7g7f"), ("+8822UM", "8h2b+")] {
-            assert_eq!(csa_move_to_usi(csa, &pos).unwrap(), usi);
-            assert_eq!(usi_move_to_csa(usi, &pos).unwrap(), csa);
-        }
-        assert_eq!(csa_move_to_usi("-3334FU", &pos).unwrap(), "3c3d");
-        let (pos, _, _) = parse_csa("P+55OU\nP-51OU\nP+00FU\n+\n").unwrap();
-        assert_eq!(csa_move_to_usi("+0076FU", &pos).unwrap(), "P*7f");
-        assert_eq!(usi_move_to_csa("P*7f", &pos).unwrap(), "+0076FU");
-    }
-
-    #[test]
-    fn non_digit_square_in_setup_lines_is_an_error_not_a_panic() {
-        // b'0' 未満の byte (空白や `*`) を含んでも減算 underflow で panic しない。
-        for text in ["P+ *FU\n", "P-5 OU\n", "PI *HI\n", "PI8 HI\n"] {
-            assert!(parse_csa(text).is_err(), "text={text:?}");
-        }
-    }
-
-    #[test]
-    fn csa_move_apis_reject_malformed_tokens_without_mutating_position() {
-        let mut invalid: Vec<String> = [
-            "", "+", "+7776F", "+ 776FU", "+/776FU", "+7\n76FU", "+7776F?", "+7776ZZ", "x7776FU",
-            "+0776FU", "+7076FU", "+7706FU", "+7770FU", "+777AFU", "+0055OU",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-        for index in 0..7 {
-            let mut token = "+7776FU".to_owned();
-            token.replace_range(index..index + 1, "あ");
-            invalid.push(token);
-        }
-        let mut pos = initial_position();
-        let before = pos.to_sfen();
-        for token in invalid {
-            assert!(csa_move_to_usi(&token, &pos).is_err(), "token={token:?}");
-            assert!(pos.apply_csa_move(&token).is_err(), "token={token:?}");
-            assert_eq!(pos.to_sfen(), before, "token={token:?}");
-        }
-    }
-
-    #[test]
-    fn apply_csa_move_errors_preserve_position() {
-        let mut pos = initial_position();
-        let before = pos.to_sfen();
-        for token in [
-            "+5553FU", "+3353FU", "+0053HI", "+0055FU", "+7777FU", "-3334FU",
-        ] {
-            assert!(pos.apply_csa_move(token).is_err(), "token={token}");
-            assert_eq!(pos.to_sfen(), before, "token={token}");
-        }
-    }
-
-    #[test]
-    fn csa_and_sfen_hand_setup_check_cumulative_capacity() {
-        for (code, sfen_piece) in [
-            ("FU", 'P'),
-            ("KY", 'L'),
-            ("KE", 'N'),
-            ("GI", 'S'),
-            ("KI", 'G'),
-            ("KA", 'B'),
-            ("HI", 'R'),
-        ] {
-            for side in ['+', '-'] {
-                let piece = if side == '+' {
-                    sfen_piece
-                } else {
-                    sfen_piece.to_ascii_lowercase()
-                };
-                let unit = format!("00{code}");
-                let setup =
-                    format!("P{side}{}\nP{side}{}\n+\n", unit.repeat(128), unit.repeat(127));
-                let (pos, _, _) = parse_csa(&setup).unwrap();
-                assert_eq!(pos.to_sfen(), format!("9/9/9/9/9/9/9/9/9 b 255{piece} 1"));
-                assert!(parse_csa(&format!("{setup}P{side}{unit}\n")).is_err());
-                assert!(parse_csa(&format!("P{side}{}\n+\n", unit.repeat(256))).is_err());
-
-                let sfen = format!("9/9/9/9/9/9/9/9/9 b {} 1", piece.to_string().repeat(255));
-                let pos = Position::from_sfen(&sfen).unwrap();
-                assert_eq!(pos.to_sfen(), format!("9/9/9/9/9/9/9/9/9 b 255{piece} 1"));
-                let overflow = format!("9/9/9/9/9/9/9/9/9 b {} 1", piece.to_string().repeat(256));
-                assert!(Position::from_sfen(&overflow).is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn apply_csa_capture_checks_hand_capacity_without_partial_updates() {
-        for (code, sfen_piece) in [
-            ("FU", 'P'),
-            ("KY", 'L'),
-            ("KE", 'N'),
-            ("GI", 'S'),
-            ("KI", 'G'),
-            ("KA", 'B'),
-            ("HI", 'R'),
-        ] {
-            for (side, opponent, target, mv) in
-                [('+', '-', "54", "+5554FU"), ('-', '+', "56", "-5556FU")]
-            {
-                let piece = if side == '+' {
-                    sfen_piece
-                } else {
-                    sfen_piece.to_ascii_lowercase()
-                };
-                for count in [254, 255] {
-                    let setup = format!(
-                        "P{side}55FU\nP{opponent}{target}{code}\nP{side}{}\n{side}\n",
-                        format!("00{code}").repeat(count)
-                    );
-                    let (mut pos, _, _) = parse_csa(&setup).unwrap();
-                    let before = pos.to_sfen();
-                    let result = pos.apply_csa_move(mv);
-                    if count == 254 {
-                        result.unwrap();
-                        assert_eq!(
-                            pos.to_sfen().split_whitespace().nth(2).unwrap(),
-                            format!("255{piece}")
-                        );
-                        assert_eq!(pos.ply, 2);
-                    } else {
-                        assert!(result.is_err());
-                        assert_eq!(pos.to_sfen(), before);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn apply_csa_move_checks_ply_before_mutating_position() {
-        let mut pos = initial_position();
-        pos.ply = u32::MAX - 1;
-        pos.apply_csa_move("+7776FU").unwrap();
-        assert_eq!(pos.ply, u32::MAX);
-        let before = pos.to_sfen();
-        assert!(pos.apply_csa_move("-3334FU").is_err());
-        assert_eq!(pos.to_sfen(), before);
-    }
-
-    #[test]
-    fn csa_move_suffixes_preserve_apply_and_conversion() {
-        let mut white = initial_position();
-        white.side_to_move = Color::White;
-        let drop = Position::from_sfen("4k4/9/9/9/9/9/9/9/4K4 b B 1").unwrap();
-        for (pos, token, usi) in [
-            (initial_position(), "+7776FU", "7g7f"),
-            (initial_position(), "+8822UM", "8h2b+"),
-            (white, "-3334FU", "3c3d"),
-            (drop, "+0055KA", "B*5e"),
-        ] {
-            let mut expected = pos.clone();
-            expected.apply_csa_move(token).unwrap();
-            for suffix in ["", ",T30", ",T30,'日本語コメント", ",日本語", "extra"] {
-                let full_token = format!("{token}{suffix}");
-                assert_eq!(csa_move_to_usi(&full_token, &pos).unwrap(), usi);
-                let mut actual = pos.clone();
-                actual.apply_csa_move(&full_token).unwrap();
-                assert_eq!(actual.to_sfen(), expected.to_sfen());
-            }
-        }
     }
 }

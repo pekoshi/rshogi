@@ -8,12 +8,12 @@
 //! - `CapturePieceToHistory`: [piece][to][captured_pt] -> score
 //! - `PieceToHistory`: [piece][to] -> score
 //! - `ContinuationHistory`: [prev_pc][prev_to][pc][to] -> score
+//! - `PawnHistory`: [pawn_key_idx][piece][to] -> score
 //! - `CounterMoveHistory`: [piece][square] -> Move
 //! - `HistoryCell`: 内部可変性ラッパー（参照リークを型で封じる）
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
-use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::types::{Color, Move, Piece, PieceType, Square};
@@ -49,21 +49,60 @@ pub const FROM_TO_SIZE: usize = 1 << 16;
 // 多くの履歴エントリは探索後に負の値になるため、
 // 開始値を「正しい」方向にシフトさせることでLMR/枝刈りの精度を上げる。
 
-/// mainHistory初期値
-const MAIN_HISTORY_INIT: i16 = SearchTuneParams::DEFAULT.main_history_init as i16;
+/// mainHistory初期値 (YO: mainHistoryDefault = 68)
+const MAIN_HISTORY_INIT: i16 = 68;
 
-/// captureHistory初期値
-const CAPTURE_HISTORY_INIT: i16 = SearchTuneParams::DEFAULT.capture_history_init as i16;
+/// captureHistory初期値 (YO: captureHistory.fill(-689))
+const CAPTURE_HISTORY_INIT: i16 = -689;
 
-/// continuationHistory初期値
-pub const CONTINUATION_HISTORY_INIT: i16 =
-    SearchTuneParams::DEFAULT.continuation_history_init as i16;
+/// continuationHistory初期値 (YO: continuationHistory.fill(-529))
+pub const CONTINUATION_HISTORY_INIT: i16 = -529;
+
+/// pawnHistory初期値 (YO: pawnHistory.clear_range(-1238, ...))
+const PAWN_HISTORY_INIT: i16 = -1238;
 
 /// 駒種の数（PieceType::NUM相当）
 const PIECE_TYPE_NUM: usize = PieceType::NUM + 1; // None含む
 
 /// 駒の数（Piece::NUM相当、先後含む）
 const PIECE_NUM: usize = Piece::NUM; // NONE含む
+
+// =============================================================================
+// 定数
+// =============================================================================
+
+/// TTMoveHistory更新ボーナス（TT手がbest moveだった場合）
+pub const TT_MOVE_HISTORY_BONUS: i32 = 811;
+
+/// TTMoveHistory更新ペナルティ（TT手がbest moveでなかった場合）
+pub const TT_MOVE_HISTORY_MALUS: i32 = -848;
+
+/// ContinuationHistory更新の重み [(ply_back, weight)]
+///
+/// 1,2,3,4,5,6手前の指し手と現在の指し手のペアを更新。
+/// 王手中は1,2手前のみ更新。
+pub const CONTINUATION_HISTORY_WEIGHTS: [(usize, i32); 6] =
+    [(1, 1157), (2, 648), (3, 288), (4, 576), (5, 140), (6, 441)];
+
+/// update_quiet_histories用のlowPlyHistory倍率
+pub const LOW_PLY_HISTORY_MULTIPLIER: i32 = 761;
+pub const LOW_PLY_HISTORY_OFFSET: i32 = 0;
+
+/// update_quiet_histories用のcontinuationHistory倍率（正負共通）
+pub const CONTINUATION_HISTORY_MULTIPLIER: i32 = 955;
+
+/// update_quiet_histories用のpawnHistory倍率（正のボーナス時）
+pub const PAWN_HISTORY_POS_MULTIPLIER: i32 = 850;
+/// update_quiet_histories用のpawnHistory倍率（負のボーナス時）
+pub const PAWN_HISTORY_NEG_MULTIPLIER: i32 = 550;
+
+/// ContinuationHistory近接ply（1,2手前）へのオフセット
+/// update_continuation_histories で (bonus * weight / 1024) + 88 * (i < 2)
+pub const CONTINUATION_HISTORY_NEAR_PLY_OFFSET: i32 = 88;
+
+/// Prior Capture Countermove Bonus（fail low時の前の捕獲手へのボーナス）
+///
+pub const PRIOR_CAPTURE_COUNTERMOVE_BONUS: i32 = 964;
 
 // =============================================================================
 // StatsEntry
@@ -123,7 +162,7 @@ impl<const D: i32> StatsEntry<D> {
 // ButterflyHistory
 // =============================================================================
 
-/// ButterflyHistory: `[Color][from_to]` -> score
+/// ButterflyHistory: [Color][from_to] -> score
 ///
 /// 静かな手（quiet moves）の成功/失敗を記録。
 /// 手の移動元と移動先でインデックス。
@@ -192,7 +231,7 @@ impl Default for ButterflyHistory {
 // LowPlyHistory
 // =============================================================================
 
-/// LowPlyHistory: `[ply][from_to]` -> score
+/// LowPlyHistory: [ply][from_to] -> score
 ///
 /// ルート付近での手の順序を改善するための履歴。
 pub struct LowPlyHistory {
@@ -229,7 +268,11 @@ impl LowPlyHistory {
 
     /// クリア（初期値97）
     pub fn clear(&mut self) {
-        self.clear_with_init(SearchTuneParams::DEFAULT.low_ply_history_init as i16);
+        for ply_table in &mut self.table {
+            for entry in ply_table.iter_mut() {
+                entry.set(97);
+            }
+        }
     }
 
     /// 指定初期値でクリア
@@ -252,11 +295,11 @@ impl Default for LowPlyHistory {
 // CapturePieceToHistory
 // =============================================================================
 
-/// CapturePieceToHistory: `[piece][to][captured_piece_type]` -> score
+/// CapturePieceToHistory: [piece][to][captured_piece_type] -> score
 ///
 /// 捕獲する手の履歴。
 ///
-/// HistoryTables内の連続領域に配置するため配列で保持する。
+/// PERF: 約3.5MB。HistoryTables内の連続領域に配置するため配列で保持する。
 pub struct CapturePieceToHistory {
     table: [[[StatsEntry<10692>; PIECE_TYPE_NUM]; Square::NUM]; PIECE_NUM],
 }
@@ -277,7 +320,7 @@ impl CapturePieceToHistory {
         unsafe { Box::<Self>::new_zeroed().assume_init() }
     }
 
-    /// 捕獲された駒の駒種を添字に、履歴値を取得する。
+    /// YaneuraOu の `type_of(capturedPiece)` 相当。
     ///
     /// 捕獲された駒そのものを渡す版。下位4bit（0=NONE, 1..14=PieceType）を
     /// インデックスに使うため、呼び出し側で `piece_type()` を取らなくてよい。
@@ -363,7 +406,7 @@ impl Default for CapturePieceToHistory {
 // PieceToHistory
 // =============================================================================
 
-/// PieceToHistory: `[piece][to]` -> score
+/// PieceToHistory: [piece][to] -> score
 ///
 /// 駒と移動先でインデックスする履歴。
 #[derive(Clone)]
@@ -423,12 +466,12 @@ impl Default for PieceToHistory {
 // ContinuationHistory
 // =============================================================================
 
-/// ContinuationHistory: `[prev_piece][prev_to][piece][to]` -> score
+/// ContinuationHistory: [prev_piece][prev_to][piece][to] -> score
 ///
 /// 連続する2手の組み合わせ履歴。
 /// 1手前の駒と移動先から、現在の駒と移動先へのスコア。
 ///
-/// HistoryTablesでは`[in_check][capture]`の組ごとに4つ保持する。
+/// PERF: 約1.3MBのサイズがあり、SearchWorkerでは[2][2]で4つ保持（計約5.2MB）。
 /// HistoryTables内の連続領域に配置するため配列で保持する。
 pub struct ContinuationHistory {
     table: [[PieceToHistory; Square::NUM]; PIECE_NUM],
@@ -512,10 +555,98 @@ impl Default for ContinuationHistory {
 }
 
 // =============================================================================
+// PawnHistory
+// =============================================================================
+
+/// PawnHistory: [pawn_key_index][piece][to] -> score
+///
+/// 歩の陣形に対する履歴。
+///
+/// PERF: 約39MB。HistoryTables内の連続領域に配置するため配列で保持する。
+pub struct PawnHistory {
+    table: [[[StatsEntry<8192>; Square::NUM]; PIECE_NUM]; PAWN_HISTORY_SIZE],
+}
+
+impl PawnHistory {
+    /// 新しいPawnHistoryを作成
+    pub fn new() -> Self {
+        let row = [[StatsEntry::default(); Square::NUM]; PIECE_NUM];
+        Self {
+            table: [row; PAWN_HISTORY_SIZE],
+        }
+    }
+
+    /// 新しいPawnHistoryを作成（ヒープ確保）
+    ///
+    /// 大きな配列のスタック確保を避けるために `Box::new_zeroed` を使う。
+    pub fn new_boxed() -> Box<Self> {
+        // SAFETY: StatsEntryはi16のみで構成され、ゼロ初期化は常に有効。
+        unsafe { Box::<Self>::new_zeroed().assume_init() }
+    }
+
+    /// 値を取得
+    #[inline]
+    pub fn get(&self, pawn_key_index: usize, pc: Piece, to: Square) -> i16 {
+        debug_assert!(pawn_key_index < PAWN_HISTORY_SIZE);
+        // SAFETY: pawn_key_index は呼び出し側でマスク済み (< PAWN_HISTORY_SIZE=8192)。
+        //         Piece::index() < PIECE_NUM=31、Square::index() < Square::NUM=81。
+        unsafe {
+            self.table
+                .get_unchecked(pawn_key_index)
+                .get_unchecked(pc.index())
+                .get_unchecked(to.index())
+                .get()
+        }
+    }
+
+    /// 値を更新
+    #[inline]
+    pub fn update(&mut self, pawn_key_index: usize, pc: Piece, to: Square, bonus: i32) {
+        debug_assert!(pawn_key_index < PAWN_HISTORY_SIZE);
+        // SAFETY: 同上。
+        unsafe {
+            self.table
+                .get_unchecked_mut(pawn_key_index)
+                .get_unchecked_mut(pc.index())
+                .get_unchecked_mut(to.index())
+                .update(bonus);
+        }
+    }
+
+    /// クリア（初期値-1238）
+    pub fn clear(&mut self) {
+        for pawn_table in self.table.iter_mut() {
+            for pc_table in pawn_table.iter_mut() {
+                for entry in pc_table.iter_mut() {
+                    entry.set(PAWN_HISTORY_INIT);
+                }
+            }
+        }
+    }
+
+    /// 指定初期値でクリア
+    pub fn clear_with_init(&mut self, init_val: i16) {
+        for pawn_table in self.table.iter_mut() {
+            for pc_table in pawn_table.iter_mut() {
+                for entry in pc_table.iter_mut() {
+                    entry.set(init_val);
+                }
+            }
+        }
+    }
+}
+
+impl Default for PawnHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
 // CounterMoveHistory
 // =============================================================================
 
-/// CounterMoveHistory: `[piece][square]` -> Move
+/// CounterMoveHistory: [piece][square] -> Move
 ///
 /// 直前の相手の手に対するカウンター手。
 pub struct CounterMoveHistory {
@@ -562,24 +693,29 @@ impl Default for CounterMoveHistory {
 // CorrectionHistory
 // =============================================================================
 
-/// Continuation correction historyの1 context分: `[piece][to]` -> correction。
-pub type CorrectionPieceToHistory =
-    [[StatsEntry<CORRECTION_HISTORY_LIMIT>; Square::NUM]; Piece::NUM];
-
-/// Continuation correction history: `[prev_pc][prev_to][pc][to]` -> correction
+/// CorrectionHistory ()
 ///
-/// 局面キーで引く pawn / minor / non-pawn の correction はスレッド間で共有する
-/// (`SharedHistories`)。ここにはスレッドごとの continuation だけを持つ。
+/// - Pawn/Minor: [key_index][color] -> correction
+/// - NonPawn: [key_index][side_to_move][piece_color] -> correction
+/// - Continuation: [prev_pc][prev_to][pc][to] -> correction
 ///
-/// HistoryTables内の連続領域に配置するため配列で保持する。
+/// PERF: 約4.5MB。HistoryTables内の連続領域に配置するため配列で保持する。
 pub struct CorrectionHistory {
-    continuation: [[CorrectionPieceToHistory; Square::NUM]; Piece::NUM],
+    pawn: [[StatsEntry<CORRECTION_HISTORY_LIMIT>; Color::NUM]; CORRECTION_HISTORY_SIZE],
+    minor: [[StatsEntry<CORRECTION_HISTORY_LIMIT>; Color::NUM]; CORRECTION_HISTORY_SIZE],
+    non_pawn:
+        [[[StatsEntry<CORRECTION_HISTORY_LIMIT>; Color::NUM]; Color::NUM]; CORRECTION_HISTORY_SIZE],
+    continuation: [[[[StatsEntry<CORRECTION_HISTORY_LIMIT>; Square::NUM]; Piece::NUM]; Square::NUM];
+        Piece::NUM],
 }
 
 impl CorrectionHistory {
     /// 新しいCorrectionHistoryを作成（初期値込み）
     pub fn new() -> Self {
         let mut history = Self {
+            pawn: [[StatsEntry::default(); Color::NUM]; CORRECTION_HISTORY_SIZE],
+            minor: [[StatsEntry::default(); Color::NUM]; CORRECTION_HISTORY_SIZE],
+            non_pawn: [[[StatsEntry::default(); Color::NUM]; Color::NUM]; CORRECTION_HISTORY_SIZE],
             continuation: [[[[StatsEntry::default(); Square::NUM]; Piece::NUM]; Square::NUM];
                 Piece::NUM],
         };
@@ -603,12 +739,88 @@ impl CorrectionHistory {
     }
 
     fn fill_initial_values(&mut self) {
+        for entry in self.pawn.iter_mut().flatten() {
+            entry.set(0);
+        }
+        for entry in self.minor.iter_mut().flatten() {
+            entry.set(0);
+        }
+        for entry in self.non_pawn.iter_mut().flatten().flatten() {
+            entry.set(0);
+        }
         for prev_pc in self.continuation.iter_mut() {
             for prev_to in prev_pc.iter_mut() {
                 for entry in prev_to.iter_mut().flatten() {
                     entry.set(8);
                 }
             }
+        }
+    }
+
+    #[inline]
+    pub fn pawn_value(&self, idx: usize, color: Color) -> i16 {
+        let masked = idx % CORRECTION_HISTORY_SIZE;
+        // SAFETY: masked < CORRECTION_HISTORY_SIZE（剰余演算で保証）。
+        //         Color::index() は 0 or 1 で Color::NUM=2 の範囲内。
+        unsafe { self.pawn.get_unchecked(masked).get_unchecked(color.index()).get() }
+    }
+
+    #[inline]
+    pub fn update_pawn(&mut self, idx: usize, color: Color, bonus: i32) {
+        let masked = idx % CORRECTION_HISTORY_SIZE;
+        // SAFETY: 同上。
+        unsafe {
+            self.pawn
+                .get_unchecked_mut(masked)
+                .get_unchecked_mut(color.index())
+                .update(bonus);
+        }
+    }
+
+    #[inline]
+    pub fn minor_value(&self, idx: usize, color: Color) -> i16 {
+        let masked = idx % CORRECTION_HISTORY_SIZE;
+        // SAFETY: masked < CORRECTION_HISTORY_SIZE（剰余演算で保証）。
+        //         Color::index() は 0 or 1 で Color::NUM=2 の範囲内。
+        unsafe { self.minor.get_unchecked(masked).get_unchecked(color.index()).get() }
+    }
+
+    #[inline]
+    pub fn update_minor(&mut self, idx: usize, color: Color, bonus: i32) {
+        let masked = idx % CORRECTION_HISTORY_SIZE;
+        // SAFETY: 同上。
+        unsafe {
+            self.minor
+                .get_unchecked_mut(masked)
+                .get_unchecked_mut(color.index())
+                .update(bonus);
+        }
+    }
+
+    #[inline]
+    pub fn non_pawn_value(&self, idx: usize, board_color: Color, stm: Color) -> i16 {
+        let masked = idx % CORRECTION_HISTORY_SIZE;
+        // SAFETY: masked < CORRECTION_HISTORY_SIZE（剰余演算で保証）。
+        //         Color::index() は 0 or 1 で Color::NUM=2 の範囲内。
+        unsafe {
+            self.non_pawn
+                .get_unchecked(masked)
+                .get_unchecked(board_color.index())
+                .get_unchecked(stm.index())
+                .get()
+        }
+    }
+
+    #[inline]
+    pub fn update_non_pawn(&mut self, idx: usize, board_color: Color, stm: Color, bonus: i32) {
+        let masked = idx % CORRECTION_HISTORY_SIZE;
+        // SAFETY: 同上。
+        unsafe {
+            self.non_pawn
+                .get_unchecked_mut(masked)
+                .get_unchecked_mut(board_color.index())
+                .get_unchecked_mut(stm.index())
+                .update(bonus);
         }
     }
 
@@ -629,28 +841,6 @@ impl CorrectionHistory {
                 .get_unchecked(to.index())
                 .get()
         }
-    }
-
-    /// 指定した直前手contextの`[piece][to]`テーブルを返す。
-    #[inline]
-    pub fn continuation_table(&self, prev_pc: Piece, prev_to: Square) -> &CorrectionPieceToHistory {
-        // SAFETY: Piece::index() < Piece::NUM=31、Square::index() < Square::NUM=81。
-        unsafe { self.continuation.get_unchecked(prev_pc.index()).get_unchecked(prev_to.index()) }
-    }
-
-    /// 事前に選択済みのcontinuation correction tableから値を取得する。
-    ///
-    /// # Safety
-    ///
-    /// `table`は生存中の`CorrectionHistory::continuation_table()`を指していなければならない。
-    #[inline]
-    pub unsafe fn continuation_value_from_table(
-        table: NonNull<CorrectionPieceToHistory>,
-        pc: Piece,
-        to: Square,
-    ) -> i16 {
-        // SAFETY: 呼出側がtableの生存期間を保証し、Piece/Square indexは各NUM未満。
-        unsafe { table.as_ref().get_unchecked(pc.index()).get_unchecked(to.index()).get() }
     }
 
     #[inline]
@@ -692,6 +882,7 @@ pub struct HistoryTables {
     pub low_ply_history: LowPlyHistory,
     pub capture_history: CapturePieceToHistory,
     pub continuation_history: [[ContinuationHistory; 2]; 2],
+    pub pawn_history: PawnHistory,
     pub correction_history: CorrectionHistory,
     pub tt_move_history: TTMoveHistory,
 }
@@ -699,17 +890,28 @@ pub struct HistoryTables {
 impl HistoryTables {
     /// 新しいHistoryTablesを作成（ヒープ確保）
     ///
-    /// `Box::new_zeroed` で一括確保し、既定の初期値を設定する。
+    /// `Box::new_zeroed` で一括確保しの初期値を設定する。
     pub fn new_boxed() -> Box<Self> {
         // SAFETY: 各テーブルは数値型のみで構成され、ゼロ初期化は常に有効。
         let mut history = unsafe { Box::<Self>::new_zeroed().assume_init() };
+        // の初期値を全テーブルに設定
         history.clear();
         history
     }
 
     /// すべての履歴テーブルをクリア
     pub fn clear(&mut self) {
-        self.clear_with_params(&SearchTuneParams::DEFAULT);
+        self.main_history.clear();
+        self.low_ply_history.clear();
+        self.capture_history.clear();
+        for row in &mut self.continuation_history {
+            for ch in row {
+                ch.clear();
+            }
+        }
+        self.pawn_history.clear();
+        self.correction_history.clear();
+        self.tt_move_history.clear();
     }
 
     /// SPSA パラメータに基づいた初期値ですべての履歴テーブルをクリア
@@ -722,6 +924,7 @@ impl HistoryTables {
                 ch.clear_with_init(tp.continuation_history_init as i16);
             }
         }
+        self.pawn_history.clear_with_init(tp.pawn_history_init as i16);
         self.correction_history.clear();
         self.tt_move_history.clear();
     }
@@ -755,16 +958,21 @@ impl HistoryCell {
         }
     }
 
-    /// 既定の初期値で、履歴をヒープ上に作成する。
+    /// Boxから作成（大きな配列のスタック確保を避ける）
+    ///
+    /// # Safety
+    ///
+    /// ゼロ初期化されたメモリでHistoryCellを構築する。
+    /// 内部のHistoryTablesはゼロ初期化が有効な型のみで構成されている。
     pub fn new_boxed() -> Box<Self> {
-        Self::new_boxed_with_params(&SearchTuneParams::DEFAULT)
-    }
-
-    pub(super) fn new_boxed_with_params(params: &SearchTuneParams) -> Box<Self> {
-        // SAFETY: UnsafeCell<HistoryTables> はゼロ初期化が有効な HistoryTables と同じ
-        // レイアウトを持ち、PhantomData はサイズ 0 のマーカー型。
-        let mut cell = unsafe { Box::<Self>::new_zeroed().assume_init() };
-        cell.get_mut().clear_with_params(params);
+        // SAFETY: HistoryCellはUnsafeCell<HistoryTables>とPhantomDataで構成
+        // UnsafeCell<T>はTと同じレイアウトを持ち、HistoryTablesはゼロ初期化が有効
+        // PhantomDataはサイズ0のマーカー型でゼロ初期化は無害
+        // new_zeroedで直接ヒープに確保し、スタックオーバーフローを回避
+        let cell = unsafe { Box::<Self>::new_zeroed().assume_init() };
+        // の初期値を全テーブルに設定
+        // SAFETY: 初期化時のみ使用、他の参照と同時保持しない
+        unsafe { cell.as_mut_unchecked() }.clear();
         cell
     }
 
@@ -868,7 +1076,8 @@ pub fn continuation_history_weight(tune_params: &SearchTuneParams, ply_back: usi
 /// ContinuationHistory近接ply（1手前）用のオフセット込みボーナスを計算
 ///
 /// `(bonus * weight / 1024) + near_ply_offset * (i < 2)`
-/// 倍率は呼び出し元で適用済みの bonus を受け取る。
+/// 955/1024 倍率は呼び出し元で適用済みの bonus を受け取る（YO は `update_quiet_histories`
+/// 内で `bonus * 955 / 1024` してから `update_continuation_histories` に渡す構造）。
 #[inline]
 pub fn continuation_history_bonus_with_offset(
     bonus: i32,
@@ -904,17 +1113,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stats_entry_update_lifecycle() {
-        let mut entry = StatsEntry::<1000>::default();
+    fn test_stats_entry_default() {
+        let entry = StatsEntry::<1000>::default();
         assert_eq!(entry.get(), 0);
+    }
+
+    #[test]
+    fn test_stats_entry_update_positive() {
+        let mut entry = StatsEntry::<1000>::default();
+
+        // ボーナスを加算
         entry.update(100);
-        assert_eq!(entry.get(), 100);
-        entry.update(1000);
-        assert_eq!(entry.get(), 1000);
-        entry.update(-100);
-        assert!(entry.get() < 1000);
-        entry.update(-1000);
-        assert_eq!(entry.get(), -1000);
+        assert!(entry.get() > 0);
+        assert!(entry.get() <= 1000);
+    }
+
+    #[test]
+    fn test_stats_entry_update_convergence() {
+        let mut entry = StatsEntry::<1000>::default();
+
+        // 繰り返し更新してもDを超えない
+        for _ in 0..100 {
+            entry.update(1000);
+        }
+        assert!(entry.get() <= 1000);
+        assert!(entry.get() > 900); // 収束に近づく
+    }
+
+    #[test]
+    fn test_stats_entry_update_negative() {
+        let mut entry = StatsEntry::<1000>::default();
+
+        // マイナス方向
+        for _ in 0..100 {
+            entry.update(-1000);
+        }
+        assert!(entry.get() >= -1000);
+        assert!(entry.get() < -900); // 収束に近づく
+    }
+
+    #[test]
+    fn test_stats_entry_decay() {
+        let mut entry = StatsEntry::<1000>::default();
+
+        // 大きなボーナスで値を上げる
+        for _ in 0..50 {
+            entry.update(1000);
+        }
+        let high_value = entry.get();
+        assert!(high_value > 0, "値が上がっているべき");
+
+        // マイナスボーナスで徐々に減衰
+        for _ in 0..5 {
+            entry.update(-100);
+        }
+        let decayed_value = entry.get();
+
+        // 減衰していることを確認（完全に0になる可能性もある）
+        assert!(decayed_value < high_value, "減衰しているべき");
     }
 
     #[test]
@@ -959,24 +1215,28 @@ mod tests {
     }
 
     #[test]
-    fn test_stat_bonus_and_malus_use_tuning_parameters() {
-        let tune = SearchTuneParams {
-            stat_bonus_depth_mult: 10,
-            stat_bonus_offset: -2,
-            stat_bonus_max: 25,
-            stat_bonus_tt_bonus: 7,
-            stat_malus_depth_mult: 20,
-            stat_malus_offset: -3,
-            stat_malus_max: 35,
-            stat_malus_move_count_mult: 4,
-            ..SearchTuneParams::default()
-        };
-        for (depth, bonus, malus) in [(1, 8, 17), (2, 18, 35), (3, 25, 35)] {
-            assert_eq!(stat_bonus(depth, false, &tune), bonus);
-            assert_eq!(stat_bonus(depth, true, &tune), bonus + 7);
-            assert_eq!(stat_malus(depth, 0, &tune), malus);
-            assert_eq!(stat_malus(depth, 2, &tune), malus - 8);
-        }
+    fn test_stat_bonus() {
+        let tune = SearchTuneParams::default();
+        // min(121*depth-77, 1633) + 375*(is_tt_move)
+        // depth=1, is_tt_move=false: 121*1-77 = 44
+        assert_eq!(stat_bonus(1, false, &tune), 44);
+        // depth=1, is_tt_move=true: 44 + 375 = 419
+        assert_eq!(stat_bonus(1, true, &tune), 419);
+        // depth=20: min(121*20-77, 1633) = min(2343, 1633) = 1633
+        assert_eq!(stat_bonus(20, false, &tune), 1633);
+        assert_eq!(stat_bonus(20, true, &tune), 1633 + 375);
+    }
+
+    #[test]
+    fn test_stat_malus() {
+        let tune = SearchTuneParams::default();
+        // min(825*depth-196, 2159) - 16*moveCount
+        // depth=1, moveCount=0: 825*1-196 = 629
+        assert_eq!(stat_malus(1, 0, &tune), 629);
+        // depth=1, moveCount=10: 629 - 16*10 = 469
+        assert_eq!(stat_malus(1, 10, &tune), 469);
+        // depth=10, moveCount=0: min(825*10-196, 2159) = min(8054, 2159) = 2159
+        assert_eq!(stat_malus(10, 0, &tune), 2159);
     }
 
     #[test]
@@ -1002,26 +1262,37 @@ mod tests {
     }
 
     #[test]
+    fn test_history_cell_read() {
+        // HistoryTablesは大きいのでnew_boxedを使用
+        let cell = HistoryCell::new_boxed();
+
+        let value = unsafe { cell.as_ref_unchecked() }
+            .main_history
+            .get(Color::Black, Move::from_usi("7g7f").unwrap());
+        assert_eq!(value, MAIN_HISTORY_INIT);
+    }
+
+    #[test]
+    fn test_history_cell_write() {
+        // HistoryTablesは大きいのでnew_boxedを使用
+        let cell = HistoryCell::new_boxed();
+        let mv = Move::from_usi("7g7f").unwrap();
+
+        unsafe { cell.as_mut_unchecked() }.main_history.update(Color::Black, mv, 100);
+
+        // 更新が反映されていることを確認
+        let value = unsafe { cell.as_ref_unchecked() }.main_history.get(Color::Black, mv);
+        assert!(value > 0);
+    }
+
+    #[test]
     fn test_history_cell_clear() {
         // HistoryTablesは大きいのでnew_boxedを使用
         let mut cell = HistoryCell::new_boxed();
         let mv = Move::from_usi("7g7f").unwrap();
 
-        // このテストだけが所有する cell であり、参照を update/clear 間で保持しない。
-        // SAFETY: cell の排他的所有があり、同時に可変参照を作らない。
-        assert_eq!(
-            unsafe { cell.as_ref_unchecked() }.main_history.get(Color::Black, mv),
-            MAIN_HISTORY_INIT
-        );
-
         // 更新
         unsafe { cell.as_mut_unchecked() }.main_history.update(Color::Black, mv, 100);
-
-        // SAFETY: 上と同じ排他的所有。更新後の値を読み、参照を保持しない。
-        assert_ne!(
-            unsafe { cell.as_ref_unchecked() }.main_history.get(Color::Black, mv),
-            MAIN_HISTORY_INIT
-        );
 
         // クリア
         cell.clear();

@@ -23,7 +23,7 @@ impl Square {
     pub const SQ_55: Square = Square(40);
     /// 9九
     pub const SQ_99: Square = Square(80);
-    // 方向定数（縦型 Bitboard 用）
+    // 方向定数（縦型Bitboardのやねうら王と同じ符号）
     pub const DELTA_D: i8 = 1; // 下(段+1)
     pub const DELTA_R: i8 = -9; // 右(筋-1)
     pub const DELTA_U: i8 = -1; // 上(段-1)
@@ -116,7 +116,6 @@ impl Square {
     }
 
     /// USI形式の文字列からSquareに変換
-    /// 互換性のため先頭2文字を解析する。全体の検証には `from_usi_strict()` を使う。
     pub fn from_usi(s: &str) -> Option<Square> {
         let mut chars = s.chars();
         let file = File::from_usi_char(chars.next()?)?;
@@ -124,16 +123,9 @@ impl Square {
         Some(Square::new(file, rank))
     }
 
-    /// USI座標トークン全体を検証する。ASCIIの筋・段2文字以外はNone。
-    pub fn from_usi_strict(s: &str) -> Option<Square> {
-        if s.len() != 2 {
-            return None;
-        }
-        Self::from_usi(s)
-    }
     /// 方向オフセットを足したSquareを返す（盤外ならNone）
     ///
-    /// 上下左右などの方向を表すオフセットを扱う。
+    /// YaneuraOuのSQ_U/SQ_D/SQ_L/SQ_R等に対応するオフセットをそのまま扱える。
     #[inline]
     pub const fn offset(self, delta: i8) -> Option<Square> {
         let (df, dr) = match delta {
@@ -178,16 +170,27 @@ impl Square {
     }
 }
 
-// Square で添字にする配列は [T; Square::NUM] (81 要素) 以上という前提で、境界検査を省く。
-// 探索の最内ループで通るため release では検査しない。Square・Color・Piece の添字と、Move・Bitboard・
-// ExtMoveBuffer のアクセサの範囲検査を release でも入れると、探索の命令数が約 4% 増え、速度が 2〜3% 落ちる。
+// =============================================================================
+// Index trait による境界チェック除去（Reckless 由来）
+//
+// Square(0..=80) は [T; Square::NUM] の有効なインデックスであることが
+// Square の構築時に保証される（new, from_index 等）。
+// この不変条件に依拠して全インデックスアクセスから境界チェックを除去する。
+// =============================================================================
+
 impl<T> Index<Square> for [T] {
     type Output = T;
 
     #[inline]
     fn index(&self, sq: Square) -> &T {
-        debug_assert!(sq.index() < self.len());
-        // SAFETY: Square の値域は 0..=80。Square で添字にする配列は [T; Square::NUM] (81 要素) 以上。
+        debug_assert!(
+            sq.index() < self.len(),
+            "Square index {} out of bounds for slice of length {}",
+            sq.index(),
+            self.len()
+        );
+        // SAFETY: Square の値域は 0..=80。Square::NUM (81) 以上のサイズの
+        // 配列に対してのみ使用される（呼び出し側の配列サイズで保証）。
         unsafe { self.get_unchecked(sq.index()) }
     }
 }
@@ -195,8 +198,14 @@ impl<T> Index<Square> for [T] {
 impl<T> IndexMut<Square> for [T] {
     #[inline]
     fn index_mut(&mut self, sq: Square) -> &mut T {
-        debug_assert!(sq.index() < self.len());
-        // SAFETY: Square の値域は 0..=80。Square で添字にする配列は [T; Square::NUM] (81 要素) 以上。
+        debug_assert!(
+            sq.index() < self.len(),
+            "Square index {} out of bounds for slice of length {}",
+            sq.index(),
+            self.len()
+        );
+        // SAFETY: Square の値域は 0..=80。Square::NUM (81) 以上のサイズの
+        // 配列に対してのみ使用される（呼び出し側の配列サイズで保証）。
         unsafe { self.get_unchecked_mut(sq.index()) }
     }
 }
@@ -205,21 +214,6 @@ impl<T> IndexMut<Square> for [T] {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_strict_usi_square_token_boundaries() {
-        for file in File::ALL {
-            for rank in Rank::ALL {
-                let square = Square::new(file, rank);
-                assert_eq!(Square::from_usi_strict(&square.to_usi()), Some(square));
-            }
-        }
-        for token in [
-            "", "7", "7gg", "7g7f", "7g+", "7g ", "7g\n", "7g\0", "7g歩", "７g", "0a", "1j",
-        ] {
-            assert_eq!(Square::from_usi_strict(token), None, "{token:?}");
-        }
-        assert_eq!(Square::from_usi("7gextra"), Square::from_usi("7g"));
-    }
     #[test]
     fn test_square_new() {
         let sq = Square::new(File::File1, Rank::Rank1);

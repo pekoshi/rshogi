@@ -23,45 +23,16 @@ use windows_sys::Win32::System::Memory::{
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum AllocKind {
-    /// Windows の MEM_LARGE_PAGES による確保に成功
-    #[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AllocKind {
     LargePages,
-    /// Linux/Android で MADV_HUGEPAGE の要求に成功。実際の backing は OS が決める
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    HugePageHint,
-    /// Large Pages 確保や hint 要求に失敗した場合のフォールバック、
-    /// または macOS 等の未対応環境で使用
+    /// Windows で Large Pages 確保失敗時のフォールバック、
+    /// または macOS 等の Large Pages 未対応環境で使用
+    #[allow(dead_code)]
     Regular,
 }
 
-impl AllocKind {
-    /// Windows の明示的な Large Pages 確保に成功した種別か。
-    /// Linux/Android の hint 要求は実際の backing を保証しないため含めない。
-    pub(crate) fn is_explicit_large_pages(self) -> bool {
-        match self {
-            #[cfg(windows)]
-            AllocKind::LargePages => true,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            AllocKind::HugePageHint => false,
-            AllocKind::Regular => false,
-        }
-    }
-
-    /// Linux/Android で huge-page hint の要求に成功した種別か。
-    pub(crate) fn is_huge_page_hint(self) -> bool {
-        match self {
-            #[cfg(windows)]
-            AllocKind::LargePages => false,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            AllocKind::HugePageHint => true,
-            AllocKind::Regular => false,
-        }
-    }
-}
-
-pub(crate) struct Allocation {
+pub(super) struct Allocation {
     ptr: NonNull<u8>,
     kind: AllocKind,
     #[cfg(not(windows))]
@@ -69,9 +40,7 @@ pub(crate) struct Allocation {
 }
 
 impl Allocation {
-    /// 非ゼロサイズの領域を確保する。内容の初期化は呼び出し側が行う。
-    pub(crate) fn allocate(size: usize, alignment: usize) -> Self {
-        assert!(size != 0, "allocation size must be nonzero");
+    pub(super) fn allocate(size: usize, alignment: usize) -> Self {
         #[cfg(windows)]
         {
             debug_assert!(alignment.is_power_of_two(), "alignment must be power of two");
@@ -87,11 +56,11 @@ impl Allocation {
         }
     }
 
-    pub(crate) fn ptr(&self) -> NonNull<u8> {
+    pub(super) fn ptr(&self) -> NonNull<u8> {
         self.ptr
     }
 
-    pub(crate) fn kind(&self) -> AllocKind {
+    pub(super) fn kind(&self) -> AllocKind {
         self.kind
     }
 }
@@ -200,43 +169,34 @@ fn alloc_windows(size: usize, alignment: usize) -> Allocation {
 #[cfg(not(windows))]
 fn alloc_unix(size: usize, alignment: usize) -> Allocation {
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let page_align = 2 * 1024 * 1024;
+    let (page_align, kind) = (2 * 1024 * 1024, AllocKind::LargePages);
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let page_align = 4096;
+    let (page_align, kind) = (4096, AllocKind::Regular);
 
     let alignment = max(alignment, page_align);
     let layout = Layout::from_size_align(size, alignment)
-        .expect("Invalid allocation layout")
+        .expect("Invalid TT allocation layout")
         .pad_to_align();
-    // SAFETY: layout は from_size_align が検証済み。呼び出し側は非ゼロの size を渡す。
-    // 返った領域は Allocation が単独所有し、Drop で同じ layout を使って解放する。
     let ptr = unsafe { alloc(layout) };
     if ptr.is_null() {
         handle_alloc_error(layout);
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let kind = {
-        // SAFETY: ptr は直前に layout で確保した領域の先頭で、layout.size() はその全長。
-        // MADV_HUGEPAGE は配置のヒントであり、領域の内容や有効性を変えない。
-        let result = unsafe { libc::madvise(ptr as *mut _, layout.size(), libc::MADV_HUGEPAGE) };
+    unsafe {
+        let result = libc::madvise(ptr as *mut _, layout.size(), libc::MADV_HUGEPAGE);
         // madvise失敗は動作に影響しないが、パフォーマンスに影響する可能性があるため
         // デバッグビルドでは警告を出力
         #[cfg(debug_assertions)]
         if result != 0 {
             eprintln!("Warning: madvise MADV_HUGEPAGE failed");
         }
-        if result == 0 {
-            AllocKind::HugePageHint
-        } else {
-            AllocKind::Regular
-        }
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let kind = AllocKind::Regular;
+        #[cfg(not(debug_assertions))]
+        let _ = result;
+    }
 
     Allocation {
-        ptr: NonNull::new(ptr).expect("Allocation returned null"),
+        ptr: NonNull::new(ptr).expect("TT allocation returned null"),
         kind,
         layout,
     }
@@ -262,47 +222,6 @@ impl Drop for Allocation {
     }
 }
 
-// SAFETY: 割当を単独所有し、所有権の移動後も同じレイアウトで解放する。共有の安全性は格納型側で保証する。
+// SAFETY: Allocation owns raw memory for the TT and is protected by higher-level synchronization.
 unsafe impl Send for Allocation {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[should_panic(expected = "allocation size must be nonzero")]
-    fn zero_size_is_rejected() {
-        Allocation::allocate(0, 64);
-    }
-
-    #[test]
-    fn regular_pages_report_neither_status() {
-        assert!(!AllocKind::Regular.is_explicit_large_pages());
-        assert!(!AllocKind::Regular.is_huge_page_hint());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn explicit_large_pages_are_not_a_hint() {
-        assert!(AllocKind::LargePages.is_explicit_large_pages());
-        assert!(!AllocKind::LargePages.is_huge_page_hint());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    fn huge_page_hint_is_not_reported_as_large_pages() {
-        assert!(AllocKind::HugePageHint.is_huge_page_hint());
-        assert!(!AllocKind::HugePageHint.is_explicit_large_pages());
-    }
-
-    #[test]
-    fn allocation_kind_matches_the_platform() {
-        let allocation = Allocation::allocate(1 << 20, 64);
-        let kind = allocation.kind();
-        assert!(!(kind.is_explicit_large_pages() && kind.is_huge_page_hint()));
-        #[cfg(not(windows))]
-        assert!(!kind.is_explicit_large_pages());
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        assert!(!kind.is_huge_page_hint());
-    }
-}
+unsafe impl Sync for Allocation {}

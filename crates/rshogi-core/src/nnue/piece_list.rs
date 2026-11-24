@@ -1,6 +1,6 @@
 //! PieceList - 全40駒の BonaPiece 管理と逆引きテーブル
 //!
-//! 両視点の駒特徴量を駒番号で管理する。
+//! YaneuraOu の EvalList に相当する。
 //! 全40駒（歩18, 香4, 桂4, 銀4, 金4, 角2, 飛2, 玉2）の BonaPiece を
 //! PieceNumber で管理し、Square → PieceNumber / BonaPiece(fb) → PieceNumber の
 //! 逆引きテーブルで O(1) アクセスを実現する。
@@ -10,7 +10,7 @@ use crate::types::Square;
 
 /// 駒番号（全40駒に対する一意な番号）
 ///
-/// 駒番号の割り当て:
+/// YaneuraOu の PieceNumber に準拠した番号割り当て:
 /// - 歩: 0-17 (18枚)
 /// - 香: 18-21 (4枚)
 /// - 桂: 22-25 (4枚)
@@ -66,7 +66,7 @@ const PT_TO_BASE_INDEX: [u8; 9] = [
 
 /// PieceList - 全40駒の BonaPiece 管理テーブル
 ///
-/// 両視点の駒特徴量を駒番号で管理する。
+/// YaneuraOu の EvalList に相当。
 /// 合計 ~332 bytes で L1 キャッシュ内に収まる。
 #[derive(Clone)]
 pub struct PieceList {
@@ -91,60 +91,71 @@ impl PieceList {
         }
     }
 
-    /// 盤上駒を設定し逆引きテーブルを更新。
-    ///
-    /// # Panics
-    /// `piece_no` が0..40の範囲外の場合。変更前に検査する。
+    /// 盤上駒を設定し逆引きテーブルを更新
     #[inline]
     pub fn put_piece_on_board(&mut self, piece_no: PieceNumber, bp: ExtBonaPiece, sq: Square) {
-        let index = piece_no.0 as usize;
-        assert!(index < PieceNumber::NB, "PieceNumber out of range");
-        assert!(sq.index() < self.piece_no_on_board.len(), "Square out of range");
-        self.piece_list_fb[index] = bp.fb;
-        self.piece_list_fw[index] = bp.fw;
-        self.piece_no_on_board[sq.index()] = piece_no;
+        debug_assert!((piece_no.0 as usize) < PieceNumber::NB);
+        debug_assert!(sq.index() < Square::NUM + 1);
+        // SAFETY: PieceNumber は 0..=39 (NB=40)、piece_list_fb/fw の長さは NB。
+        //         Square::index() は 0..=80、piece_no_on_board の長さは Square::NUM+1=82
+        //         （盤外マス用の番兵スロットを含む）。
+        unsafe {
+            *self.piece_list_fb.get_unchecked_mut(piece_no.0 as usize) = bp.fb;
+            *self.piece_list_fw.get_unchecked_mut(piece_no.0 as usize) = bp.fw;
+            *self.piece_no_on_board.get_unchecked_mut(sq.index()) = piece_no;
+        }
     }
 
-    /// 手駒を設定し逆引きテーブルを更新。
-    ///
-    /// # Panics
-    /// `piece_no` が0..40の範囲外、または `bp.fb` が手駒範囲外の場合。
-    /// すべての添字を変更前に検査する。
+    /// 手駒を設定し逆引きテーブルを更新
     #[inline]
     pub fn put_piece_on_hand(&mut self, piece_no: PieceNumber, bp: ExtBonaPiece) {
-        let index = piece_no.0 as usize;
-        let hand_index = bp.fb.value() as usize;
-        assert!(index < PieceNumber::NB, "PieceNumber out of range");
-        assert!(hand_index < FE_HAND_END, "BonaPiece out of hand range");
-        self.piece_list_fb[index] = bp.fb;
-        self.piece_list_fw[index] = bp.fw;
-        self.piece_no_on_hand[hand_index] = piece_no;
+        debug_assert!((piece_no.0 as usize) < PieceNumber::NB);
+        debug_assert!(
+            (bp.fb.value() as usize) < FE_HAND_END,
+            "fb ({}) out of hand range (< {})",
+            bp.fb.value(),
+            FE_HAND_END
+        );
+        // SAFETY: PieceNumber は 0..=39 (NB=40)、piece_list_fb/fw の長さは NB。
+        //         BonaPiece(fb) は手駒範囲内 (< FE_HAND_END)、piece_no_on_hand の長さは FE_HAND_END。
+        unsafe {
+            *self.piece_list_fb.get_unchecked_mut(piece_no.0 as usize) = bp.fb;
+            *self.piece_list_fw.get_unchecked_mut(piece_no.0 as usize) = bp.fw;
+            *self.piece_no_on_hand.get_unchecked_mut(bp.fb.value() as usize) = piece_no;
+        }
     }
 
-    /// 盤上逆引き: Square → PieceNumber。
+    /// 盤上逆引き: Square → PieceNumber
     #[inline]
     pub fn piece_no_of_board(&self, sq: Square) -> PieceNumber {
-        self.piece_no_on_board[sq.index()]
+        debug_assert!(sq.index() < Square::NUM + 1);
+        // SAFETY: Square::index() は 0..=80、piece_no_on_board の長さは Square::NUM+1=82。
+        unsafe { *self.piece_no_on_board.get_unchecked(sq.index()) }
     }
 
-    /// 手駒逆引き: BonaPiece(fb) → PieceNumber。
-    ///
-    /// # Panics
-    /// `fb` が手駒範囲外の場合。
+    /// 手駒逆引き: BonaPiece(fb) → PieceNumber
     #[inline]
     pub fn piece_no_of_hand(&self, fb: BonaPiece) -> PieceNumber {
-        self.piece_no_on_hand[fb.value() as usize]
+        debug_assert!(
+            (fb.value() as usize) < FE_HAND_END,
+            "fb ({}) out of hand range (< {})",
+            fb.value(),
+            FE_HAND_END
+        );
+        // SAFETY: BonaPiece(fb) は手駒範囲内 (< FE_HAND_END)、piece_no_on_hand の長さは FE_HAND_END。
+        unsafe { *self.piece_no_on_hand.get_unchecked(fb.value() as usize) }
     }
 
-    /// PieceNumber → ExtBonaPiece 取得。
-    ///
-    /// # Panics
-    /// `piece_no` が0..40の範囲外の場合。
+    /// PieceNumber → ExtBonaPiece 取得
     #[inline]
     pub fn bona_piece(&self, piece_no: PieceNumber) -> ExtBonaPiece {
-        ExtBonaPiece {
-            fb: self.piece_list_fb[piece_no.0 as usize],
-            fw: self.piece_list_fw[piece_no.0 as usize],
+        debug_assert!((piece_no.0 as usize) < PieceNumber::NB);
+        // SAFETY: PieceNumber は 0..=39 (NB=40)、piece_list_fb/fw の長さは NB。
+        unsafe {
+            ExtBonaPiece {
+                fb: *self.piece_list_fb.get_unchecked(piece_no.0 as usize),
+                fw: *self.piece_list_fw.get_unchecked(piece_no.0 as usize),
+            }
         }
     }
 
@@ -184,53 +195,6 @@ pub fn piece_number_base(pt: crate::types::PieceType) -> u8 {
 mod tests {
     use super::*;
     use crate::types::PieceType;
-
-    #[test]
-    fn safe_boundary_piece_list_rejects_before_mutation() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-        let mut list = PieceList::new();
-        let piece = PieceNumber(0);
-        let original = ExtBonaPiece::new(BonaPiece::new(1), BonaPiece::new(20));
-        list.put_piece_on_board(piece, original, Square::SQ_55);
-        list.put_piece_on_hand(piece, original);
-        for index in [40, u8::MAX] {
-            let invalid = PieceNumber(index);
-            assert!(catch_unwind(|| list.bona_piece(invalid)).is_err());
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| list.put_piece_on_board(
-                    invalid,
-                    original,
-                    Square::SQ_55
-                )))
-                .is_err()
-            );
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| list.put_piece_on_hand(invalid, original)))
-                    .is_err()
-            );
-            assert_eq!(list.bona_piece(piece), original);
-            assert_eq!(list.piece_no_of_board(Square::SQ_55), piece);
-            assert_eq!(list.piece_no_of_hand(original.fb), piece);
-        }
-        for index in [FE_HAND_END as u16, u16::MAX] {
-            let invalid = BonaPiece::new(index);
-            assert!(catch_unwind(|| list.piece_no_of_hand(invalid)).is_err());
-            let replacement = ExtBonaPiece::new(invalid, BonaPiece::new(99));
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| list.put_piece_on_hand(piece, replacement)))
-                    .is_err()
-            );
-            assert_eq!(list.bona_piece(piece), original);
-            assert_eq!(list.piece_no_of_hand(original.fb), piece);
-        }
-        // Square の safe constructor は盤外値を作らない。
-        assert!(Square::from_u8(81).is_none());
-        assert!(Square::from_u8(u8::MAX).is_none());
-        let last = PieceNumber(39);
-        list.put_piece_on_board(last, original, Square::SQ_99);
-        assert_eq!(list.bona_piece(last), original);
-        assert_eq!(list.piece_no_of_board(Square::SQ_99), last);
-    }
 
     #[test]
     fn test_piece_number_base() {

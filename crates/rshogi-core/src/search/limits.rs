@@ -4,8 +4,6 @@
 
 use crate::time::Instant;
 use crate::types::Color;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 // =============================================================================
 // TimePoint
@@ -23,9 +21,6 @@ pub type TimePoint = i64;
 /// USI `go` コマンドで指定されるパラメータを保持する。
 #[derive(Clone)]
 pub struct LimitsType {
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) reserved_game_mate_threads: usize,
-    pub(crate) analysis: Option<super::analysis::AnalysisRun>,
     /// 両者の残り時間（ミリ秒）
     pub time: [TimePoint; Color::NUM],
 
@@ -39,11 +34,15 @@ pub struct LimitsType {
     pub movetime: TimePoint,
 
     /// rtime: ランダム化された固定思考時間（ミリ秒）
-    /// go rtime 用
+    /// YaneuraOu互換の go rtime 用
     pub rtime: TimePoint,
 
     /// 探索深さ固定（0以外なら有効）
     pub depth: i32,
+
+    /// 詰み専用探索の手数（0以外なら有効）
+    /// USI `go mate N` の N は手数（1手=先後1回ずつ）で、内部比較では 2*N 手目まで探索する。
+    pub mate: i32,
 
     /// perftテスト中のフラグ（非0なら深さ）
     pub perft: i32,
@@ -51,72 +50,46 @@ pub struct LimitsType {
     /// 思考時間無制限フラグ
     pub infinite: bool,
 
-    /// 探索ノード数制限（0以外なら有効）。helper を含む全スレッドの合計で判定する。
+    /// 探索ノード数制限（0以外なら有効）
     pub nodes: u64,
 
     /// ponder有効フラグ
     pub ponder: bool,
 
     /// MultiPV（候補手複数探索）の数（1以上、デフォルト1）
-    /// 複数の候補手を探索して表示する
+    /// YaneuraOu準拠: 複数の候補手を探索して表示する
     pub multi_pv: usize,
 
     /// 探索対象の手のリスト
     /// 空なら全合法手を探索
     pub search_moves: Vec<crate::types::Move>,
 
-    /// 制限で反復が途中で止まったとき、完了した反復があればその最後の結果を返す。
-    /// 偽なら、中断した反復で根の先頭に別の手が残っていればその手と下界・上界の評価値を返す。
-    /// depth 1 も完了しないうちに止まった場合は、真でも中断した探索の結果になる。
-    /// 評価値を教師ラベルなど確定値として保存する呼出側が真にする。
-    pub return_completed_iteration: bool,
-
     /// 探索開始時刻
     pub(crate) start_time: Option<Instant>,
-
-    /// helper を使う `go nodes` で、全 worker の合計ノード数を集める共有カウンタ。
-    /// `Search::go` が設定する。`None` なら各 worker は自分のノード数で判定する。
-    pub(crate) searched_nodes: Option<Arc<AtomicU64>>,
 }
 
 impl Default for LimitsType {
     fn default() -> Self {
         Self {
-            #[cfg(not(target_arch = "wasm32"))]
-            reserved_game_mate_threads: 0,
-            analysis: None,
             time: [0; Color::NUM],
             inc: [0; Color::NUM],
             byoyomi: [0; Color::NUM],
             movetime: 0,
             rtime: 0,
             depth: 0,
+            mate: 0,
             perft: 0,
             infinite: false,
             nodes: 0,
             ponder: false,
             multi_pv: 1, // デフォルトは1（通常探索）
             search_moves: Vec::new(),
-            return_completed_iteration: false,
             start_time: None,
-            searched_nodes: None,
         }
     }
 }
 
 impl LimitsType {
-    pub(crate) fn stop_check_interval(&self) -> i32 {
-        let nodes = match self.analysis.as_ref().map(|run| run.budget) {
-            Some(super::AnalysisBudget::Nodes(nodes)) => nodes,
-            _ => self.nodes,
-        };
-        if nodes > 0 {
-            (nodes / 1024).clamp(1, 512) as i32
-        } else {
-            512
-        }
-    }
-
     /// 新しいLimitsTypeを作成
     pub fn new() -> Self {
         Self::default()
@@ -125,6 +98,7 @@ impl LimitsType {
     /// 時間制御を行うべきかの判定
     ///
     /// 以下のいずれかが指定されている場合は時間制御を行わない：
+    /// - mate（詰み探索）
     /// - movetime（固定思考時間）
     /// - depth（固定深さ）
     /// - nodes（ノード数制限）
@@ -132,7 +106,7 @@ impl LimitsType {
     /// - infinite（無制限）
     #[inline]
     pub fn use_time_management(&self) -> bool {
-        self.analysis.is_none()
+        self.mate == 0
             && self.movetime == 0
             && self.depth == 0
             && self.nodes == 0
@@ -143,11 +117,6 @@ impl LimitsType {
     /// 探索開始時刻を設定
     pub fn set_start_time(&mut self) {
         self.start_time = Some(Instant::now());
-    }
-
-    /// 探索開始時刻を指定した時刻に設定
-    pub fn set_start_time_at(&mut self, start_time: Instant) {
-        self.start_time = Some(start_time);
     }
 
     /// 探索開始からの経過時間（ミリ秒）
@@ -189,34 +158,6 @@ impl LimitsType {
     #[inline]
     pub fn has_movetime(&self) -> bool {
         self.movetime > 0
-    }
-
-    /// 暴走探索を engine 自身が打ち切れる予算（時間・ノード・infinite）を持つか。
-    ///
-    /// `false`（深さ／詰み目標の完了のみで停止し、時間もノードも `stop` も効かない探索）の場合、
-    /// remaining depth が減らない探索pathが置換表飽和下で連鎖して探索木が
-    /// 深さ方向に成長し続けても止める手段が無く、`go depth N` が事実上終了しなくなる。
-    /// この判定が `false` の探索だけ動的depth-liveness guardの追跡対象にする。
-    ///
-    /// 「実際に enforce される停止条件」のみを予算とみなす:
-    /// - `use_time_management()`: 純粋な時間管理が有効で時間で停止する（`go depth N btime T` の
-    ///   ように depth 併用だと時間管理は無効化されるため `true` にならず、この場合は guard 対象）。
-    ///   `rtime` は `time_manager.init` でこの判定が真のときだけ反映されるため（depth 併用時は
-    ///   `!use_time_management()` の早期 return より後で処理され enforce されない）、ここでは
-    ///   独立項を持たず `use_time_management()` に内包する。
-    /// - movetime: 固定思考時間。`time_manager.init` の最初に処理され depth 併用でも enforce される。
-    /// - nodes: ノード数で停止。
-    /// - infinite: `stop` で打ち切り可能。
-    ///
-    /// なお `go perft N` は `use_time_management()` が `false` になり「予算なし」扱いだが、
-    /// perft は alpha-beta を通らず guard 追跡を行わない（実害なし）。
-    #[inline]
-    pub fn has_interrupt_budget(&self) -> bool {
-        self.analysis.is_some()
-            || self.use_time_management()
-            || self.movetime != 0
-            || self.nodes != 0
-            || self.infinite
     }
 }
 
@@ -286,53 +227,16 @@ mod tests {
     }
 
     #[test]
-    fn test_has_interrupt_budget() {
-        // 純粋な depth 固定（go depth N）は engine 自身の打ち切り予算なし → guard 対象
-        let mut l = LimitsType::new();
-        l.depth = 15;
-        assert!(!l.has_interrupt_budget());
+    fn test_elapsed() {
+        let mut limits = LimitsType::new();
+        limits.set_start_time();
 
-        // 純粋な時間管理（depth 併用なし）は予算あり。increment のみ（go binc）・rtime 単独も時間管理が有効。
-        for set in [
-            |l: &mut LimitsType| l.time[Color::Black.index()] = 60000,
-            |l: &mut LimitsType| l.byoyomi[Color::Black.index()] = 30000,
-            |l: &mut LimitsType| l.inc[Color::Black.index()] = 1000,
-            |l: &mut LimitsType| l.rtime = 1000,
-        ] {
-            let mut l = LimitsType::new();
-            set(&mut l);
-            assert!(l.has_interrupt_budget());
-        }
+        // 少し待つ
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
-        // movetime / nodes / infinite は depth 併用でも enforce されるため予算あり
-        for set in [
-            |l: &mut LimitsType| l.movetime = 1000,
-            |l: &mut LimitsType| l.nodes = 100000,
-            |l: &mut LimitsType| l.infinite = true,
-        ] {
-            let mut l = LimitsType::new();
-            l.depth = 15;
-            set(&mut l);
-            assert!(l.has_interrupt_budget());
-        }
-
-        // depth + rtime は time_manager.init で rtime 処理前に !use_time_management() で早期 return
-        // され rtime が enforce されない → 予算なし扱い（guard 対象）
-        let mut l = LimitsType::new();
-        l.depth = 15;
-        l.rtime = 1000;
-        assert!(!l.has_interrupt_budget());
-
-        // depth と残り時間/秒読みの併用は時間管理が無効化される（time MAX/2 で実 enforce されない）
-        // ため予算なし扱い → guard 対象とし、この組合せでもハングしないようにする
-        let mut l = LimitsType::new();
-        l.depth = 15;
-        l.time[Color::Black.index()] = 60000;
-        assert!(!l.has_interrupt_budget());
-        let mut l = LimitsType::new();
-        l.depth = 15;
-        l.byoyomi[Color::Black.index()] = 30000;
-        assert!(!l.has_interrupt_budget());
+        let elapsed = limits.elapsed();
+        assert!(elapsed >= 10);
+        assert!(elapsed < 1000); // 1秒以内
     }
 
     #[test]

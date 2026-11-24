@@ -1,0 +1,23 @@
+[package]
+name = "p2-transformer"
+version = "0.1.0"
+edition = "2024"
+description = "Shogi-specialized token system for the序中盤 Transformer + PUCT engine"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+rshogi-core = { path = "../rshogi-core", default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[lib]
+name = "p2_transformer"
+path = "src/lib.rs"
+
+[[bench]]
+name = "tokenize"
+harness = false

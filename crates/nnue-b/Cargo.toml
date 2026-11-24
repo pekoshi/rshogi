@@ -1,0 +1,52 @@
+[package]
+name = "nnue-b"
+version = "0.1.0"
+edition = "2021"
+description = "PUCT hybrid 用 NNUE-B Transformer (Candle) モデル定義 + 訓練 + ONNX export"
+publish = false
+
+[features]
+default = []
+# CUDA 版 Candle backend (GPU 訓練用)
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# CPU のみ build (default と同等、 明示用 alias)
+cpu = []
+# ONNX export (candle-onnx を pull する)。 build 時間短縮のため default 無効。
+onnx = ["dep:prost", "dep:clap"]
+# 訓練 binary を build (PSV reader + AdamW loop)。 dataset I/O を含む。
+train = ["dep:clap", "dep:tools"]
+
+[dependencies]
+# workspace の他 crate との整合性のため candle 0.8 を使用
+candle-core = { version = "0.8", default-features = false }
+candle-nn = { version = "0.8", default-features = false }
+# ONNX export を build script (protoc) 経由にしないため、 prost を derive macro で
+# 直接使う。 candle-onnx は protoc 必須でビルド負担が大きいため引かない。
+prost = { version = "0.12", optional = true }
+
+rshogi-core = { path = "../rshogi-core", default-features = false }
+# 訓練 binary でのみ pull (PSV unpack / move16 decode / dlshogi policy label)。
+# tools crate は p2-nnue / p2-search 等の heavy deps を持つため、 lib 側には付けず
+# train feature 経由でのみ pull する。
+tools = { path = "../tools", default-features = false, optional = true }
+
+anyhow.workspace = true
+# train binary 用 (features = ["train"] でのみ pull、 derive macro 必須)
+clap = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "nnue_b"
+path = "src/lib.rs"
+
+[[bin]]
+name = "train_nnue_b"
+path = "src/bin/train_nnue_b.rs"
+required-features = ["train"]
+
+[[bin]]
+name = "export_onnx"
+path = "src/bin/export_onnx.rs"
+required-features = ["onnx"]

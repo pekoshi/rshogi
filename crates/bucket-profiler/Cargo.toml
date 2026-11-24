@@ -1,0 +1,50 @@
+[package]
+name = "bucket-profiler"
+version = "0.1.0"
+edition = "2021"
+description = "PSV file の progress8kpabs bucket 分布を診断する CLI"
+license = "GPL-3.0-only"
+
+[dependencies]
+rshogi-core = { path = "../rshogi-core" }
+p2-search   = { path = "../p2-search" }
+anyhow      = { workspace = true }
+clap        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+indicatif   = "0.18"
+crossbeam-channel = "0.5"
+glob        = "0.3"
+rayon       = "1.10"
+
+[[bin]]
+name = "bucket-profile"
+path = "src/bin/bucket_profile.rs"
+
+[[bin]]
+name = "filter-endgame"
+path = "src/bin/filter_endgame.rs"
+
+[[bin]]
+name = "filter-middle"
+path = "src/bin/filter_middle.rs"
+
+[[bin]]
+name = "hard-mining"
+path = "src/bin/hard_mining.rs"
+
+[[bin]]
+name = "spk_to_psv"
+path = "src/bin/spk_to_psv.rs"
+
+[[bin]]
+name = "preprocess-mate-threat"
+path = "src/bin/preprocess_mate_threat.rs"
+
+[[bin]]
+name = "psv-dump"
+path = "src/bin/psv_dump.rs"
+
+[[bin]]
+name = "filter-bucket"
+path = "src/bin/filter_bucket.rs"

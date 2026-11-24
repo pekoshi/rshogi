@@ -1,0 +1,32 @@
+[package]
+name = "p2-midgame-policy"
+version = "0.1.0"
+edition = "2024"
+description = "Transformer policy で αβ 中盤の move ordering を補完するモジュール"
+publish = false
+
+# 注意:
+# - default features は **CPU only / runtime adapter なし** で build できる構成。
+#   これにより workspace 全体の `cargo build -p p2-midgame-policy --no-default-features --features cpu`
+#   が候補 GPU stack (candle/CUDA) を引きずらずに済む。
+# - `transformer-runtime` feature を有効化すると、 並行 Agent B が実装中の
+#   p2-transformer-runtime::TransformerRuntime からの adapter が enable される。
+#   その場合のみ candle 依存を pull する (= 重い build)。
+[features]
+default = ["cpu"]
+# CPU-only build。 Transformer runtime adapter なし。 デフォルトの軽量構成。
+cpu = []
+# Agent B の TransformerRuntime trait 用 adapter を有効化する。
+transformer-runtime = ["dep:p2-transformer-runtime", "dep:p2-transformer"]
+
+[dependencies]
+rshogi-core = { path = "../rshogi-core", default-features = false }
+log.workspace = true
+
+# Optional (transformer-runtime feature)。 default では引かない。
+p2-transformer-runtime = { path = "../p2-transformer-runtime", optional = true }
+p2-transformer = { path = "../p2-transformer", optional = true }
+
+[lib]
+name = "p2_midgame_policy"
+path = "src/lib.rs"

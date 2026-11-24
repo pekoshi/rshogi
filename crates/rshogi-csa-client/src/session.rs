@@ -26,7 +26,6 @@ use anyhow::Result;
 use rshogi_csa::{Color, Position, csa_move_to_usi, usi_move_to_csa};
 
 use crate::config::CsaClientConfig;
-use crate::csa_writer::EndReason;
 use crate::engine::{BestMoveResult, SearchInfo, SearchOutcome, UsiEngine, UsiEngineDriver};
 use crate::event::Event;
 use crate::events::{
@@ -35,19 +34,11 @@ use crate::events::{
     SearchInfoSnapshot, SearchOrigin, SessionError, SessionEventSink, SessionOutcome,
     SessionProgress, Side, SinkError,
 };
-use crate::jsonl::{LiveJsonlWriter, remove_complete_live_jsonl};
 use crate::protocol::{
     CsaConnection, GameResult, GameSummary, ReconnectState as ProtocolReconnectState,
     parse_game_result, parse_server_move,
 };
-use crate::record::{GameRecord, JsonlMoveExtra, RecordStatus, ResumeRecordDecision};
-
-/// record 引き継ぎ付き resume API の戻り値。
-#[derive(Debug)]
-pub struct RecordedSessionOutcome {
-    pub outcome: SessionOutcome,
-    pub status: RecordStatus,
-}
+use crate::record::{GameRecord, JsonlMoveExtra};
 
 // ────────────────────────────────────────────
 // 公開エントリポイント
@@ -72,17 +63,7 @@ where
     E: UsiEngineDriver + ?Sized,
     S: SessionEventSink + ?Sized,
 {
-    let mut status = RecordStatus::Complete;
-    drive_session(
-        config,
-        conn,
-        engine,
-        shutdown.as_ref(),
-        sink,
-        SessionMode::Fresh,
-        None,
-        &mut status,
-    )
+    drive_session(config, conn, engine, shutdown.as_ref(), sink, SessionMode::Fresh)
 }
 
 /// `LOGIN ... reconnect:<game_id>+<token>` 後の resume セッションを進捗通知付きで
@@ -102,17 +83,7 @@ where
     E: UsiEngineDriver + ?Sized,
     S: SessionEventSink + ?Sized,
 {
-    let mut status = RecordStatus::Complete;
-    drive_session(
-        config,
-        conn,
-        engine,
-        shutdown.as_ref(),
-        sink,
-        SessionMode::Resumed,
-        None,
-        &mut status,
-    )
+    drive_session(config, conn, engine, shutdown.as_ref(), sink, SessionMode::Resumed)
 }
 
 /// 進捗通知不要な consumer 向けの薄いラッパー。内部で [`NoopSessionEventSink`] を渡す。
@@ -125,8 +96,7 @@ pub fn run_game_session(
     shutdown: &AtomicBool,
 ) -> Result<SessionOutcome, SessionError> {
     let mut sink = NoopSessionEventSink;
-    let mut status = RecordStatus::Complete;
-    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Fresh, None, &mut status)
+    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Fresh)
 }
 
 /// 進捗通知不要な consumer 向けの薄いラッパー (resume 経路)。
@@ -137,43 +107,7 @@ pub fn run_resumed_session(
     shutdown: &AtomicBool,
 ) -> Result<SessionOutcome, SessionError> {
     let mut sink = NoopSessionEventSink;
-    let mut status = RecordStatus::Complete;
-    drive_session(
-        config,
-        conn,
-        engine,
-        shutdown,
-        &mut sink,
-        SessionMode::Resumed,
-        None,
-        &mut status,
-    )
-}
-
-/// 進捗通知不要な CLI 等に向けた、切断前 record 引き継ぎ付き resume entry point。
-/// 再送 `Game_Summary` の現在局面と保持局面を照合し、一致すれば対局開始からの
-/// 通し record を返す。不一致なら警告を出し、resume 局面から
-/// [`crate::record::RecordStatus::ReconnectFragment`] として記録する。
-pub fn run_resumed_session_with_record(
-    conn: &mut CsaConnection,
-    engine: &mut UsiEngine,
-    config: &CsaClientConfig,
-    shutdown: &AtomicBool,
-    retained_record: GameRecord,
-) -> Result<RecordedSessionOutcome, SessionError> {
-    let mut sink = NoopSessionEventSink;
-    let mut status = RecordStatus::Complete;
-    let outcome = drive_session(
-        config,
-        conn,
-        engine,
-        shutdown,
-        &mut sink,
-        SessionMode::Resumed,
-        Some(retained_record),
-        &mut status,
-    )?;
-    Ok(RecordedSessionOutcome { outcome, status })
+    drive_session(config, conn, engine, shutdown, &mut sink, SessionMode::Resumed)
 }
 
 // ────────────────────────────────────────────
@@ -193,8 +127,6 @@ fn drive_session<E, S>(
     shutdown: &AtomicBool,
     sink: &mut S,
     mode: SessionMode,
-    retained_record: Option<GameRecord>,
-    record_status: &mut RecordStatus,
 ) -> Result<SessionOutcome, SessionError>
 where
     E: UsiEngineDriver + ?Sized,
@@ -209,79 +141,50 @@ where
     }
 
     // Step 2: Game_Summary 受信
-    let (summary, reconnect_state_protocol) = loop {
-        let mut summary = match conn
-            .recv_game_summary_while(config.server.keepalive.ping_interval_sec, || {
-                !shutdown.load(Ordering::SeqCst) && sink.should_continue()
-            }) {
-            Ok(Some(s)) => s,
-            Ok(None) => return abort_before_start(conn, sink, shutdown),
+    let summary = match conn.recv_game_summary(config.server.keepalive.ping_interval_sec) {
+        Ok(s) => s,
+        Err(err) => {
+            return Err(map_anyhow_to_session_error(err));
+        }
+    };
+    let summary_arc = Arc::new(summary.clone());
+
+    // resume の場合は Reconnect_State も受信する
+    let reconnect_state_protocol = if mode == SessionMode::Resumed {
+        match conn.recv_reconnect_state() {
+            Ok(state) => Some(state),
             Err(err) => {
                 return Err(map_anyhow_to_session_error(err));
             }
-        };
-        let summary_arc = Arc::new(summary.clone());
-
-        // resume の場合は Reconnect_State も受信する
-        let reconnect_state_protocol = if mode == SessionMode::Resumed {
-            match conn.recv_reconnect_state() {
-                Ok(state) => Some(state),
-                Err(err) => {
-                    return Err(map_anyhow_to_session_error(err));
-                }
-            }
-        } else {
-            None
-        };
-
-        // Step 3: Resumed / GameSummary を発火
-        let progress = match mode {
-            SessionMode::Fresh => SessionProgress::GameSummary(Arc::clone(&summary_arc)),
-            SessionMode::Resumed => {
-                let state = build_reconnect_state(&summary, reconnect_state_protocol.as_ref());
-                SessionProgress::Resumed {
-                    summary: Arc::clone(&summary_arc),
-                    state,
-                }
-            }
-        };
-        if let Some(action) = emit_with_nonfatal_warn(sink, progress) {
-            return handle_sink_error(action, conn, sink, Some(summary), false);
         }
-        if !sink.should_continue() {
-            return abort_for_should_continue(conn, sink, Some(summary), false);
-        }
-
-        // 不成立はログアウトせず、同じ接続で次の Game_Summary を受信する。
-        if mode == SessionMode::Fresh {
-            let response = conn
-                .agree_and_wait_start(
-                    &summary.game_id,
-                    config.server.keepalive.ping_interval_sec,
-                    || !shutdown.load(Ordering::SeqCst) && sink.should_continue(),
-                )
-                .map_err(map_anyhow_to_session_error)?;
-            match response {
-                crate::protocol::StartResponse::Started(game_id) => {
-                    let id_changed = summary.game_id != game_id;
-                    summary.game_id = game_id;
-                    if id_changed {
-                        // 候補時点では ID が未確定でも、GameStarted の前に確定値を通知する。
-                        let progress = SessionProgress::GameSummary(Arc::new(summary.clone()));
-                        if let Some(action) = emit_with_nonfatal_warn(sink, progress) {
-                            return handle_sink_error(action, conn, sink, Some(summary), false);
-                        }
-                    }
-                }
-                crate::protocol::StartResponse::Rejected => continue,
-                crate::protocol::StartResponse::Cancelled => {
-                    return abort_before_start(conn, sink, shutdown);
-                }
-            }
-        }
-        break (summary, reconnect_state_protocol);
+    } else {
+        None
     };
-    apply_advertised_entering_king_rule(config, engine, &summary)?;
+
+    // Step 3: Resumed / GameSummary を発火
+    let progress = match mode {
+        SessionMode::Fresh => SessionProgress::GameSummary(Arc::clone(&summary_arc)),
+        SessionMode::Resumed => {
+            let state = build_reconnect_state(&summary, reconnect_state_protocol.as_ref());
+            SessionProgress::Resumed {
+                summary: Arc::clone(&summary_arc),
+                state,
+            }
+        }
+    };
+    if let Some(action) = emit_with_nonfatal_warn(sink, progress) {
+        return handle_sink_error(action, conn, sink, Some(summary), false);
+    }
+    if !sink.should_continue() {
+        return abort_for_should_continue(conn, sink, Some(summary), false);
+    }
+
+    // Step 4: AGREE / engine.new_game (Fresh のみ AGREE 必要)
+    if mode == SessionMode::Fresh
+        && let Err(err) = conn.agree_and_wait_start(&summary.game_id)
+    {
+        return Err(map_anyhow_to_session_error(err));
+    }
     if let Err(err) = engine.new_game() {
         return Err(SessionError::Engine(format!("{err}")));
     }
@@ -303,8 +206,6 @@ where
         summary.clone(),
         reconnect_state_protocol,
         sink,
-        retained_record,
-        record_status,
     );
 
     match loop_result {
@@ -389,15 +290,11 @@ struct SessionState<'a, E: ?Sized + 'a, S: ?Sized + 'a> {
     ponder_state: Option<PonderState>,
     my_color: Color,
     initial_sfen: String,
-    initial_position_is_game_start: bool,
     sink: &'a mut S,
     info_throttle: SearchInfoThrottle,
     /// 直前に ponder miss が発生したか。次の自手番の fresh search に
     /// `SearchOrigin::PonderMiss` を載せるためのフラグ。
     pending_ponder_miss: bool,
-    /// 対局中の JSONL live 追記 (`[record] live_jsonl`)。作成・追記に失敗したら
-    /// `None` に落として対局は続行する(補助機能で進行を妨げない)。
-    live_jsonl: Option<LiveJsonlWriter>,
 }
 
 /// 探索結果の処理結果
@@ -412,42 +309,6 @@ enum MoveAction {
 // メインループ
 // ────────────────────────────────────────────
 
-/// サーバーが Game_Summary で広告した入玉ルールをエンジンへ伝える。
-///
-/// config の `engine.options` に `EnteringKingRule` が明示されている場合は
-/// ユーザー設定を優先し、広告値と異なるときは warn のみ出す。未指定なら
-/// `setoption` で広告値を注入する。広告が無いサーバーでは何もしない
-/// (エンジンは既定値、または同一プロセスで前局に注入された値のまま)。
-fn apply_advertised_entering_king_rule<E>(
-    config: &CsaClientConfig,
-    engine: &mut E,
-    summary: &GameSummary,
-) -> Result<(), SessionError>
-where
-    E: UsiEngineDriver + ?Sized,
-{
-    let Some(rule) = summary.entering_king_rule else {
-        return Ok(());
-    };
-    let advertised = rule.to_usi();
-    if let Some(configured) = config.engine.options.get("EnteringKingRule") {
-        let configured = match configured {
-            toml::Value::String(v) => v.clone(),
-            other => other.to_string(),
-        };
-        if configured != advertised {
-            log::warn!(
-                "[CSA] EnteringKingRule 設定 ({configured}) がサーバー広告 ({advertised}) と一致しません。設定値を優先します"
-            );
-        }
-        return Ok(());
-    }
-    log::info!("[CSA] サーバー広告に従い EnteringKingRule={advertised} を設定します");
-    engine
-        .set_option("EnteringKingRule", advertised)
-        .map_err(|err| SessionError::Engine(format!("{err}")))
-}
-
 fn run_session_loop<E, S>(
     conn: &mut CsaConnection,
     engine: &mut E,
@@ -456,8 +317,6 @@ fn run_session_loop<E, S>(
     summary: GameSummary,
     resume_state: Option<ProtocolReconnectState>,
     sink: &mut S,
-    retained_record: Option<GameRecord>,
-    record_status: &mut RecordStatus,
 ) -> LoopOutcome
 where
     E: UsiEngineDriver + ?Sized,
@@ -470,67 +329,16 @@ where
 
     let mut clock = Clock::from_summary(&summary);
     if let Some(state) = &resume_state {
-        clock.apply_resume_remaining(state.black_remaining_ms, state.white_remaining_ms);
-        clock.resume_turn_clock = state.current_turn.zip(state.turn_clock);
+        clock.black_time_ms = state.black_remaining_ms.max(0);
+        clock.white_time_ms = state.white_remaining_ms.max(0);
     }
 
-    let reconnect_turn = resume_state.as_ref().and_then(|state| state.current_turn);
-    let (record, pos, initial_sfen, usi_moves, apply_summary_initial_moves, status) =
-        match retained_record.map(|record| record.continue_for_resume(&summary, reconnect_turn)) {
-            Some(ResumeRecordDecision::Continued {
-                record,
-                position,
-                usi_moves,
-            }) => {
-                log::info!(
-                    "[REC] resume 局面一致。切断前の棋譜を継続: game_id={} retained_moves={}",
-                    record.game_id,
-                    record.moves.len()
-                );
-                let initial_sfen = record.initial_position.to_sfen();
-                (*record, *position, initial_sfen, usi_moves, false, RecordStatus::Complete)
-            }
-            Some(ResumeRecordDecision::Fragment {
-                record,
-                retained_record,
-                reason,
-            }) => {
-                log::warn!(
-                    "[REC] resume 局面不一致。再接続以降を断片棋譜として保存します: {reason}"
-                );
-                if config.record.live_jsonl
-                    && let Some(dir) = config.record.jsonl_dir()
-                    && let Err(err) = remove_complete_live_jsonl(&dir, &retained_record, config)
-                {
-                    log::warn!("[REC] 切断前 live JSONL の削除に失敗しました: {err:#}");
-                }
-                let pos = summary.position.clone();
-                let initial_sfen = pos.to_sfen();
-                (
-                    *record,
-                    pos,
-                    initial_sfen,
-                    Vec::new(),
-                    true,
-                    RecordStatus::ReconnectFragment { reason },
-                )
-            }
-            None => {
-                let record = GameRecord::new(&summary);
-                let pos = summary.position.clone();
-                let initial_sfen = pos.to_sfen();
-                (record, pos, initial_sfen, Vec::new(), true, RecordStatus::Complete)
-            }
-        };
-    *record_status = status.clone();
-
     let mut s = SessionState {
-        pos,
-        initial_sfen,
-        initial_position_is_game_start: resume_state.is_none(),
-        usi_moves,
+        pos: summary.position.clone(),
+        initial_sfen: summary.position.to_sfen(),
+        usi_moves: Vec::new(),
         clock,
-        record,
+        record: GameRecord::new(&summary),
         ponder_state: None,
         my_color: summary.my_color,
         conn,
@@ -541,7 +349,6 @@ where
         sink,
         info_throttle: SearchInfoThrottle::new(config.game.search_info_emit.clone()),
         pending_ponder_miss: false,
-        live_jsonl: None,
     };
 
     // 途中局面の手順を適用 (Fresh で `initial_moves` がある時のみ。resume では
@@ -549,12 +356,7 @@ where
     // 一部であり、この時点では既に局面に焼き込まれている扱いとして MoveConfirmed は
     // emit しない。ただし record / clock / usi_moves には反映する必要がある)。
     let mut move_color = summary.position.side_to_move;
-    let summary_initial_moves = if apply_summary_initial_moves {
-        summary.initial_moves.as_slice()
-    } else {
-        &[]
-    };
-    for cm in summary_initial_moves {
+    for cm in &summary.initial_moves {
         let usi = match csa_move_to_usi(&cm.mv, &s.pos) {
             Ok(u) => u,
             Err(err) => return LoopOutcome::Error(map_anyhow_to_session_error(err)),
@@ -564,15 +366,14 @@ where
             return LoopOutcome::Error(map_anyhow_to_session_error(err));
         }
         s.usi_moves.push(usi.clone());
-        let (time_sec, elapsed_ms) = s.clock.consume(move_color, cm.time_sec.unwrap_or(0));
+        if let Some(t) = cm.time_sec {
+            s.clock.consume(move_color, t);
+        }
+        let time_sec = cm.time_sec.unwrap_or(0);
         s.record.add_move(&cm.mv, time_sec, None, move_color);
-        push_opponent_jsonl(&mut s.record, initial_sfen_before, usi, move_color, elapsed_ms);
+        push_opponent_jsonl(&mut s.record, initial_sfen_before, usi, move_color, time_sec);
         move_color = opposite(move_color);
     }
-
-    // initial_moves (途中局面開始) や resume 済みの手も含めて書き出すため、
-    // 手順の反映が終わってから live ライターを作る。
-    s.live_jsonl = make_live_writer(config, &s.record, &status);
 
     loop {
         // 各イテレーション先頭で sink.should_continue() を確認
@@ -705,10 +506,8 @@ where
                                 return LoopOutcome::Error(map_anyhow_to_session_error(err));
                             }
                             let reason_line = s.conn.pending_end_reason.take();
-                            s.record.set_game_end(
-                                record_result_with_reason(&game_result, reason_line.as_deref()),
-                                &game_result,
-                            );
+                            s.record
+                                .set_result(record_result_with_reason(&game_result, &reason_line));
                             if let Err(err) = s.engine.gameover(gameover_str(&game_result)) {
                                 return LoopOutcome::Error(map_anyhow_to_session_error(err));
                             }
@@ -795,10 +594,7 @@ where
             let (game_result, reason_line, raw_result_line) =
                 parse_server_interrupt_lines_full(lines);
             log::info!("[CSA] サーバー終局割り込み: {:?}", game_result);
-            s.record.set_game_end(
-                record_result_with_reason(&game_result, reason_line.as_deref()),
-                &game_result,
-            );
+            s.record.set_result(record_result_with_reason(&game_result, &reason_line));
             if let Err(err) = s.engine.gameover(gameover_str(&game_result)) {
                 return MoveAction::sink_or_error(err);
             }
@@ -826,13 +622,8 @@ where
         if let Err(err) = s.conn.send_resign() {
             return MoveAction::sink_or_error(err);
         }
-        // サーバーの結果が届かないまま切断されても、自分が送った終局コマンドは残す。
         s.record.set_result("resign");
         let (game_result, reason_line, raw_result_line) = wait_game_end_full_from_rx(s.server_rx);
-        // サーバーが理由行を返したらそちらを正とする（宣言の却下は `#ILLEGAL_MOVE`）。
-        let reason = end_reason_from_line(&game_result, reason_line.as_deref())
-            .map_or("resign", EndReason::as_str);
-        s.record.set_game_end(reason, &game_result);
         if let Err(err) = s.engine.gameover(gameover_str(&game_result)) {
             return MoveAction::sink_or_error(err);
         }
@@ -844,13 +635,8 @@ where
         if let Err(err) = s.conn.send_win() {
             return MoveAction::sink_or_error(err);
         }
-        // サーバーの結果が届かないまま切断されても、自分が送った終局コマンドは残す。
         s.record.set_result("win_declaration");
         let (game_result, reason_line, raw_result_line) = wait_game_end_full_from_rx(s.server_rx);
-        // サーバーが理由行を返したらそちらを正とする（宣言の却下は `#ILLEGAL_MOVE`）。
-        let reason = end_reason_from_line(&game_result, reason_line.as_deref())
-            .map_or("win_declaration", EndReason::as_str);
-        s.record.set_game_end(reason, &game_result);
         if let Err(err) = s.engine.gameover(gameover_str(&game_result)) {
             return MoveAction::sink_or_error(err);
         }
@@ -864,17 +650,8 @@ where
         Err(err) => return MoveAction::sink_or_error(err),
     };
 
-    let previous_sfen = previous_move_sfen(&s.record, s.initial_position_is_game_start);
-    let pv_csa = validated_move_pv(info, &s.pos, &result.bestmove, previous_sfen);
-    let validated_info = pv_csa.as_ref().map(|pv| {
-        let mut info = info.clone();
-        info.pv.truncate(pv.len());
-        info
-    });
-    let observed_info = validated_info.as_ref();
-
     // BestMoveSelected 発火 (CSA サーバ送信前)
-    let snapshot = observed_info.map(search_info_to_snapshot);
+    let snapshot = search_info_to_snapshot(info);
     let best_event = BestMoveEvent {
         usi_move: result.bestmove.clone(),
         csa_move_candidate: Some(csa_move.clone()),
@@ -882,7 +659,7 @@ where
         side: Side::from(s.my_color),
         ply: s.pos.ply,
         search_origin: origin,
-        search: snapshot.clone(),
+        search: Some(snapshot.clone()),
     };
     if let Err(err) = s.sink.on_event(SessionProgress::BestMoveSelected(best_event))
         && let Some(action) = handle_loop_sink_err_action(err, false)
@@ -891,7 +668,7 @@ where
     }
 
     let comment = if s.config.server.floodgate {
-        observed_info.and_then(|info| build_floodgate_comment(info, s.my_color, pv_csa.as_ref()?))
+        Some(build_floodgate_comment(info, s.my_color, &s.pos, &result.bestmove))
     } else {
         None
     };
@@ -905,7 +682,7 @@ where
     }
     let sfen_after = s.pos.to_sfen();
     s.usi_moves.push(result.bestmove.clone());
-    s.record.add_move(&csa_move, 0, observed_info, s.my_color);
+    s.record.add_move(&csa_move, 0, Some(info), s.my_color);
     let elapsed_ms = turn_start.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let engine_label = label_for_color(&s.record, s.my_color);
     s.record.add_jsonl_move(JsonlMoveExtra {
@@ -914,11 +691,12 @@ where
         engine_label,
         elapsed_ms,
         think_limit_ms,
-        seldepth: observed_info.and_then(|i| i.seldepth),
-        nodes: observed_info.and_then(|i| i.nodes),
-        time_ms: observed_info.and_then(|i| i.time_ms),
-        nps: observed_info.and_then(|i| i.nps),
+        seldepth: info.seldepth,
+        nodes: info.nodes,
+        time_ms: info.time_ms,
+        nps: info.nps,
     });
+
     // MoveSent 発火 (送信直後、サーバ echo の time_sec はまだ未確定)
     let move_sent_event = MoveEvent {
         player: MovePlayer::SelfPlayer,
@@ -930,7 +708,7 @@ where
         sfen_before: sfen_before.clone(),
         sfen_after: sfen_after.clone(),
         search_origin: Some(origin),
-        search: snapshot.clone(),
+        search: Some(snapshot.clone()),
     };
     let move_sent_ply = move_sent_event.ply;
     if let Err(err) = s.sink.on_event(SessionProgress::MoveSent(move_sent_event))
@@ -939,19 +717,24 @@ where
         return action;
     }
 
-    // 再接続直後の台帳は切断前の経過を未精算なので、サーバーの消費時間を待つ。
-    let defer_ponder = s.clock.resume_budget_ms(s.my_color).is_some();
-    if !defer_ponder
-        && s.config.game.ponder
+    // ponder 開始
+    if s.config.game.ponder
         && let Some(ref ponder_mv) = result.ponder_move
     {
         let my_estimated_ms = turn_start.elapsed().as_millis() as i64;
-        let go_args =
+        let ponder_pos_cmd =
+            build_position_cmd_with_ponder(&s.initial_sfen, &s.usi_moves, ponder_mv);
+        let ponder_go = format!(
+            "go ponder {}",
             s.clock
-                .build_ponder_go_args(s.config.time.margin_msec, s.my_color, my_estimated_ms);
-        if let Err(err) = start_ponder(s, ponder_mv, &go_args) {
+                .build_ponder_go_args(s.config.time.margin_msec, s.my_color, my_estimated_ms,)
+        );
+        if let Err(err) = s.engine.go_ponder(&ponder_pos_cmd, &ponder_go) {
             return MoveAction::sink_or_error(err);
         }
+        s.ponder_state = Some(PonderState {
+            expected_usi: ponder_mv.clone(),
+        });
     }
 
     // サーバーエコー待ち
@@ -960,19 +743,8 @@ where
             Ok(Event::ServerLine(line)) => {
                 if line.starts_with('+') || line.starts_with('-') {
                     let (_, time_sec) = parse_server_move(&line);
-                    let (time_sec, _) = s.clock.consume(s.my_color, time_sec);
+                    s.clock.consume(s.my_color, time_sec);
                     s.record.update_last_time(time_sec);
-                    // エコー前に終局すると自手を取り消すため、live には確定後だけ追記する。
-                    live_append(&mut s.live_jsonl, &s.record);
-                    if defer_ponder
-                        && s.config.game.ponder
-                        && let Some(ref ponder_mv) = result.ponder_move
-                    {
-                        let go_args = s.clock.build_go_args(s.config.time.margin_msec, s.my_color);
-                        if let Err(err) = start_ponder(s, ponder_mv, &go_args) {
-                            return MoveAction::sink_or_error(err);
-                        }
-                    }
                     // MoveConfirmed 発火 (自エンジンの手、time_sec 確定)
                     let confirmed_event = MoveEvent {
                         player: MovePlayer::SelfPlayer,
@@ -984,7 +756,7 @@ where
                         sfen_before: sfen_before.clone(),
                         sfen_after: sfen_after.clone(),
                         search_origin: Some(origin),
-                        search: snapshot.clone(),
+                        search: Some(snapshot.clone()),
                     };
                     if let Err(err) =
                         s.sink.on_event(SessionProgress::MoveConfirmed(confirmed_event))
@@ -1001,13 +773,7 @@ where
                             return MoveAction::sink_or_error(err);
                         }
                         let reason = s.conn.pending_end_reason.take();
-                        // 送った手のエコーが返る前に終局した。その手はサーバーに受理されて
-                        // いない（反則手・時間切れ後に届いた手など）ので指し手列から外す。
-                        s.record.reject_unconfirmed_last_move();
-                        s.record.set_game_end(
-                            record_result_with_reason(&game_result, reason.as_deref()),
-                            &game_result,
-                        );
+                        s.record.set_result(record_result_with_reason(&game_result, &reason));
                         if let Err(err) = s.engine.gameover(gameover_str(&game_result)) {
                             return MoveAction::sink_or_error(err);
                         }
@@ -1058,23 +824,6 @@ where
     }
 }
 
-fn start_ponder<E, S>(
-    s: &mut SessionState<'_, E, S>,
-    ponder_mv: &str,
-    go_args: &str,
-) -> anyhow::Result<()>
-where
-    E: UsiEngineDriver + ?Sized,
-    S: SessionEventSink + ?Sized,
-{
-    let position = build_position_cmd_with_ponder(&s.initial_sfen, &s.usi_moves, ponder_mv);
-    s.engine.go_ponder(&position, &format!("go ponder {go_args}"))?;
-    s.ponder_state = Some(PonderState {
-        expected_usi: ponder_mv.to_owned(),
-    });
-    Ok(())
-}
-
 /// 相手手番で受信した指し手 1 行 (`+...` / `-...`) を処理する。
 fn handle_opponent_move_line<E, S>(s: &mut SessionState<'_, E, S>, line: &str) -> MoveAction
 where
@@ -1097,16 +846,15 @@ where
             }
             let opponent_sfen_after = s.pos.to_sfen();
             s.usi_moves.push(opponent_usi.clone());
-            let (time_sec, elapsed_ms) = s.clock.consume(opposite(s.my_color), time_sec);
+            s.clock.consume(opposite(s.my_color), time_sec);
             s.record.add_move(&mv, time_sec, None, opposite(s.my_color));
             push_opponent_jsonl(
                 &mut s.record,
                 opponent_sfen_before.clone(),
                 opponent_usi.clone(),
                 opposite(s.my_color),
-                elapsed_ms,
+                time_sec,
             );
-            live_append(&mut s.live_jsonl, &s.record);
 
             // 相手の手 MoveConfirmed
             let opp_event = MoveEvent {
@@ -1177,16 +925,15 @@ where
             }
             let opponent_sfen_after = s.pos.to_sfen();
             s.usi_moves.push(opponent_usi.clone());
-            let (time_sec, elapsed_ms) = s.clock.consume(opposite(s.my_color), time_sec);
+            s.clock.consume(opposite(s.my_color), time_sec);
             s.record.add_move(&mv, time_sec, None, opposite(s.my_color));
             push_opponent_jsonl(
                 &mut s.record,
                 opponent_sfen_before.clone(),
                 opponent_usi.clone(),
                 opposite(s.my_color),
-                elapsed_ms,
+                time_sec,
             );
-            live_append(&mut s.live_jsonl, &s.record);
             let opp_event = MoveEvent {
                 player: MovePlayer::Opponent,
                 csa_move: mv.clone(),
@@ -1218,16 +965,15 @@ where
         }
         let opponent_sfen_after = s.pos.to_sfen();
         s.usi_moves.push(opponent_usi.clone());
-        let (time_sec, elapsed_ms) = s.clock.consume(opposite(s.my_color), time_sec);
+        s.clock.consume(opposite(s.my_color), time_sec);
         s.record.add_move(&mv, time_sec, None, opposite(s.my_color));
         push_opponent_jsonl(
             &mut s.record,
             opponent_sfen_before.clone(),
             opponent_usi.clone(),
             opposite(s.my_color),
-            elapsed_ms,
+            time_sec,
         );
-        live_append(&mut s.live_jsonl, &s.record);
         let opp_event = MoveEvent {
             player: MovePlayer::Opponent,
             csa_move: mv,
@@ -1257,7 +1003,7 @@ where
 /// 後処理を行う:
 /// 1. CSA `%CHUDAN` を best-effort で送信 (対局未終了時のみ、write/flush timeout 1s)
 /// 2. CSA `LOGOUT` を best-effort 送信 (write/flush timeout 1s)
-/// 3. transport の切断は呼び出し側での `CsaConnection` の drop 時に行う
+/// 3. transport close
 /// 4. sink.on_error を best-effort 呼び出し
 /// 5. SessionProgress::Disconnected を emit
 fn terminate_session<S>(
@@ -1281,9 +1027,9 @@ fn terminate_session<S>(
         log::warn!("[CSA] LOGOUT 送信失敗 (best-effort): {err:#}");
     }
 
-    // 3. 呼び出し側が CsaConnection を drop すると transport が下層ソケットを
-    //    shutdown し、reader thread の受信待ちも解除する。本関数は conn を借用して
-    //    いるため、戻り後に値を破棄する責務は呼び出し側にある。
+    // 3. transport close: CsaConnection を drop すれば close される。明示 close は
+    //    現状 API が無いので drop に任せる (本関数の return 時に conn は呼び出し側に
+    //    返るが、呼び出し側は本関数の後で値を捨てる責務を持つ)。
 
     // 4. sink.on_error
     if let Err(err) = sink.on_error(cause) {
@@ -1342,26 +1088,6 @@ where
 {
     let cause = SessionError::SinkAborted(err);
     terminate_session(conn, sink, &cause, DisconnectReason::SinkAborted, game_already_ended);
-    Err(cause)
-}
-
-// 対局成立前には %CHUDAN / %TORYO を送らずログアウトする。
-fn abort_before_start<S: SessionEventSink + ?Sized>(
-    conn: &mut CsaConnection,
-    sink: &mut S,
-    shutdown: &AtomicBool,
-) -> Result<SessionOutcome, SessionError> {
-    let (cause, reason) = if shutdown.load(Ordering::SeqCst) {
-        (SessionError::Shutdown, DisconnectReason::Shutdown)
-    } else {
-        (
-            SessionError::SinkAborted(SinkError::Fatal(Box::new(std::io::Error::other(
-                "sink.should_continue() == false",
-            )))),
-            DisconnectReason::SinkAborted,
-        )
-    };
-    terminate_session(conn, sink, &cause, reason, true);
     Err(cause)
 }
 
@@ -1598,43 +1324,18 @@ struct Clock {
     white_byoyomi_ms: i64,
     black_increment_ms: i64,
     white_increment_ms: i64,
-    black_time_unit_ms: i64,
-    white_time_unit_ms: i64,
-    resume_turn_clock:
-        Option<(Color, (rshogi_csa_server::protocol::reconnect::ReconnectClock, Instant))>,
 }
 
 impl Clock {
     fn from_summary(summary: &GameSummary) -> Self {
         Self {
-            // #858: btime/wtime は「増分を加える前の真の残時間」= total_time_ms を採る。
-            // 以前は init に increment を足し込んでいたため、go で別途送る binc/winc と
-            // 合わせてエンジンが増分を二重計上した残時間で思考していた。consume 側で
-            // 各手 post-increment (`slot - consumed + inc`) するので、ここは pre-increment。
-            black_time_unit_ms: summary.black_time.time_unit_ms,
-            white_time_unit_ms: summary.white_time.time_unit_ms,
-            black_time_ms: summary.black_time.total_time_ms,
-            white_time_ms: summary.white_time.total_time_ms,
+            black_time_ms: summary.black_time.total_time_ms + summary.black_time.increment_ms,
+            white_time_ms: summary.white_time.total_time_ms + summary.white_time.increment_ms,
             black_byoyomi_ms: summary.black_time.byoyomi_ms,
             white_byoyomi_ms: summary.white_time.byoyomi_ms,
             black_increment_ms: summary.black_time.increment_ms,
             white_increment_ms: summary.white_time.increment_ms,
-            resume_turn_clock: None,
         }
-    }
-
-    /// 再接続 (`BEGIN Reconnect_State`) の `Black/White_Time_Remaining_Ms` を
-    /// 台帳へ反映する。
-    ///
-    /// サーバーが送る値は `remaining_main_ms` = fischer では slot そのもの
-    /// (次手の増分込み post-increment)。#858 で台帳 btime/wtime は pre-increment
-    /// (増分を足す前の残時間) 規約になったため、各色の増分を差し引いてから
-    /// 書き込む。そのまま代入すると再接続後は台帳が恒久的に +inc 膨張し、
-    /// エンジンへの報告予算がサーバー予算を超えて TimeUp を招く。
-    /// byoyomi / sudden-death は increment=0 なので従来どおり素通しになる。
-    fn apply_resume_remaining(&mut self, black_remaining_ms: i64, white_remaining_ms: i64) {
-        self.black_time_ms = (black_remaining_ms.max(0) - self.black_increment_ms).max(0);
-        self.white_time_ms = (white_remaining_ms.max(0) - self.white_increment_ms).max(0);
     }
 
     fn increment_ms(&self, color: Color) -> i64 {
@@ -1644,82 +1345,23 @@ impl Clock {
         }
     }
 
-    fn consume(&mut self, color: Color, time_units: u32) -> (u32, u64) {
-        let unit = match color {
-            Color::Black => self.black_time_unit_ms,
-            Color::White => self.white_time_unit_ms,
-        };
-        if self.resume_turn_clock.is_some_and(|(turn, _)| turn == color) {
-            self.resume_turn_clock = None;
-        }
-        let consumed_ms = i64::from(time_units).saturating_mul(unit);
+    fn consume(&mut self, color: Color, time_sec: u32) {
+        let consumed_ms = time_sec as i64 * 1000;
         let inc = self.increment_ms(color);
         match color {
             Color::Black => {
-                self.black_time_ms =
-                    (self.black_time_ms.saturating_sub(consumed_ms).saturating_add(inc)).max(0);
+                self.black_time_ms = (self.black_time_ms - consumed_ms + inc).max(0);
             }
             Color::White => {
-                self.white_time_ms =
-                    (self.white_time_ms.saturating_sub(consumed_ms).saturating_add(inc)).max(0);
+                self.white_time_ms = (self.white_time_ms - consumed_ms + inc).max(0);
             }
         }
-        ((consumed_ms / 1000).min(i64::from(u32::MAX)) as u32, consumed_ms as u64)
-    }
-
-    fn resume_budget_ms(&self, color: Color) -> Option<u64> {
-        self.resume_turn_clock
-            .filter(|(turn, _)| *turn == color)
-            .map(|(_, (clock, received))| {
-                clock.remaining_ms.saturating_sub(
-                    u64::try_from(received.elapsed().as_millis()).unwrap_or(u64::MAX),
-                )
-            })
     }
 
     fn build_go_args(&self, margin_msec: u64, side_to_move: Color) -> String {
-        if let Some(budget) = self.resume_budget_ms(side_to_move) {
-            let budget = i64::try_from(budget.saturating_sub(margin_msec)).unwrap_or(i64::MAX);
-            let mut btime = self.black_time_ms.max(0);
-            let mut wtime = self.white_time_ms.max(0);
-            let own = match side_to_move {
-                Color::Black => &mut btime,
-                Color::White => &mut wtime,
-            };
-            if self.black_increment_ms > 0 || self.white_increment_ms > 0 {
-                let mut binc = self.black_increment_ms.max(0);
-                let mut winc = self.white_increment_ms.max(0);
-                let inc = match side_to_move {
-                    Color::Black => &mut binc,
-                    Color::White => &mut winc,
-                };
-                *inc = (*inc).min(budget);
-                *own = (*own).min(budget - *inc);
-                return format!("btime {btime} wtime {wtime} binc {binc} winc {winc}");
-            }
-            let byoyomi = match side_to_move {
-                Color::Black => self.black_byoyomi_ms,
-                Color::White => self.white_byoyomi_ms,
-            }
-            .max(0);
-            let byoyomi = byoyomi.min(budget);
-            *own = (*own).min(budget - byoyomi);
-            return if self.black_byoyomi_ms > 0 || self.white_byoyomi_ms > 0 {
-                format!("btime {btime} wtime {wtime} byoyomi {byoyomi}")
-            } else {
-                format!("btime {btime} wtime {wtime}")
-            };
-        }
         let btime = self.black_time_ms.max(0);
         let wtime = self.white_time_ms.max(0);
         if self.black_increment_ms > 0 || self.white_increment_ms > 0 {
-            // #858: fischer でも byoyomi 分岐と同趣旨で、エンジンへ報告する自分の持ち時間
-            // から通信マージンを差し引く。手番側 (side_to_move) の btime/wtime のみ減算し、
-            // 相手側は情報用途なので触らない。think_limit_ms 側と同じ実効予算にする。
-            let (btime, wtime) = match side_to_move {
-                Color::Black => ((btime - margin_msec as i64).max(0), wtime),
-                Color::White => (btime, (wtime - margin_msec as i64).max(0)),
-            };
             format!(
                 "btime {} wtime {} binc {} winc {}",
                 btime, wtime, self.black_increment_ms, self.white_increment_ms
@@ -1732,36 +1374,21 @@ impl Clock {
             let byoyomi = (byoyomi_ms - margin_msec as i64).max(0);
             format!("btime {} wtime {} byoyomi {}", btime, wtime, byoyomi)
         } else {
-            // sudden-death (増分・秒読みなし) も fischer/byoyomi 分岐と同趣旨で
-            // 手番側の残時間から通信マージンを差し引く。
-            let (btime, wtime) = match side_to_move {
-                Color::Black => ((btime - margin_msec as i64).max(0), wtime),
-                Color::White => (btime, (wtime - margin_msec as i64).max(0)),
-            };
             format!("btime {} wtime {}", btime, wtime)
         }
     }
 
     fn think_limit_ms(&self, margin_msec: u64, side_to_move: Color) -> u64 {
-        let limit = self.normal_think_limit_ms(margin_msec, side_to_move);
-        self.resume_budget_ms(side_to_move)
-            .map_or(limit, |budget| limit.min(budget.saturating_sub(margin_msec)))
-    }
-
-    fn normal_think_limit_ms(&self, margin_msec: u64, side_to_move: Color) -> u64 {
         let (total_ms, byoyomi_ms, increment_ms) = match side_to_move {
             Color::Black => (self.black_time_ms, self.black_byoyomi_ms, self.black_increment_ms),
             Color::White => (self.white_time_ms, self.white_byoyomi_ms, self.white_increment_ms),
         };
         if increment_ms > 0 {
-            // #858: fischer でも margin をエンジンへの実効思考予算から差し引く
-            // (byoyomi 分岐と同趣旨)。total(pre-increment) + inc から margin を引く。
-            (total_ms.max(0) + increment_ms.max(0) - margin_msec as i64).max(0) as u64
+            total_ms.max(0) as u64 + increment_ms.max(0) as u64
         } else if byoyomi_ms > 0 {
             (byoyomi_ms - margin_msec as i64).max(0) as u64
         } else if total_ms > 0 {
-            // sudden-death も他分岐と同様に margin を実効思考予算から差し引く。
-            (total_ms - margin_msec as i64).max(0) as u64
+            total_ms as u64
         } else {
             0
         }
@@ -1896,49 +1523,19 @@ fn label_for_color(record: &GameRecord, color: Color) -> String {
     }
 }
 
-/// `[record] live_jsonl` 有効時に live ライターを作る。失敗は warn に留めて `None`
-/// (live 追記は補助機能で、対局の進行を妨げない)。`save_jsonl` 無効時も `None`。
-fn make_live_writer(
-    config: &CsaClientConfig,
-    record: &GameRecord,
-    status: &RecordStatus,
-) -> Option<LiveJsonlWriter> {
-    if !config.record.live_jsonl {
-        return None;
-    }
-    let dir = config.record.jsonl_dir()?;
-    match LiveJsonlWriter::create_with_status(&dir, record, config, status) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            log::warn!("live JSONL の作成に失敗 (追記なしで続行): {e:#}");
-            None
-        }
-    }
-}
-
-/// live JSONL へ未書き出しの手を追記する。失敗したら以後の追記を止める(対局は続行)。
-fn live_append(live: &mut Option<LiveJsonlWriter>, record: &GameRecord) {
-    if let Some(w) = live.as_mut()
-        && let Err(e) = w.append_new_moves(record)
-    {
-        log::warn!("live JSONL 追記に失敗 (以後の追記を停止): {e:#}");
-        *live = None;
-    }
-}
-
 fn push_opponent_jsonl(
     record: &mut GameRecord,
     sfen_before: String,
     move_usi: String,
     side: Color,
-    elapsed_ms: u64,
+    time_sec: u32,
 ) {
     let engine_label = label_for_color(record, side);
     record.add_jsonl_move(JsonlMoveExtra {
         sfen_before,
         move_usi,
         engine_label,
-        elapsed_ms,
+        elapsed_ms: u64::from(time_sec) * 1000,
         think_limit_ms: 0,
         seldepth: None,
         nodes: None,
@@ -1956,56 +1553,30 @@ fn gameover_str(result: &GameResult) -> &'static str {
     }
 }
 
-/// サーバーの終局理由行（`#RESIGN` / `#TIME_UP` など）を棋譜の終局理由に直す。
-/// 理由行がなければ `None`。知らない理由行で勝敗が付いた場合は、投了とは断定できないので
-/// 異常終了（`abnormal`）とし、勝敗の付かない結果なら `None`。
-///
-/// shogi-server の内部分類にある王手放置（`oute_kaihimore`）などの細かい反則は、
-/// CSA プロトコル上は `#ILLEGAL_MOVE` として届くので区別しない。
-///
-/// `#JISHOGI` は入玉宣言の成立で送られ、`#WIN` / `#LOSE` が続く（shogi-server /
-/// rshogi-csa-server 共通）。`#DRAW` が続く場合だけ持将棋の引き分けとして扱う。
-fn end_reason_from_line(result: &GameResult, reason_line: Option<&str>) -> Option<EndReason> {
-    let line = reason_line?;
-    // `#OUTE_SENNICHITE` は `SENNICHITE` を含むので先に見る。
-    let reason = if line.contains("OUTE_SENNICHITE") {
-        EndReason::OuteSennichite
-    } else if line.contains("SENNICHITE") {
-        EndReason::Sennichite
-    } else if line.contains("RESIGN") {
-        EndReason::Resign
-    } else if line.contains("TIME_UP") {
-        EndReason::TimeUp
-    } else if line.contains("ILLEGAL") {
-        EndReason::IllegalMove
-    } else if line.contains("JISHOGI") {
-        match result {
-            GameResult::Win | GameResult::Lose => EndReason::WinDeclaration,
-            _ => EndReason::Jishogi,
+fn record_result_with_reason(result: &GameResult, reason: &Option<String>) -> &'static str {
+    if let Some(r) = reason {
+        if r.contains("TIME_UP") {
+            return "time_up";
         }
-    } else if line.contains("MAX_MOVES") {
-        EndReason::MaxMoves
-    } else if line.contains("ABNORMAL") || matches!(result, GameResult::Win | GameResult::Lose) {
-        EndReason::Abnormal
-    } else {
-        return None;
-    };
-    Some(reason)
-}
-
-/// 棋譜（CSA の終局コマンドと JSONL の `reason`）に記録する終局理由。
-///
-/// 理由行がまったく無いときは最終結果だけから決める。その場合の勝敗は理由が分からないので
-/// `win` / `lose` のまま残す（CSA では投了扱い）。
-fn record_result_with_reason(result: &GameResult, reason_line: Option<&str>) -> &'static str {
-    if let Some(reason) = end_reason_from_line(result, reason_line) {
-        return reason.as_str();
+        if r.contains("ILLEGAL") {
+            return "illegal_move";
+        }
+        if r.contains("MAX_MOVES") {
+            return "max_moves";
+        }
+        if r.contains("JISHOGI") {
+            return "jishogi";
+        }
+        if r.contains("SENNICHITE") {
+            return "sennichite";
+        }
     }
     match result {
         GameResult::Win => "win",
         GameResult::Lose => "lose",
-        GameResult::Draw => EndReason::Sennichite.as_str(),
-        GameResult::Interrupted | GameResult::Censored => EndReason::Interrupted.as_str(),
+        GameResult::Draw => "sennichite",
+        GameResult::Interrupted => "interrupted",
+        GameResult::Censored => "interrupted",
     }
 }
 
@@ -2038,96 +1609,46 @@ fn build_position_cmd_with_ponder(
     cmd
 }
 
-fn previous_move_sfen(
-    record: &GameRecord,
-    initial_position_is_game_start: bool,
-) -> Result<Option<&str>, ()> {
-    if record.moves.is_empty() {
-        return if initial_position_is_game_start {
-            Ok(None)
-        } else {
-            Err(())
-        };
-    }
-    if record.jsonl_moves.len() != record.moves.len() {
-        return Err(());
-    }
-    record.jsonl_moves.last().map(|mv| Some(mv.sfen_before.as_str())).ok_or(())
-}
-
-fn validated_move_pv(
-    info: &SearchInfo,
-    pos: &Position,
-    bestmove: &str,
-    previous_sfen: Result<Option<&str>, ()>,
-) -> Option<Vec<String>> {
-    if !info.has_score() || !info.matches_bestmove(bestmove) {
-        return None;
-    }
-    let moves: Vec<_> = info
-        .pv
-        .iter()
-        .map_while(|token| rshogi_core::types::Move::from_usi_strict(token))
-        .collect();
-    let first = moves.first()?;
-    let mut legal_pos = rshogi_core::position::Position::new();
-    legal_pos.set_sfen(&pos.to_sfen()).ok()?;
-    let mut pv_pos = pos.clone();
-    let mut pv_csa = Vec::with_capacity(moves.len());
-    for (usi_mv, &mv) in info.pv.iter().zip(&moves) {
-        if !legal_pos.pseudo_legal(mv) || !legal_pos.is_legal(mv) {
-            return None;
-        }
-        let csa = usi_move_to_csa(usi_mv, &pv_pos).ok()?;
-        pv_pos.apply_csa_move(&csa).ok()?;
-        let gives_check = legal_pos.gives_check(mv);
-        legal_pos.do_move(mv, gives_check);
-        pv_csa.push(csa);
-    }
-    // 盤上の駒を動かす手は、相手の手番では移動元の駒の所有者が合わず非合法になる。
-    if first.is_drop()
-        && let Some(sfen) = previous_sfen.ok()?
-    {
-        let mut previous_pos = rshogi_core::position::Position::new();
-        previous_pos.set_sfen(sfen).ok()?;
-        let all_legal = moves.iter().all(|&mv| {
-            if !previous_pos.pseudo_legal(mv) || !previous_pos.is_legal(mv) {
-                return false;
-            }
-            let gives_check = previous_pos.gives_check(mv);
-            previous_pos.do_move(mv, gives_check);
-            true
-        });
-        if all_legal {
-            return None;
-        }
-    }
-    Some(pv_csa)
-}
-
 fn build_floodgate_comment(
     info: &SearchInfo,
     my_color: Color,
-    pv_csa: &[String],
-) -> Option<String> {
+    pos: &Position,
+    last_bestmove: &str,
+) -> String {
     let score = if let Some(cp) = info.score_cp {
         match my_color {
             Color::Black => cp,
-            Color::White => cp.checked_neg()?,
+            Color::White => -cp,
         }
-    } else {
-        let mate = info.score_mate?;
+    } else if let Some(mate) = info.score_mate {
         let base = if mate > 0 { 100000 } else { -100000 };
         match my_color {
             Color::Black => base,
             Color::White => -base,
         }
+    } else {
+        0
     };
     let mut comment = format!("* {score}");
-    for csa in pv_csa {
-        write!(comment, " {csa}").unwrap();
+    if !info.pv.is_empty() {
+        let mut pv_pos = pos.clone();
+        let pv_start = if info.pv.first().map(|s| s.as_str()) == Some(last_bestmove) {
+            1
+        } else {
+            0
+        };
+        for usi_mv in &info.pv[pv_start..] {
+            if let Ok(csa) = usi_move_to_csa(usi_mv, &pv_pos) {
+                write!(comment, " {csa}").unwrap();
+                if pv_pos.apply_csa_move(&csa).is_err() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
     }
-    Some(comment)
+    comment
 }
 
 // ────────────────────────────────────────────
@@ -2265,271 +1786,6 @@ mod tests {
             nps: Some(20000),
             pv: vec!["7g7f".to_owned()],
         }
-    }
-
-    #[test]
-    fn record_result_keeps_every_server_reason_line() {
-        use GameResult::{Censored, Draw, Interrupted, Lose, Win};
-        let cases: [(GameResult, Option<&str>, &str); 20] = [
-            (Win, Some("#RESIGN"), "resign"),
-            (Lose, Some("#RESIGN"), "resign"),
-            (Win, Some("#TIME_UP"), "time_up"),
-            (Lose, Some("#TIME_UP"), "time_up"),
-            (Win, Some("#ILLEGAL_MOVE"), "illegal_move"),
-            (Lose, Some("#ILLEGAL_MOVE"), "illegal_move"),
-            (Draw, Some("#SENNICHITE"), "sennichite"),
-            // `SENNICHITE` を含むが千日手の引き分けではない。
-            (Win, Some("#OUTE_SENNICHITE"), "oute_sennichite"),
-            (Lose, Some("#OUTE_SENNICHITE"), "oute_sennichite"),
-            // 入玉宣言の成立は `#JISHOGI` + `#WIN` / `#LOSE`。
-            (Win, Some("#JISHOGI"), "win_declaration"),
-            (Lose, Some("#JISHOGI"), "win_declaration"),
-            (Draw, Some("#JISHOGI"), "jishogi"),
-            (Censored, Some("#MAX_MOVES"), "max_moves"),
-            (Draw, Some("#MAX_MOVES"), "max_moves"),
-            (Win, Some("#ABNORMAL"), "abnormal"),
-            (Lose, Some("#ABNORMAL"), "abnormal"),
-            // 理由行がないときは最終結果だけから決める。
-            (Win, None, "win"),
-            (Lose, None, "lose"),
-            (Draw, None, "sennichite"),
-            (Interrupted, None, "interrupted"),
-        ];
-        for (result, line, expected) in cases {
-            assert_eq!(record_result_with_reason(&result, line), expected, "{result:?} {line:?}");
-        }
-        // 知らない理由行で勝敗が付いたら、投了と断定せず異常終了として記録する。
-        assert_eq!(record_result_with_reason(&Win, Some("#UNKNOWN_FUTURE")), "abnormal");
-        assert_eq!(record_result_with_reason(&Lose, Some("#UNKNOWN_FUTURE")), "abnormal");
-        // 勝敗の付かない結果は最終結果から決める。
-        assert_eq!(record_result_with_reason(&Draw, Some("#UNKNOWN_FUTURE")), "sennichite");
-        assert_eq!(end_reason_from_line(&Interrupted, Some("#UNKNOWN_FUTURE")), None);
-    }
-
-    fn build_floodgate_comment(
-        info: &SearchInfo,
-        color: Color,
-        pos: &Position,
-        bestmove: &str,
-    ) -> Option<String> {
-        let pv = validated_move_pv(info, pos, bestmove, Ok(None))?;
-        super::build_floodgate_comment(info, color, &pv)
-    }
-
-    fn floodgate_info(pv: &[&str]) -> SearchInfo {
-        SearchInfo {
-            score_cp: Some(123),
-            pv: pv.iter().map(|mv| (*mv).to_owned()).collect(),
-            ..SearchInfo::default()
-        }
-    }
-
-    #[test]
-    fn floodgate_comment_includes_bestmove_itself() {
-        let pos = rshogi_csa::initial_position();
-        let info = floodgate_info(&["7g7f", "3c3d", "2g2f", "8c8d"]);
-
-        let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
-
-        assert_eq!(comment.as_deref(), Some("* 123 +7776FU -3334FU +2726FU -8384FU"));
-    }
-
-    #[test]
-    fn drop_pv_requires_legal_continuation() {
-        let mut pos = rshogi_csa::initial_position();
-        for mv in ["+7776FU", "-3334FU", "+8822UM", "-3122GI"] {
-            pos.apply_csa_move(mv).unwrap();
-        }
-        for pv in [
-            vec!["B*5e", "2g2f"],
-            vec!["B*5e", "8c8e"],
-            vec!["B*5e", "8c8d", "2g2e"],
-        ] {
-            assert_eq!(
-                build_floodgate_comment(&floodgate_info(&pv), Color::Black, &pos, "B*5e"),
-                None
-            );
-        }
-        assert_eq!(
-            build_floodgate_comment(&floodgate_info(&["B*5e", "8c8d"]), Color::Black, &pos, "B*5e")
-                .as_deref(),
-            Some("* 123 +0055KA -8384FU")
-        );
-    }
-
-    #[test]
-    fn previous_position_uses_retained_history_and_handles_missing_history() {
-        let before = "k8/9/9/9/9/9/9/9/7K1 w BPbp 42";
-        let mut summary = GameSummary {
-            game_id: "g".to_owned(),
-            my_color: Color::Black,
-            sente_name: "b".to_owned(),
-            gote_name: "w".to_owned(),
-            position: Position::from_sfen(before).unwrap(),
-            initial_moves: Vec::new(),
-            black_time: crate::protocol::TimeConfig::default(),
-            white_time: crate::protocol::TimeConfig::default(),
-            reconnect_token: None,
-            entering_king_rule: None,
-        };
-        let mut record = GameRecord::new(&summary);
-        assert_eq!(previous_move_sfen(&record, true), Ok(None));
-        assert_eq!(previous_move_sfen(&record, false), Err(()));
-        record.add_move("-9192OU", 0, None, Color::White);
-        assert_eq!(previous_move_sfen(&record, false), Err(()));
-        push_opponent_jsonl(&mut record, before.to_owned(), "9a9b".to_owned(), Color::White, 0);
-        summary.position.apply_csa_move("-9192OU").unwrap();
-        let ResumeRecordDecision::Continued {
-            record, position, ..
-        } = record.continue_for_resume(&summary, Some(Color::Black))
-        else {
-            panic!("保持棋譜と再接続局面が一致するはず");
-        };
-        assert_eq!(previous_move_sfen(&record, false), Ok(Some(before)));
-        assert_eq!(
-            validated_move_pv(
-                &floodgate_info(&["B*5e", "P*5d"]),
-                &position,
-                "B*5e",
-                previous_move_sfen(&record, false),
-            ),
-            None
-        );
-        let fragment = GameRecord::new(&summary);
-        assert_eq!(previous_move_sfen(&fragment, false), Err(()));
-    }
-
-    #[test]
-    fn drop_pv_legal_in_both_positions_is_omitted() {
-        let before = "k8/9/9/9/9/9/9/9/7K1 w BPbp 1";
-        let mut pos = Position::from_sfen(before).unwrap();
-        pos.apply_csa_move("-9192OU").unwrap();
-        let info = floodgate_info(&["B*5e", "P*5d"]);
-        assert_eq!(validated_move_pv(&info, &pos, "B*5e", Ok(Some(before))), None);
-    }
-
-    #[test]
-    fn mating_drop_pv_needs_no_reply() {
-        let before = "3l1l3/4k4/4G4/9/9/9/9/9/K8 w G 1";
-        let mut pos = Position::from_sfen(before).unwrap();
-        pos.apply_csa_move("-5251OU").unwrap();
-        let info = SearchInfo {
-            score_mate: Some(1),
-            pv: vec!["G*5b".to_owned()],
-            ..SearchInfo::default()
-        };
-        assert_eq!(
-            validated_move_pv(&info, &pos, "G*5b", Ok(Some(before))),
-            Some(vec!["+0052KI".to_owned()])
-        );
-        let mut mate_pos = rshogi_core::position::Position::new();
-        mate_pos.set_sfen(&pos.to_sfen()).unwrap();
-        let mv = rshogi_core::types::Move::from_usi_strict("G*5b").unwrap();
-        assert!(mate_pos.gives_check(mv));
-        mate_pos.do_move(mv, true);
-        let mut replies = rshogi_core::movegen::MoveList::new();
-        rshogi_core::movegen::generate_legal_all(&mate_pos, &mut replies);
-        assert!(replies.is_empty());
-    }
-
-    #[test]
-    fn drop_pv_distinguished_by_later_move_is_accepted() {
-        let before = "k8/9/9/9/9/9/9/9/7K1 w Bb 1";
-        let mut pos = Position::from_sfen(before).unwrap();
-        pos.apply_csa_move("-9192OU").unwrap();
-        let info = floodgate_info(&["B*5e", "9b9c"]);
-        assert_eq!(
-            validated_move_pv(&info, &pos, "B*5e", Ok(Some(before))),
-            Some(vec!["+0055KA".to_owned(), "-9293OU".to_owned()])
-        );
-    }
-
-    #[test]
-    fn drop_pv_at_game_start_is_accepted_but_missing_history_is_omitted() {
-        let pos = Position::from_sfen("k8/9/9/9/9/9/9/9/7K1 b B 42").unwrap();
-        let info = floodgate_info(&["B*5e"]);
-        assert!(validated_move_pv(&info, &pos, "B*5e", Ok(None)).is_some());
-        assert_eq!(validated_move_pv(&info, &pos, "B*5e", Err(())), None);
-        let info = floodgate_info(&["2i2h"]);
-        assert!(validated_move_pv(&info, &pos, "2i2h", Err(())).is_some());
-    }
-
-    #[test]
-    fn pv_stops_at_non_move_token_but_rejects_illegal_moves() {
-        let pos = rshogi_csa::initial_position();
-        for end in ["win", "resign", "rep_draw", "unknown"] {
-            let info = floodgate_info(&["7g7f", "3c3d", end, "5e5f"]);
-            assert_eq!(
-                validated_move_pv(&info, &pos, "7g7f", Ok(None)),
-                Some(vec!["+7776FU".to_owned(), "-3334FU".to_owned()])
-            );
-            let info = floodgate_info(&[end]);
-            assert_eq!(validated_move_pv(&info, &pos, end, Ok(None)), None);
-            let info = floodgate_info(&["7g7f", "5e5f", end]);
-            assert_eq!(validated_move_pv(&info, &pos, "7g7f", Ok(None)), None);
-        }
-    }
-
-    #[test]
-    fn floodgate_comment_omitted_when_root_move_differs_from_bestmove() {
-        let pos = rshogi_csa::initial_position();
-        let info = floodgate_info(&["2g2f", "8c8d"]);
-
-        let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
-
-        assert_eq!(comment, None);
-    }
-
-    #[test]
-    fn floodgate_comment_omitted_without_pv() {
-        let pos = rshogi_csa::initial_position();
-        for info in [
-            floodgate_info(&[]),
-            SearchInfo {
-                score_mate: Some(3),
-                ..SearchInfo::default()
-            },
-        ] {
-            assert_eq!(build_floodgate_comment(&info, Color::Black, &pos, "7g7f"), None);
-        }
-    }
-
-    #[test]
-    fn floodgate_matching_pv_preserves_white_and_mate_scores() {
-        let mut pos = rshogi_csa::initial_position();
-        pos.apply_csa_move("+7776FU").unwrap();
-        let mut info = floodgate_info(&["3c3d", "2g2f"]);
-        assert_eq!(
-            build_floodgate_comment(&info, Color::White, &pos, "3c3d").as_deref(),
-            Some("* -123 -3334FU +2726FU")
-        );
-        info.score_cp = None;
-        info.score_mate = Some(-3);
-        assert_eq!(
-            build_floodgate_comment(&info, Color::White, &pos, "3c3d").as_deref(),
-            Some("* 100000 -3334FU +2726FU")
-        );
-    }
-
-    #[test]
-    fn floodgate_comment_omits_unconvertible_pv_move() {
-        let pos = rshogi_csa::initial_position();
-        let info = floodgate_info(&["7g7f", "3c3d", "5e5f", "2g2f"]);
-
-        let comment = build_floodgate_comment(&info, Color::Black, &pos, "7g7f");
-
-        assert_eq!(comment, None);
-    }
-
-    #[test]
-    fn floodgate_comment_omits_unrepresentable_white_min_score() {
-        let pos = rshogi_csa::initial_position();
-        let info = SearchInfo {
-            score_cp: Some(i32::MIN),
-            pv: vec!["7g7f".to_owned()],
-            ..SearchInfo::default()
-        };
-        assert_eq!(build_floodgate_comment(&info, Color::White, &pos, "7g7f"), None);
     }
 
     #[test]
@@ -2680,13 +1936,11 @@ mod tests {
             black_time: crate::protocol::TimeConfig::default(),
             white_time: crate::protocol::TimeConfig::default(),
             reconnect_token: None,
-            entering_king_rule: None,
         };
         let proto_state = ProtocolReconnectState {
             current_turn: Some(Color::Black),
             black_remaining_ms: 10_000,
             white_remaining_ms: 5_000,
-            ..Default::default()
         };
         let pub_state = build_reconnect_state(&summary, Some(&proto_state));
         // last_sfen は summary.position.to_sfen() と一致 (履歴 replay は無し)
@@ -2694,105 +1948,6 @@ mod tests {
         assert_eq!(pub_state.side_to_move, Side::Black);
         assert_eq!(pub_state.remaining_time_sec_self, Some(10));
         assert_eq!(pub_state.remaining_time_sec_opp, Some(5));
-    }
-
-    /// set_option 呼び出しだけを記録する stub。他の driver method は
-    /// apply_advertised_entering_king_rule から呼ばれない契約なので panic でよい。
-    struct RecordingEngine {
-        set_options: Vec<(String, String)>,
-    }
-
-    impl UsiEngineDriver for RecordingEngine {
-        fn new_game(&mut self) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn set_option(&mut self, name: &str, value: &str) -> anyhow::Result<()> {
-            self.set_options.push((name.to_owned(), value.to_owned()));
-            Ok(())
-        }
-        fn go_with_info(
-            &mut self,
-            _: &str,
-            _: &str,
-            _: &std::sync::atomic::AtomicBool,
-            _: &std::sync::mpsc::Receiver<Event>,
-            _: &mut crate::engine::InfoCallback<'_>,
-        ) -> anyhow::Result<SearchOutcome> {
-            unreachable!()
-        }
-        fn go_ponder(&mut self, _: &str, _: &str) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn ponderhit_with_info(
-            &mut self,
-            _: &std::sync::atomic::AtomicBool,
-            _: &std::sync::mpsc::Receiver<Event>,
-            _: &mut crate::engine::InfoCallback<'_>,
-        ) -> anyhow::Result<SearchOutcome> {
-            unreachable!()
-        }
-        fn stop_and_wait(&mut self) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn gameover(&mut self, _: &str) -> anyhow::Result<()> {
-            unreachable!()
-        }
-    }
-
-    fn summary_with_rule(rule: Option<rshogi_core::types::EnteringKingRule>) -> GameSummary {
-        use rshogi_csa::{Color, initial_position};
-        GameSummary {
-            game_id: "g".to_owned(),
-            my_color: Color::Black,
-            sente_name: "b".to_owned(),
-            gote_name: "w".to_owned(),
-            position: initial_position(),
-            initial_moves: Vec::new(),
-            black_time: crate::protocol::TimeConfig::default(),
-            white_time: crate::protocol::TimeConfig::default(),
-            reconnect_token: None,
-            entering_king_rule: rule,
-        }
-    }
-
-    #[test]
-    fn advertised_rule_is_injected_when_config_unset() {
-        let config = CsaClientConfig::default();
-        let mut engine = RecordingEngine {
-            set_options: Vec::new(),
-        };
-        let summary = summary_with_rule(Some(rshogi_core::types::EnteringKingRule::Point24));
-        apply_advertised_entering_king_rule(&config, &mut engine, &summary).unwrap();
-        assert_eq!(
-            engine.set_options,
-            vec![("EnteringKingRule".to_owned(), "CSARule24".to_owned())]
-        );
-    }
-
-    #[test]
-    fn configured_rule_wins_over_advertised() {
-        let mut config = CsaClientConfig::default();
-        config
-            .engine
-            .options
-            .insert("EnteringKingRule".to_owned(), toml::Value::String("CSARule27".to_owned()));
-        let mut engine = RecordingEngine {
-            set_options: Vec::new(),
-        };
-        let summary = summary_with_rule(Some(rshogi_core::types::EnteringKingRule::Point24));
-        apply_advertised_entering_king_rule(&config, &mut engine, &summary).unwrap();
-        assert!(engine.set_options.is_empty());
-    }
-
-    #[test]
-    fn no_advertisement_leaves_engine_untouched() {
-        let config = CsaClientConfig::default();
-        let mut engine = RecordingEngine {
-            set_options: Vec::new(),
-        };
-        let summary = summary_with_rule(None);
-        apply_advertised_entering_king_rule(&config, &mut engine, &summary).unwrap();
-        assert!(engine.set_options.is_empty());
     }
 
     #[test]
@@ -2808,259 +1963,15 @@ mod tests {
             black_time: crate::protocol::TimeConfig::default(),
             white_time: crate::protocol::TimeConfig::default(),
             reconnect_token: None,
-            entering_king_rule: None,
         };
         let proto_state = ProtocolReconnectState {
             current_turn: Some(Color::White),
             black_remaining_ms: 10_000,
             white_remaining_ms: 5_000,
-            ..Default::default()
         };
         let pub_state = build_reconnect_state(&summary, Some(&proto_state));
         // self は白 (5_000ms), opp は黒 (10_000ms)
         assert_eq!(pub_state.remaining_time_sec_self, Some(5));
         assert_eq!(pub_state.remaining_time_sec_opp, Some(10));
-    }
-
-    // ---- #858: fischer の btime 二重計上 + margin 未適用の修正 ----
-
-    fn fischer_summary(total_ms: i64, inc_ms: i64) -> GameSummary {
-        use rshogi_csa::{Color, initial_position};
-        let time = crate::protocol::TimeConfig {
-            time_unit_ms: 1000,
-            total_time_ms: total_ms,
-            byoyomi_ms: 0,
-            increment_ms: inc_ms,
-        };
-        GameSummary {
-            game_id: "g".to_owned(),
-            my_color: Color::Black,
-            sente_name: "b".to_owned(),
-            gote_name: "w".to_owned(),
-            position: initial_position(),
-            initial_moves: Vec::new(),
-            black_time: time.clone(),
-            white_time: time,
-            reconnect_token: None,
-            entering_king_rule: None,
-        }
-    }
-
-    fn byoyomi_summary(total_ms: i64, byoyomi_ms: i64) -> GameSummary {
-        use rshogi_csa::{Color, initial_position};
-        let time = crate::protocol::TimeConfig {
-            time_unit_ms: 1000,
-            total_time_ms: total_ms,
-            byoyomi_ms,
-            increment_ms: 0,
-        };
-        GameSummary {
-            game_id: "g".to_owned(),
-            my_color: Color::Black,
-            sente_name: "b".to_owned(),
-            gote_name: "w".to_owned(),
-            position: initial_position(),
-            initial_moves: Vec::new(),
-            black_time: time.clone(),
-            white_time: time,
-            reconnect_token: None,
-            entering_king_rule: None,
-        }
-    }
-
-    #[test]
-    fn clock_from_summary_btime_excludes_increment() {
-        // #858: btime/wtime は total_time_ms (pre-increment) で、増分を足し込まない。
-        let clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
-        assert_eq!(clock.black_time_ms, 60_000);
-        assert_eq!(clock.white_time_ms, 60_000);
-        // increment 自体は保持する (go の binc/winc で送るため)。
-        assert_eq!(clock.black_increment_ms, 5_000);
-        assert_eq!(clock.white_increment_ms, 5_000);
-    }
-
-    #[test]
-    fn clock_fischer_go_args_report_pre_increment_time_minus_margin() {
-        use rshogi_csa::Color;
-        // #858: fischer の go は btime=total-margin(手番側のみ) / binc=inc。
-        // 旧実装は btime=total+inc(=65000) を送り、binc と合わせて二重計上していた。
-        let clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
-        // 先手番: 自分 (black) の btime から margin(1500) を引く。wtime は据え置き。
-        assert_eq!(
-            clock.build_go_args(1_500, Color::Black),
-            "btime 58500 wtime 60000 binc 5000 winc 5000"
-        );
-        // 後手番: 自分 (white) の wtime から margin を引く。
-        assert_eq!(
-            clock.build_go_args(1_500, Color::White),
-            "btime 60000 wtime 58500 binc 5000 winc 5000"
-        );
-    }
-
-    #[test]
-    fn clock_fischer_think_limit_applies_margin() {
-        use rshogi_csa::Color;
-        // #858: think_limit = total(pre-increment) + inc - margin = 60000 + 5000 - 1500。
-        // 旧実装は btime に inc 込みで total_ms=65000 → 65000 + 5000 = 70000 だった。
-        let clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
-        assert_eq!(clock.think_limit_ms(1_500, Color::Black), 63_500);
-    }
-
-    #[test]
-    fn clock_fischer_margin_larger_than_budget_clamps_to_zero() {
-        use rshogi_csa::Color;
-        // margin が予算より大きいときは go/think_limit とも 0 にクランプ (負値を送らない)。
-        let clock = Clock::from_summary(&fischer_summary(1_000, 500));
-        assert_eq!(clock.think_limit_ms(5_000, Color::Black), 0);
-        assert_eq!(
-            clock.build_go_args(5_000, Color::Black),
-            "btime 0 wtime 1000 binc 500 winc 500"
-        );
-    }
-
-    #[test]
-    fn clock_sudden_death_applies_margin() {
-        use rshogi_csa::Color;
-        // 増分・秒読みなし (sudden-death) でも手番側の btime/think_limit から
-        // margin を差し引く (fischer/byoyomi 分岐と同趣旨)。
-        let clock = Clock::from_summary(&byoyomi_summary(60_000, 0));
-        assert_eq!(clock.build_go_args(1_500, Color::Black), "btime 58500 wtime 60000");
-        assert_eq!(clock.build_go_args(1_500, Color::White), "btime 60000 wtime 58500");
-        assert_eq!(clock.think_limit_ms(1_500, Color::Black), 58_500);
-    }
-
-    #[test]
-    fn clock_byoyomi_branch_unchanged_by_858() {
-        use rshogi_csa::Color;
-        // #858 の変更は fischer(inc>0) 限定。byoyomi(inc=0) は従来どおり
-        // btime=total / go byoyomi=byoyomi-margin / think_limit=byoyomi-margin。
-        let clock = Clock::from_summary(&byoyomi_summary(60_000, 10_000));
-        assert_eq!(clock.black_time_ms, 60_000);
-        assert_eq!(
-            clock.build_go_args(1_500, Color::Black),
-            "btime 60000 wtime 60000 byoyomi 8500"
-        );
-        assert_eq!(clock.think_limit_ms(1_500, Color::Black), 8_500);
-    }
-
-    #[test]
-    fn clock_resume_fischer_subtracts_increment_from_server_remaining() {
-        use rshogi_csa::Color;
-        // fischer 再接続: サーバーの Black/White_Time_Remaining_Ms は slot
-        // (次手の増分込み post-increment)。台帳は pre-increment 規約なので、
-        // 各色の増分を差し引いた値になること。差し引かず素通しすると台帳が
-        // +inc 膨張し、以後の全手でエンジン報告予算がサーバー予算を超える。
-        let mut clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
-        clock.apply_resume_remaining(30_000, 25_000);
-        assert_eq!(clock.black_time_ms, 25_000);
-        assert_eq!(clock.white_time_ms, 20_000);
-        // エンジン報告予算 = 台帳 + inc - margin = server slot - margin を維持。
-        assert_eq!(clock.think_limit_ms(1_500, Color::Black), 28_500);
-        assert_eq!(
-            clock.build_go_args(1_500, Color::Black),
-            "btime 23500 wtime 20000 binc 5000 winc 5000"
-        );
-    }
-
-    #[test]
-    fn clock_resume_fischer_clamps_when_remaining_below_increment() {
-        // サーバー slot は生存中 (consume 後) は常に >= inc だが、負値・inc 未満の
-        // 入力でも台帳が負にならないこと (防御的 clamp)。
-        let mut clock = Clock::from_summary(&fischer_summary(60_000, 5_000));
-        clock.apply_resume_remaining(3_000, -1_000);
-        assert_eq!(clock.black_time_ms, 0);
-        assert_eq!(clock.white_time_ms, 0);
-    }
-
-    #[test]
-    fn clock_resume_byoyomi_passes_server_remaining_through() {
-        // byoyomi (inc=0): remaining_main_ms は本体残時間そのもので、従来どおり
-        // 素通しになる (#858 前後で挙動不変)。
-        let mut clock = Clock::from_summary(&byoyomi_summary(60_000, 10_000));
-        clock.apply_resume_remaining(30_000, 25_000);
-        assert_eq!(clock.black_time_ms, 30_000);
-        assert_eq!(clock.white_time_ms, 25_000);
-    }
-    fn set_resume_budget(clock: &mut Clock, color: Color, remaining_ms: u64, received: Instant) {
-        clock.resume_turn_clock = Some((
-            color,
-            (
-                rshogi_csa_server::protocol::reconnect::ReconnectClock { remaining_ms },
-                received,
-            ),
-        ));
-    }
-
-    #[test]
-    fn resume_budget_caps_main_byoyomi_and_fischer_without_debiting_ledger() {
-        for summary in [
-            byoyomi_summary(60_000, 0),
-            byoyomi_summary(60_000, 10_000),
-            fischer_summary(60_000, 5_000),
-        ] {
-            let mut clock = Clock::from_summary(&summary);
-            clock.apply_resume_remaining(60_000, 50_000);
-            let before = (clock.black_time_ms, clock.white_time_ms);
-            set_resume_budget(&mut clock, Color::Black, 3_000, Instant::now());
-            assert!(clock.think_limit_ms(500, Color::Black) <= 2_500);
-            let args = clock.build_go_args(500, Color::Black);
-            let fields: Vec<_> = args.split_whitespace().collect();
-            let value = |key| {
-                fields
-                    .windows(2)
-                    .find(|pair| pair[0] == key)
-                    .map(|pair| pair[1].parse::<u64>().unwrap())
-                    .unwrap_or(0)
-            };
-            assert!(value("btime") + value("byoyomi") + value("binc") <= 2_500, "{args}");
-            assert_eq!(value("wtime"), before.1 as u64);
-            assert_eq!((clock.black_time_ms, clock.white_time_ms), before);
-            clock.consume(Color::Black, 2);
-            assert!(clock.resume_turn_clock.is_none());
-            assert_eq!(clock.black_time_ms, (before.0 - 2_000 + clock.black_increment_ms).max(0));
-        }
-    }
-
-    #[test]
-    fn resume_budget_ages_and_is_replaced_on_each_reconnect() {
-        let mut clock = Clock::from_summary(&byoyomi_summary(0, 10_000));
-        set_resume_budget(
-            &mut clock,
-            Color::White,
-            3_000,
-            Instant::now() - Duration::from_millis(2_000),
-        );
-        assert!(clock.think_limit_ms(100, Color::White) <= 900);
-        assert_eq!(clock.think_limit_ms(100, Color::Black), 9_900);
-        clock.consume(Color::Black, 1);
-        assert!(clock.resume_turn_clock.is_some());
-        set_resume_budget(&mut clock, Color::White, 5_000, Instant::now());
-        let remaining = clock.think_limit_ms(100, Color::White);
-        assert!(remaining > 3_000 && remaining <= 4_900);
-        set_resume_budget(&mut clock, Color::White, 0, Instant::now());
-        assert_eq!(clock.think_limit_ms(100, Color::White), 0);
-        assert!(clock.build_go_args(100, Color::White).ends_with("wtime 0 byoyomi 0"));
-    }
-
-    #[test]
-    fn color_totals_reach_engine_go_and_consume_separately() {
-        use rshogi_csa::Color;
-        let mut summary = fischer_summary(3_000, 2_000);
-        summary.white_time.total_time_ms = 8_000;
-        let mut clock = Clock::from_summary(&summary);
-        assert_eq!(
-            clock.build_go_args(0, Color::Black),
-            "btime 3000 wtime 8000 binc 2000 winc 2000"
-        );
-        clock.consume(Color::Black, 1);
-        assert_eq!(
-            clock.build_go_args(0, Color::White),
-            "btime 4000 wtime 8000 binc 2000 winc 2000"
-        );
-        clock.consume(Color::White, 3);
-        assert_eq!(
-            clock.build_go_args(0, Color::Black),
-            "btime 4000 wtime 7000 binc 2000 winc 2000"
-        );
     }
 }

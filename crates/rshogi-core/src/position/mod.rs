@@ -17,17 +17,15 @@ pub mod json_conversion;
 #[cfg(feature = "move-features")]
 mod move_features;
 mod movepicker_support;
-#[cfg(test)]
-pub(crate) mod playout_test_support;
 mod pos;
 mod sfen;
 mod state;
 mod zobrist;
 
-pub use board_effect::BoardEffects;
+pub(crate) use board_effect::BoardEffects;
 #[cfg(feature = "move-features")]
 pub use move_features::MoveFeatures;
-pub use pos::{EnteringKingPointInfo, Position};
-pub use sfen::{MAX_GAME_PLY, SFEN_HIRATE, SfenError, StaticPosition};
+pub use pos::Position;
+pub use sfen::{SFEN_HIRATE, SfenError};
 pub use state::StateInfo;
 pub use zobrist::{ZOBRIST, zobrist_hand, zobrist_no_pawns, zobrist_psq, zobrist_side};

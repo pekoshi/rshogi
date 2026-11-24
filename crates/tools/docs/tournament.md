@@ -1,37 +1,7 @@
 # tournament — 並列トーナメント・SPRT 検定
 
-複数エンジン間の総当たり (round-robin) 対局、base-vs-N 対局、または SPRT（逐次確率比検定）を並列実行するツール。先後を固定した単局にも対応する。
+複数エンジン間の総当たり (round-robin) 対局、base-vs-N 対局、または SPRT（逐次確率比検定）を並列実行するツール。
 対局ログは analyze_selfplay 互換の JSONL 形式で出力される。
-
-## USI評価の進捗値と同一行の主PV記録
-
-move行の `eval.depth` / `score_cp` / `pv` などは、従来どおり存在するfieldだけを
-更新した進捗値である。例えばdepth8/score30/PVの後に `info depth 9 nodes 200`
-だけが届くと、進捗値のdepthは9、scoreとPVは前の報告のままになる。
-
-USI backendはこれとは別に `eval.last_exact_primary` を保存する。
-採用条件は、**同じ1行に有効なdepth・score・非空PVがあり、multipvが省略または1で、
-lowerbound/upperboundがないこと**。depth/score/multipvの重複や不正なPVトークンは採用しない。
-部分行を結合してこの記録を作ることはなく、secondary PVや不完全な行では前の記録を維持する。
-
-```json
-{"depth":8,"score":{"cp":30},"pv":["7g7f","3c3d"],"raw_line":"info depth 8 score cp 30 pv 7g7f 3c3d"}
-```
-
-`score` は `{"cp":整数}` / `{"mate":符号付き手数}` / `"mate_win"` / `"mate_loss"`。
-後二者はUSIの `score mate +` / `score mate -` に対応し、手数やcpを補作しない。
-`raw_line` は採用したinfo行そのもの。PVの字句は検証するが、盤面上の合法性はこのparserでは検証しない。
-
-USIには汎用的なiteration完了通知がないため、この記録は**最後のboundなし主PV報告**であり、
-反復の完了・指定深さへの到達・最終bestmoveとの一致を証明するものではない。
-教師や診断への採用時には探索の成否、停止理由、必要深さ、PV先頭とbestmoveの一致を別に確認する。
-進捗側のnodes/timeをこの記録のdepthに対応する値として扱わない。
-
-該当行がなければfield自体を省略する。旧ログの読込みでも欠落のままとし、既存fieldから復元しない。
-Native backendはUSI原文を持たず単一SearchResultからevalを作るため、この追加fieldは出力しない。
-Native backendのevalは、制限で反復が途中で止まり根の先頭に完了した反復と別の手が残ったとき、
-その手の下界・上界の評価値になり、`score_bound` に記録される（裁定では評価値欠落と同様に扱う）。
-既存の投了・引分け裁定や分析は従来fieldを使い、追加記録だけでは挙動を変更しない。
 
 ## ビルド
 
@@ -43,33 +13,11 @@ cargo build -p tools --bin tournament --release
 
 | モード | 概要 | 主なオプション |
 |--------|------|---------------|
-| **単局** | 指定順に先手・後手を固定して1局実行 | `--single-game` |
 | **総当たり** | N エンジン間の全 C(N,2) ペアを対局 | `--engine` × N |
 | **base-vs-N** | 基準 1 体 vs 他 N 体のみ対局 | `--base-label` |
 | **SPRT** | A/B 2 エンジンで有意差を逐次判定、境界到達で自動停止 | `--sprt` |
 
 ## クイックスタート
-
-### 棋譜を引き継いで1局指す
-
-```bash
-./target/release/tournament \
-  --engine /path/to/black-engine --engine-label black \
-  --engine /path/to/white-engine --engine-label white \
-  --single-game --preserve-start-history \
-  --startpos-file continuation.txt --nodes 1000000 --max-moves 512 \
-  --out-dir runs/selfplay/continuation
-```
-
-`continuation.txt` は `startpos moves 7g7f 3c3d` のような1局面を指定する。上の例では3手目から対局し、
-`--max-moves` は初手から数える。後手番の局面でも、1番目のエンジンが先手、2番目が後手を担当する。
-単局では先後交換、エラー時の再対局、`control.json` による対局数・並列数の変更は行わない。
-`--games`、`--sprt`、`--base-label`、`--startpos-order cycle` とは併用できず、並列数は1。
-開始局面ファイルを省略した場合は平手初期局面を使う。
-
-JSONL と `meta.json` の `settings` に `games: 1` と `single_game: true` を記録する。
-結果行に `pair_index` と `pair_slot` は付与しない。`analyze_selfplay` はこの結果を単局として集計する。
-複数の分岐を比較する場合は、分岐ごとに開始局面ファイルと出力先を指定して起動する。
 
 ### 総当たり（2 エンジン、各方向 100 局 = 合計 200 局）
 
@@ -78,20 +26,19 @@ JSONL と `meta.json` の `settings` に `games: 1` と `single_game: true` を�
   --engine target/release/rshogi-usi-v1 --engine-label v1 \
   --engine target/release/rshogi-usi-v2 --engine-label v2 \
   --games 100 --byoyomi 1000 --hash-mb 256 --threads 1 --concurrency 8 \
-  --seed 42 \
   --startpos-file data/startpos/start_sfens_ply32.txt \
   --out-dir runs/selfplay/$(date +%Y%m%d_%H%M%S)-v1-vs-v2
 ```
 
 ### SPRT（有意差の早期判定）
 
-H0=0、H1=+5 nElo、名目 α=β=0.05 の SPRT を行う例:
+test エンジンが base より +5 nelo 以上強いかを有意水準 95% で検定する。
 差が明確なら早期に判定終了し、差が微妙なら `--games` 上限まで対局を続ける。
 
 - `--sprt-nelo0 0`: H0 = 差なし（帰無仮説）
-- `--sprt-nelo1 5`: H1 の正規化 Elo = +5（対立仮説）
-- `--sprt-alpha 0.05`: 名目第一種過誤率 5%
-- `--sprt-beta 0.05`: 名目第二種過誤率 5%
+- `--sprt-nelo1 5`: H1 = +5 nelo 以上の差あり（対立仮説、検出したい最小効果量）
+- `--sprt-alpha 0.05`: H0 が真なのに H1 と誤判定する確率の上限 5%
+- `--sprt-beta 0.05`: H1 が真なのに H0 と誤判定する確率の上限 5%
 - `--games 5000`: SPRT が境界に達しなかった場合の対局数上限（保険）
 
 `--sprt-base-label` を省略すると `--base-label` の値が自動で使われる。
@@ -101,7 +48,6 @@ H0=0、H1=+5 nElo、名目 α=β=0.05 の SPRT を行う例:
   --engine /path/to/base-engine --engine-label base \
   --engine /path/to/test-engine --engine-label test \
   --games 5000 --byoyomi 1000 --hash-mb 256 --threads 1 --concurrency 16 \
-  --seed 42 \
   --startpos-file data/startpos/start_sfens_ply32.txt \
   --base-label base \
   --sprt --sprt-test-label test \
@@ -117,236 +63,40 @@ H0=0、H1=+5 nElo、名目 α=β=0.05 の SPRT を行う例:
 |-----------|-----------|------|
 | `--engine PATH` | (必須、2 つ以上) | エンジンバイナリパス。`--engine` の数だけエンジン登録される |
 | `--engine-label LABEL` | パスから自動生成 | エンジンラベル（`--engine` と同数・同順で指定）。同一パスを複数回指定する場合は区別のため必須 |
-| `--single-game` | off | エンジン2つ、開始局面1つで、指定順に先後を固定して1局だけ指す |
 | `--games N` | 100 | 各方向の対局数（双方向で 2×N 局/ペア） |
-| `--max-moves N` | 512 | 引分とする総手数。開始局面までの手数（SFEN の手数欄と `moves` の手順）を含めて数えるため、平手から始まる本番対局 (floodgate 等) の手数制限と同じ値を指定する。開始局面が既にこの手数以上ならエラー |
-| `--adjudicate-resign "movecount=3,score=600"` | off | 同一側の劣勢評価の連続による投了裁定 |
-| `--adjudicate-win "movecount=3,score=600"` | off | 同一側の優勢評価の連続による勝ち裁定 |
-| `--adjudicate-draw "movenumber=34,movecount=8,score=20"` | off | 両側を通じた均衡評価の連続による引分裁定。手数は開始局面からの対局内 ply（`--max-moves` と異なり開始局面までの手数は含まない） |
-| `--adjudicate-agreement "movecount=3,score=800"` | off | 両側の自己視点の評価が勝ち側 +score 以上・負け側 -score 以下で一致した状態の連続による勝敗の裁定 |
-| `--concurrency N` | 1 | 並列対局数。1 局あたり通常は約 Threads スレッド、ponder 時は最大 2×Threads スレッドが同時に探索する |
-| `--ponder INDEX:true/false` | 全 engine false | engine index（0 始まり）ごとの相手手番思考。複数指定可 |
+| `--max-moves N` | 512 | 1 局の最大手数（超過で引き分け） |
+| `--concurrency N` | 1 | 並列対局数。1 対局は手番制で約 1 CPU スレッド消費 |
 | `--report-interval N` | 10 | N 局ごとに進捗を表示 |
-
-### エンジンに渡す対局履歴
-
-各探索には `position sfen <対局開始局面> moves <対局開始後の全指し手>` を送る。
-初手は `moves` を省略する。毎手の現在局面だけを SFEN で送っていた旧 driver と異なり、
-エンジンは現在局面に加えて過去の反復・連続王手を復元し、探索で利用できる。
-
-既定の履歴の基点は、千日手裁定と同じく開始局面ファイルの `moves` を適用した後の局面。
-開始局面ファイルの手順は基点 SFEN に反映済みなので、送信する手順に重ねて追加しない。
-`--preserve-start-history` を指定すると、開始局面ファイルの基点から `moves` を探索と千日手裁定の両方に引き継ぐ。
-開始手順中に千日手が成立している場合は対局エラーになる。棋譜の途中から継ぎ指しする場合は、
-記録の初期局面とそこからの指し手を渡す。生の SFEN より前の履歴は復元できない。
-この設定は `settings.preserve_start_history: true` として出力され、`--single-game` とは独立に指定できる。
-pass 使用時は基点の `passrights` を `moves` より前に送り、手順再生で権利を消費する。
-
-履歴は各局・再試行ごとに作り直し、両エンジンに同じ手順を渡す。これは TT・EvalHash・
-探索履歴テーブルなどのキャッシュを対局間で保持するかとは別の処理。
-`resign` / `win` / 不正手 / 時間切れ応答は手順に加えず、合法手だけを正規化して記録する。
-エンジンの指し手と開始局面ファイルの手順は完全合法手集合で検査する。
-move 行の `sfen_before` は従来どおり着手直前の現在局面を表す。
-
-この変更は探索条件を変えるため、旧 driver の対局結果と混ぜず、実験記録に driver の
-コミットを残す。共有対局ループを使う `spsa` にも適用する。
-
-### ルールによる自動終局
-
-千日手は常時有効。同一局面（盤・手番・持駒、pass 使用時は両側の pass 権も）が
-4 回出現した時点で引分にする。開始局面を 1 回目と数え、開始局面ファイルの
-手順を適用した後の局面から履歴を保持する。1 回目から連続して王手をかけていた
-側があれば、その側の反則負け（連続王手の千日手）になる。
-
-評価値による裁定は **既定 off**。chess の閾値（600cp / 20cp 等）は将棋で未較正であり、
-有効化は保存済み棋譜で誤裁定率を測ってから行う。
-
-- `--adjudicate-resign "movecount=3,score=600"`: 着手側の自己視点評価が -600cp 以下の
-  着手を、同一側で 3 回連続するとその側の負け。相手の着手はカウントに含めない。
-  負の mate score は劣勢として数え、正の mate score・条件外の cp・評価値欠落でリセットする。
-- `--adjudicate-win "movecount=3,score=600"`: 着手側の自己視点の確定評価が +600cp 以上の
-  着手を、同一側で 3 回連続するとその側の勝ち。両側を独立に数え、正の mate score も
-  優勢として数える。負・ゼロの mate score、条件外の cp、評価値欠落でリセットする。
-  投了裁定と併用でき、両方を `movecount=1,score=300` にすれば自己評価が ±300cp に
-  達した合法手の直後に終局する。
-- `--adjudicate-draw "movenumber=34,movecount=8,score=20"`: 両側を通じて絶対値 20cp 以下が
-  8 手連続し、対局内の手数が 34 手以上なら引分。`movenumber` と `movecount` はいずれも
-  将棋の手数（ply）であり、chess の full move ではない（fastchess の `movecount=8` は
-  16 ply 相当）。連続回数は 34 手未満でも数え、mate score・条件外の cp・
-  評価値欠落でリセットする。
-
-- `--adjudicate-agreement "movecount=3,score=800"`: 勝ち側の自己視点の評価が +800cp 以上、
-  負け側の自己視点の評価が -800cp 以下の状態が、**両側とも自分の直近 3 手**で続いたら勝ち側の勝ち
-  （各側の手数で数えるので、対局全体では 6 手前後）。片側だけの評価では裁定しない。
-  詰みの評価は符号の向きで閾値を越えたものとして扱い（勝ち側の正の mate、負け側の負の mate。
-  距離不明の `score mate +` / `score mate -` も数える）、
-  条件外の cp・逆向きの mate・評価値欠落でその側の連続をリセットする。`score` は 1 以上。
-  採用 SPRT と `spsa --dispatch async` で同じ条件にできるよう、spsa にも同じ option がある。
-  閾値は保存済みの対局に `analyze_selfplay --adjudication-sweep` を当てて決める
-  （[analyze_selfplay](analyze_selfplay.md#評価値の一致による裁定の後付け集計)）。
-
-`lowerbound` / `upperbound` 付きの score は確定評価ではないため、投了・勝ち・一致・引分裁定の
-すべてで評価値欠落と同様に連続回数をリセットする。move 行の `eval.score_bound` に
-`lowerbound` / `upperbound` を記録する（確定評価と旧ログでは省略）。
-
-各フラグの key はすべて必須で、`,` または空白区切りに対応する（値全体を引用符で囲む）。
-未知・重複 key はエラー。`movecount` は 1 以上、`score` は非負の i32、`movenumber` は
-非負の u32 とする。有効な設定は meta の `settings.adjudicate_resign` /
-`settings.adjudicate_win` / `settings.adjudicate_draw` / `settings.adjudicate_agreement` に記録し、
-無効な設定は省略する。
-
-合法手の適用後に千日手 → 投了裁定 → 勝ち裁定 → 一致の裁定 → 引分裁定の順に判定し、終局手も move 行に記録する。
-千日手・引分裁定・最大手数による引分は通常の引分として WLD / pentanomial に算入する。
-連続王手の千日手と投了・勝ち・一致の裁定には勝者を記録する。
-
-結果 JSONL の `reason` は次のとおり。
-
-| reason | 意味 |
-|--------|------|
-| `resign` | エンジンの投了 |
-| `win` | エンジンの勝ち宣言 |
-| `sennichite` | 千日手による引分 |
-| `sennichite_perpetual_check` | 連続王手をかけた側の反則負け |
-| `adjudication_resign` | 評価値による投了裁定 |
-| `adjudication_win` | 評価値による勝ち裁定 |
-| `adjudication_draw` | 評価値による引分裁定 |
-| `adjudication_agreement` | 両側の評価の一致による勝敗の裁定 |
-| `max_moves` | 最大手数到達による引分 |
-| `timeout` | 時間切れ負け |
-| `illegal_move` | 不正な指し手による負け |
-| `no_bestmove` | bestmove 欠落による負け |
-| `error: ...` | ワーカー・エンジン等のエラー（再対局対象） |
 
 ### 時間・エンジン設定
 
-時間管理オプション (`--byoyomi`, `--btime`/`--binc`, `--depth`, `--nodes`, `--engine-nodes`) のいずれかの指定が必須。
+時間管理オプション (`--byoyomi`, `--btime`/`--binc`, `--depth`, `--nodes`) のいずれかの指定が必須。
 すべて省略するとエラーになる。
 
 | オプション | デフォルト | 説明 |
 |-----------|-----------|------|
-| `--byoyomi MS` | — | 秒読み（ミリ秒）。`--btime`/`--binc`/`--wtime`/`--winc` と排他 |
-| `--btime MS` | 0 | 先手の持ち時間（ミリ秒、フィッシャー時計）。`--byoyomi` と排他 |
-| `--binc MS` | 0 | 先手の 1 手ごとの加算時間（ミリ秒、フィッシャー時計） |
-| `--wtime MS` | `--btime` の値 | 後手の持ち時間（ミリ秒、フィッシャー時計専用） |
-| `--winc MS` | `--binc` の値 | 後手の 1 手ごとの加算時間（ミリ秒、フィッシャー時計専用） |
+| `--byoyomi MS` | — | 秒読み（ミリ秒）。`--btime`/`--binc` と排他 |
+| `--btime MS` | 0 | 持ち時間（ミリ秒、フィッシャー時計）。`--byoyomi` と排他 |
+| `--binc MS` | 0 | 1 手ごとの加算時間（ミリ秒、フィッシャー時計） |
 | `--depth N` | — | 深さ制限（`go depth N` を送出） |
-| `--nodes N` | — | ノード制限（`go nodes N` を送出）。全エンジン共通。rshogi は全スレッドの合計ノード数で打ち切る |
-| `--engine-nodes "IDX:NODES"` | — | エンジン個別の固定ノード数（0 始まりインデックス、複数指定可）。指定したエンジンは global `--nodes` を上書きし、未指定のエンジンは `--nodes` にフォールバックする。エンジンごとに異なるノード数を割り当てたい場合（ノード正規化対局・ハンディキャップ対局など）に使う |
+| `--nodes N` | — | ノード制限（`go nodes N` を送出） |
 | `--threads N` | 1 | Threads USI オプション |
 | `--hash-mb N` | 256 | USI_Hash（MiB） |
 | `--usi-option "Name=Value"` | — | 全エンジン共通の USI オプション（複数指定可） |
-| `--engine-usi-option "IDX:Name=Value"` | — | エンジン個別の USI オプション（0 始まりインデックス）。共通 `--usi-option` にマージされ、同じキーは engine 個別指定が上書きする |
-| `--strict-engine-usi-option` | false | `--engine-usi-option` を指定したエンジンでは共通 `--usi-option` を完全に置換する（旧挙動） |
+| `--engine-usi-option "IDX:Name=Value"` | — | エンジン個別の USI オプション（0 始まりインデックス）。指定したエンジンは共通 `--usi-option` が**完全に置換**される（マージではない） |
 | `--engine-params-file "IDX:FILE"` | — | SPSA `.params` ファイルから USI オプションを読み込む。`--engine-usi-option` と併用可（マージ） |
-| `--nps-scaling` | off | Fischer の時計を機械の NPS で補正する（[下記](#機械の速さによる時計の補正---nps-scaling)） |
-| `--reference-nps N` | 350000 | `--nps-scaling` の基準 NPS（1 thread あたり、全 slot 同時） |
-| `--min-nps-ratio R` | 0.5 | `--nps-scaling` の足切り。実測 NPS が `基準 × R` 未満なら起動しない |
-| `--cpu-affinity off\|numa` | off | numa は worker ごとに `--threads` 個の論理 CPU を一つの NUMA node 内から割り当て、その worker の全エンジンを固定する（Linux 専用） |
-
-`--wtime` / `--winc` はそれぞれ独立に省略でき、省略した値だけ先手と同じになる。
-明示した `0` はそのまま使う。後手オプションだけの指定は不可で、`--btime` / `--binc` の
-少なくとも一方に正の値が必要。補完後の後手も持ち時間・加算時間の少なくとも一方が正でなければならない。
-`--byoyomi` による秒読みとは併用できず、後手オプションが `0` でも拒否する。
-時計はエンジンごとでなく先後ごとに割り当てるため、先後交換後も先手には先手の時計が適用される。
-
-フィッシャー時計では、エンジンへ送る `btime` / `wtime` は加算前の残り時間で、その手に使えるのは
-「残り時間 + 加算時間」。指した後の残り時間は「残り時間 + 加算時間 − 消費時間」になり、
-加算分まで使った手の後は残り時間が加算時間より少なくなる（下限は 0）。
-
-例: 先手 3 分 + 2 秒/手、後手 10 分 + 2 秒/手:
-
-```bash
-./target/release/tournament \
-  --engine /path/to/engine-a --engine /path/to/engine-b \
-  --games 10 --out-dir runs/asymmetric-clock \
-  --btime 180000 --binc 2000 --wtime 600000 --winc 2000
-```
-
-`meta.json` と各 JSONL の `meta` 行の `settings` には、補完後の `wtime` / `winc` を
-ゼロも含めて記録する。旧ログにこの 2 フィールドがない場合は、それぞれ `btime` / `binc`
-と同値（先手のフィールドもなければゼロ）を意味する。既存 run の再開は引き続き未対応。
-`jsonl_to_kif` もこの補完を行い、明示されたゼロは保持する。
-先後いずれかに加算時間があれば、KIF にも先後それぞれの加算時間を記載する。
-
-### 機械の速さによる時計の補正 (`--nps-scaling`)
-
-`--btime` / `--binc`（と `--wtime` / `--winc`）を「基準 NPS の機械での時計」とみなし、開始時に測ったこの機械の
-NPS から `倍率 = 基準 NPS ÷ 実測 NPS` を求めて、持ち時間と加算の両方に掛けて指す。spsa の `--nps-scaling`
-（[runbook §17](spsa_runbook.md#17-fischer-と-nps-による時計の補正---nps-scaling)）と同じ bench・同じ既定値なので、
-SPSA と同じ条件で SPRT を回せる。
-
-```bash
-tournament   --engine /path/to/rshogi-usi --engine-label base   --engine /path/to/rshogi-usi --engine-label tuned   --engine-params-file 1:tuned.params   --usi-option EvalFile=/path/to/nn.bin --usi-option RoundUpToFullSecond=false   --threads 8 --concurrency 23 --cpu-affinity numa   --btime 20000 --binc 2500 --nps-scaling   --sprt --sprt-base-label base --sprt-test-label tuned   --games 2500 --startpos-file start_sfens.txt --out-dir runs/sprt-tuned
-```
-
-- bench は spsa と共通の `spsa-bench-v1`（既定 4 局面を depth 12 で warmup した後 depth 16 で 1 周）。
-  slot 数は `--concurrency` で、全 slot を同時に走らせる。各 slot には対局の worker と同じく全エンジンを
-  `--threads`・`--hash-mb`・USI オプション・`--cpu-affinity` の割り当てで起動し、探索は bench エンジンだけが行う。
-  NPS は `nodes ÷ 時間 ÷ Threads` の slot 間平均。
-- bench エンジンは SPRT の base（`--sprt-base-label`、省略時 `--base-label`）。SPRT でなければ `--base-label` が必須。
-  採用の判定で候補自身の NPS の低下を持ち時間の増加で相殺しないよう、倍率は base 側で決める。
-  そのエンジンの USI オプションで Threads を指定すると拒否する（bench は `--threads` で割る）。
-- 倍率は起動時に 1 回測り、run 中は固定する（`control.json` で concurrency を変えても測り直さない）。
-  補正後の値は `round(基準 × 倍率)`（0 でない値は 1 ms 以上）。時間切れ判定の `--timeout-margin-ms` には掛けない。
-- Fischer 専用。`--byoyomi`・`--depth`・`--nodes`・`--engine-nodes` との併用は拒否する。
-  `--reference-nps` / `--min-nps-ratio` は `--nps-scaling` なしでは指定できない。
-- 標準出力に `nps bench: ... nps/thread (slots: ...)` と
-  `clock: btime=... binc=... (reference ...+... x scale ...; measured ... nps/thread, reference ...)` を出す。
-- `meta.json` と各 JSONL の `meta` 行の `settings.btime` / `binc` / `wtime` / `winc` は補正後の実際の時計。
-  `nps_scaling` に `bench_version`・`bench_engine_label`・`reference_nps`・`min_nps_ratio`・`measured_nps`・
-  `slot_nps`・`scale`・`reference_btime` / `reference_binc` / `reference_wtime` / `reference_winc`・
-  `btime` / `binc` / `wtime` / `winc`・`bench_depth`・`warmup_depth`・`bench_positions`・`threads`・`slots`・
-  `measured_at` を記録する。
-- 短い時計では rshogi の秒単位の時間管理で倍率が効かないため、`RoundUpToFullSecond=false` を渡す
-  （[runbook §17.6](spsa_runbook.md#176-rshogi-の秒単位の時間管理-rounduptofullsecond)）。
-
-`--cpu-affinity numa` の CPU 群は起動時の `--concurrency` 分だけ確保する。`control.json` でそれを越える
-concurrency を指定しても無視する（減らすのは可）。退役した worker の CPU 群は、そのエンジンが終了してから後任に渡す。
 
 ### 開始局面
 
 | オプション | 説明 |
 |-----------|------|
 | `--startpos-file FILE` | 開始局面ファイル（1 行 1 局面、USI position 形式）。省略時は平手初期局面 1 局面のみ使用（全対局が同一局面になるため棋力評価には不向き）。**棋力評価では必須** |
-| `--startpos-order random\|sequential\|cycle` | 既定は random。開始局面の割り当て順。sequential はカード内のペア通番で循環。cycle はファイルを動的に読み直し、カードごとに組数が最小の局面を選ぶ（`--startpos-file` 必須） |
-| `--seed N` | 開始局面選択の seed。同じ seed・エンジン構成（順序を含む）・開始局面ファイルでは、各 matchup の同じペア通番に同じ局面を割り当てる。`control.json` で対局数を途中変更しても局面列は変わらない。省略時は entropy から生成し、起動ログへ表示する |
-
-#### 動的な局面集での均一巡回
-
-`--startpos-order cycle --startpos-file FILE` は、新しい先後交換の組の1局目を配る前に、
-最短5秒間隔でファイルの更新時刻と長さを確認する。変化があれば内容の SHA-256 を比較し、
-内容が変わっていて正しく読めた場合に局面集を置き換える。標準エラー出力に
-`[startpos] reloaded sha256=... positions=N added=a removed=r` を出す。
-読めない・空・不正なファイルは警告して直前の局面集で継続する。同じ警告は連続して出さない。
-起動時の読み込み失敗はエラーになる。ファイルは一時ファイルへ書き出してから rename で置き換えると、
-書き込み途中の内容を読み込むことを避けられる。
-
-既存の `position ...` または生の SFEN に加えて、`名前<TAB>position ...` を受け付ける。
-行全体が局面として読めればその行は名前なしとして扱う（局面内の空白に TAB を使ってよい）。読めなければ
-最初の TAB を名前の区切りとし、後の TAB は局面内の空白として扱う。名前の前後の空白と行頭の空白（TAB を含む）は除く。
-空の名前と名前の重複はエラー。名前なしの行には、正規化した position 文字列の
-SHA-256 の先頭12桁（16進数）を名前として付けるので、名前なしで同じ局面を 2 行書くと重複名になる。空行と、空白を除いた先頭が `#` の行は無視する。
-局面の合法性と `--max-moves` に対する検査は起動時と読み直し時の両方で行う。
-
-エンジンの対戦カードごと（総当たり・base-vs-N とも）に、名前ごとの配った組数を保持する。
-現在の局面集で最小の組数の局面を選び、同数ならファイル順で選ぶ。1局目の送信が確定した時に
-組数を増やすため、複数 worker へ配る場合も均一に巡回する。初めて現れた名前は、新しい
-局面集に含まれる既知の名前の最小の組数から始める（既知の名前がなければ0）。削除した名前の数も保持し、再登場したときに引き継ぐ。
-同じ名前の局面を書き換えた場合も数を引き継ぐ。組の2局目と retry は、途中でファイルが
-変わっても1局目に配った局面を使う。cycle の選択に seed は使わない。
-
-cycle の result 行には `startpos`（`position ...` 文字列）と `startpos_name` を記録する。
-`startpos_idx` は配局時の局面集内の番号であり、cycle では局面を特定しない
-（kifu_player の開始局面での絞り込みなど `startpos_idx` を使う表示は、読み直しの後は別の局面を指しうる）。
-局面の特定には `startpos` / `startpos_name` を使う。`meta.json` の `start_positions` は
-起動時の局面集のままで、`settings.startpos_order` は `cycle` になる。
-停止には通常どおり `control.json` または SIGINT を使う。
 
 ### 出力
 
 | オプション | 説明 |
 |-----------|------|
-| `--out-dir DIR` | (必須) 出力ディレクトリ（既存の対局出力があれば拒否）。`pair-{i}-{j}__{label_i}-vs-{label_j}.jsonl` と、開始局面選択の seed を含む `meta.json` が生成される |
+| `--out-dir DIR` | (必須) 出力ディレクトリ。`{label_i}-vs-{label_j}.jsonl` と `meta.json` が生成される |
 
 ### base-vs-N モード
 
@@ -358,11 +108,11 @@ cycle の result 行には `startpos`（`position ...` 文字列）と `startpos
 
 | オプション | デフォルト | 説明 |
 |-----------|-----------|------|
-| `--sprt` | — | SPRT を有効化。境界到達で新しいペアを止め、開始済みペアの 2 局目・再試行・進行中の対局を回収してから終了 |
+| `--sprt` | — | SPRT を有効化。境界到達で新規対局の供給を停止し、進行中ゲームを完了待ちで drain |
 | `--sprt-test-label LABEL` | (必須) | H1 側（challenger）のエンジンラベル。正の nelo = このエンジンが強い |
 | `--sprt-base-label LABEL` | `--base-label` | H0 側（base）のエンジンラベル。省略時は `--base-label` を流用 |
-| `--sprt-nelo0 F` | 0.0 | H0 仮説の正規化 Elo（通常 0 = 差なし）。負値は `--sprt-nelo0 -10` のまま渡せる |
-| `--sprt-nelo1 F` | 5.0 | H1 仮説の正規化 Elo（検出したい最小効果量）。負値可、ただし nelo0 < nelo1 必須 |
+| `--sprt-nelo0 F` | 0.0 | H0 仮説の正規化 Elo（通常 0 = 差なし） |
+| `--sprt-nelo1 F` | 5.0 | H1 仮説の正規化 Elo（検出したい最小効果量） |
 | `--sprt-alpha F` | 0.05 | 第一種過誤率 α（H0 が真なのに H1 を採択する確率の上限） |
 | `--sprt-beta F` | 0.05 | 第二種過誤率 β（H1 が真なのに H0 を採択する確率の上限） |
 | `--sprt-report-interval N` | 10 | ペア何単位ごとに SPRT レポートを出力 |
@@ -370,8 +120,8 @@ cycle の result 行には `startpos`（`position ...` 文字列）と `startpos
 #### SPRT 出力例
 
 ```
-[SPRT pair=1014 | test vs base] LLR=+2.950 (bounds -2.94..+2.94)  nelo=+38.05 ± 15.12  penta=[184, 15, 508, 17, 290]  state=accept_h1 (stopped at pair=1014)
-[SPRT] terminal decision reached; draining 15 in-flight game(s) and closing started pairs...
+[SPRT pair=1014 | test vs base] LLR=+2.950 (bounds -2.94..+2.94)  nelo=+38.05 ± 15.12  penta=[184, 15, 508, 17, 290]  state=accept_h1
+[SPRT] terminal decision reached; draining 15 in-flight game(s)...
 
 === SPRT Summary (test vs base) ===
 bounds: LLR ∈ [-2.944, +2.944]  (alpha=0.05, beta=0.05)
@@ -383,30 +133,10 @@ final:       pairs=1022, LLR=+2.889, decision=running
 ================================
 ```
 
-`stopped_at` は境界到達時点のスナップショット。`final` は回収完了後の最終値で、
-開始済みペアと進行中ゲームの結果を含むため LLR・ペア数が微差する。判定は `stopped_at` の時点で
+`stopped_at` は境界到達時点のスナップショット。`final` は drain 完了後の最終値で、
+進行中ゲームの結果を含むため LLR・ペア数が微差する。判定は `stopped_at` の時点で
 確定済みのため、`final` の `decision` が `running` と表示されることがあるが、
-判定結果が覆ることはない。停止後の進捗行の `state=` も停止時の判定と停止時のペア数を示す。
-
-境界到達後は新しいペアの 1 局目を出さない。1 局目を送信済みのペアには先後を入れ替えた
-2 局目を出し、error ペアの再試行も続けるので、正常に完走した run には片側だけのペアが残らない。
-`stopped_at` は meta.json の `sprt_stopped_at` にも保存され、analyze_selfplay の
-post-hoc 判定がこれを `stopped_at` として表示する。
-
-#### game error の再対局
-
-同一開始局面を先後入れ替えた 2 局のどちらかが engine 起動・通信・worker panic
-などの game error になった場合、その世代の 2 局は統計から除外される。同じ
-`pair_index`、開始局面、先後割当のまま最大 2 回再対局し、再対局は目標局数を消化しない。
-JSONL の result 行には初回 0 の `attempt` が記録される。
-通信・`usinewgame`・worker panic の error 後はその worker を退役させ、再対局は新しく
-起動した engine process で行う。
-
-最終サマリと `meta.json` の `error_pairs`、`retried_pairs`、`exhausted_pairs` で状況を
-確認できる。2 回の再試行後も error を含むペアがあれば `invalid: true` となる。
-これは統計的敗北ではなくインフラ障害を示すので、SPRT の採否は表示せず、終了コードは非ゼロとなる。
-`incomplete_pairs` または `unreturned_games` が正の run も同じく invalid とする
-（analyze_selfplay が不完全入力とみなす条件と同じ）。
+判定結果が覆ることはない。
 
 #### SPRT 用語
 
@@ -415,42 +145,22 @@ JSONL の result 行には初回 0 の `attempt` が記録される。
 | **LLR** (Log-Likelihood Ratio) | 対数尤度比。H1 と H0 のどちらがデータをよく説明するかを示すスコア |
 | **nelo** (Normalized Elo) | pentanomial ペアスコアの分散で正規化した Elo。引分率に依存しない棋力差推定 |
 | **penta** (Pentanomial) | 2 局ペア（同一開始局面・先後入替）の結果を 5 カテゴリ [LL, LD, DD/WL, WD, WW] に分類した分布。中央の DD/WL は「両局引き分け」または「test の勝ち/負けが 1 局ずつ」でペアスコアが同値 (0.5) になるため同カテゴリ |
-| **accept_h1** | LLR が上側境界に到達し、H1 を採択 |
-| **accept_h0** | LLR が下側境界に到達し、H0 を採択 |
-
-#### LLR の計算と保存ログの再計算
-
-LLR は先後ペアの5カテゴリ件数を使う。ゼロのカテゴリだけに0.001件を補い、
-補正後の合計で確率を正規化する。LLR の乗数も事前件数を含む合計を使う。
-実際のペア数・WLD・表示用 nElo は観測件数のままで、架空の対局は追加しない。
-pentanomial の仮説変換には `sqrt(2)` を使う。
-
-これは [fishtest の固定版の件数補正](https://github.com/official-stockfish/fishtest/blob/93fe81eb8256b870ab759ec4470f6251fe985827/server/fishtest/stats/LLRcalc.py#L197-L212)
-に合わせた算術処理である。MLE/ITP solver の収束条件は異なり、全入力での同値性や
-連続監視時の誤判定率を較正したことは意味しない。H1/H0 採択は仮説間の証拠に基づく
-判定であり、効果量の下限・上限の保証ではない。
-
-確率自体を0.001以上へ切り上げていた版からは、LLR と境界判定が変わる場合がある。
-保存ログを調べる際は、当時の実行版・仮説・ペア集計・停止時点を保持し、
-同じ入力の旧新 LLR を比較する。終端の集計だけでは最初の境界通過時点を再現できない。
-再計算値は診断として記録し、過去の受理を一括で無効にしたり、仮説を後から選び直したりしない。
+| **accept_h1** | test が base より `nelo1` 以上強い（有意差あり） |
+| **accept_h0** | 差が `nelo0` 以下（有意差なし） |
 
 ### 外部エンジンとの対局
 
-rshogi と YaneuraOu のようにエンジンごとに USI オプションが異なる場合、`--engine-usi-option` で個別指定する。
-共通 `--usi-option` を完全に置換したい場合は `--strict-engine-usi-option` を併用する:
+rshogi と YaneuraOu のようにエンジンごとに USI オプションが異なる場合、`--engine-usi-option` で個別指定する:
 
 ```bash
 ./target/release/tournament \
   --engine target/release/rshogi-usi --engine-label rshogi \
   --engine /path/to/YaneuraOu-binary --engine-label yaneuraou \
-  --strict-engine-usi-option \
   --engine-usi-option "0:EvalFile=eval/model.bin" \
   --engine-usi-option "1:EvalDir=/path/to/eval_dir" \
   --engine-usi-option "1:FV_SCALE=28" \
   --engine-usi-option "1:BookFile=no_book" \
   --games 100 --byoyomi 1000 --concurrency 8 \
-  --seed 42 \
   --out-dir runs/selfplay/$(date +%Y%m%d_%H%M%S)-rshogi-vs-yo
 ```
 
@@ -468,9 +178,7 @@ tournament の出力 JSONL を読み込み、勝率・Elo 差・NPS 等を集計
 - **直接対決**（Elo 差 ± CI、nElo 差 ± CI）
   - Elo 差: trinomial（1 局ごとの WDL）ベース
   - nElo: pentanomial（ペア単位）ベース。開始局面・先後の交絡を除去した、より正確な推定
-  - 通常はエンジンラベルの辞書順で左側の視点。`--sprt` 時は SPRT
-    対象ペアを test vs base の順にし、Elo/nElo の符号も test 視点に揃える
-- **追加統計**（平均手数、先手勝率、error 局・再試行関連件数、NPS、depth、seldepth 等）
+- **追加統計**（平均手数、先手勝率、NPS、depth、seldepth 等）
 
 ### SPRT post-hoc 判定
 
@@ -485,172 +193,9 @@ tournament の出力 JSONL を読み込み、勝率・Elo 差・NPS 等を集計
 
 - `--sprt`: SPRT 判定モードを有効化
 - `--sprt-base-label` / `--sprt-test-label`: pentanomial の集計方向を指定する（どちらが test 側か）。
-  nelo の符号は test 視点で決まる。省略時は tournament が記録した SPRT meta / base
-  label 等から自動推定し、推定根拠を標準エラー出力に表示する。自動推定の役割が意図と
-  異なる場合は、tournament 実行時の `--engine-label` と一致する値を明示する
+  nelo の符号は test 視点で決まるため、**両方とも省略不可**。
+  値は tournament 実行時の `--engine-label` で指定したラベルと一致させること
 - `--sprt-nelo0` / `--sprt-nelo1`: tournament 実行時と異なる閾値を指定して
   「この閾値なら何局で打ち切れたか」を事後検証できる
 
 通常の集計出力の末尾に SPRT レポートが追加される。
-
-## 実行中の目標局数変更と先後交換ペア
-
-control.json の target_games を変更した場合も、片側を発行済みのカードは
-先後交換のもう 1 局を発行してから別カードへ移ります。複数カードで目標を増やしても
-pair_index と slot 0/1 の対応を保ち、完成ペアの集計や失敗時の同条件再対局へ渡します。
-目標を減らした場合も、発行済みペアのもう片側は完結させます。
-
-旧版で複数カードの途中に目標を増やしたログは、先後交換 2 局の開始局面が一致していても
-pair_index が分かれ、完成ペア集計から欠落する場合があります。元ログを保持し、
-カード・slot・attempt・開始局面・発行順を確認してください。開始局面の一致だけで
-ペアを推定し直したり、旧結果を一括無効としたりしないでください。
-
-## 中断時の結果保存と終了状態
-
-Ctrl-C では新規発行を停止し、実行中の対局終了を待って回収した結果と棋譜を保存する。
-途中のペアを完結するための追加対局や retry は開始しない。エンジン初期化に失敗した場合も
-他 worker から回収できた結果を保存する。どちらも成功完了とは区別し、終了コードは非ゼロとなる。
-
-meta.json の run_status は起動時 running、終了時 completed / interrupted / worker_failed。
-interrupted と worker_failed は invalid=true とし、最終 SPRT 採否を表示しない。
-incomplete_pairs は発行済み通常ペアのうち有効な 2 局が揃っていない数（失敗ペアを含む）、
-unreturned_games は送信済みチケットのうち結果を回収できなかった数を示す。
-完成ペアがすべて回収できても、中断 run を通常完走の採否として扱わない。
-
-旧版の中断ログには、終了を待った対局の結果が保存されていない場合がある。
-元ログと実行記録を保持し、中断の有無・期待局数・完成ペアを確認する。
-記録のない対局を推定して補完したり、通常完走の結果まで一括無効としたりしない。
-
-## 出力先とカード識別
-
-出力先は run ごとに分ける。既存の meta.json、control.json、control_history.jsonl、
-または直下の JSONL がある場合は開始前に拒否する。resume / 上書きモードはなく、
-失敗した run の成果物も残すため、再実行時には別の出力先を選ぶ。
-空のディレクトリや起動前に準備した engine-stderr wrapper は許容する。
-出力先そのものの symlink は拒否する。
-
-.tournament.lock の OS ファイルロックを run 中保持して同時起動を防ぐ。
-このファイルは終了後も残るが、lock 自体は終了時に解放される。
-各カードと最初の meta は既存ファイルを上書きしない作成モードで開く。
-
-カードのファイル名は `pair-{i}-{j}__{label_i}-vs-{label_j}.jsonl`。
-i/j は `--engine` の指定順の 0 始まり index（i < j）で、一意性を担う。
-例えば `--engine-label baseline` と `--engine-label pass-root-bonus` なら
-`pair-0-1__baseline-vs-pass-root-bonus.jsonl` となる。先後入替の両方向を同じファイルに保存する。
-
-表示部分は各ラベルの先頭48文字を取り、ASCII 英数字・`_`・`-` 以外を `-` に置換し、
-先頭・末尾の `-` を除く。空になれば `engine` を使う。整形後の表示部分やハイフン連結が
-衝突しても index が異なるため別ファイルになり、パス区切りで出力先が変わることもない。
-元ラベルの重複は従来どおり拒否する。meta と結果集計のラベルには整形を適用しない。
-ラベル未指定時の実行ファイル名由来の既定値は従来どおりで、NNUE 名やワークツリー名は推定しない。
-表示を調整するには `--engine-label` を明示する。
-
-実際のエンジン名と元ラベルは各 JSONL の meta と run の meta.json で確認できる。
-旧版の `pair-{i}-{j}.jsonl` / `{label_i}-vs-{label_j}.jsonl` を前提とするスクリプトは、
-新ファイル名または meta によるカード選択へ更新する。旧ログ自体は変更しない。
-
-旧版で連結名が衝突するラベルを使った場合や出力先を再利用した場合は、元ファイルと
-run 記録を保持し、カード別局数と meta の対応を確認する。失われた記録の復元は保証しない。
-
-## 同じエンジン同士で候補手を比べる
-
-候補手を指した後の局面を、開始局面ファイルに1行ずつ書く。例えば平手の初手を比較する場合:
-
-```text
-position startpos moves 7g7f
-position startpos moves 2g2f
-```
-
-同じエンジンを異なるラベルで2つ登録する。以下は持ち時間300秒・1手10秒加算、
-候補2つを各20局（先後交換10ペア）ずつ比較する例。エンジン別成績ではなく、
-開始局面別の先手・後手の成績で候補を比較する。
-先手勝ち / 後手勝ちは盤上の手番（outcome の black/white）で数え、平手からの開始局面の手順が偶数手なら候補手（最後の1手）を指した側は後手。
-
-```bash
-./target/release/tournament \
-  --engine /path/to/rshogi --engine-label a \
-  --engine /path/to/rshogi --engine-label b \
-  --usi-option "EvalFile=$SHOGI_DATA/nnue/model.nnue" \
-  --startpos-file /path/to/candidates.txt --startpos-order sequential \
-  --games 20 --btime 300000 --binc 10000 \
-  --adjudicate-resign "movecount=1,score=300" \
-  --adjudicate-win "movecount=1,score=300" \
-  --out-dir runs/candidates
-./target/release/analyze_selfplay --by-startpos runs/candidates
-```
-
-`random` は従来と同じ seed による決定的な割り当て。
-`sequential` は各 matchup 内の `local_pair_index % 開始局面数` で選ぶため、seed を使わない。
-先後交換の2局と再試行は同じ局面を使い、`control.json` の `target_games` を増減しても
-同じカード・ペア通番の割り当ては変わらない。K行に対して `--games` がKの倍数なら、
-各局面は同数になる（`--games` は各方向の局数なので、各局面は `2 × games / K` 局）。
-局面の割り当てはペアごとに循環する。並列実行時の開始・完了時刻の順序は保証しない。
-meta の `settings.startpos_order` は既定も含めて常に記録する。
-集計の詳細は [analyze_selfplay](analyze_selfplay.md#開始局面別の集計) を参照。
-
-## 相手手番の思考（ponder）
-
-`--ponder INDEX:true` で engine ごとに有効にする。index は `--engine-usi-option`
-と同じ 0 始まりで、複数指定できる。全 engine の既定は無効。例えば片側だけ有効にする場合:
-
-```bash
-./target/release/tournament \
-  --engine /path/to/engine-a --engine-label a \
-  --engine /path/to/engine-b --engine-label b \
-  --ponder 0:true 1:false --games 10 --byoyomi 1000 \
-  --out-dir runs/selfplay/ponder-comparison
-```
-
-通常は `bestmove ... ponder ...` の合法な予想手を着手後の手順に足して `go ponder` を送る。
-予想手がない場合や、最大手数までに自分の次の手番が来ない場合は開始しない。一致時は `ponderhit`、不一致時は `stop` の bestmove を
-読み捨て、実際の手順で `position` と `go` を送る。有効な engine の `USI_Ponder`
-（または `Ponder`）は true に設定する。ただし option を広告する engine にその名前がない場合は送らない。`--usi-option` / `--engine-usi-option` で
-`USI_Ponder` / `Ponder` を明示する場合、同じ engine に `--ponder INDEX:true/false` も明示していれば、
-値を大文字小文字を区別せず比較し、矛盾を起動時エラーにする。`--ponder` 無指定の engine は検査せず従来どおり渡す。
-
-`Stochastic_Ponder=true` は `--usi-option` / `--engine-usi-option` で engine に渡す。
-tournament の送信列は通常の ponder と同じで、合法な予想手を末尾に足した `position` と
-`go ponder` を送り、一致時は `ponderhit`、不一致時は `stop` の bestmove を回収して
-実際の手順で `position` と `go` を送る。予想手がなければ開始しない。
-rshogi は内部で予想手を 1 手戻した相手手番の局面から先読みし、`ponderhit` で先読みを止め、
-直近の position と ponder を除いた go で通常探索をやり直す。
-`Stochastic_Ponder` だけでは tournament の ponder を有効にしない。
-
-ponder 有効の engine の消費時間は相手の bestmove を受信した時点から計測する。
-ponder 無効の engine は従来どおり go の送信後から計測する。予想が外れた場合の stop・回収と
-読み直しにかかった時間は消費に含み、相手手番中の ponder 時間は含めない。
-終局時は残っている ponder を停止して bestmove を回収する。5 秒以内に回収できない場合は
-確定した対局結果を保持して worker を退役させ、次の対局には新しいプロセスを使う。
-時間切れ後の回収が失敗しても時間切れ負けのまま記録する。対局途中の通信エラーには
-既存のエラーペア再試行規則を適用する。
-的中時は先読み中の行も含めて info を受信順に取り込み、途中経過を info コールバックには渡さない。
-bestmove の受信時に、最後の score 付き主 PV と返す PV の先頭手を検査する。
-PV がない場合や bestmove と一致しない場合は評価値・PV を採用せず、JSONL や評価値による裁定に渡さない。
-保持した厳密な主 PV は、それ自身の先頭手が bestmove と一致するときだけ残す。
-的中した手が `resign` / `win` の場合や、bestmove を返さず時間切れになった場合も評価値・PV は記録しない。
-nodes・nps・time は保持する。的中した探索の途中経過は info コールバックに流さないため、MultiPV 候補も渡らない。
-先読みの PV の先頭手が駒打ちなどで bestmove と文字列だけ一致する場合は区別できない。
-USI に反して ponderhit より前に bestmove を返す engine では、的中時はその手を採用して探索中の状態を解除し、
-同じ PV 検査を行う。不一致時は stop の回収で読み捨て、次の探索・対局に持ち越さない。
-
-`--max-moves` は従来どおり開始局面までを含む総手数である。
-
-ponder 有効時のみ、JSONL の result に `ponder` を追加する。先手、後手の順の 2 要素で、
-各要素は `sent`（`go ponder` の送信回数）、`hits`（`ponderhit` の送信回数）、
-`hit_rate`（`hits / sent`、未送信なら null）を持つ。終局時に中断した ponder も sent に含む。最大手数で開始しなかった先読みは sent に含めない。
-`Stochastic_Ponder=true` でも同じ規則で集計する。`meta.json` の engines には有効な engine の `ponder: true`、
-トップレベルの `ponder` には engine index 順の集計を保存し、完了時の標準出力にも割合を表示する。
-集計は正常に結果を回収できた対局（再試行分を含む）の合計で、棋力集計の有効ペア数とは別である。
-通信エラーになった対局の途中統計は含めない。
-既存の analyze_selfplay は追加フィールドを無視して読み込める。
-ponder 無指定時の出力形式は変わらない。
-
-### CPU の割り当てと時計補正
-
-ponder 中は対局中の 2 engine が同時に CPU を使う。必要な探索スレッド数の上限は
-`2 × --threads × --concurrency`。`--cpu-affinity numa` は従来どおり worker あたり
-`--threads` 個の論理 CPU を確保し、worker 内の全 engine が同じ CPU 群を共有する。
-ponder を使うとこの群で CPU 競合が起き得るため、専用 CPU を分けたい場合は affinity を off にし、
-engine の wrapper などで割り当てる。off の場合も同時使用を考慮して concurrency を選ぶ。
-`--nps-scaling` の事前測定は worker あたり 1 engine の通常探索であり、ponder による CPU
-競合を再現しない。補正値で ponder 有無の計算資源が等しくなるとは限らない。

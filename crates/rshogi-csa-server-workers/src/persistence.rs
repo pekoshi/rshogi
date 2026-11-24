@@ -10,18 +10,15 @@
 //! - `slots` (= [`crate::session_state::Slot`]): WebSocket 別の役割割当
 //! - [`PersistedConfig`]: マッチ成立時に確定する対局メタ + 開始局面 SFEN
 //! - `moves` テーブル ([`MoveRow`]): ply 順の指し手列（SQL）
-//! - `reconnect_clock_credits` テーブル: ply ごとの有界な再接続時計補償（SQL）
 //! - [`FinishedState`]: 終局確定後のフラグ（同 DO で再起動した場合の早期 return）
 //!
 //! cold start 復元の手順は [`replay_core_room`] のドキュメントを参照。
 
-use crate::attachment::FinalizingBroadcast;
 use serde::{Deserialize, Serialize};
 
+use rshogi_core::types::EnteringKingRule;
 use rshogi_csa_server::ClockSpec;
-use rshogi_csa_server::game::room::{
-    GameRoom as CoreRoom, GameRoomConfig, HandleOutcome, HandleResult,
-};
+use rshogi_csa_server::game::room::{GameRoom as CoreRoom, GameRoomConfig};
 use rshogi_csa_server::types::{Color, CsaLine, GameId, PlayerName};
 
 /// マッチ成立時に永続化する対局設定。`CoreRoom` の再構築に必要な最小情報。
@@ -31,14 +28,8 @@ pub struct PersistedConfig {
     pub(crate) game_id: String,
     /// 先手プレイヤのハンドル。
     pub(crate) black_handle: String,
-    /// 先手の公開用 opaque player ID。旧 snapshot は空文字から legacy ID に解決する。
-    #[serde(default)]
-    pub(crate) black_player_id: String,
     /// 後手プレイヤのハンドル。
     pub(crate) white_handle: String,
-    /// 後手の公開用 opaque player ID。旧 snapshot は空文字から legacy ID に解決する。
-    #[serde(default)]
-    pub(crate) white_player_id: String,
     /// LOGIN ハンドル末尾の `<game_name>`。マッチ確認・棋譜メタに使う。
     pub(crate) game_name: String,
     /// 時計設定（Countdown / Fischer / StopWatch）。
@@ -58,13 +49,6 @@ pub struct PersistedConfig {
     /// 対局では `Some(sfen)` で、cold start 復元時もこの SFEN から `CoreRoom` を
     /// 組み直す。
     pub(crate) initial_sfen: Option<String>,
-    /// 対局開始時に確定した再接続 grace 時間（ミリ秒）。
-    ///
-    /// `websocket_close` 時に env を読み直すと、対局中の deploy / 設定変更で
-    /// token 配布有無と grace 判定がずれるため、マッチ単位で固定した値を保存する。
-    /// 旧 schema では存在しないため `None` として読み、保守的に grace 無効として扱う。
-    #[serde(default)]
-    pub(crate) reconnect_grace_ms: Option<u64>,
     /// 先手向けに発行した再接続トークン。`Game_Summary` 末尾拡張行で配布した
     /// 値そのまま (32 文字 hex)。`websocket_close` 時に grace registry へ写して
     /// 切断側 LOGIN reconnect 要求の `expected_token` 照合に使う。再接続プロトコル
@@ -76,95 +60,15 @@ pub struct PersistedConfig {
     /// 後手向けの再接続トークン。挙動・契約は [`Self::black_reconnect_token`] と同様。
     #[serde(default)]
     pub(crate) white_reconnect_token: Option<String>,
-    /// 対局開始時に確定した `%KACHI` 判定の入玉ルール (USI トークン、例 `CSARule27`)。
-    ///
-    /// env `ENTERING_KING_RULE` を対局中に変えても進行中の局が別ルールで判定されない
-    /// よう、マッチ単位で固定した値を保存する ([`Self::reconnect_grace_ms`] と同じ理由)。
-    /// 旧 schema には存在しないため `#[serde(default)]` で `None` として読み、
-    /// [`Self::entering_king_rule`] が [`crate::config::DEFAULT_ENTERING_KING_RULE`] に
-    /// フォールバックする。
-    #[serde(default)]
-    pub(crate) entering_king_rule: Option<String>,
-}
-
-impl PersistedConfig {
-    /// 保存した USI トークンから `%KACHI` 判定ルールを復元する。`None` / 不正
-    /// トークン (旧 schema・手書き改変) は [`crate::config::DEFAULT_ENTERING_KING_RULE`]。
-    pub(crate) fn entering_king_rule(&self) -> rshogi_core::types::EnteringKingRule {
-        self.entering_king_rule
-            .as_deref()
-            .and_then(rshogi_core::types::EnteringKingRule::from_usi)
-            .unwrap_or(crate::config::DEFAULT_ENTERING_KING_RULE)
-    }
 }
 
 /// 終局フラグ。一度 `Some` になったらその DO は同じ対局を二度開始しない。
-///
-/// `exported_at_ms` は R2 棋譜エクスポートが全 PUT 完了した時刻 (UNIX epoch ms)。
-/// `None` のあいだは終局はしているが R2 への書き出しが未完了で、R2 export retry の
-/// `KEY_EXPORT_PENDING` + `PendingAlarmKind::ExportRetry` 経路で再試行されている
-/// ことを示す。`#[serde(default)]` で旧 schema (このフィールド導入前の cold start
-/// snapshot) との互換を保つ。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinishedState {
     /// CSA 終局コード（`#RESIGN` / `#TIME_UP` / `#ILLEGAL_MOVE` 等）。
     pub(crate) result_code: String,
     /// 終局確定時刻（UNIX エポック ミリ秒）。
     pub(crate) ended_at_ms: u64,
-    /// R2 棋譜エクスポート完了時刻。`None` は export 未完了 (retry 待ち) を示す。
-    #[serde(default)]
-    pub(crate) exported_at_ms: Option<u64>,
-}
-
-/// 終局時の R2 export PUT のうち失敗した key を表すエントリ (R2 export retry)。
-///
-/// `body_kind` で再 PUT 時に乗せる本文 (`csa` = CSA 本文 / `meta` = JSON meta) を
-/// 区別する。`key` 文字列の prefix 推測ではなく明示分類にするのは、key 形式の
-/// 将来変更に対する堅牢性のため (例: `kifu-by-id/` と `games-index/` で同 JSON
-/// body だが path が違う、`YYYY/MM/DD/` と `kifu-by-id/` で同 CSA 本文だが path
-/// が違う、といった対応関係を struct で固定する)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FailedExportObject {
-    /// R2 オブジェクトキー (例: `2026/05/08/g1.csa` / `kifu-by-id/g1.meta.json`)。
-    pub(crate) key: String,
-    /// 再 PUT 時に本文として乗せる種別。
-    pub(crate) body_kind: ExportBodyKind,
-}
-
-/// `FailedExportObject` の本文種別。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExportBodyKind {
-    /// CSA V2 形式の棋譜本文 (`YYYY/MM/DD/<id>.csa` / `kifu-by-id/<id>.csa`)。
-    Csa,
-    /// `GamesIndexEntry` を serialize した JSON (`kifu-by-id/<id>.meta.json` /
-    /// `games-index/<inv>-<id>.json`)。
-    Meta,
-}
-
-/// 終局時に R2 export の一部または全部が失敗したときに DO storage へ残す
-/// retry payload。
-///
-/// CSA 本文 / meta JSON は finalize 時点で計算済のものをそのまま保存する
-/// (cold start 後でも `load_moves` を呼び直さず再 PUT できる)。`failed_keys`
-/// は初回 finalize 時点で実際に PUT 失敗した key のみが残り、retry alarm が
-/// 順番に再 PUT する。`attempt` は再試行回数で、`RETRY_DELAYS_SEC` の上限を
-/// 超えたら exhausted として alarm を停止する (= pending entry は残置し
-/// 観測性を保つ)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExportPendingState {
-    /// 対局 ID。観測ログ / cold start 後の retry 経路の primary key。
-    pub(crate) game_id: String,
-    /// 終局確定時刻。`exported_at_ms` を埋める際に再利用する。
-    pub(crate) ended_at_ms: u64,
-    /// 再 PUT 用の CSA V2 棋譜本文 (`Csa` 種別の `failed_keys` に流す)。
-    pub(crate) csa_text: String,
-    /// 再 PUT 用の meta JSON 本文 (`Meta` 種別の `failed_keys` に流す)。
-    pub(crate) meta_body: Vec<u8>,
-    /// 残っている再 PUT 対象 key 一覧 (初回 finalize で失敗したもの)。
-    pub(crate) failed_keys: Vec<FailedExportObject>,
-    /// これまでの retry 回数 (0 = 初回 finalize 後の最初の alarm が attempt=0)。
-    pub(crate) attempt: u32,
 }
 
 /// `moves` SQL テーブル 1 行分。replay / alarm で使う。
@@ -182,11 +86,6 @@ pub struct MoveRow {
     pub(crate) line: String,
     /// 手を受信した瞬間の wall-clock ミリ秒。replay の clock 復元に使う。
     pub(crate) at_ms: i64,
-    /// この手番で再接続により課金対象外とした累積時間（ミリ秒）。
-    /// `moves` と `reconnect_clock_credits` の LEFT JOIN で埋め、過去の補償手も
-    /// cold-start replay 時に同じ `T` / 時計消費へ復元する。
-    #[serde(default)]
-    pub(crate) reconnect_credit_ms: i64,
 }
 
 /// `replay_core_room` の戻り値。cold start 復元の各分岐をデータとして表現する。
@@ -203,11 +102,9 @@ pub enum ReplaySummary {
     /// 失敗系の小さい variant とのサイズ差を抑える目的で `Box` でくるんで持つ
     /// (clippy::large_enum_variant)。
     Restored {
-        /// 復元済み `CoreRoom`。終局手まで保存済みなら `Finished` となるため、
-        /// 呼び出し側は未完了の終局永続化を再開する。
+        /// 復元済み `CoreRoom`。`AgreeWaiting`（`play_started_at_ms = None`）または
+        /// `Playing`（AGREE 再送後）のどちらかの状態にある。
         core: Box<CoreRoom>,
-        /// 再開時にも終局手の告知を失わないよう保持する。
-        last_result: Option<HandleResult>,
     },
     /// 開始局面 SFEN が `CoreRoom::new` で拒否された。`reason` は console_log 用。
     InvalidSfen {
@@ -242,10 +139,9 @@ pub enum ReplaySummary {
 ///    検証に失敗したら [`ReplaySummary::InvalidSfen`] を返す
 /// 3. `cfg.play_started_at_ms` が `Some(t)` のとき:
 ///    - 両側に AGREE を `t` のタイムスタンプで再送して `Playing` に遷移
-///    - `moves` を ply 順に逐次 `handle_line` で再生する。各手の直前にその ply の
-///      `reconnect_credit_ms` を戻し、wall-clock タイムスタンプは
-///      `at_ms.max(0).max(t)` に正規化（負値や AGREE より前の `at_ms` は clock を
-///      巻き戻すため）
+///    - `moves` を ply 順に逐次 `handle_line` で再生する。各手の wall-clock
+///      タイムスタンプは `at_ms.max(0).max(t)` に正規化（負値や AGREE より
+///      前の `at_ms` は clock を巻き戻すため）
 /// 4. `play_started_at_ms = None` の場合は `AgreeWaiting` のまま返す
 ///
 /// 設計上、本関数は I/O を持たないため、ホスト target で網羅的にテスト可能。
@@ -259,7 +155,7 @@ pub fn replay_core_room(cfg: &PersistedConfig, moves: &[MoveRow]) -> ReplaySumma
             white: PlayerName::new(cfg.white_handle.clone()),
             max_moves: cfg.max_moves,
             time_margin_ms: cfg.time_margin_ms,
-            entering_king_rule: cfg.entering_king_rule(),
+            entering_king_rule: EnteringKingRule::Point24,
             initial_sfen: cfg.initial_sfen.clone(),
         },
         clock,
@@ -276,7 +172,6 @@ pub fn replay_core_room(cfg: &PersistedConfig, moves: &[MoveRow]) -> ReplaySumma
         // AGREE 前のスナップショットからの cold start。CoreRoom は AgreeWaiting で返す。
         return ReplaySummary::Restored {
             core: Box::new(core),
-            last_result: None,
         };
     };
 
@@ -290,7 +185,6 @@ pub fn replay_core_room(cfg: &PersistedConfig, moves: &[MoveRow]) -> ReplaySumma
             .expect("CoreRoom::new returns AgreeWaiting; AGREE from there must succeed");
     }
 
-    let mut last_result = None;
     for m in moves {
         let color = match m.color.as_str() {
             "black" => Color::Black,
@@ -302,91 +196,26 @@ pub fn replay_core_room(cfg: &PersistedConfig, moves: &[MoveRow]) -> ReplaySumma
                 };
             }
         };
-        core.restore_current_turn_reconnect_credit_ms(
-            m.reconnect_credit_ms.max(0) as u64,
-            cfg.clock.reconnect_compensation_limit_ms(),
-        );
         let ts = (m.at_ms.max(0) as u64).max(play_started_at_ms);
-        match core.handle_line(color, &CsaLine::new(&m.line), ts) {
-            Ok(result) => last_result = Some(result),
-            Err(e) => {
-                return ReplaySummary::MoveReplayFailed {
-                    ply: m.ply,
-                    line: m.line.clone(),
-                    reason: format!("{e:?}"),
-                };
-            }
+        if let Err(e) = core.handle_line(color, &CsaLine::new(&m.line), ts) {
+            return ReplaySummary::MoveReplayFailed {
+                ply: m.ply,
+                line: m.line.clone(),
+                reason: format!("{e:?}"),
+            };
         }
     }
 
     ReplaySummary::Restored {
         core: Box::new(core),
-        last_result,
     }
-}
-
-/// replay が返した告知を保ち、履歴にない裁定を生成しない。
-pub fn pending_finalization(result: Option<HandleResult>) -> Option<HandleResult> {
-    result.filter(|result| matches!(result.outcome, HandleOutcome::GameEnded(_)))
-}
-
-/// 告知前に保存する終局の裁定と終局時刻。isolate 破棄後の再開と再試行で
-/// 同じ裁定・同じ終局時刻 (R2 のキーと本文) を使うために残す。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FinalizingState {
-    /// 確定させる裁定。
-    pub result: rshogi_csa_server::game::result::GameResult,
-    /// 棋譜・履歴に記録する終局時刻 (epoch ms)。
-    pub ended_at_ms: u64,
-    /// 復帰後も終局手と時計を元の順序で告知するために残す。
-    pub broadcasts: Vec<FinalizingBroadcast>,
-    /// 外部イベントの頻度で再試行の猶予を消費しないため、初回と alarm のみ数える。
-    pub attempt: u32,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rshogi_csa_server::GameStatus;
-    use rshogi_csa_server::game::result::{GameResult, IllegalReason};
-
-    #[test]
-    fn finalizing_state_roundtrips_every_result() {
-        for result in [
-            GameResult::Toryo {
-                winner: Color::Black,
-            },
-            GameResult::TimeUp {
-                loser: Color::White,
-            },
-            GameResult::IllegalMove {
-                loser: Color::Black,
-                reason: IllegalReason::IllegalKachi,
-            },
-            GameResult::Kachi {
-                winner: Color::White,
-            },
-            GameResult::OuteSennichite {
-                loser: Color::Black,
-            },
-            GameResult::Sennichite,
-            GameResult::MaxMoves,
-            GameResult::Abnormal { winner: None },
-        ] {
-            let state = FinalizingState {
-                broadcasts: vec![FinalizingBroadcast {
-                    target: rshogi_csa_server::BroadcastTarget::All,
-                    line: "-5251OU,T3".into(),
-                    ply: Some(12),
-                }],
-                attempt: 3,
-                result,
-                ended_at_ms: 1_700_000_000_000,
-            };
-            let json = serde_json::to_string(&state).unwrap();
-            assert_eq!(serde_json::from_str::<FinalizingState>(&json).unwrap(), state);
-        }
-    }
+    use rshogi_csa_server::game::result::GameResult;
+    use rshogi_csa_server::game::room::{GameStatus, HandleOutcome};
     use rshogi_csa_server::record::kifu::primary_result_code;
 
     /// `play_started_at_ms` の代表値（適当な epoch ms）。テスト全体で共有。
@@ -396,25 +225,19 @@ mod tests {
         PersistedConfig {
             game_id: "room-1-test".to_owned(),
             black_handle: "alice".to_owned(),
-            black_player_id: crate::player_identity::legacy_player_id("alice"),
             white_handle: "bob".to_owned(),
-            white_player_id: crate::player_identity::legacy_player_id("bob"),
             game_name: "g1".to_owned(),
             clock: ClockSpec::Countdown {
                 total_time_sec: 60,
                 byoyomi_sec: 10,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
             },
             max_moves: 256,
             time_margin_ms: 0,
             matched_at_ms: PLAY_STARTED_AT_MS - 100,
             play_started_at_ms: None,
             initial_sfen: None,
-            reconnect_grace_ms: Some(0),
             black_reconnect_token: None,
             white_reconnect_token: None,
-            entering_king_rule: None,
         }
     }
 
@@ -424,7 +247,6 @@ mod tests {
             color: color.to_owned(),
             line: line.to_owned(),
             at_ms: (PLAY_STARTED_AT_MS + at_ms_offset_from_start) as i64,
-            reconnect_credit_ms: 0,
         }
     }
 
@@ -439,7 +261,7 @@ mod tests {
                 white: PlayerName::new(cfg.white_handle.clone()),
                 max_moves: cfg.max_moves,
                 time_margin_ms: cfg.time_margin_ms,
-                entering_king_rule: cfg.entering_king_rule(),
+                entering_king_rule: EnteringKingRule::Point24,
                 initial_sfen: cfg.initial_sfen.clone(),
             },
             cfg.clock.build_clock(),
@@ -458,10 +280,6 @@ mod tests {
                 "white" => Color::White,
                 _ => unreachable!("test data must use black/white only"),
             };
-            core.restore_current_turn_reconnect_credit_ms(
-                m.reconnect_credit_ms.max(0) as u64,
-                cfg.clock.reconnect_compensation_limit_ms(),
-            );
             let ts = (m.at_ms.max(0) as u64).max(t0);
             core.handle_line(color, &CsaLine::new(&m.line), ts)
                 .expect("move in directly_played");
@@ -470,171 +288,10 @@ mod tests {
     }
 
     #[test]
-    fn entering_king_rule_accessor_maps_token_and_falls_back() {
-        use rshogi_core::types::EnteringKingRule;
-        let mut cfg = baseline_config();
-        // 既定 (None) はフォールバック値。
-        assert_eq!(cfg.entering_king_rule(), crate::config::DEFAULT_ENTERING_KING_RULE);
-        cfg.entering_king_rule = Some("CSARule24".to_owned());
-        assert_eq!(cfg.entering_king_rule(), EnteringKingRule::Point24);
-        cfg.entering_king_rule = Some("bogus".to_owned());
-        assert_eq!(cfg.entering_king_rule(), crate::config::DEFAULT_ENTERING_KING_RULE);
-    }
-
-    #[test]
-    fn old_snapshot_without_rule_field_deserializes_to_default() {
-        // 本フィールド導入前に永続化された snapshot (entering_king_rule 欠落) を
-        // deserialize しても失敗せず、accessor は既定へフォールバックする。
-        let mut cfg = baseline_config();
-        cfg.entering_king_rule = Some("CSARule24".to_owned());
-        let mut json: serde_json::Value = serde_json::to_value(&cfg).unwrap();
-        json.as_object_mut().unwrap().remove("entering_king_rule");
-        let restored: PersistedConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(restored.entering_king_rule, None);
-        assert_eq!(restored.entering_king_rule(), crate::config::DEFAULT_ENTERING_KING_RULE);
-    }
-
-    #[test]
-    fn replay_preserves_full_repetition_history_and_terminal_broadcasts() {
-        let long_cycle = [
-            "+5949OU", "-5141OU", "+4939OU", "-4131OU", "+3938OU", "-3132OU", "+3837OU", "-3233OU",
-            "+3747OU", "-3343OU", "+4757OU", "-4353OU", "+5767OU", "-5363OU", "+6768OU", "-6362OU",
-            "+6869OU", "-6261OU", "+6959OU", "-6151OU",
-        ];
-        for (sfen, cycle, code) in [
-            ("4k4/9/9/9/9/9/9/9/4K4 b Pp 1", long_cycle.as_slice(), "#SENNICHITE"),
-            (
-                "9/6k2/9/9/9/9/9/6R2/K8 w - 1",
-                ["-3242OU", "+3848HI", "-4232OU", "+4838HI"].as_slice(),
-                "#OUTE_SENNICHITE",
-            ),
-            (
-                "9/5k3/9/9/9/9/9/6R2/K8 b - 1",
-                ["+3848HI", "-4232OU", "+4838HI", "-3242OU"].as_slice(),
-                "#OUTE_SENNICHITE",
-            ),
-        ] {
-            let mut cfg = baseline_config();
-            cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
-            cfg.initial_sfen = Some(sfen.to_owned());
-            let cfg: PersistedConfig =
-                serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-            let rows: Vec<_> = cycle
-                .iter()
-                .cycle()
-                .take(cycle.len() * 3)
-                .enumerate()
-                .map(|(ply, line)| {
-                    move_row(
-                        ply as i64 + 1,
-                        if line.starts_with('+') {
-                            "black"
-                        } else {
-                            "white"
-                        },
-                        line,
-                        0,
-                    )
-                })
-                .collect();
-            let rows: Vec<MoveRow> =
-                serde_json::from_str(&serde_json::to_string(&rows).unwrap()).unwrap();
-            let mut uninterrupted = directly_played(&cfg, &[]);
-            let split = rows.len() - 1;
-            for row in &rows[..split] {
-                let side = if row.color == "black" {
-                    Color::Black
-                } else {
-                    Color::White
-                };
-                let result = uninterrupted
-                    .handle_line(side, &CsaLine::new(&row.line), PLAY_STARTED_AT_MS)
-                    .unwrap();
-                assert!(matches!(result.outcome, HandleOutcome::MoveAccepted { .. }));
-            }
-            let ReplaySummary::Restored { mut core, .. } = replay_core_room(&cfg, &rows[..split])
-            else {
-                panic!("restore failed");
-            };
-            assert!(!matches!(core.status(), GameStatus::Finished(_)));
-            let last = &rows[split];
-            let side = if last.color == "black" {
-                Color::Black
-            } else {
-                Color::White
-            };
-            let expected = uninterrupted
-                .handle_line(side, &CsaLine::new(&last.line), PLAY_STARTED_AT_MS)
-                .unwrap();
-            let actual =
-                core.handle_line(side, &CsaLine::new(&last.line), PLAY_STARTED_AT_MS).unwrap();
-            assert_eq!(actual.outcome, expected.outcome);
-            if code == "#SENNICHITE" {
-                assert!(matches!(actual.outcome, HandleOutcome::GameEnded(GameResult::Sennichite)));
-                assert!(actual.broadcasts.iter().any(|b| b.line.as_str() == "#DRAW"));
-            } else {
-                assert!(matches!(
-                    actual.outcome,
-                    HandleOutcome::GameEnded(GameResult::OuteSennichite {
-                        loser: Color::Black
-                    })
-                ));
-                assert!(actual.broadcasts.iter().any(|b| b.line.as_str() == "#LOSE"));
-                assert!(actual.broadcasts.iter().any(|b| b.line.as_str() == "#WIN"));
-            }
-            assert!(actual.broadcasts.iter().any(|b| b.line.as_str() == code));
-            assert!(actual.broadcasts.iter().any(
-                |b| b.ply == Some(rows.len() as u32) && b.line.as_str().starts_with(&last.line)
-            ));
-            let messages = |result: &rshogi_csa_server::game::room::HandleResult| {
-                result
-                    .broadcasts
-                    .iter()
-                    .map(|b| (b.target, b.line.as_str().to_owned(), b.ply))
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(messages(&actual), messages(&expected));
-            let ReplaySummary::Restored {
-                core: finished,
-                last_result,
-            } = replay_core_room(&cfg, &rows)
-            else {
-                panic!("terminal move restore failed");
-            };
-            assert_eq!(finished.status(), core.status());
-            assert_eq!(finished.moves_played(), rows.len() as u32);
-            let pending = pending_finalization(last_result).expect("終局の永続化が必要");
-            assert_eq!(pending.outcome, expected.outcome);
-            assert_eq!(pending.broadcasts, expected.broadcasts);
-        }
-    }
-
-    #[test]
-    fn pending_finalization_preserves_max_moves_after_terminal_move_replay() {
-        let mut cfg = baseline_config();
-        assert!(pending_finalization(None).is_none());
-        cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
-        cfg.max_moves = 1;
-        let rows = [move_row(1, "black", "+7776FU", 0)];
-        let ReplaySummary::Restored {
-            mut core,
-            last_result,
-        } = replay_core_room(&cfg, &rows)
-        else {
-            panic!("terminal move restore failed");
-        };
-        assert_eq!(core.force_time_up(Color::White).outcome, HandleOutcome::Continue);
-        let pending = pending_finalization(last_result).expect("終局の永続化が必要");
-        assert_eq!(pending.outcome, HandleOutcome::GameEnded(GameResult::MaxMoves));
-        assert!(pending.broadcasts.iter().any(|entry| entry.ply == Some(1)));
-        assert_eq!(core.moves_played(), 1);
-    }
-
-    #[test]
     fn replay_without_play_started_returns_agree_waiting_room() {
         let cfg = baseline_config();
         let summary = replay_core_room(&cfg, &[]);
-        let ReplaySummary::Restored { core, .. } = summary else {
+        let ReplaySummary::Restored { core } = summary else {
             panic!("expected Restored, got {summary:?}");
         };
         assert!(matches!(core.status(), GameStatus::AgreeWaiting));
@@ -646,7 +303,7 @@ mod tests {
         let mut cfg = baseline_config();
         cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
         let summary = replay_core_room(&cfg, &[]);
-        let ReplaySummary::Restored { core, .. } = summary else {
+        let ReplaySummary::Restored { core } = summary else {
             panic!("expected Restored, got {summary:?}");
         };
         assert!(matches!(core.status(), GameStatus::Playing));
@@ -666,7 +323,6 @@ mod tests {
 
         let ReplaySummary::Restored {
             core: replayed_core,
-            ..
         } = replay_core_room(&cfg, &moves)
         else {
             panic!("expected Restored");
@@ -698,39 +354,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replay_reapplies_credit_for_past_reconnected_turns() {
-        let mut cfg = baseline_config();
-        cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
-        cfg.clock = ClockSpec::Countdown {
-            total_time_sec: 1,
-            byoyomi_sec: 1,
-            black_total_time_sec: None,
-            white_total_time_sec: None,
-        };
-        let mut first = move_row(1, "black", "+7776FU,T2", 3_500);
-        first.reconnect_credit_ms = 1_000;
-        let second = move_row(2, "white", "-3334FU,T0", 4_000);
-        let moves = vec![first.clone(), second.clone()];
-
-        let ReplaySummary::Restored { core, .. } = replay_core_room(&cfg, &moves) else {
-            panic!("credit を含む過去手は replay できる必要がある");
-        };
-        assert_eq!(core.moves_played(), 2);
-        assert_eq!(core.current_turn(), Color::Black);
-        assert_eq!(core.clock_remaining_main_ms(Color::Black), 0);
-        assert_eq!(core.clock_remaining_main_ms(Color::White), 1_000);
-
-        // 同じ wall-clock 列で credit が無いと先手 1 手目が TimeUp になり、後手を
-        // replay できない。テストが credit 適用を実際に必要としていることを固定する。
-        let mut without_credit = moves;
-        without_credit[0].reconnect_credit_ms = 0;
-        assert!(matches!(
-            replay_core_room(&cfg, &without_credit),
-            ReplaySummary::MoveReplayFailed { ply: 2, .. }
-        ));
-    }
-
     /// Fischer / StopWatch でも replay 後の `clock_turn_budget_ms` と本体残時間が
     /// 中断なし構築と完全一致する。`clock_remaining_main_ms` だけでは increment や
     /// byoyomi の状態崩壊を捕捉できないため、各 ClockSpec で turn_budget も比較する。
@@ -740,20 +363,14 @@ mod tests {
             ClockSpec::Countdown {
                 total_time_sec: 60,
                 byoyomi_sec: 10,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
             },
             ClockSpec::Fischer {
                 total_time_sec: 60,
                 increment_sec: 5,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
             },
             ClockSpec::StopWatch {
                 total_time_min: 1,
                 byoyomi_min: 1,
-                black_total_time_min: None,
-                white_total_time_min: None,
             },
         ];
         let moves = vec![
@@ -766,7 +383,6 @@ mod tests {
             cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
             let ReplaySummary::Restored {
                 core: replayed_core,
-                ..
             } = replay_core_room(&cfg, &moves)
             else {
                 panic!("expected Restored for {clock:?}");
@@ -802,7 +418,6 @@ mod tests {
 
         let ReplaySummary::Restored {
             core: replayed_core,
-            ..
         } = replay_core_room(&cfg, &moves)
         else {
             panic!("expected Restored");
@@ -851,7 +466,6 @@ mod tests {
 
         let ReplaySummary::Restored {
             core: mut replayed_core,
-            ..
         } = replay_core_room(&cfg, &played_moves)
         else {
             panic!("expected Restored");
@@ -890,7 +504,6 @@ mod tests {
         cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
         let ReplaySummary::Restored {
             core: mut replayed_core,
-            ..
         } = replay_core_room(&cfg, &[])
         else {
             panic!("expected Restored");
@@ -915,101 +528,6 @@ mod tests {
         }
     }
 
-    /// hibernation evict を跨いだ cold start で replay 直後の `turn_started_at_ms`
-    /// は最後の手の at_ms のまま残る (#852 の計時統一)。DO 側は起点を「今」へ
-    /// 張り直さないため、休眠滞留を跨いで実時間が予算を超えていれば、live 側の次の
-    /// 手でも replay 同様に `TimeUp` する。live と replay が同じ規則で課金される
-    /// (= 乖離しない) ことを固定する対照テスト
-    /// (<https://github.com/SH11235/rshogi/issues/852>)。
-    #[test]
-    fn cold_start_charges_real_elapsed_and_times_out_when_over_budget() {
-        let mut cfg = baseline_config();
-        cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
-        let moves = vec![move_row(1, "black", "+7776FU,T3", 3_000)];
-        let ReplaySummary::Restored { mut core, .. } = replay_core_room(&cfg, &moves) else {
-            panic!("expected Restored");
-        };
-        // 黒の手 (at_ms = PLAY_STARTED + 3s) の 30 分後に白が指す（白番の長考中に DO
-        // が evict され、復帰後に着手した状況）。本体 60s + 秒読み 10s の予算を実時間が
-        // 大きく超えるため、live 側 (handle_line) でも TimeUp(White) になる。これが
-        // 従来 replay 側だけが TimeUp し live と乖離していた幽霊 TimeUp を解消する。
-        let resumed_at_ms = PLAY_STARTED_AT_MS + 30 * 60_000;
-        let result = core
-            .handle_line(Color::White, &CsaLine::new("-3334FU,T1"), resumed_at_ms + 1_000)
-            .expect("handle_line itself must succeed");
-        assert!(
-            matches!(
-                result.outcome,
-                HandleOutcome::GameEnded(GameResult::TimeUp {
-                    loser: Color::White
-                })
-            ),
-            "実時間が予算超過なら live 側でも TimeUp するはず: {:?}",
-            result.outcome
-        );
-    }
-
-    /// 「大きな at_ms ギャップ (長考) を含む手列」でも各手の実消費が予算内なら、
-    /// replay は `MoveReplayFailed` にならず `Restored` する (#852 root fix の対照)。
-    /// 本番で発症した fischer-60-5F を模し、40 秒級の長考を 2 手繋いでも 60s バンク +
-    /// 5s increment の予算内なので TimeUp しない
-    /// (<https://github.com/SH11235/rshogi/issues/852>)。
-    #[test]
-    fn cold_start_replay_with_large_but_within_budget_fischer_gaps_restores() {
-        let mut cfg = baseline_config();
-        cfg.clock = ClockSpec::Fischer {
-            total_time_sec: 60,
-            increment_sec: 5,
-            black_total_time_sec: None,
-            white_total_time_sec: None,
-        };
-        cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
-        // 黒 40s 長考 → 白 40s 長考。いずれも 60s バンク + 5s increment の予算内。
-        let moves = vec![
-            move_row(1, "black", "+7776FU,T40", 40_000),
-            move_row(2, "white", "-3334FU,T40", 80_000),
-        ];
-        let ReplaySummary::Restored { core, .. } = replay_core_room(&cfg, &moves) else {
-            panic!("予算内の長考なら Restored のはず (MoveReplayFailed になってはいけない)");
-        };
-        assert_eq!(core.moves_played(), 2);
-        // 予算内なので両者とも残時間が正 (TimeUp していない)。
-        assert!(core.clock_remaining_main_ms(Color::Black) > 0);
-        assert!(core.clock_remaining_main_ms(Color::White) > 0);
-    }
-
-    /// cold-start 復元後の alarm 判定を固定する (#852)。計時起点を張り直さないので、
-    /// 実時間が予算を超えた `now` では `current_turn_remaining_ms` が `0` を返し、
-    /// alarm は `force_time_up` を発火する。予算内の `now` では残時間が正で、alarm は
-    /// 残時間ぶん貼り直す (<https://github.com/SH11235/rshogi/issues/852>)。
-    #[test]
-    fn cold_start_alarm_decides_time_up_from_real_remaining() {
-        let mut cfg = baseline_config();
-        cfg.play_started_at_ms = Some(PLAY_STARTED_AT_MS);
-        let moves = vec![move_row(1, "black", "+7776FU,T3", 3_000)];
-        let ReplaySummary::Restored { mut core, .. } = replay_core_room(&cfg, &moves) else {
-            panic!("expected Restored");
-        };
-        // 次手番は白。計時起点は黒の手の at_ms (= PLAY_STARTED + 3s) のまま。
-        let turn_start = PLAY_STARTED_AT_MS + 3_000;
-        let budget = core.clock_turn_budget_ms(Color::White).max(0) as u64;
-        assert!(budget > 0);
-        // 予算内の now → 残時間が正 → alarm は reschedule する。
-        let within = turn_start + budget / 2;
-        assert_eq!(core.current_turn_remaining_ms(within), Some(budget - budget / 2));
-        // 予算超過の now (30 分後) → 残 0 → alarm は force_time_up する。
-        let over = turn_start + 30 * 60_000;
-        assert_eq!(core.current_turn_remaining_ms(over), Some(0));
-        // 実際に force_time_up が GameEnded(TimeUp{White}) を返すこと。
-        let result = core.force_time_up(core.current_turn());
-        assert!(matches!(
-            result.outcome,
-            HandleOutcome::GameEnded(GameResult::TimeUp {
-                loser: Color::White
-            })
-        ));
-    }
-
     /// `MoveRow::at_ms` が 0 未満や `play_started_at_ms` より小さい異常値でも、
     /// `replay_core_room` が `at_ms.max(0).max(play_started_at_ms)` で正規化する
     /// 結果として時計が巻き戻らないことを直接検証する。`directly_played` ヘルパに
@@ -1027,19 +545,16 @@ mod tests {
                 color: "black".to_owned(),
                 line: "+7776FU,T0".to_owned(),
                 at_ms: -42,
-                reconnect_credit_ms: 0,
             },
             MoveRow {
                 ply: 2,
                 color: "white".to_owned(),
                 line: "-3334FU,T0".to_owned(),
                 at_ms: (PLAY_STARTED_AT_MS - 10_000) as i64,
-                reconnect_credit_ms: 0,
             },
         ];
         let ReplaySummary::Restored {
             core: replayed_core,
-            ..
         } = replay_core_room(&cfg, &moves)
         else {
             panic!("expected Restored");
@@ -1100,59 +615,11 @@ mod tests {
         let original = FinishedState {
             result_code: "#RESIGN".to_owned(),
             ended_at_ms: PLAY_STARTED_AT_MS + 9_000,
-            exported_at_ms: Some(PLAY_STARTED_AT_MS + 9_500),
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: FinishedState = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.result_code, original.result_code);
         assert_eq!(restored.ended_at_ms, original.ended_at_ms);
-        assert_eq!(restored.exported_at_ms, original.exported_at_ms);
-    }
-
-    /// 旧 schema (`exported_at_ms` フィールド導入前) で書かれた DO storage
-    /// 値が `#[serde(default)]` 経由で `None` として deserialize できることを
-    /// 固定する。この契約が壊れると cold start 後の DO で
-    /// `load_finished` が失敗し、終局済 DO が新規 LOGIN を受け付ける退行になる。
-    #[test]
-    fn finished_state_deserializes_when_exported_at_ms_absent() {
-        let json = r##"{
-            "result_code": "#RESIGN",
-            "ended_at_ms": 1234567890
-        }"##;
-        let restored: FinishedState = serde_json::from_str(json).unwrap();
-        assert_eq!(restored.result_code, "#RESIGN");
-        assert_eq!(restored.ended_at_ms, 1_234_567_890);
-        assert_eq!(restored.exported_at_ms, None);
-    }
-
-    /// `ExportPendingState` の round-trip 固定 (R2 export retry の永続化契約)。
-    /// `failed_keys` の `body_kind` が `csa` / `meta` の lower snake で
-    /// wire される (rename_all) ことも実装契約として固定する。
-    #[test]
-    fn export_pending_state_round_trips_through_serde_json() {
-        let original = ExportPendingState {
-            game_id: "lobby-1".to_owned(),
-            ended_at_ms: PLAY_STARTED_AT_MS + 10_000,
-            csa_text: "V2.2\nN+alice\nN-bob\n".to_owned(),
-            meta_body: br#"{"game_id":"lobby-1"}"#.to_vec(),
-            failed_keys: vec![
-                FailedExportObject {
-                    key: "2026/05/08/lobby-1.csa".to_owned(),
-                    body_kind: ExportBodyKind::Csa,
-                },
-                FailedExportObject {
-                    key: "kifu-by-id/lobby-1.meta.json".to_owned(),
-                    body_kind: ExportBodyKind::Meta,
-                },
-            ],
-            attempt: 1,
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        // wire 形式で `body_kind` が snake_case の lower 表現になっていること
-        assert!(json.contains(r#""body_kind":"csa""#), "json={json}");
-        assert!(json.contains(r#""body_kind":"meta""#), "json={json}");
-        let restored: ExportPendingState = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored, original);
     }
 
     #[test]
@@ -1163,135 +630,11 @@ mod tests {
         let buoy_sfen = "lnsg1gsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL w - 1";
         cfg.initial_sfen = Some(buoy_sfen.to_owned());
         let summary = replay_core_room(&cfg, &[]);
-        let ReplaySummary::Restored { core, .. } = summary else {
+        let ReplaySummary::Restored { core } = summary else {
             panic!("expected Restored, got {summary:?}");
         };
         // SFEN ラウンドトリップで開始局面が保たれること。`current_turn` も白で一致する。
         assert_eq!(core.position().to_sfen(), buoy_sfen);
         assert_eq!(core.current_turn(), Color::White);
-    }
-
-    /// 旧 schema (本フィールド導入前の cold start snapshot) に
-    /// `black_reconnect_token` / `white_reconnect_token` フィールドが存在しなくても、
-    /// `#[serde(default)]` で `None` として deserialize できる。https://github.com/SH11235/rshogi/issues/591 hotfix で
-    /// `start_match` が常に `Some` を書く挙動から `None` も書く挙動に変わったため、
-    /// 旧 snapshot との互換性を回帰防止する。
-    #[test]
-    fn persisted_config_deserializes_when_reconnect_token_fields_absent() {
-        let json = r#"{
-            "game_id": "room-1-old",
-            "black_handle": "alice",
-            "white_handle": "bob",
-            "game_name": "g1",
-            "clock": {"kind":"countdown","total_time_sec":60,"byoyomi_sec":10},
-            "max_moves": 256,
-            "time_margin_ms": 0,
-            "matched_at_ms": 999000,
-            "play_started_at_ms": null,
-            "initial_sfen": null
-        }"#;
-        let cfg: PersistedConfig =
-            serde_json::from_str(json).expect("旧 schema は default 経由で deserialize できる");
-        assert_eq!(cfg.reconnect_grace_ms, None);
-        assert_eq!(cfg.black_reconnect_token, None);
-        assert_eq!(cfg.white_reconnect_token, None);
-        assert!(cfg.black_player_id.is_empty());
-        assert!(cfg.white_player_id.is_empty());
-    }
-
-    /// 明示 `null` 値は `None` として読まれる (`#[serde(default)]` と同等の振る舞い)。
-    #[test]
-    fn persisted_config_deserializes_null_reconnect_token_as_none() {
-        let json = r#"{
-            "game_id": "room-1-null",
-            "black_handle": "alice",
-            "white_handle": "bob",
-            "game_name": "g1",
-            "clock": {"kind":"countdown","total_time_sec":60,"byoyomi_sec":10},
-            "max_moves": 256,
-            "time_margin_ms": 0,
-            "matched_at_ms": 999000,
-            "play_started_at_ms": null,
-            "initial_sfen": null,
-            "reconnect_grace_ms": null,
-            "black_reconnect_token": null,
-            "white_reconnect_token": null
-        }"#;
-        let cfg: PersistedConfig =
-            serde_json::from_str(json).expect("null 値は None として deserialize できる");
-        assert_eq!(cfg.reconnect_grace_ms, None);
-        assert_eq!(cfg.black_reconnect_token, None);
-        assert_eq!(cfg.white_reconnect_token, None);
-    }
-
-    /// 値あり (`grace > 0` で `start_match` が token を発行した場合の永続化形式) も
-    /// そのまま読み込める。grace 値と token 値の round-trip を pin する。
-    #[test]
-    fn persisted_config_round_trips_with_reconnect_token_values() {
-        let mut original = baseline_config();
-        original.entering_king_rule = Some("CSARule24".into());
-        original.reconnect_grace_ms = Some(30_000);
-        original.black_reconnect_token = Some("a".repeat(32));
-        original.white_reconnect_token = Some("b".repeat(32));
-        let json = serde_json::to_string(&original).expect("serialize cfg");
-        let restored: PersistedConfig =
-            serde_json::from_str(&json).expect("deserialize cfg with token values");
-        assert_eq!(restored.entering_king_rule(), rshogi_core::types::EnteringKingRule::Point24);
-        assert_eq!(restored.reconnect_grace_ms, original.reconnect_grace_ms);
-        assert_eq!(restored.black_reconnect_token, original.black_reconnect_token);
-        assert_eq!(restored.white_reconnect_token, original.white_reconnect_token);
-    }
-
-    #[test]
-    fn persisted_config_ignores_incompatible_color_fields() {
-        let original = baseline_config();
-        let mut value = serde_json::to_value(&original).unwrap();
-        value["clock"]["black_total_time_min"] = 3.into();
-        value["clock"]["white_total_time_ms"] = 8.into();
-        let restored: PersistedConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(restored.clock, original.clock);
-    }
-
-    #[test]
-    fn color_totals_survive_persistence_and_replay() {
-        for kind in ["countdown", "fischer", "countdown_msec", "stopwatch"] {
-            let (unit, extra, factor) = match kind {
-                "countdown_msec" => ("ms", "byoyomi_ms", 1),
-                "stopwatch" => ("min", "byoyomi_min", 60_000),
-                "fischer" => ("sec", "increment_sec", 1000),
-                _ => ("sec", "byoyomi_sec", 1000),
-            };
-            let mut value = serde_json::to_value(baseline_config()).unwrap();
-            value["play_started_at_ms"] = PLAY_STARTED_AT_MS.into();
-            value["clock"] =
-                serde_json::json!({"kind": kind, format!("total_time_{unit}"): 10, extra: 2});
-            for asymmetric in [false, true] {
-                if asymmetric {
-                    value["clock"][format!("black_total_time_{unit}")] = 3.into();
-                    value["clock"][format!("white_total_time_{unit}")] = 8.into();
-                }
-                let cfg: PersistedConfig = serde_json::from_value(value.clone()).unwrap();
-                let saved = serde_json::to_string(&cfg).unwrap();
-                let restored: PersistedConfig = serde_json::from_str(&saved).unwrap();
-                assert_eq!(restored.clock, cfg.clock);
-                let moves = [
-                    move_row(1, "black", "+7776FU,T1", factor),
-                    move_row(2, "white", "-3334FU,T2", 3 * factor),
-                ];
-                let ReplaySummary::Restored { core, .. } = replay_core_room(&restored, &moves)
-                else {
-                    panic!("restore failed");
-                };
-                let inc = if kind == "fischer" { 4 } else { 0 };
-                assert_eq!(
-                    core.clock_remaining_main_ms(Color::Black),
-                    ((if asymmetric { 3 } else { 10 }) - 1 + inc) * factor as i64
-                );
-                assert_eq!(
-                    core.clock_remaining_main_ms(Color::White),
-                    ((if asymmetric { 8 } else { 10 }) - 2 + inc) * factor as i64
-                );
-            }
-        }
     }
 }

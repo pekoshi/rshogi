@@ -47,13 +47,12 @@
 ///
 /// 変更は `<out-dir>/control_history.jsonl` に追記され、`pair_index` 整合は維持されるため
 /// `analyze_selfplay` の集計と矛盾しない。
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -64,23 +63,13 @@ use crossbeam_channel as chan;
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 
-use tools::selfplay::adjudication::parse_agreement_rule;
-use tools::selfplay::cpu_affinity::{CpuAffinityMode, discover_numa_cpu_affinities};
-use tools::selfplay::engine::PonderStats;
 use tools::selfplay::game::{GameConfig, MoveEvent, run_game};
-use tools::selfplay::nps_bench;
 use tools::selfplay::time_control::TimeControl;
 use tools::selfplay::types::{EvalLog, side_label};
-use tools::selfplay::{CONTROL_HISTORY_FILE_NAME, DrawRule, ResignRule};
 use tools::selfplay::{
-    EngineConfig, EngineProcess, GameOutcome, ParsedPosition,
-    ensure_start_positions_within_max_moves, load_start_positions,
+    EngineConfig, EngineProcess, GameOutcome, ParsedPosition, load_start_positions,
 };
-use tools::sprt::{Decision, GameSide, Penta, SprtMetaLog, SprtParameters, SprtStopLog, judge};
-
-#[path = "tournament/startpos_cycle.rs"]
-mod startpos_cycle;
-use startpos_cycle::{CyclePosition, CycleState};
+use tools::sprt::{Decision, GameSide, Penta, SprtMetaLog, SprtParameters, judge};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -102,56 +91,30 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     games: u32,
 
-    /// Play exactly one game with engines in Black, White order.
-    #[arg(long, conflicts_with_all = ["games", "sprt", "base_label"])]
-    single_game: bool,
-
-    /// Pass the start position's move sequence to the engines and repetition adjudicator.
-    #[arg(long)]
-    preserve_start_history: bool,
-
     /// Number of concurrent workers
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
 
-    /// Byoyomi time per move in milliseconds (mutually exclusive with --btime/--binc/--wtime/--winc)
+    /// Byoyomi time per move in milliseconds (mutually exclusive with --btime/--binc)
     #[arg(long, default_value_t = 0)]
     byoyomi: u64,
 
-    /// 先手の持ち時間（ミリ秒、Fischer 時計、--byoyomi と排他）
+    /// Initial time per side in milliseconds (Fischer clock, mutually exclusive with --byoyomi)
     #[arg(long, default_value_t = 0)]
     btime: u64,
 
-    /// 先手の加算時間（ミリ秒、Fischer 時計、--byoyomi と排他）
+    /// Increment per move in milliseconds (Fischer clock, mutually exclusive with --byoyomi)
     #[arg(long, default_value_t = 0)]
     binc: u64,
 
-    /// 後手の持ち時間（ミリ秒、省略時 --btime）。Fischer 専用、単独指定不可、先後それぞれ持ち時間か加算の正値が必須
-    #[arg(long)]
-    wtime: Option<u64>,
+    /// 後手だけ別の持ち時間 (ms)。 0 なら --btime と同値 (従来と bit-exact)。
+    /// 電竜戦は 先手 3 分 / 後手 10 分 の非対称なので使う。
+    #[arg(long, default_value_t = 0)]
+    wtime: u64,
 
-    /// 後手の加算時間（ミリ秒、省略時 --binc）。Fischer 専用、単独指定不可、先後それぞれ持ち時間か加算の正値が必須
-    #[arg(long)]
-    winc: Option<u64>,
-
-    /// Fischer 専用: `--btime` / `--binc` (と `--wtime` / `--winc`) を基準 NPS での時計とみなし、
-    /// 開始時に測ったこの機械の NPS との比 (基準 ÷ 実測) を掛けて指す。bench は SPRT の base
-    /// (`--sprt-base-label`、省略時 `--base-label`) の engine で測る。
-    #[arg(long, default_value_t = false)]
-    nps_scaling: bool,
-
-    /// `--nps-scaling` の基準 NPS (1 thread あたり、全 slot 同時)。既定 350000。
-    #[arg(long)]
-    reference_nps: Option<u64>,
-
-    /// `--nps-scaling` の足切り。実測 NPS が基準のこの割合未満なら起動を拒否する。既定 0.5。
-    #[arg(long)]
-    min_nps_ratio: Option<f64>,
-
-    /// engine の CPU affinity。numa は worker ごとに Threads 個の論理 CPU を同一 NUMA node 内から
-    /// 割り当て、その worker の全 engine を固定する (Linux 専用)。
-    #[arg(long, value_enum, default_value_t = CpuAffinityMode::Off)]
-    cpu_affinity: CpuAffinityMode,
+    /// 後手だけ別の加算 (ms)。 0 なら --binc と同値。
+    #[arg(long, default_value_t = 0)]
+    winc: u64,
 
     /// Threads per engine
     #[arg(long, default_value_t = 1)]
@@ -170,10 +133,6 @@ struct Cli {
     #[arg(long = "engine-usi-option", num_args = 1..)]
     engine_usi_options: Option<Vec<String>>,
 
-    /// engine ごとの ponder (INDEX:true / INDEX:false、複数指定可)。既定は全 engine 無効。
-    #[arg(long, num_args = 1..)]
-    ponder: Vec<String>,
-
     /// Make --engine-usi-option replace common --usi-option for that engine.
     #[arg(long = "strict-engine-usi-option")]
     strict_engine_usi_option: bool,
@@ -184,37 +143,26 @@ struct Cli {
     #[arg(long = "engine-params-file", num_args = 1..)]
     engine_params_files: Option<Vec<String>>,
 
-    /// 引分とする総手数。開始局面までの手数 (SFEN の手数欄と開始手順) も含めて数える。
+    /// Maximum plies per game
     #[arg(long, default_value_t = 512)]
     max_moves: u32,
-    /// 評価値による投了裁定 (movecount=3,score=600)。既定 off。
-    #[arg(long, value_parser = clap::value_parser!(ResignRule))]
-    adjudicate_resign: Option<ResignRule>,
-    /// 評価値による勝ち裁定 (movecount=3,score=600)。既定 off。
-    #[arg(long, value_parser = clap::value_parser!(ResignRule))]
-    adjudicate_win: Option<ResignRule>,
-    /// 評価値による引分裁定 (movenumber=34,movecount=8,score=20)。手数は開始局面からの対局内 ply。
-    #[arg(long, value_parser = clap::value_parser!(DrawRule))]
-    adjudicate_draw: Option<DrawRule>,
-    /// 両側の評価の一致による勝敗の裁定 (movecount=3,score=800)。勝ち側の自己視点が +score 以上、
-    /// 負け側の自己視点が -score 以下の状態が両側とも自分の直近 movecount 手で続いたら裁定する。既定 off。
-    #[arg(long, value_parser = parse_agreement_rule)]
-    adjudicate_agreement: Option<ResignRule>,
 
-    /// 出力ディレクトリ。既存の対局出力がある場合は拒否する。
+    /// Output directory (required)
     #[arg(long)]
     out_dir: PathBuf,
 
     /// Start position file (USI position lines, one per line)
     #[arg(long)]
     startpos_file: Option<PathBuf>,
-    /// 開始局面の割り当て順。sequential は seed を使わない。cycle はファイルを読み直して均一巡回する。
-    #[arg(long, value_enum, default_value_t = StartposOrder::Random)]
-    startpos_order: StartposOrder,
 
     /// 開始局面選択用の乱数 seed。省略時は entropy から生成して起動ログに表示する。
     #[arg(long)]
     seed: Option<u64>,
+
+    /// 開始局面を seed によるランダム選択ではなく、 ペア通番で順番に使う (p2shogi 独自)。
+    /// 同一局面集で条件だけ変えた A/B を回すとき、 両者に同じ局面列を割り当てるために使う。
+    #[arg(long, default_value_t = false)]
+    startpos_sequential: bool,
 
     /// Report progress every N games
     #[arg(long, default_value_t = 10)]
@@ -257,12 +205,12 @@ struct Cli {
     #[arg(long)]
     sprt_base_label: Option<String>,
 
-    /// H0 仮説の正規化 Elo（default: 0.0）。負値も `--sprt-nelo0 -10` の形で受け付ける。
-    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    /// H0 仮説の正規化 Elo（default: 0.0）
+    #[arg(long, default_value_t = 0.0)]
     sprt_nelo0: f64,
 
-    /// H1 仮説の正規化 Elo（default: 5.0）。負値もスペース区切りで受け付ける（例: `--sprt-nelo0 -20 --sprt-nelo1 -5`。nelo0 < nelo1 必須）。
-    #[arg(long, default_value_t = 5.0, allow_negative_numbers = true)]
+    /// H1 仮説の正規化 Elo（default: 5.0）
+    #[arg(long, default_value_t = 5.0)]
     sprt_nelo1: f64,
 
     /// 第一種過誤率 α（default: 0.05）
@@ -292,7 +240,6 @@ struct MatchTicket {
     white_idx: usize,
     /// 開始局面インデックス
     startpos_idx: usize,
-    cycle_position: Option<Arc<CyclePosition>>,
     /// 同じ startpos の先後入替ペアの通し番号（0, 1, 2, ... = ペアの index）
     pair_index: u32,
     /// ペア内のスロット: 0 = 1 局目, 1 = 2 局目（先後入替）
@@ -307,7 +254,6 @@ struct MatchResult {
     reason: String,
     plies: u32,
     move_logs: Vec<MoveLogEntry>,
-    ponder: Option<[PonderStats; 2]>,
     /// エンジン起動失敗・通信エラー等で対局が成立しなかった場合 true。
     /// SPRT 集計からは除外される。
     error: bool,
@@ -336,8 +282,6 @@ struct MoveLogEntry {
 
 #[derive(Serialize)]
 struct ResultLogEntry<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ponder: Option<[PonderStats; 2]>,
     #[serde(rename = "type")]
     kind: &'static str,
     game_id: u32,
@@ -356,10 +300,6 @@ struct ResultLogEntry<'a> {
     attempt: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     startpos_idx: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    startpos: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    startpos_name: Option<&'a str>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     error: bool,
 }
@@ -381,76 +321,21 @@ struct MetaLogEntry {
     /// analyze_selfplay 側でラベル自動推定に利用する。
     #[serde(skip_serializing_if = "Option::is_none")]
     sprt: Option<SprtMetaLog>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nps_scaling: Option<NpsScalingMeta>,
-}
-
-/// `--nps-scaling` の較正。run 開始時に 1 回測り、run 中は固定する。
-#[derive(Clone, Serialize)]
-struct NpsScalingMeta {
-    bench_version: &'static str,
-    /// bench を走らせた engine (SPRT の base)。
-    bench_engine_label: String,
-    reference_nps: u64,
-    min_nps_ratio: f64,
-    measured_nps: f64,
-    slot_nps: Vec<f64>,
-    /// 基準 ÷ 実測。持ち時間と加算の両方に掛ける。時間切れ判定のマージンには掛けない。
-    scale: f64,
-    reference_btime: u64,
-    reference_binc: u64,
-    reference_wtime: u64,
-    reference_winc: u64,
-    btime: u64,
-    binc: u64,
-    wtime: u64,
-    winc: u64,
-    bench_depth: u32,
-    warmup_depth: u32,
-    bench_positions: usize,
-    threads: usize,
-    slots: usize,
-    measured_at: String,
-}
-
-impl NpsScalingMeta {
-    fn time_control(&self) -> TimeControl {
-        TimeControl::new(self.btime, self.wtime, self.binc, self.winc, 0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum StartposOrder {
-    Random,
-    Sequential,
-    Cycle,
 }
 
 #[derive(Serialize)]
 struct MetaSettings {
-    startpos_order: StartposOrder,
     games: u32,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    single_game: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    preserve_start_history: bool,
     seed: u64,
     max_moves: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    adjudicate_resign: Option<ResignRule>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    adjudicate_win: Option<ResignRule>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    adjudicate_draw: Option<DrawRule>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    adjudicate_agreement: Option<ResignRule>,
     byoyomi: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
     btime: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
     binc: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
     wtime: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
     winc: u64,
     timeout_margin_ms: u64,
     threads: usize,
@@ -459,33 +344,6 @@ struct MetaSettings {
     depth: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nodes: Option<u64>,
-}
-
-impl MetaSettings {
-    fn new(cli: &Cli, time_control: TimeControl, seed: u64) -> Self {
-        Self {
-            startpos_order: cli.startpos_order,
-            games: if cli.single_game { 1 } else { cli.games * 2 },
-            single_game: cli.single_game,
-            preserve_start_history: cli.preserve_start_history,
-            seed,
-            max_moves: cli.max_moves,
-            adjudicate_resign: cli.adjudicate_resign,
-            adjudicate_win: cli.adjudicate_win,
-            adjudicate_draw: cli.adjudicate_draw,
-            adjudicate_agreement: cli.adjudicate_agreement,
-            byoyomi: cli.byoyomi,
-            btime: time_control.black_time,
-            binc: time_control.black_inc,
-            wtime: time_control.white_time,
-            winc: time_control.white_inc,
-            timeout_margin_ms: cli.timeout_margin_ms,
-            threads: cli.threads,
-            hash_mb: cli.hash_mb,
-            depth: cli.depth,
-            nodes: cli.nodes,
-        }
-    }
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -510,8 +368,6 @@ struct EngineCommandMeta {
 
 #[derive(Serialize)]
 struct TournamentMeta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ponder: Option<Vec<PonderStats>>,
     timestamp: String,
     settings: MetaSettings,
     engines: Vec<EngineMetaEntry>,
@@ -519,25 +375,6 @@ struct TournamentMeta {
     output_dir: String,
     #[serde(flatten)]
     retry: RetrySummary,
-    run_status: RunStatus,
-    /// 発行した通常ペアのうち、有効な 2 局が揃っていない数。
-    incomplete_pairs: u32,
-    /// 送信済みだが worker から結果を回収できなかったチケット数。
-    unreturned_games: u32,
-    /// SPRT が最初に境界へ達した時点の集計。採否はこの値で決まる。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sprt_stopped_at: Option<SprtStopLog>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nps_scaling: Option<NpsScalingMeta>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RunStatus {
-    Running,
-    Completed,
-    Interrupted,
-    WorkerFailed,
 }
 
 #[derive(Clone, Copy, Default, Serialize)]
@@ -550,8 +387,6 @@ struct RetrySummary {
 
 #[derive(Serialize)]
 struct EngineMetaEntry {
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    ponder: bool,
     index: usize,
     label: String,
     path: String,
@@ -703,27 +538,6 @@ impl SprtState {
         self.penta.pair_count()
     }
 
-    fn meta_log(&self) -> SprtMetaLog {
-        SprtMetaLog {
-            base_label: self.base_label.clone(),
-            test_label: self.test_label.clone(),
-            nelo0: self.params.nelo0,
-            nelo1: self.params.nelo1,
-            alpha: self.params.alpha,
-            beta: self.params.beta,
-        }
-    }
-
-    fn stop_log(&self) -> Option<SprtStopLog> {
-        self.stopped_at.as_ref().map(|snap| SprtStopLog {
-            hypothesis: self.meta_log(),
-            decision: snap.decision,
-            pairs: snap.pairs,
-            llr: snap.llr,
-            penta: snap.penta,
-        })
-    }
-
     fn snapshot(&self, decision: Decision) -> SprtSnapshot {
         SprtSnapshot {
             decision,
@@ -767,16 +581,15 @@ impl SprtState {
             hi,
             nelo_txt,
             self.penta,
-            match self.stopped_at.as_ref() {
-                Some(snap) =>
-                    format!("{} (stopped at pair={})", snap.decision.as_str(), snap.pairs),
-                None => judge(&self.params, self.penta).as_str().to_string(),
+            match (self.stopped_at.as_ref(), judge(&self.params, self.penta)) {
+                (Some(snap), _) => snap.decision.as_str(),
+                (None, d) => d.as_str(),
             }
         );
     }
 }
 
-fn print_sprt_final(state: &SprtState) {
+fn print_sprt_final(state: &SprtState, retry: RetrySummary) {
     let (lo, hi) = state.params.llr_bounds();
     let current_llr = state.params.llr(state.penta);
     let current_decision = judge(&state.params, state.penta);
@@ -816,6 +629,9 @@ fn print_sprt_final(state: &SprtState) {
         println!("             nelo=n/a  penta={}", state.penta);
     }
     println!("================================");
+    if retry.invalid {
+        println!("WARNING: invalid test — exhausted error pairs: {}", retry.exhausted_pairs);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,8 +649,8 @@ impl PairWriter {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let file = File::create_new(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
+        let file =
+            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
         Ok(Self {
             writer: BufWriter::new(file),
         })
@@ -860,125 +676,19 @@ struct WorkerConfig {
     engine_paths: Vec<PathBuf>,
     engine_labels: Vec<String>,
     engine_usi_options: Vec<Vec<String>>,
-    engine_ponder: Vec<bool>,
     threads: usize,
     hash_mb: u32,
     max_moves: u32,
-    preserve_start_history: bool,
-    adjudicate_resign: Option<ResignRule>,
-    adjudicate_win: Option<ResignRule>,
-    adjudicate_draw: Option<DrawRule>,
-    adjudicate_agreement: Option<ResignRule>,
     timeout_margin_ms: u64,
-    time_control: TimeControl,
+    byoyomi: u64,
+    btime: u64,
+    binc: u64,
+    wtime: u64,
+    winc: u64,
     go_depth: Option<u32>,
     /// エンジン index ごとの固定ノード数。`go_nodes[i]` が `engine_paths[i]` に対応する。
     go_nodes: Vec<Option<u64>>,
     start_positions: Vec<ParsedPosition>,
-    cpu_slots: Option<Arc<CpuSlots>>,
-}
-
-fn parse_ponder(values: &[String], engines: usize) -> Result<Vec<bool>> {
-    let mut enabled = vec![false; engines];
-    for value in values {
-        let (index, flag) =
-            value.split_once(':').context("--ponder requires INDEX:true or INDEX:false")?;
-        let index: usize = index.parse().context("invalid --ponder engine index")?;
-        let slot = enabled.get_mut(index).context("--ponder engine index out of range")?;
-        *slot = flag.parse().context("--ponder value must be true or false")?;
-    }
-    Ok(enabled)
-}
-
-fn engine_config(
-    path: &Path,
-    usi_options: &[String],
-    threads: usize,
-    hash_mb: u32,
-) -> EngineConfig {
-    EngineConfig {
-        path: path.to_path_buf(),
-        args: Vec::new(),
-        threads,
-        hash_mb,
-        network_delay: None,
-        network_delay2: None,
-        minimum_thinking_time: None,
-        slowmover: None,
-        ponder: false,
-        usi_options: usi_options.to_vec(),
-    }
-}
-
-fn spawn_engine(
-    cfg: &EngineConfig,
-    label: String,
-    cpus: Option<&[usize]>,
-) -> Result<EngineProcess> {
-    let mut engine = EngineProcess::spawn_uninitialized_with_cpu_affinity(cfg, label, cpus)?;
-    engine.initialize(cfg)?;
-    Ok(engine)
-}
-
-/// `--cpu-affinity numa` の CPU 群。worker は起動時に空いている群を 1 つ取り、終了時に返す。
-/// 退役した worker の engine が終わる前に後任が同じ CPU 群で起動しないよう、返すまで待たせる。
-struct CpuSlots {
-    sets: Vec<Vec<usize>>,
-    /// 小さい index から取るよう降順に積む (bench の slot と同じ群を先に使う)。
-    free: Mutex<Vec<usize>>,
-    returned: Condvar,
-}
-
-impl CpuSlots {
-    fn new(sets: Vec<Vec<usize>>) -> Self {
-        let free = (0..sets.len()).rev().collect();
-        Self {
-            sets,
-            free: Mutex::new(free),
-            returned: Condvar::new(),
-        }
-    }
-
-    /// 空きが出るまで待つ。shutdown なら None。
-    fn acquire(self: &Arc<Self>, shutdown: &AtomicBool) -> Option<CpuSlotGuard> {
-        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                return None;
-            }
-            if let Some(index) = free.pop() {
-                return Some(CpuSlotGuard {
-                    slots: self.clone(),
-                    index,
-                });
-            }
-            free = self
-                .returned
-                .wait_timeout(free, Duration::from_millis(100))
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-    }
-}
-
-struct CpuSlotGuard {
-    slots: Arc<CpuSlots>,
-    index: usize,
-}
-
-impl CpuSlotGuard {
-    fn cpus(&self) -> &[usize] {
-        &self.slots.sets[self.index]
-    }
-}
-
-impl Drop for CpuSlotGuard {
-    fn drop(&mut self) {
-        let mut free = self.slots.free.lock().unwrap_or_else(|e| e.into_inner());
-        free.push(self.index);
-        free.sort_unstable_by(|a, b| b.cmp(a));
-        self.slots.returned.notify_one();
-    }
 }
 
 fn worker_main(
@@ -986,53 +696,46 @@ fn worker_main(
     rx: chan::Receiver<Option<MatchTicket>>,
     tx: chan::Sender<MatchResult>,
     shutdown: Arc<AtomicBool>,
-    worker_failed: Arc<AtomicBool>,
 ) {
     let WorkerConfig {
         engine_paths,
         engine_labels,
         engine_usi_options,
-        engine_ponder,
         threads,
         hash_mb,
         max_moves,
-        preserve_start_history,
-        adjudicate_resign,
-        adjudicate_win,
-        adjudicate_draw,
-        adjudicate_agreement,
         timeout_margin_ms,
-        time_control,
+        byoyomi,
+        btime,
+        binc,
+        wtime,
+        winc,
         go_depth,
         go_nodes,
         start_positions,
-        cpu_slots,
     } = cfg;
-    // engine より先に宣言し、engine の終了後に CPU 群を返す。
-    let cpu_slot = match &cpu_slots {
-        Some(slots) => match slots.acquire(&shutdown) {
-            Some(guard) => Some(guard),
-            None => return,
-        },
-        None => None,
-    };
-    let cpu_affinity = cpu_slot.as_ref().map(CpuSlotGuard::cpus);
     // ワーカー内で全エンジンを起動
     let mut engines: Vec<EngineProcess> = Vec::new();
     for (i, path) in engine_paths.iter().enumerate() {
         let label = engine_labels[i].clone();
-        let mut cfg = engine_config(path, &engine_usi_options[i], threads, hash_mb);
-        cfg.ponder = engine_ponder[i];
-        match spawn_engine(&cfg, label, cpu_affinity).and_then(|mut engine| {
-            engine.enable_tournament_ponder(engine_ponder[i])?;
-            Ok(engine)
-        }) {
+        let cfg = EngineConfig {
+            path: path.clone(),
+            args: Vec::new(),
+            threads,
+            hash_mb,
+            network_delay: None,
+            network_delay2: None,
+            minimum_thinking_time: None,
+            slowmover: None,
+            ponder: false,
+            usi_options: engine_usi_options[i].clone(),
+        };
+        match EngineProcess::spawn(&cfg, label) {
             Ok(ep) => {
                 engines.push(ep);
             }
             Err(e) => {
                 eprintln!("worker: failed to spawn engine {i} ({}): {e}", path.display());
-                worker_failed.store(true, Ordering::Relaxed);
                 shutdown.store(true, Ordering::Relaxed);
                 return;
             }
@@ -1063,29 +766,25 @@ fn worker_main(
                 reason: format!("error: new game: {e}"),
                 plies: 0,
                 move_logs: Vec::new(),
-                ponder: None,
                 error: true,
                 worker_retired: true,
             });
             return;
         }
 
-        let start_pos = ticket
-            .cycle_position
-            .as_ref()
-            .map_or_else(|| &start_positions[ticket.startpos_idx], |position| &position.parsed);
-        // 時計はエンジン index に依存せず、各局の先後に割り当てる。
-        let tc = time_control;
+        let start_pos = &start_positions[ticket.startpos_idx];
+        // 🚨電竜戦は 先手 3 分 + 2 秒 / 後手 10 分 + 2 秒 の**非対称**な持ち時間。
+        //   後手側を --wtime / --winc で別に渡せるようにした。
+        //   **0 のときは先手と同値** = 従来の全 run と bit-exact。
+        let tc = TimeControl::new(
+            btime,
+            if wtime > 0 { wtime } else { btime },
+            binc,
+            if winc > 0 { winc } else { binc },
+            byoyomi,
+        );
         let config = GameConfig {
-            limit_only_timeout_ms: None,
-            cancel: None,
             max_moves,
-            preserve_start_history,
-            resign_rule: adjudicate_resign,
-            win_rule: adjudicate_win,
-            draw_rule: adjudicate_draw,
-            agreement_rule: adjudicate_agreement,
-            game_time_limit_ms: None,
             timeout_margin_ms,
             pass_rights: None,
             go_depth,
@@ -1121,20 +820,15 @@ fn worker_main(
         }));
         match run_result {
             Ok(Ok(result)) => {
-                let worker_retired = !black.is_reusable() || !white.is_reusable();
                 let _ = tx.send(MatchResult {
                     ticket,
                     outcome: result.outcome,
                     reason: result.reason,
                     plies: result.plies,
                     move_logs,
-                    ponder: result.ponder,
                     error: false,
-                    worker_retired,
+                    worker_retired: false,
                 });
-                if worker_retired {
-                    return;
-                }
             }
             Ok(Err(e)) => {
                 eprintln!("worker: game error: {e}; retiring worker");
@@ -1144,7 +838,6 @@ fn worker_main(
                     reason: format!("error: {e}"),
                     plies: 0,
                     move_logs,
-                    ponder: None,
                     error: true,
                     worker_retired: true,
                 });
@@ -1158,7 +851,6 @@ fn worker_main(
                     reason: "error: worker panic".to_string(),
                     plies: 0,
                     move_logs,
-                    ponder: None,
                     error: true,
                     worker_retired: true,
                 });
@@ -1176,22 +868,19 @@ struct SpawnCtx<'a> {
     engine_paths: &'a [PathBuf],
     engine_labels: &'a [String],
     engine_usi_options: &'a [Vec<String>],
-    engine_ponder: &'a [bool],
     threads: usize,
     hash_mb: u32,
     max_moves: u32,
-    preserve_start_history: bool,
-    adjudicate_resign: Option<ResignRule>,
-    adjudicate_win: Option<ResignRule>,
-    adjudicate_draw: Option<DrawRule>,
-    adjudicate_agreement: Option<ResignRule>,
     timeout_margin_ms: u64,
-    time_control: TimeControl,
+    byoyomi: u64,
+    btime: u64,
+    binc: u64,
+    wtime: u64,
+    winc: u64,
     go_depth: Option<u32>,
     /// エンジン index ごとの固定ノード数。`go_nodes[i]` が `engine_paths[i]` に対応する。
     go_nodes: &'a [Option<u64>],
     start_defs: &'a [ParsedPosition],
-    cpu_slots: Option<&'a Arc<CpuSlots>>,
 }
 
 /// ワーカースレッドを 1 つ起動して `handles` に追加する。初期起動と動的増員で共用する。
@@ -1200,24 +889,21 @@ fn spawn_worker(
     ticket_rx: &chan::Receiver<Option<MatchTicket>>,
     result_tx: &chan::Sender<MatchResult>,
     shutdown: &Arc<AtomicBool>,
-    worker_failed: &Arc<AtomicBool>,
     handles: &mut Vec<thread::JoinHandle<()>>,
 ) {
     let cfg = WorkerConfig {
         engine_paths: ctx.engine_paths.to_vec(),
         engine_labels: ctx.engine_labels.to_vec(),
         engine_usi_options: ctx.engine_usi_options.to_vec(),
-        engine_ponder: ctx.engine_ponder.to_vec(),
         threads: ctx.threads,
         hash_mb: ctx.hash_mb,
         max_moves: ctx.max_moves,
-        preserve_start_history: ctx.preserve_start_history,
-        adjudicate_resign: ctx.adjudicate_resign,
-        adjudicate_win: ctx.adjudicate_win,
-        adjudicate_draw: ctx.adjudicate_draw,
-        adjudicate_agreement: ctx.adjudicate_agreement,
         timeout_margin_ms: ctx.timeout_margin_ms,
-        time_control: ctx.time_control,
+        byoyomi: ctx.byoyomi,
+        btime: ctx.btime,
+        binc: ctx.binc,
+        wtime: ctx.wtime,
+        winc: ctx.winc,
         go_depth: ctx.go_depth,
         go_nodes: ctx.go_nodes.to_vec(),
         start_positions: ctx
@@ -1230,83 +916,38 @@ fn spawn_worker(
                 source_line: p.source_line,
             })
             .collect(),
-        cpu_slots: ctx.cpu_slots.cloned(),
     };
     let rx = ticket_rx.clone();
     let tx = result_tx.clone();
     let sd = shutdown.clone();
-    let failed = worker_failed.clone();
-    handles.push(thread::spawn(move || {
-        // panic で結果送信元だけが消えても、main が channel 待ちを続けないよう通知する。
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            worker_main(cfg, rx, tx, sd.clone(), failed.clone());
-        }))
-        .is_err()
-        {
-            failed.store(true, Ordering::Relaxed);
-            sd.store(true, Ordering::Relaxed);
-        }
-    }));
+    handles.push(thread::spawn(move || worker_main(cfg, rx, tx, sd)));
 }
 
 // ---------------------------------------------------------------------------
 // メイン
 // ---------------------------------------------------------------------------
 
-fn check_output_directory(path: &Path) -> Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if matches!(name.to_str(), Some("meta.json" | "control.json" | CONTROL_HISTORY_FILE_NAME))
-            || entry.path().extension().is_some_and(|ext| ext == "jsonl")
-        {
-            bail!(
-                "既存出力 {} を保護します。別の --out-dir を指定してください",
-                entry.path().display()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn reserve_output_directory(path: &Path) -> Result<File> {
-    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        bail!("出力先ディレクトリの symlink は使用できません: {}", path.display());
-    }
-    fs::create_dir_all(path)?;
-    check_output_directory(path)?;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path.join(".tournament.lock"))?;
-    lock.try_lock()
-        .with_context(|| format!("別の tournament が出力先 {} を使用しています", path.display()))?;
-    // 検査と lock 取得の間に先行 run が出力して終了した場合も上書きしない。
-    check_output_directory(path)?;
-    Ok(lock)
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let seed = cli.seed.unwrap_or_else(|| rand::rng().random());
-    eprintln!("startpos seed: {seed}");
+    let seed = if cli.startpos_sequential {
+        if cli.seed.is_some() {
+            bail!("--startpos-sequential と --seed は同時に指定できません");
+        }
+        SEQUENTIAL_SEED
+    } else {
+        cli.seed.unwrap_or_else(|| rand::rng().random())
+    };
+    if cli.startpos_sequential {
+        eprintln!("startpos: sequential (ペア通番で順に使用)");
+    } else {
+        eprintln!("startpos seed: {seed}");
+    }
 
     if cli.engines.len() < 2 {
         bail!("at least 2 engines are required");
     }
     if cli.concurrency == 0 {
         bail!("--concurrency must be at least 1");
-    }
-
-    if cli.single_game {
-        anyhow::ensure!(cli.engines.len() == 2, "--single-game requires exactly 2 engines");
-        anyhow::ensure!(cli.concurrency == 1, "--single-game requires --concurrency 1");
-        anyhow::ensure!(
-            cli.startpos_order != StartposOrder::Cycle,
-            "--single-game cannot be used with --startpos-order cycle"
-        );
     }
 
     // バイナリ存在確認
@@ -1360,39 +1001,34 @@ fn main() -> Result<()> {
     // --engine-nodes が指定されたエンジンはその値を、それ以外は global --nodes を使う。
     let engine_nodes = resolve_engine_nodes(n, cli.nodes, cli.engine_nodes.as_deref())?;
 
-    let time_control = resolve_time_control(&cli, &engine_nodes)?;
-    validate_nps_scaling(&cli, &engine_nodes)?;
+    // 時間管理のバリデーション
+    let use_byoyomi = cli.byoyomi > 0;
+    // 🚨2026-10-17: 電竜戦は 先手 3 分 + 2 秒 / 後手 10 分 + 2 秒 の**非対称**。
+    //   --wtime / --winc だけ指定されたときも フィッシャーとして扱う (下の検査で btime 必須)。
+    let use_fischer = cli.btime > 0 || cli.binc > 0 || cli.wtime > 0 || cli.winc > 0;
+    // engine_nodes は cli.nodes も織り込んだ解決済み Vec なので、resolve 後の状態で判定する。
+    let use_fixed = cli.depth.is_some() || engine_nodes.iter().any(|n| n.is_some());
+    if use_byoyomi && use_fischer {
+        bail!("--byoyomi と --btime/--binc は同時に指定できません");
+    }
+    if !use_byoyomi && !use_fischer && !use_fixed {
+        bail!(
+            "時間管理を指定してください: --byoyomi, --btime/--binc, --depth, --nodes, --engine-nodes のいずれか"
+        );
+    }
+    if use_fischer && cli.btime == 0 && cli.binc == 0 {
+        bail!("フィッシャー時計: --btime または --binc の少なくとも一方を正の値で指定してください");
+    }
+    ensure_node_coverage(&engine_nodes, use_byoyomi || use_fischer, cli.depth.is_some())?;
 
     // 開始局面のロード
-    let cycle = if cli.startpos_order == StartposOrder::Cycle {
-        let path = cli
-            .startpos_file
-            .as_ref()
-            .context("--startpos-order cycle requires --startpos-file")?;
-        Some(CycleState::load(path.clone(), cli.max_moves)?)
-    } else {
-        None
-    };
-    let (start_defs, start_commands) = if let Some(cycle) = &cycle {
-        let commands: Vec<_> = cycle.positions.iter().map(|p| p.command.clone()).collect();
-        let defs = commands
-            .iter()
-            .map(|command| {
-                load_start_positions(None, Some(command), None, None)
-                    .map(|(mut defs, _)| defs.remove(0))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        (defs, commands)
-    } else {
-        load_start_positions(cli.startpos_file.as_deref(), None, None, None)?
-    };
-    anyhow::ensure!(
-        !cli.single_game || start_defs.len() == 1,
-        "--single-game requires exactly one start position"
-    );
-    ensure_start_positions_within_max_moves(&start_defs, cli.max_moves)?;
+    let (start_defs, start_commands) =
+        load_start_positions(cli.startpos_file.as_deref(), None, None, None)?;
 
-    let engine_ponder = parse_ponder(&cli.ponder, cli.engines.len())?;
+    // 出力ディレクトリの作成
+    fs::create_dir_all(&cli.out_dir)
+        .with_context(|| format!("failed to create {}", cli.out_dir.display()))?;
+
     let common_usi_options = cli.usi_options.clone().unwrap_or_default();
 
     // per-engine オプションを解析: HashMap<usize, Vec<String>>
@@ -1463,15 +1099,23 @@ fn main() -> Result<()> {
     //   エンジン間で実質的な思考時間が不平等になる。
     // - MinimumThinkingTime: byoyomi 時は byoyomi と一致させることで秒読み全体を使い切れる。
     //   フィッシャー時は 0（エンジンの時間管理に委ねる）。
+    // 2026-09-08: フィッシャー時は最小値 1。 YaneuraOu の定義は Option(2000, 1, 100000) で min=1 のため、
+    //   0 を渡すと usioption.cpp の範囲チェックで**黙って破棄され default 2000ms のまま**になる。
+    //   その結果 8s+0.08s では optimum = maximum = 2000ms に固定され、 最初の 3-4 手で持ち時間が
+    //   枯渇し、 残りは下限 100ms の弾丸戦になっていた (100局 9,260手で 91% が 300ms 未満、 depth 13)。
+    //   RoundUpToFullSecond も default true だと remain_estimate から (MTG+1)*1000ms を引くため
+    //   短い持ち時間で残り時間が 0 に潰れる。 A/B 対局では false が正しい。
+    //   ★この修正は 2026-09-08 の上流版 tournament.rs 全面置換で一度失われ、 再発した。
     let min_think = if cli.byoyomi > 0 {
         cli.byoyomi.to_string()
     } else {
-        "0".to_string()
+        "1".to_string()
     };
     let time_defaults = [
         ("NetworkDelay", "0"),
         ("NetworkDelay2", "0"),
         ("MinimumThinkingTime", min_think.as_str()),
+        ("RoundUpToFullSecond", "false"),
     ];
     let engine_usi_options: Vec<Vec<String>> = (0..n)
         .map(|i| {
@@ -1490,69 +1134,8 @@ fn main() -> Result<()> {
             opts
         })
         .collect();
-    for (index, options) in engine_usi_options.iter().enumerate() {
-        let explicit = cli.ponder.iter().any(|entry| {
-            entry.split_once(':').is_some_and(|(i, _)| i.parse::<usize>() == Ok(index))
-        });
-        for option in options {
-            if explicit
-                && let Some((name, value)) = option.split_once('=')
-                && matches!(name.trim(), "USI_Ponder" | "Ponder")
-                && !value.trim().eq_ignore_ascii_case(if engine_ponder[index] {
-                    "true"
-                } else {
-                    "false"
-                })
-            {
-                bail!(
-                    "engine {index}: {option} conflicts with --ponder {index}:{}",
-                    engine_ponder[index]
-                );
-            }
-        }
-    }
-    let bench_idx = if cli.nps_scaling {
-        let idx = nps_bench_engine_index(&cli, &engine_labels)?;
-        if nps_bench::sets_threads_option(&engine_usi_options[idx]) {
-            bail!("--nps-scaling では Threads を USI option ではなく --threads で指定してください");
-        }
-        Some(idx)
-    } else {
-        None
-    };
-    let cpu_slots = match cli.cpu_affinity {
-        CpuAffinityMode::Off => None,
-        CpuAffinityMode::Numa => {
-            let sets = discover_numa_cpu_affinities(cli.threads, cli.concurrency)?;
-            eprintln!(
-                "CPU affinity: {} worker(s), {} CPU(s)/worker, NUMA-local",
-                cli.concurrency, cli.threads
-            );
-            for (index, cpus) in sets.iter().enumerate() {
-                eprintln!("  worker{}: {cpus:?}", index + 1);
-            }
-            Some(Arc::new(CpuSlots::new(sets)))
-        }
-    };
-
-    // run 全体の出力先を排他的に確保する。既存成果物や同時起動 run を上書きしない。
-    let output_guard = reserve_output_directory(&cli.out_dir)?;
-
-    let nps_scaling = match bench_idx {
-        Some(idx) => Some(calibrate_nps_scaling(
-            &cli,
-            idx,
-            &engine_labels,
-            &engine_usi_options,
-            time_control,
-            cpu_slots.as_deref(),
-        )?),
-        None => None,
-    };
-    let time_control = nps_scaling.as_ref().map_or(time_control, NpsScalingMeta::time_control);
     let timestamp = Local::now();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let worker_failed = Arc::new(AtomicBool::new(false));
 
     // Ctrl-C ハンドラ
     {
@@ -1565,12 +1148,24 @@ fn main() -> Result<()> {
     }
 
     let mut tournament_meta = TournamentMeta {
-        ponder: engine_ponder.iter().any(|&p| p).then(|| vec![PonderStats::default(); n]),
         timestamp: timestamp.to_rfc3339(),
-        settings: MetaSettings::new(&cli, time_control, seed),
+        settings: MetaSettings {
+            games: cli.games * 2,
+            seed,
+            max_moves: cli.max_moves,
+            byoyomi: cli.byoyomi,
+            btime: cli.btime,
+            binc: cli.binc,
+            wtime: cli.wtime,
+            winc: cli.winc,
+            timeout_margin_ms: cli.timeout_margin_ms,
+            threads: cli.threads,
+            hash_mb: cli.hash_mb,
+            depth: cli.depth,
+            nodes: cli.nodes,
+        },
         engines: (0..n)
             .map(|i| EngineMetaEntry {
-                ponder: engine_ponder[i],
                 index: i,
                 label: engine_labels[i].clone(),
                 path: cli.engines[i].display().to_string(),
@@ -1581,15 +1176,10 @@ fn main() -> Result<()> {
         start_positions: start_commands.clone(),
         output_dir: cli.out_dir.display().to_string(),
         retry: RetrySummary::default(),
-        run_status: RunStatus::Running,
-        incomplete_pairs: 0,
-        unreturned_games: 0,
-        sprt_stopped_at: None,
-        nps_scaling: nps_scaling.clone(),
     };
     // meta.json 書き出し
     {
-        let meta_file = File::create_new(cli.out_dir.join("meta.json"))?;
+        let meta_file = File::create(cli.out_dir.join("meta.json"))?;
         serde_json::to_writer_pretty(BufWriter::new(meta_file), &tournament_meta)?;
     }
 
@@ -1652,39 +1242,24 @@ fn main() -> Result<()> {
     // これにより実行中に control.json で target_games を増減でき、対局境界で追従する。
     // cli.games は「各方向の対局数」。1 ペアあたり cli.games * 2 局。
     let target_per_dir = Arc::new(AtomicU32::new(cli.games));
-    let mut source = TicketSource::new(
-        pair_indices.clone(),
-        start_defs.len(),
-        target_per_dir.clone(),
-        seed,
-        cli.startpos_order,
-    );
-
-    source.cycle = cycle.map(RefCell::new);
-    source.single_game = cli.single_game;
+    let mut source =
+        TicketSource::new(pair_indices.clone(), start_defs.len(), target_per_dir.clone(), seed);
 
     let mode_label = if base_idx.is_some() {
         "base-vs-N"
     } else {
         "round-robin"
     };
-    if cli.single_game {
-        println!(
-            "tournament: single game (Black: {}, White: {})",
-            engine_labels[0], engine_labels[1]
-        );
-    } else {
-        println!(
-            "tournament: {} engines, {} pairs ({}), {} games/direction, {} games/pair, {} total games, concurrency={}",
-            n,
-            pair_indices.len(),
-            mode_label,
-            cli.games,
-            cli.games * 2,
-            source.current_target_total(),
-            cli.concurrency
-        );
-    }
+    println!(
+        "tournament: {} engines, {} pairs ({}), {} games/direction, {} games/pair, {} total games, concurrency={}",
+        n,
+        pair_indices.len(),
+        mode_label,
+        cli.games,
+        cli.games * 2,
+        source.current_target_total(),
+        cli.concurrency
+    );
 
     // ペア別のファイルライターを準備し、meta行を書き出す
     let mut pair_writers: HashMap<(usize, usize), PairWriter> = HashMap::new();
@@ -1693,11 +1268,7 @@ fn main() -> Result<()> {
 
     for &(i, j) in &pair_indices {
         {
-            let filename = format!(
-                "pair-{i}-{j}__{}-vs-{}.jsonl",
-                filename_label(&engine_labels[i]),
-                filename_label(&engine_labels[j])
-            );
+            let filename = format!("{}-vs-{}.jsonl", engine_labels[i], engine_labels[j]);
             let path = cli.out_dir.join(&filename);
             let mut pw = PairWriter::new(&path)?;
 
@@ -1705,14 +1276,39 @@ fn main() -> Result<()> {
             // pair_indices は (min, max) 正規化済みなので両順序をカバーする。
             let sprt_meta = sprt_state.as_ref().and_then(|state| {
                 let pair = (state.base_idx.min(state.test_idx), state.base_idx.max(state.test_idx));
-                (pair == (i, j)).then(|| state.meta_log())
+                if pair == (i, j) {
+                    Some(SprtMetaLog {
+                        base_label: state.base_label.clone(),
+                        test_label: state.test_label.clone(),
+                        nelo0: state.params.nelo0,
+                        nelo1: state.params.nelo1,
+                        alpha: state.params.alpha,
+                        beta: state.params.beta,
+                    })
+                } else {
+                    None
+                }
             });
 
             // meta行を書く
             let meta = MetaLogEntry {
                 kind: "meta".to_string(),
                 timestamp: timestamp.to_rfc3339(),
-                settings: MetaSettings::new(&cli, time_control, seed),
+                settings: MetaSettings {
+                    games: cli.games * 2, // 各方向 cli.games 局、双方向で合計
+                    seed,
+                    max_moves: cli.max_moves,
+                    byoyomi: cli.byoyomi,
+                    btime: cli.btime,
+                    binc: cli.binc,
+                    wtime: cli.wtime,
+                    winc: cli.winc,
+                    timeout_margin_ms: cli.timeout_margin_ms,
+                    threads: cli.threads,
+                    hash_mb: cli.hash_mb,
+                    depth: cli.depth,
+                    nodes: cli.nodes,
+                },
                 engine_cmd: EngineCommandMeta {
                     path_black: cli.engines[i].display().to_string(),
                     path_white: cli.engines[j].display().to_string(),
@@ -1727,7 +1323,6 @@ fn main() -> Result<()> {
                 output: path.display().to_string(),
                 base_label: cli.base_label.clone(),
                 sprt: sprt_meta,
-                nps_scaling: nps_scaling.clone(),
             };
             pw.write_json(&meta)?;
             pw.flush()?;
@@ -1748,27 +1343,24 @@ fn main() -> Result<()> {
         engine_paths: &cli.engines,
         engine_labels: &engine_labels,
         engine_usi_options: &engine_usi_options,
-        engine_ponder: &engine_ponder,
         threads: cli.threads,
         hash_mb: cli.hash_mb,
         max_moves: cli.max_moves,
-        preserve_start_history: cli.preserve_start_history,
-        adjudicate_resign: cli.adjudicate_resign,
-        adjudicate_win: cli.adjudicate_win,
-        adjudicate_draw: cli.adjudicate_draw,
-        adjudicate_agreement: cli.adjudicate_agreement,
         timeout_margin_ms: cli.timeout_margin_ms,
-        time_control,
+        byoyomi: cli.byoyomi,
+        btime: cli.btime,
+        binc: cli.binc,
+        wtime: cli.wtime,
+        winc: cli.winc,
         go_depth: cli.depth,
         go_nodes: &engine_nodes,
         start_defs: &start_defs,
-        cpu_slots: cpu_slots.as_ref(),
     };
 
     // ワーカースレッドの起動
     let mut handles = Vec::new();
     for _ in 0..cli.concurrency {
-        spawn_worker(&spawn_ctx, &ticket_rx, &result_tx, &shutdown, &worker_failed, &mut handles);
+        spawn_worker(&spawn_ctx, &ticket_rx, &result_tx, &shutdown, &mut handles);
     }
 
     // 勝敗カウンターと出力をまとめる集計器。
@@ -1778,8 +1370,6 @@ fn main() -> Result<()> {
     }
     let start_time = Instant::now();
     let mut agg = Aggregator {
-        single_game: cli.single_game,
-        ponder: tournament_meta.ponder.clone(),
         engine_labels: &engine_labels,
         pair_writers,
         pair_stats,
@@ -1797,22 +1387,18 @@ fn main() -> Result<()> {
 
     // 制御プレーンの状態。
     let control_path = cli.out_dir.join("control.json");
-    let history_path = cli.out_dir.join(CONTROL_HISTORY_FILE_NAME);
+    let history_path = cli.out_dir.join("control_history.jsonl");
     let mut applied = ControlState {
         target_games: cli.games,
         concurrency: cli.concurrency,
     };
-    if !cli.single_game {
-        println!(
-            "[control] 実行中の動的制御: {} を {}ms 間隔でポーリング (例: echo '{{\"target_games\":N,\"concurrency\":M}}' > {})",
-            control_path.display(),
-            CONTROL_POLL_INTERVAL.as_millis(),
-            control_path.display(),
-        );
-    }
+    println!(
+        "[control] 実行中の動的制御: {} を {}ms 間隔でポーリング (例: echo '{{\"target_games\":N,\"concurrency\":M}}' > {})",
+        control_path.display(),
+        CONTROL_POLL_INTERVAL.as_millis(),
+        control_path.display(),
+    );
 
-    // CPU 群は起動時の --concurrency 分だけ確保するので、それを越える増員は受け付けない。
-    let max_workers = cpu_slots.as_ref().map(|slots| slots.sets.len());
     let mut tickets_sent: u32 = 0;
     let mut live_workers = cli.concurrency;
     let mut desired_workers = cli.concurrency;
@@ -1826,9 +1412,9 @@ fn main() -> Result<()> {
     // - 退役: live_workers > desired_workers なら poison(None) を 1 つ送る
     // - 増員: live_workers < desired_workers なら worker を spawn
     // - 終了: 供給するものが無く、in-flight も 0 になったら抜ける
-    while !shutdown.load(Ordering::Relaxed) && (!cli.single_game || agg.completed == 0) {
+    while !shutdown.load(Ordering::Relaxed) {
         // control.json を throttle ポーリング。
-        if !cli.single_game && last_poll.is_none_or(|t| t.elapsed() >= CONTROL_POLL_INTERVAL) {
+        if last_poll.is_none_or(|t| t.elapsed() >= CONTROL_POLL_INTERVAL) {
             last_poll = Some(Instant::now());
             apply_control(
                 &control_path,
@@ -1837,20 +1423,12 @@ fn main() -> Result<()> {
                 &target_per_dir,
                 &mut desired_workers,
                 agg.completed,
-                max_workers,
             );
         }
 
         // 増員（即時 spawn）。
         while live_workers < desired_workers {
-            spawn_worker(
-                &spawn_ctx,
-                &ticket_rx,
-                &result_tx,
-                &shutdown,
-                &worker_failed,
-                &mut handles,
-            );
+            spawn_worker(&spawn_ctx, &ticket_rx, &result_tx, &shutdown, &mut handles);
             live_workers += 1;
         }
 
@@ -1859,8 +1437,19 @@ fn main() -> Result<()> {
         // 送信前に target が下がった場合は `still_wanted` で再評価して破棄する。
         let offer: Option<Option<MatchTicket>> = if live_workers > desired_workers {
             Some(None)
+        } else if agg.stop_feeding && source.retry_queue.is_empty() {
+            None
         } else {
-            source.offer_ticket(&mut pending, agg.stop_feeding).map(Some)
+            if agg.stop_feeding && pending.as_ref().is_some_and(|ticket| ticket.attempt == 0) {
+                pending = None;
+            }
+            if pending.as_ref().is_some_and(|t| !source.still_wanted(t)) {
+                pending = None; // target 減少で不要になった未送信チケットを破棄
+            }
+            if pending.is_none() {
+                pending = source.peek_ticket();
+            }
+            pending.clone().map(Some)
         };
         let target_total = source.current_target_total();
 
@@ -1888,16 +1477,11 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                    // 全 worker の初期化失敗でも送信待ちへ残らず shutdown を再確認する。
-                    default(Duration::from_millis(100)) => {}
                 }
             }
             None => {
                 let inflight = tickets_sent.saturating_sub(agg.completed);
                 if inflight == 0 {
-                    if cli.single_game {
-                        break;
-                    }
                     // 終了直前に最後の制御変更（target 増加）を取りこぼさないよう強制ポーリング。
                     last_poll = Some(Instant::now());
                     apply_control(
@@ -1907,9 +1491,8 @@ fn main() -> Result<()> {
                         &target_per_dir,
                         &mut desired_workers,
                         agg.completed,
-                        max_workers,
                     );
-                    if source.offer_ticket(&mut pending, agg.stop_feeding).is_some()
+                    if source.has_next() && (!agg.stop_feeding || !source.retry_queue.is_empty())
                         || live_workers > desired_workers
                     {
                         continue;
@@ -1917,7 +1500,7 @@ fn main() -> Result<()> {
                     break;
                 }
                 // in-flight を drain。
-                match result_rx.recv_timeout(Duration::from_millis(100)) {
+                match result_rx.recv() {
                     Ok(result) => {
                         agg.on_result(&result, tickets_sent, target_total)?;
                         source.observe_result(&result);
@@ -1925,8 +1508,7 @@ fn main() -> Result<()> {
                             live_workers = live_workers.saturating_sub(1);
                         }
                     }
-                    Err(chan::RecvTimeoutError::Timeout) => continue,
-                    Err(chan::RecvTimeoutError::Disconnected) => break,
+                    Err(_) => break,
                 }
             }
         }
@@ -1939,26 +1521,13 @@ fn main() -> Result<()> {
     // 手放したら join する。
     drop(ticket_tx);
     drop(result_tx);
-    while let Ok(result) = result_rx.recv() {
-        agg.on_result(&result, tickets_sent, source.current_target_total())?;
-        source.observe_result(&result);
-    }
+    while result_rx.recv().is_ok() {}
     for h in handles {
-        if h.join().is_err() {
-            worker_failed.store(true, Ordering::Relaxed);
-        }
+        let _ = h.join();
     }
-    let run_status = if worker_failed.load(Ordering::Relaxed) {
-        RunStatus::WorkerFailed
-    } else if shutdown.load(Ordering::Relaxed) {
-        RunStatus::Interrupted
-    } else {
-        RunStatus::Completed
-    };
 
     // 集計器を分解して以降の表示に使う。
     let Aggregator {
-        ponder,
         mut pair_writers,
         pair_stats,
         sprt_state,
@@ -1968,16 +1537,13 @@ fn main() -> Result<()> {
     } = agg;
 
     // ライターをフラッシュ
-    for pw in pair_writers.values_mut() {
+    for (_, pw) in pair_writers.iter_mut() {
         pw.flush()?;
     }
 
     // 完了直前の進捗を 1 行出す（report_interval で割り切れない端数対策）。
     // 直近のループで既に同じ行を出している場合（completed が interval の倍数）は重複を避ける。
-    if !cli.single_game
-        && valid_completed > 0
-        && !valid_completed.is_multiple_of(cli.report_interval.max(1))
-    {
+    if valid_completed > 0 && !valid_completed.is_multiple_of(cli.report_interval.max(1)) {
         print_progress(
             valid_completed,
             source.current_target_total().max(valid_completed),
@@ -1987,63 +1553,15 @@ fn main() -> Result<()> {
         );
     }
 
-    let incomplete_pairs = if cli.single_game {
-        0
-    } else {
-        source
-            .emitted
-            .iter()
-            .sum::<u32>()
-            .div_ceil(2)
-            .saturating_sub(valid_completed / 2)
-    };
-    let unreturned_games = tickets_sent.saturating_sub(completed);
-    let mut retry_summary = source.retry_summary();
-    // analyze_selfplay の `run_meta_issue` と同じ条件で invalid にする。
-    retry_summary.invalid |= run_status != RunStatus::Completed
-        || incomplete_pairs > 0
-        || unreturned_games > 0
-        || (cli.single_game && valid_completed != 1);
-    tournament_meta.ponder = ponder;
+    let retry_summary = source.retry_summary();
     tournament_meta.retry = retry_summary;
-    tournament_meta.run_status = run_status;
-    tournament_meta.incomplete_pairs = incomplete_pairs;
-    tournament_meta.unreturned_games = unreturned_games;
-    tournament_meta.sprt_stopped_at = sprt_state.as_ref().and_then(SprtState::stop_log);
     let meta_file = File::create(cli.out_dir.join("meta.json"))?;
     serde_json::to_writer_pretty(BufWriter::new(meta_file), &tournament_meta)?;
 
     println!();
-    println!(
-        "{}",
-        match run_status {
-            RunStatus::Completed => "=== Tournament Complete ===",
-            RunStatus::Interrupted => "=== Tournament Interrupted ===",
-            RunStatus::WorkerFailed => "=== Tournament Worker Failed ===",
-            RunStatus::Running => unreachable!(),
-        }
-    );
+    println!("=== Tournament Complete ===");
     println!("Total: {} games in {:.1}s", completed, start_time.elapsed().as_secs_f64());
-    if !cli.single_game {
-        print_final_table(&pair_stats, &engine_labels);
-    }
-    if let Some(stats) = &tournament_meta.ponder {
-        for ((label, stats), enabled) in engine_labels.iter().zip(stats).zip(&engine_ponder) {
-            if !enabled {
-                continue;
-            }
-            println!(
-                "Ponder {label}: {}/{} ({:.1}%)",
-                stats.hits,
-                stats.sent,
-                if stats.sent == 0 {
-                    0.0
-                } else {
-                    100.0 * stats.hits as f64 / stats.sent as f64
-                }
-            );
-        }
-    }
+    print_final_table(&pair_stats, &engine_labels);
     println!(
         "Error pairs: {}  Retried pairs: {}  Exhausted pairs: {}  Invalid: {}",
         retry_summary.error_pairs,
@@ -2051,30 +1569,13 @@ fn main() -> Result<()> {
         retry_summary.exhausted_pairs,
         retry_summary.invalid,
     );
-    println!("Incomplete pairs: {}  Unreturned games: {}", incomplete_pairs, unreturned_games);
     println!("Output: {}", cli.out_dir.display());
     println!("===========================");
 
-    if run_status != RunStatus::Completed {
-        if sprt_state.is_some() {
-            println!("SPRT decision withheld: run did not complete.");
-        }
-        bail!("tournament did not complete; recovered results and run status were saved");
-    }
-    if retry_summary.invalid {
-        if sprt_state.is_some() {
-            println!("SPRT decision withheld: invalid run (exhausted or incomplete pairs).");
-        }
-        if cli.single_game {
-            bail!("single game did not produce a valid result; run status was saved");
-        }
-        bail!("tournament run is invalid; recovered results and run status were saved");
-    }
     if let Some(state) = sprt_state.as_ref() {
-        print_sprt_final(state);
+        print_sprt_final(state, retry_summary);
     }
 
-    drop(output_guard);
     Ok(())
 }
 
@@ -2092,12 +1593,10 @@ fn handle_sprt_observation(
     let _ = state.observe(result);
     state.maybe_report(false);
     if !was_terminal && state.stopped_at.is_some() && !*stop_feeding {
-        // 境界到達: 新しいペアを止め、開始済みペアの 2 局目・再試行と in-flight を回収する。
+        // 境界到達: 新規チケット供給を止め、在庫（in-flight）だけ drain する。
         *stop_feeding = true;
         let inflight = tickets_sent.saturating_sub(completed);
-        println!(
-            "[SPRT] terminal decision reached; draining {inflight} in-flight game(s) and closing started pairs..."
-        );
+        println!("[SPRT] terminal decision reached; draining {inflight} in-flight game(s)...");
     }
 }
 
@@ -2153,7 +1652,6 @@ fn apply_control(
     target_per_dir: &AtomicU32,
     desired_workers: &mut usize,
     completed: u32,
-    max_workers: Option<usize>,
 ) {
     let Ok(text) = fs::read_to_string(control_path) else {
         return;
@@ -2179,10 +1677,6 @@ fn apply_control(
     if let Some(c) = parsed.concurrency {
         if c == 0 {
             eprintln!("[control] concurrency=0 は不正のため無視します");
-        } else if let Some(max) = max_workers.filter(|&max| c > max) {
-            eprintln!(
-                "[control] concurrency={c} は --cpu-affinity numa で確保した CPU 群 ({max}) を越えるため無視します"
-            );
         } else if c != applied.concurrency {
             applied.concurrency = c;
             *desired_workers = c;
@@ -2237,9 +1731,6 @@ fn append_control_history(path: &Path, entry: &ControlHistoryEntry) -> Result<()
 /// 再試行チケットは新しい `id` を得る一方、元の `pair_index` / `pair_slot` を引き継ぐ。
 /// 各ペアの通常発行数は常に偶数境界で次ペアへ移るため、2 局ペアが境界をまたがない。
 struct TicketSource {
-    single_game: bool,
-    cycle: Option<RefCell<CycleState>>,
-    startpos_order: StartposOrder,
     pair_indices: Vec<(usize, usize)>,
     start_defs_len: usize,
     target_per_dir: Arc<AtomicU32>,
@@ -2267,13 +1758,9 @@ impl TicketSource {
         start_defs_len: usize,
         target_per_dir: Arc<AtomicU32>,
         seed: u64,
-        startpos_order: StartposOrder,
     ) -> Self {
         let pair_count = pair_indices.len();
         TicketSource {
-            single_game: false,
-            cycle: None,
-            startpos_order,
             pair_indices,
             start_defs_len,
             target_per_dir,
@@ -2290,11 +1777,7 @@ impl TicketSource {
 
     /// 各ペアあたりの目標ゲーム数（双方向なので `target_games * 2`）。
     fn target_per_pair(&self) -> u32 {
-        if self.single_game {
-            1
-        } else {
-            self.target_per_dir.load(Ordering::Relaxed).saturating_mul(2)
-        }
+        self.target_per_dir.load(Ordering::Relaxed).saturating_mul(2)
     }
 
     /// 現在の目標値での全ペア合計ゲーム数。進捗表示の分母に使う。
@@ -2311,32 +1794,13 @@ impl TicketSource {
         emitted < target_per_pair || !emitted.is_multiple_of(2)
     }
 
-    /// 送信候補を `pending` に保持して返す。送信成功 (`commit_sent`) まで発行数は進めない。
-    ///
-    /// `stop_feeding` (SPRT 境界到達後) は新しいペアの 1 局目を出さず、開始済みペアの
-    /// 2 局目と error ペアの再試行だけを出す。
-    fn offer_ticket(
-        &self,
-        pending: &mut Option<MatchTicket>,
-        stop_feeding: bool,
-    ) -> Option<MatchTicket> {
-        let wanted = |ticket: &MatchTicket| {
-            self.still_wanted(ticket)
-                && (!stop_feeding || ticket.attempt > 0 || ticket.pair_slot == 1)
-        };
-        if pending.as_ref().is_some_and(|ticket| !wanted(ticket)) {
-            *pending = None;
+    /// 現在の目標値で、まだ発行すべきチケットが残っているか。
+    fn has_next(&self) -> bool {
+        if !self.retry_queue.is_empty() {
+            return true;
         }
-        // cycle の新しい組は、待っている間の読み直しと最新の組数で選び直す
-        if self.cycle.is_some()
-            && pending.as_ref().is_some_and(|t| t.attempt == 0 && t.pair_slot == 0)
-        {
-            *pending = None;
-        }
-        if pending.is_none() {
-            *pending = self.peek_ticket().filter(wanted);
-        }
-        pending.clone()
+        let target = self.target_per_pair();
+        self.emitted.iter().any(|&e| Self::pair_needs_more(e, target))
     }
 
     /// 次に発行すべきチケットを計算する（状態は進めない）。全ペアが目標到達なら `None`。
@@ -2344,7 +1808,6 @@ impl TicketSource {
     /// 状態を進めないため、`peek_ticket` で得たチケットを送信前に保持している間に
     /// `target_games` が変化しても、`still_wanted` で現在値に対して再評価できる。
     /// 送信が確定したら `commit_sent` で状態を進める。
-    /// cycle では発行の状態は進めないが、新しい組の 1 局目を計算するときに局面ファイルを読み直す。
     fn peek_ticket(&self) -> Option<MatchTicket> {
         if let Some(retry) = self.retry_queue.front() {
             let mut ticket = retry.clone();
@@ -2352,16 +1815,7 @@ impl TicketSource {
             return Some(ticket);
         }
         let target = self.target_per_pair();
-        if self.single_game && self.emitted[0] == target {
-            return None;
-        }
-        // 目標増加で前のカードが未達に戻っても、発行中の先後交換ペアを先に閉じる。
-        // 通常発行数由来の pair_index とカード内 slot を同じ 2 局へ対応させるため。
-        let pair_pos = self
-            .emitted
-            .iter()
-            .position(|&e| !e.is_multiple_of(2))
-            .or_else(|| self.emitted.iter().position(|&e| Self::pair_needs_more(e, target)))?;
+        let pair_pos = self.emitted.iter().position(|&e| Self::pair_needs_more(e, target))?;
         let (i, j) = self.pair_indices[pair_pos];
         let game_idx = self.emitted[pair_pos];
 
@@ -2376,32 +1830,16 @@ impl TicketSource {
         let normal_emitted: u32 = self.emitted.iter().copied().sum();
         let pair_index = normal_emitted / 2;
         let local_pair_index = game_idx / 2;
-        let cycle_selection = self.cycle.as_ref().map(|cycle| {
-            let mut cycle = cycle.borrow_mut();
-            if game_idx.is_multiple_of(2) {
-                cycle.refresh();
-                cycle.select(pair_pos)
-            } else {
-                cycle.open_pairs[&pair_pos].clone()
-            }
-        });
         Some(MatchTicket {
             id,
-            cycle_position: cycle_selection.as_ref().map(|(_, p)| p.clone()),
             black_idx,
             white_idx,
-            startpos_idx: if let Some((idx, _)) = cycle_selection {
-                idx
-            } else if self.startpos_order == StartposOrder::Sequential {
-                local_pair_index as usize % self.start_defs_len
-            } else {
-                deterministic_startpos_index(
-                    self.seed,
-                    (i, j),
-                    local_pair_index,
-                    self.start_defs_len,
-                )
-            },
+            startpos_idx: deterministic_startpos_index(
+                self.seed,
+                (i, j),
+                local_pair_index,
+                self.start_defs_len,
+            ),
             pair_slot: game_idx % 2,
             pair_index,
             attempt: 0,
@@ -2420,16 +1858,6 @@ impl TicketSource {
         }
         let pair = (ticket.black_idx.min(ticket.white_idx), ticket.black_idx.max(ticket.white_idx));
         if let Some(pos) = self.pair_indices.iter().position(|&p| p == pair) {
-            if let Some(cycle) = &self.cycle {
-                let mut cycle = cycle.borrow_mut();
-                if ticket.pair_slot == 0 {
-                    let position = ticket.cycle_position.as_ref().expect("cycle position").clone();
-                    *cycle.counts[pos].entry(position.name.clone()).or_default() += 1;
-                    cycle.open_pairs.insert(pos, (ticket.startpos_idx, position));
-                } else {
-                    cycle.open_pairs.remove(&pos);
-                }
-            }
             self.emitted[pos] += 1;
         }
     }
@@ -2454,9 +1882,6 @@ impl TicketSource {
     }
 
     fn observe_result(&mut self, result: &MatchResult) {
-        if self.single_game {
-            return;
-        }
         let key = (result.ticket.pair_index, result.ticket.attempt);
         let slot = result.ticket.pair_slot.min(1) as usize;
         let entry = self.retry_observations.entry(key).or_default();
@@ -2510,6 +1935,10 @@ fn deterministic_startpos_index(
     if startpos_count <= 1 {
         return 0;
     }
+    // seed == SEQUENTIAL_SEED は `--startpos-sequential` の合図。 ペア通番で順に使う。
+    if seed == SEQUENTIAL_SEED {
+        return (local_pair_index as usize) % startpos_count;
+    }
 
     // matchup ごとに独立したストリームを作り、その matchup 内のペア通番で進める。
     // global ticket id を使わないため、control.json の target_games をいつ増やしても、
@@ -2524,6 +1953,9 @@ fn deterministic_startpos_index(
     (splitmix64(stream_value) % startpos_count as u64) as usize
 }
 
+/// `--startpos-sequential` 用の番兵 seed。 通常の entropy 由来 seed と衝突しない値。
+const SEQUENTIAL_SEED: u64 = u64::MAX;
+
 fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -2537,8 +1969,6 @@ fn splitmix64(mut value: u64) -> u64 {
 
 /// 対局結果の集計とファイル出力をまとめる。メインループの各 recv 地点から共通で呼ぶ。
 struct Aggregator<'a> {
-    single_game: bool,
-    ponder: Option<Vec<PonderStats>>,
     engine_labels: &'a [String],
     pair_writers: HashMap<(usize, usize), PairWriter>,
     pair_stats: HashMap<(usize, usize), (u32, u32, u32)>,
@@ -2575,23 +2005,9 @@ impl Aggregator<'_> {
             self.engine_labels,
             &mut self.pair_writers,
             &mut self.pair_game_count,
-            self.single_game,
         )?;
-        if self.single_game {
-            if !result.error && result.outcome != GameOutcome::InProgress {
-                self.valid_completed += 1;
-                println!("Single game result: {} ({})", result.outcome.label(), result.reason);
-            }
-        } else if self.observe_direct_result(result) {
+        if self.observe_direct_result(result) {
             self.valid_completed += 2;
-        }
-        if let (Some(total), Some(stats)) = (&mut self.ponder, result.ponder) {
-            for (index, stat) in
-                [result.ticket.black_idx, result.ticket.white_idx].into_iter().zip(stats)
-            {
-                total[index].sent += stat.sent;
-                total[index].hits += stat.hits;
-            }
         }
         self.completed += 1;
         handle_sprt_observation(
@@ -2601,7 +2017,7 @@ impl Aggregator<'_> {
             self.completed,
             tickets_sent,
         );
-        if !self.single_game && self.completed.is_multiple_of(self.report_interval) {
+        if self.completed.is_multiple_of(self.report_interval) {
             print_progress(
                 self.valid_completed,
                 target_total.max(self.valid_completed),
@@ -2677,7 +2093,6 @@ fn process_result(
     engine_labels: &[String],
     pair_writers: &mut HashMap<(usize, usize), PairWriter>,
     pair_game_count: &mut HashMap<(usize, usize), u32>,
-    single_game: bool,
 ) -> Result<()> {
     let bi = result.ticket.black_idx;
     let wi = result.ticket.white_idx;
@@ -2715,19 +2130,16 @@ fn process_result(
         };
         let result_entry = ResultLogEntry {
             kind: "result",
-            ponder: result.ponder,
             game_id,
             outcome: result.outcome.label(),
             reason: &result.reason,
             plies: result.plies,
             winner,
             ticket_id: Some(result.ticket.id),
-            pair_index: (!single_game).then_some(result.ticket.pair_index),
-            pair_slot: (!single_game).then_some(result.ticket.pair_slot),
+            pair_index: Some(result.ticket.pair_index),
+            pair_slot: Some(result.ticket.pair_slot),
             attempt: result.ticket.attempt,
             startpos_idx: Some(result.ticket.startpos_idx as u32),
-            startpos: result.ticket.cycle_position.as_ref().map(|p| p.command.as_str()),
-            startpos_name: result.ticket.cycle_position.as_ref().map(|p| p.name.as_str()),
             error: result.error,
         };
         pw.write_json(&result_entry)?;
@@ -2807,27 +2219,6 @@ fn print_final_table(
             wr * 100.0,
             elo_str
         );
-    }
-}
-
-/// 表示用の短い ASCII 名を作る。一意性はカード index が担い、元ラベルは meta に残す。
-fn filename_label(label: &str) -> String {
-    let sanitized: String = label
-        .chars()
-        .take(48)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let trimmed = sanitized.trim_matches('-');
-    if trimmed.is_empty() {
-        "engine".to_string()
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -2927,447 +2318,11 @@ fn ensure_node_coverage(
     Ok(())
 }
 
-/// `--nps-scaling` は Fischer の時計だけに掛ける。byoyomi・depth・nodes の対局では倍率の意味が無い。
-fn validate_nps_scaling(cli: &Cli, engine_nodes: &[Option<u64>]) -> Result<()> {
-    if !cli.nps_scaling {
-        if cli.reference_nps.is_some() || cli.min_nps_ratio.is_some() {
-            bail!("--reference-nps / --min-nps-ratio は --nps-scaling と一緒に指定してください");
-        }
-        return Ok(());
-    }
-    if cli.byoyomi > 0
-        || cli.depth.is_some()
-        || engine_nodes.iter().any(Option::is_some)
-        || (cli.btime == 0 && cli.binc == 0)
-    {
-        bail!(
-            "--nps-scaling は Fischer (--btime / --binc、--byoyomi・--depth・--nodes・--engine-nodes なし) の対局で使います"
-        );
-    }
-    if cli.reference_nps == Some(0) {
-        bail!("--reference-nps must be >= 1");
-    }
-    if cli.min_nps_ratio.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
-        bail!("--min-nps-ratio must be in [0, 1]");
-    }
-    Ok(())
-}
-
-/// bench を走らせる engine。採用 SPRT の倍率を base で決め、候補自身の NPS の低下を持ち時間の
-/// 増加で相殺しないようにする。
-fn nps_bench_engine_index(cli: &Cli, engine_labels: &[String]) -> Result<usize> {
-    let label = cli
-        .sprt_base_label
-        .as_deref()
-        .filter(|_| cli.sprt)
-        .or(cli.base_label.as_deref())
-        .context("--nps-scaling は bench を測る engine を --base-label (SPRT では --sprt-base-label も可) で指定してください")?;
-    engine_labels.iter().position(|l| l == label).with_context(|| {
-        format!("--nps-scaling の bench engine '{label}' が engines に存在しません")
-    })
-}
-
-/// 全 slot (`--concurrency` 本) で同時に bench を走らせ、基準の時計に掛ける倍率を決める。
-/// slot には対局の worker と同じく全 engine を常駐させ、探索は bench engine だけが行う。
-fn calibrate_nps_scaling(
-    cli: &Cli,
-    bench_idx: usize,
-    engine_labels: &[String],
-    engine_usi_options: &[Vec<String>],
-    reference: TimeControl,
-    cpu_slots: Option<&CpuSlots>,
-) -> Result<NpsScalingMeta> {
-    let configs: Vec<EngineConfig> = cli
-        .engines
-        .iter()
-        .zip(engine_usi_options)
-        .map(|(path, options)| engine_config(path, options, cli.threads, cli.hash_mb))
-        .collect();
-    let slots = cli.concurrency;
-    let bench_label = &engine_labels[bench_idx];
-    println!(
-        "nps bench: {slots} slot(s) x {} thread(s), engine {bench_label} ...",
-        cli.threads
-    );
-    let bench = nps_bench::measure(slots, cli.threads, cli.timeout_margin_ms, |idx, cancel| {
-        let cpus = cpu_slots.map(|slots| slots.sets[idx].as_slice());
-        let mut searcher = None;
-        let mut resident = Vec::new();
-        for (i, cfg) in configs.iter().enumerate() {
-            if cancel.load(Ordering::Acquire) {
-                return Err(nps_bench::BenchCancelled.into());
-            }
-            let engine = spawn_engine(cfg, format!("bench{}_{}", idx + 1, engine_labels[i]), cpus)?;
-            if i == bench_idx {
-                searcher = Some(engine);
-            } else {
-                resident.push(engine);
-            }
-        }
-        Ok((searcher.context("bench engine was not spawned")?, resident))
-    })?;
-    println!("{}", bench.summary());
-    let reference_nps = cli.reference_nps.unwrap_or(nps_bench::DEFAULT_REFERENCE_NPS);
-    let min_nps_ratio = cli.min_nps_ratio.unwrap_or(nps_bench::DEFAULT_MIN_NPS_RATIO);
-    bench.ensure_above_floor(reference_nps, min_nps_ratio)?;
-    let scale = reference_nps as f64 / bench.nps;
-    let meta = NpsScalingMeta {
-        bench_version: nps_bench::BENCH_VERSION,
-        bench_engine_label: bench_label.clone(),
-        reference_nps,
-        min_nps_ratio,
-        measured_nps: bench.nps,
-        slots: bench.slot_nps.len(),
-        slot_nps: bench.slot_nps,
-        scale,
-        reference_btime: reference.black_time,
-        reference_binc: reference.black_inc,
-        reference_wtime: reference.white_time,
-        reference_winc: reference.white_inc,
-        btime: nps_bench::scale_clock(reference.black_time, scale),
-        binc: nps_bench::scale_clock(reference.black_inc, scale),
-        wtime: nps_bench::scale_clock(reference.white_time, scale),
-        winc: nps_bench::scale_clock(reference.white_inc, scale),
-        bench_depth: bench.depth,
-        warmup_depth: bench.warmup_depth,
-        bench_positions: bench.positions,
-        threads: cli.threads,
-        measured_at: Local::now().to_rfc3339(),
-    };
-    let white = if (meta.wtime, meta.winc) == (meta.btime, meta.binc) {
-        String::new()
-    } else {
-        format!(" wtime={} winc={}", meta.wtime, meta.winc)
-    };
-    println!(
-        "clock: btime={} binc={}{white} (reference {}+{} x scale {:.4}; measured {:.0} nps/thread, reference {})",
-        meta.btime,
-        meta.binc,
-        meta.reference_btime,
-        meta.reference_binc,
-        meta.scale,
-        meta.measured_nps,
-        meta.reference_nps
-    );
-    Ok(meta)
-}
-
-/// 省略された後手の時計を補完し、探索制限との組み合わせを検証する。
-fn resolve_time_control(cli: &Cli, engine_nodes: &[Option<u64>]) -> Result<TimeControl> {
-    let use_byoyomi = cli.byoyomi > 0;
-    let white_specified = cli.wtime.is_some() || cli.winc.is_some();
-    let use_fischer = cli.btime > 0 || cli.binc > 0 || white_specified;
-    // engine_nodes は global --nodes も織り込んだ解決済みの値。
-    let use_fixed = cli.depth.is_some() || engine_nodes.iter().any(|n| n.is_some());
-    if use_byoyomi && white_specified {
-        bail!("--byoyomi と --wtime/--winc は同時に指定できません");
-    }
-    if use_byoyomi && use_fischer {
-        bail!("--byoyomi と --btime/--binc は同時に指定できません");
-    }
-    if !use_byoyomi && !use_fischer && !use_fixed {
-        bail!(
-            "時間管理を指定してください: --byoyomi, --btime/--binc, --depth, --nodes, --engine-nodes のいずれか"
-        );
-    }
-    if use_fischer && cli.btime == 0 && cli.binc == 0 {
-        bail!(
-            "フィッシャー時計: --wtime/--winc の後手時計だけでは指定できません。--btime または --binc の少なくとも一方を正の値で指定してください"
-        );
-    }
-    let wtime = cli.wtime.unwrap_or(cli.btime);
-    let winc = cli.winc.unwrap_or(cli.binc);
-    if use_fischer && wtime == 0 && winc == 0 {
-        bail!("フィッシャー時計: --wtime または --winc の少なくとも一方を正の値で指定してください");
-    }
-    ensure_node_coverage(engine_nodes, use_byoyomi || use_fischer, cli.depth.is_some())?;
-    Ok(TimeControl::new(cli.btime, wtime, cli.binc, winc, cli.byoyomi))
-}
-
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
-    fn clock_cli(args: &[&str]) -> super::Cli {
-        super::Cli::try_parse_from(
-            [
-                "tournament",
-                "--engine",
-                "base",
-                "--engine",
-                "test",
-                "--out-dir",
-                "out",
-            ]
-            .into_iter()
-            .chain(args.iter().copied()),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn fischer_white_defaults_to_black_independently() {
-        for (extra, expected_time, expected_inc) in [
-            (vec![], 180_000, 2_000),
-            (vec!["--wtime", "600000"], 600_000, 2_000),
-            (vec!["--winc", "3000"], 180_000, 3_000),
-            (vec!["--wtime", "0"], 0, 2_000),
-            (vec!["--winc", "0"], 180_000, 0),
-        ] {
-            let mut args = vec!["--btime", "180000", "--binc", "2000"];
-            args.extend(extra);
-            let cli = clock_cli(&args);
-            let tc = super::resolve_time_control(&cli, &[None, None]).unwrap();
-            assert_eq!((tc.black_time, tc.black_inc), (180_000, 2_000));
-            assert_eq!((tc.white_time, tc.white_inc), (expected_time, expected_inc));
-        }
-    }
-
-    #[test]
-    fn asymmetric_fischer_clock_reaches_each_colour() {
-        use rshogi_core::types::Color;
-
-        let cli = clock_cli(&[
-            "--btime", "180000", "--binc", "2000", "--wtime", "600000", "--winc", "3000",
-        ]);
-        let mut tc = super::resolve_time_control(&cli, &[None, None]).unwrap();
-        let args = tc.time_args();
-        assert_eq!(
-            (args.btime, args.wtime, args.binc, args.winc),
-            (180_000, 600_000, 2_000, 3_000)
-        );
-        assert_eq!(tc.think_limit_ms(Color::Black), 182_000);
-        assert_eq!(tc.think_limit_ms(Color::White), 603_000);
-        tc.update_after_move(Color::Black, 1_000);
-        tc.update_after_move(Color::White, 5_000);
-        assert_eq!(tc.remaining(Color::Black), 181_000);
-        assert_eq!(tc.remaining(Color::White), 598_000);
-    }
-
-    #[test]
-    fn asymmetric_meta_settings_serializes_resolved_clocks() {
-        let cli = clock_cli(&[
-            "--btime", "180000", "--binc", "2000", "--wtime", "600000", "--winc", "3000",
-        ]);
-        let tc = super::resolve_time_control(&cli, &[None, None]).unwrap();
-        let settings = super::MetaSettings::new(&cli, tc, 42);
-        let json = serde_json::to_value(settings).unwrap();
-        assert_eq!(json["btime"], 180_000);
-        assert_eq!(json["binc"], 2_000);
-        assert_eq!(json["wtime"], 600_000);
-        assert_eq!(json["winc"], 3_000);
-    }
-
-    #[test]
-    fn byoyomi_rejects_white_clock_even_when_zero() {
-        for option in ["--wtime", "--winc"] {
-            for value in ["0", "2000"] {
-                let cli = clock_cli(&["--byoyomi", "1000", option, value]);
-                let error = super::resolve_time_control(&cli, &[None, None]).err().unwrap();
-                assert_eq!(error.to_string(), "--byoyomi と --wtime/--winc は同時に指定できません");
-            }
-        }
-        let cli = clock_cli(&["--byoyomi", "1000"]);
-        let tc = super::resolve_time_control(&cli, &[None, None]).unwrap();
-        assert_eq!(tc.byoyomi, 1_000);
-        assert_eq!((tc.black_time, tc.white_time, tc.black_inc, tc.white_inc), (0, 0, 0, 0));
-    }
-
-    #[test]
-    fn fischer_requires_positive_time_or_increment_for_each_colour() {
-        for args in [
-            vec!["--wtime", "600000"],
-            vec!["--winc", "2000", "--nodes", "100"],
-            vec!["--wtime", "0", "--depth", "1"],
-        ] {
-            let cli = clock_cli(&args);
-            let error = super::resolve_time_control(&cli, &[None, None]).err().unwrap();
-            assert!(error.to_string().contains("--wtime/--winc の後手時計だけでは指定できません"));
-        }
-        let cli = clock_cli(&["--btime", "180000", "--wtime", "0", "--winc", "0"]);
-        let error = super::resolve_time_control(&cli, &[None, None]).err().unwrap();
-        assert!(error.to_string().contains("--wtime または --winc"));
-    }
-
-    #[test]
-    fn sprt_nelo_bounds_accept_space_separated_negative_values() {
-        for (nelo0, nelo1, expected0, expected1) in [
-            ("-10", "0", -10.0, 0.0),
-            ("-20", "-5", -20.0, -5.0),
-            ("-10.5", "-0.5", -10.5, -0.5),
-        ] {
-            let cli = super::Cli::try_parse_from([
-                "tournament",
-                "--engine",
-                "base",
-                "--engine",
-                "test",
-                "--out-dir",
-                "out",
-                "--sprt-nelo0",
-                nelo0,
-                "--sprt-nelo1",
-                nelo1,
-            ])
-            .unwrap();
-            assert_eq!(cli.sprt_nelo0, expected0);
-            assert_eq!(cli.sprt_nelo1, expected1);
-        }
-    }
-
-    #[test]
-    fn adjudication_flags_parse_and_default_off() {
-        let args = [
-            "tournament",
-            "--engine",
-            "base",
-            "--engine",
-            "test",
-            "--out-dir",
-            "out",
-        ];
-        let cli = super::Cli::try_parse_from(args).unwrap();
-        assert_eq!(cli.adjudicate_resign, None);
-        assert_eq!(cli.adjudicate_win, None);
-        assert_eq!(cli.startpos_order, super::StartposOrder::Random);
-        assert_eq!(cli.adjudicate_draw, None);
-        assert_eq!(cli.adjudicate_agreement, None);
-        for separator in [",", " "] {
-            let resign = ["movecount=3", "score=600"].join(separator);
-            let draw = ["movenumber=34", "movecount=8", "score=20"].join(separator);
-            let cli = super::Cli::try_parse_from(args.into_iter().chain([
-                "--adjudicate-resign",
-                resign.as_str(),
-                "--adjudicate-win",
-                resign.as_str(),
-                "--adjudicate-draw",
-                draw.as_str(),
-                "--adjudicate-agreement",
-                resign.as_str(),
-            ]))
-            .unwrap();
-            assert_eq!(cli.adjudicate_agreement, cli.adjudicate_resign);
-            assert_eq!(
-                cli.adjudicate_resign,
-                Some(super::ResignRule {
-                    movecount: 3,
-                    score: 600
-                })
-            );
-            assert_eq!(cli.adjudicate_win, cli.adjudicate_resign);
-            assert_eq!(
-                cli.adjudicate_draw,
-                Some(super::DrawRule {
-                    movenumber: 34,
-                    movecount: 8,
-                    score: 20
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn adjudication_flags_reject_invalid_fields() {
-        for (flag, value) in [
-            ("--adjudicate-resign", "movecount=3,score=600,unknown=1"),
-            ("--adjudicate-win", "movecount=3,score=600,unknown=1"),
-            ("--adjudicate-resign", "movecount=3"),
-            ("--adjudicate-win", "movecount=3"),
-            ("--adjudicate-resign", "score=600"),
-            ("--adjudicate-win", "score=600"),
-            ("--adjudicate-resign", "movecount=3,score=600,score=20"),
-            ("--adjudicate-win", "movecount=3,score=600,score=20"),
-            ("--adjudicate-resign", "movecount=0,score=600"),
-            ("--adjudicate-win", "movecount=0,score=600"),
-            ("--adjudicate-resign", "movecount=3,score=-1"),
-            ("--adjudicate-win", "movecount=3,score=-1"),
-            ("--adjudicate-resign", "movecount=3,score=2147483648"),
-            ("--adjudicate-win", "movecount=3,score=2147483648"),
-            ("--adjudicate-resign", "movecount=x,score=600"),
-            ("--adjudicate-win", "movecount=x,score=600"),
-            ("--adjudicate-resign", "movecount=3,score"),
-            ("--adjudicate-win", "movecount=3,score"),
-            ("--adjudicate-draw", "movenumber=34,movecount=8,score=20,unknown=1"),
-            ("--adjudicate-draw", "movecount=8,score=20"),
-            ("--adjudicate-draw", "movenumber=34,score=20"),
-            ("--adjudicate-draw", "movenumber=34,movecount=8"),
-            ("--adjudicate-draw", "movenumber=34,movecount=8,score=20,movenumber=40"),
-            ("--adjudicate-draw", "movenumber=34,movecount=0,score=20"),
-            ("--adjudicate-agreement", "movecount=3,score=0"),
-            ("--adjudicate-agreement", "movecount=0,score=600"),
-            ("--adjudicate-agreement", "score=600"),
-        ] {
-            assert!(
-                super::Cli::try_parse_from([
-                    "tournament",
-                    "--engine",
-                    "base",
-                    "--engine",
-                    "test",
-                    "--out-dir",
-                    "out",
-                    flag,
-                    value,
-                ])
-                .is_err(),
-                "{flag} {value}"
-            );
-        }
-    }
-
-    #[test]
-    fn adjudication_meta_omits_disabled_rules() {
-        let mut settings = super::MetaSettings {
-            startpos_order: super::StartposOrder::Random,
-            games: 2,
-            single_game: false,
-            preserve_start_history: false,
-            seed: 0,
-            max_moves: 512,
-            adjudicate_resign: None,
-            adjudicate_win: None,
-            adjudicate_draw: None,
-            adjudicate_agreement: None,
-            byoyomi: 100,
-            btime: 0,
-            binc: 0,
-            wtime: 0,
-            winc: 0,
-            timeout_margin_ms: 0,
-            threads: 1,
-            hash_mb: 16,
-            depth: None,
-            nodes: None,
-        };
-        let json = serde_json::to_value(&settings).unwrap();
-        assert!(json.get("adjudicate_resign").is_none());
-        assert!(json.get("adjudicate_win").is_none());
-        assert!(json.get("adjudicate_agreement").is_none());
-        assert_eq!(json["startpos_order"], "random");
-        // 明示したゼロを「先手と同じ」と誤解しないよう、後手の値は常に記録する。
-        assert_eq!(json["wtime"], 0);
-        assert_eq!(json["winc"], 0);
-        settings.startpos_order = super::StartposOrder::Sequential;
-        settings.adjudicate_win = Some("movecount=1,score=300".parse().unwrap());
-        assert!(json.get("adjudicate_draw").is_none());
-        settings.adjudicate_resign = Some("movecount=3,score=600".parse().unwrap());
-        settings.adjudicate_draw = Some("movenumber=34,movecount=8,score=20".parse().unwrap());
-        settings.adjudicate_agreement = Some("movecount=4,score=800".parse().unwrap());
-        let json = serde_json::to_value(&settings).unwrap();
-        assert_eq!(json["adjudicate_agreement"], serde_json::json!({"movecount":4,"score":800}));
-        assert_eq!(json["startpos_order"], "sequential");
-        assert_eq!(json["adjudicate_win"], serde_json::json!({"movecount":1,"score":300}));
-        assert_eq!(json["adjudicate_resign"], serde_json::json!({"movecount":3,"score":600}));
-        assert_eq!(
-            json["adjudicate_draw"],
-            serde_json::json!({"movenumber":34,"movecount":8,"score":20})
-        );
-    }
-
     use super::{
-        CONTROL_HISTORY_FILE_NAME, ControlFile, MatchResult, SprtState, TicketSource,
-        build_engine_usi_options, deterministic_startpos_index, ensure_node_coverage,
-        resolve_engine_nodes, splitmix64,
+        ControlFile, MatchResult, SprtState, TicketSource, build_engine_usi_options,
+        deterministic_startpos_index, ensure_node_coverage, resolve_engine_nodes, splitmix64,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -3399,7 +2354,6 @@ mod tests {
             reason: String::new(),
             plies: 0,
             move_logs: Vec::new(),
-            ponder: None,
             error,
             worker_retired: false,
         }
@@ -3455,77 +2409,14 @@ mod tests {
     }
 
     #[test]
-    fn output_directory_lock_excludes_another_run_and_releases_on_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = super::reserve_output_directory(dir.path()).unwrap();
-        assert!(super::reserve_output_directory(dir.path()).is_err());
-        drop(first);
-        assert!(super::reserve_output_directory(dir.path()).is_ok());
-        std::fs::write(dir.path().join("pair-0-1.jsonl"), b"saved").unwrap();
-        assert!(super::reserve_output_directory(dir.path()).is_err());
-        assert_eq!(std::fs::read(dir.path().join("pair-0-1.jsonl")).unwrap(), b"saved");
-    }
-
-    #[test]
-    fn worker_panic_notifies_shutdown_before_main_join() {
-        let ctx = super::SpawnCtx {
-            engine_paths: &[],
-            engine_labels: &[],
-            engine_usi_options: &[],
-            engine_ponder: &[],
-            threads: 1,
-            hash_mb: 1,
-            max_moves: 1,
-            preserve_start_history: false,
-            adjudicate_resign: None,
-            adjudicate_win: None,
-            adjudicate_draw: None,
-            adjudicate_agreement: None,
-            timeout_margin_ms: 1,
-            time_control: super::TimeControl::new(0, 0, 0, 0, 0),
-            go_depth: None,
-            go_nodes: &[],
-            start_defs: &[],
-            cpu_slots: None,
-        };
-        let (ticket_tx, ticket_rx) = super::chan::bounded(1);
-        let (result_tx, _result_rx) = super::chan::bounded(1);
-        let shutdown = Arc::new(super::AtomicBool::new(false));
-        let failed = Arc::new(super::AtomicBool::new(false));
-        let mut handles = Vec::new();
-        super::spawn_worker(&ctx, &ticket_rx, &result_tx, &shutdown, &failed, &mut handles);
-        // 内部の不正 fixture で安全な slice 境界 panic を起こし、外側の監督経路を検証する。
-        ticket_tx
-            .send(Some(super::MatchTicket {
-                id: 0,
-                black_idx: 0,
-                white_idx: 1,
-                cycle_position: None,
-                startpos_idx: 0,
-                pair_index: 0,
-                pair_slot: 0,
-                attempt: 0,
-            }))
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !shutdown.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(shutdown.load(Ordering::Relaxed));
-        assert!(failed.load(Ordering::Relaxed));
-        handles.pop().unwrap().join().unwrap();
-    }
-
-    #[test]
     fn ticket_source_single_pair_emits_expected_pairs() {
         let target = Arc::new(AtomicU32::new(2)); // 各方向 2 局 = 1 ペアあたり 4 局
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 1, target.clone(), 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         assert_eq!(source.current_target_total(), 4);
 
         let tickets = drain_source(&mut source);
         assert_eq!(tickets.len(), 4);
-        assert!(source.peek_ticket().is_none());
+        assert!(!source.has_next());
         // id 連番 0..4、pair_index = id/2、pair_slot = id%2
         let ids: Vec<u64> = tickets.iter().map(|t| t.id).collect();
         assert_eq!(ids, vec![0, 1, 2, 3]);
@@ -3538,15 +2429,14 @@ mod tests {
     #[test]
     fn ticket_source_target_increase_continues_consistently() {
         let target = Arc::new(AtomicU32::new(1)); // 1 ペアあたり 2 局
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 1, target.clone(), 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         let first = drain_source(&mut source);
         assert_eq!(first.len(), 2);
-        assert!(source.peek_ticket().is_none());
+        assert!(!source.has_next());
 
         // 実行中に target を増やす → 追加分を発行できる
         target.store(3, Ordering::Relaxed); // 1 ペアあたり 6 局
-        assert!(source.peek_ticket().is_some());
+        assert!(source.has_next());
         let more = drain_source(&mut source);
         assert_eq!(more.len(), 4); // 6 - 2
 
@@ -3559,127 +2449,15 @@ mod tests {
     }
 
     #[test]
-    fn target_increase_mid_card_keeps_all_completed_pairs() {
-        let target = Arc::new(AtomicU32::new(1));
-        let mut source = TicketSource::new(
-            vec![(0, 1), (0, 2)],
-            1000,
-            target.clone(),
-            42,
-            super::StartposOrder::Random,
-        );
-        let mut tickets = (0..3).map(|_| pull(&mut source).unwrap()).collect::<Vec<_>>();
-        target.store(2, Ordering::Relaxed);
-        tickets.extend(drain_source(&mut source));
-        assert_eq!(tickets.len(), 8);
-        assert_pentanomial_integrity(&tickets);
-        assert_eq!(tickets.iter().map(|t| t.id).collect::<Vec<_>>(), (0..8).collect::<Vec<_>>());
-
-        let labels = strings(&["base", "other", "test"]);
-        let mut aggregate = super::Aggregator {
-            single_game: false,
-            ponder: None,
-            engine_labels: &labels,
-            pair_writers: Default::default(),
-            pair_stats: [((0, 1), (0, 0, 0)), ((0, 2), (0, 0, 0))].into(),
-            pair_game_count: Default::default(),
-            direct_buffer: Default::default(),
-            direct_completed_pairs: Default::default(),
-            completed: 0,
-            valid_completed: 0,
-            sprt_state: None,
-            stop_feeding: false,
-            report_interval: 10,
-            start_time: std::time::Instant::now(),
-        };
-        let mut sprt = SprtState::new(
-            super::SprtParameters::new(0.0, 5.0, 0.05, 0.05).unwrap(),
-            0,
-            2,
-            10,
-            "base".into(),
-            "test".into(),
-        );
-        let mut completed_pairs = 0;
-        // 到着順が発行順と違っても、対象カードの勝敗だけを集計する。
-        for ticket in tickets.into_iter().rev() {
-            let outcome = if ticket.black_idx == 2 {
-                super::GameOutcome::BlackWin
-            } else if ticket.white_idx == 2 {
-                super::GameOutcome::WhiteWin
-            } else {
-                super::GameOutcome::Draw
-            };
-            let game = result(ticket, outcome, false);
-            source.observe_result(&game);
-            completed_pairs += u32::from(aggregate.observe_direct_result(&game));
-            sprt.observe(&game);
-        }
-        assert_eq!(completed_pairs, 4);
-        assert!(aggregate.direct_buffer.is_empty());
-        assert_eq!(aggregate.pair_stats[&(0, 1)], (0, 0, 4));
-        assert_eq!(aggregate.pair_stats[&(0, 2)], (0, 4, 0));
-        assert!(source.retry_observations.is_empty());
-        assert_eq!(
-            sprt.penta,
-            super::Penta {
-                ww: 2,
-                ..super::Penta::ZERO
-            }
-        );
-    }
-
-    #[test]
-    fn target_increase_mid_card_still_retries_failed_pair() {
-        let target = Arc::new(AtomicU32::new(1));
-        let mut source = TicketSource::new(
-            vec![(0, 1), (0, 2)],
-            1000,
-            target.clone(),
-            42,
-            super::StartposOrder::Random,
-        );
-        let first = pull(&mut source).unwrap();
-        let second = pull(&mut source).unwrap();
-        let open = pull(&mut source).unwrap();
-        target.store(2, Ordering::Relaxed);
-        let close = pull(&mut source).unwrap();
-        assert_pentanomial_integrity(&[open.clone(), close.clone()]);
-        source.observe_result(&result(open.clone(), super::GameOutcome::Draw, true));
-        source.observe_result(&result(close.clone(), super::GameOutcome::Draw, false));
-        let retries = [pull(&mut source).unwrap(), pull(&mut source).unwrap()];
-        assert_pentanomial_integrity(&retries);
-        for (retry, original) in retries.iter().zip([&open, &close]) {
-            assert_eq!(retry.attempt, 1);
-            assert_eq!(retry.pair_index, original.pair_index);
-            assert_eq!(retry.startpos_idx, original.startpos_idx);
-            assert_eq!(
-                (retry.black_idx, retry.white_idx),
-                (original.black_idx, original.white_idx)
-            );
-            assert!(retry.id > close.id);
-            source.observe_result(&result(retry.clone(), super::GameOutcome::Draw, false));
-        }
-        let mut normal = vec![first, second, open, close];
-        normal.extend(drain_source(&mut source));
-        assert_eq!(normal.len(), 8);
-        assert_pentanomial_integrity(&normal);
-        assert_eq!(source.retry_summary().retried_pairs, 1);
-        assert!(!source.retry_summary().invalid);
-        assert!(source.retry_observations.is_empty());
-    }
-
-    #[test]
     fn ticket_source_target_decrease_stops_feeding() {
         let target = Arc::new(AtomicU32::new(3)); // 1 ペアあたり 6 局
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 1, target.clone(), 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         // 2 局だけ発行
         assert!(pull(&mut source).is_some());
         assert!(pull(&mut source).is_some());
         // target を発行済みより小さくする → それ以上は発行しない
         target.store(1, Ordering::Relaxed); // 1 ペアあたり 2 局（既に到達）
-        assert!(source.peek_ticket().is_none());
+        assert!(!source.has_next());
         assert!(pull(&mut source).is_none());
     }
 
@@ -3687,8 +2465,7 @@ mod tests {
     fn ticket_source_round_robin_keeps_pairs_within_engine_pair() {
         let target = Arc::new(AtomicU32::new(1)); // 各ペア 2 局
         let pairs = vec![(0, 1), (0, 2), (1, 2)];
-        let mut source =
-            TicketSource::new(pairs.clone(), 1, target.clone(), 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(pairs.clone(), 1, target.clone(), 0);
         assert_eq!(source.current_target_total(), 6);
         let tickets = drain_source(&mut source);
         assert_eq!(tickets.len(), 6);
@@ -3700,8 +2477,7 @@ mod tests {
         use std::collections::HashMap;
         let target = Arc::new(AtomicU32::new(1)); // 各ペア 2 局
         let pairs = vec![(0, 1), (0, 2), (1, 2)];
-        let mut source =
-            TicketSource::new(pairs.clone(), 1, target.clone(), 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(pairs.clone(), 1, target.clone(), 0);
         let first = drain_source(&mut source);
         assert_eq!(first.len(), 6);
 
@@ -3747,21 +2523,14 @@ mod tests {
 
         // まず各方向 1 局を発行し、その後 3 局へ増やす。
         let dynamic_target = Arc::new(AtomicU32::new(1));
-        let mut dynamic = TicketSource::new(
-            pairs.clone(),
-            65_521,
-            dynamic_target.clone(),
-            42,
-            super::StartposOrder::Random,
-        );
+        let mut dynamic = TicketSource::new(pairs.clone(), 65_521, dynamic_target.clone(), 42);
         let mut dynamic_tickets = drain_source(&mut dynamic);
         dynamic_target.store(3, Ordering::Relaxed);
         dynamic_tickets.extend(drain_source(&mut dynamic));
 
         // 最初から最終 target を指定した場合と、matchup ごとの局面列が一致する。
         let fixed_target = Arc::new(AtomicU32::new(3));
-        let mut fixed =
-            TicketSource::new(pairs, 65_521, fixed_target, 42, super::StartposOrder::Random);
+        let mut fixed = TicketSource::new(pairs, 65_521, fixed_target, 42);
         let fixed_tickets = drain_source(&mut fixed);
 
         assert_eq!(collect_startpos(dynamic_tickets), collect_startpos(fixed_tickets));
@@ -3771,127 +2540,27 @@ mod tests {
     fn ticket_source_decrease_mid_pair_completes_pair() {
         // ペアの 1 局目だけ発行した状態で target を下げても、2 局目を発行してペアを完結させる。
         let target = Arc::new(AtomicU32::new(3)); // 1 ペアあたり 6 局
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 1, target.clone(), 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         let slot0 = pull(&mut source).unwrap();
         assert_eq!(slot0.pair_slot, 0);
 
         // 発行済み (=1, 奇数) より小さい target に下げる。
         target.store(0, Ordering::Relaxed);
         // 奇数 emitted のため 2 局目はまだ発行できる。
-        assert!(source.peek_ticket().is_some());
+        assert!(source.has_next());
         let slot1 = pull(&mut source).unwrap();
         assert_eq!(slot1.pair_slot, 1);
         assert_eq!(slot0.pair_index, slot1.pair_index);
         // ペアが完結したので以降は発行しない。
-        assert!(source.peek_ticket().is_none());
+        assert!(!source.has_next());
         assert!(pull(&mut source).is_none());
         assert_pentanomial_integrity(&[slot0, slot1]);
     }
 
     #[test]
-    fn sprt_stop_closes_open_pair_without_starting_new_pairs() {
-        // 停止前・ペア途中・ペア境界・カード切替の各境界で止める。
-        for sent_before_stop in 0usize..=7 {
-            let target = Arc::new(AtomicU32::new(2));
-            let mut source = TicketSource::new(
-                vec![(0, 1), (0, 2), (1, 2)],
-                1000,
-                target.clone(),
-                42,
-                super::StartposOrder::Random,
-            );
-            let mut tickets =
-                (0..sent_before_stop).map(|_| pull(&mut source).unwrap()).collect::<Vec<_>>();
-            let mut pending = source.peek_ticket();
-            let pending_id = pending.as_ref().unwrap().id;
-            // 停止後に target が増えても新しいペアは始めない。
-            target.store(10, Ordering::Relaxed);
-            if !sent_before_stop.is_multiple_of(2) {
-                let closing = source.offer_ticket(&mut pending, true).unwrap();
-                let first = tickets.last().unwrap();
-                assert_eq!(closing.id, pending_id);
-                assert_eq!(closing.pair_slot, 1);
-                assert_eq!(closing.pair_index, first.pair_index);
-                assert_eq!(closing.startpos_idx, first.startpos_idx);
-                assert_eq!(
-                    (closing.black_idx, closing.white_idx),
-                    (first.white_idx, first.black_idx)
-                );
-                // 送信より先に結果の受信が選ばれても、同じ未送信候補を保持する。
-                assert_eq!(source.offer_ticket(&mut pending, true).unwrap().id, closing.id);
-                source.commit_sent(&pending.take().unwrap());
-                tickets.push(closing);
-            }
-            assert!(source.offer_ticket(&mut pending, true).is_none());
-            assert!(pending.is_none());
-            assert_eq!(tickets.len(), sent_before_stop.div_ceil(2) * 2);
-            assert_pentanomial_integrity(&tickets);
-        }
-    }
-
-    #[test]
-    fn sprt_stop_keeps_retries_and_closes_open_pair() {
-        let target = Arc::new(AtomicU32::new(3));
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 1000, target.clone(), 42, super::StartposOrder::Random);
-        let first = pull(&mut source).unwrap();
-        let second = pull(&mut source).unwrap();
-        let open = pull(&mut source).unwrap();
-        let mut pending = source.peek_ticket();
-        source.observe_result(&result(first.clone(), super::GameOutcome::Draw, true));
-        source.observe_result(&result(second.clone(), super::GameOutcome::Draw, false));
-        target.store(0, Ordering::Relaxed);
-
-        let mut sent = Vec::new();
-        while let Some(ticket) = source.offer_ticket(&mut pending, true) {
-            source.commit_sent(&pending.take().unwrap());
-            sent.push(ticket);
-        }
-        let closing: Vec<_> = sent.iter().filter(|t| t.attempt == 0).cloned().collect();
-        assert_eq!(closing.len(), 1);
-        assert_eq!(closing[0].pair_slot, 1);
-        assert_eq!(closing[0].pair_index, open.pair_index);
-        assert_pentanomial_integrity(&[open, closing[0].clone()]);
-        let retries: Vec<_> = sent.iter().filter(|t| t.attempt == 1).cloned().collect();
-        assert_eq!(retries.len(), 2);
-        for (retry, original) in retries.iter().zip([&first, &second]) {
-            assert_eq!(retry.pair_index, original.pair_index);
-            assert_eq!(retry.pair_slot, original.pair_slot);
-            assert_eq!(retry.startpos_idx, original.startpos_idx);
-            assert_eq!(
-                (retry.black_idx, retry.white_idx),
-                (original.black_idx, original.white_idx)
-            );
-        }
-        assert!(source.peek_ticket().is_none());
-    }
-
-    #[test]
-    fn offer_ticket_without_stop_follows_target_and_keeps_pair() {
-        let target = Arc::new(AtomicU32::new(2));
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 1000, target.clone(), 42, super::StartposOrder::Random);
-        let mut pending = source.peek_ticket();
-        target.store(0, Ordering::Relaxed);
-        assert!(source.offer_ticket(&mut pending, false).is_none());
-        target.store(2, Ordering::Relaxed);
-        let first = source.offer_ticket(&mut pending, false).unwrap();
-        assert_eq!(first.pair_slot, 0);
-        source.commit_sent(&pending.take().unwrap());
-        target.store(0, Ordering::Relaxed);
-        let second = source.offer_ticket(&mut pending, false).unwrap();
-        assert_eq!(second.pair_slot, 1);
-        source.commit_sent(&pending.take().unwrap());
-        assert_pentanomial_integrity(&[first, second]);
-        assert!(source.offer_ticket(&mut pending, false).is_none());
-    }
-
-    #[test]
     fn ticket_source_peek_does_not_advance_state() {
         let target = Arc::new(AtomicU32::new(2));
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 1, target.clone(), 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
         let a = source.peek_ticket().unwrap();
         let b = source.peek_ticket().unwrap();
         assert_eq!(a.id, b.id, "peek は状態を進めない");
@@ -3903,8 +2572,7 @@ mod tests {
     #[test]
     fn ticket_source_still_wanted_reflects_target_decrease() {
         let target = Arc::new(AtomicU32::new(2)); // 各ペア 4 局
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 1, target.clone(), 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target.clone(), 0);
 
         // 未コミットの 1 局目（偶数 slot）は、target を下げると不要になる。
         let fresh = source.peek_ticket().unwrap();
@@ -3928,7 +2596,7 @@ mod tests {
         use super::{ControlState, apply_control};
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("control.json");
-        let history_path = dir.path().join(CONTROL_HISTORY_FILE_NAME);
+        let history_path = dir.path().join("control_history.jsonl");
 
         let target = AtomicU32::new(100);
         let mut desired = 4usize;
@@ -3938,12 +2606,12 @@ mod tests {
         };
 
         // ファイル不在 → 何もしない（履歴も作られない）。
-        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 0, None);
+        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 0);
         assert!(!history_path.exists());
 
         // target と concurrency を変更。
         std::fs::write(&control_path, r#"{"target_games": 150, "concurrency": 8}"#).unwrap();
-        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 10, None);
+        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 10);
         assert_eq!(target.load(Ordering::Relaxed), 150);
         assert_eq!(desired, 8);
         assert_eq!(applied.target_games, 150);
@@ -3952,106 +2620,27 @@ mod tests {
         assert_eq!(history.lines().count(), 1, "変更 1 件で履歴 1 行");
 
         // 同じ内容の再ポーリングは no-op（履歴が増えない）。
-        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 20, None);
+        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 20);
         let history = std::fs::read_to_string(&history_path).unwrap();
         assert_eq!(history.lines().count(), 1, "差分なしでは履歴が増えない");
 
         // concurrency=0 は無視され、target だけ反映される。
         std::fs::write(&control_path, r#"{"target_games": 200, "concurrency": 0}"#).unwrap();
-        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 30, None);
+        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 30);
         assert_eq!(target.load(Ordering::Relaxed), 200);
         assert_eq!(desired, 8, "concurrency=0 は無視");
 
         // 壊れた JSON は無視され、実行継続（既存値も維持）。
         std::fs::write(&control_path, "{ not json").unwrap();
-        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 40, None);
+        apply_control(&control_path, &history_path, &mut applied, &target, &mut desired, 40);
         assert_eq!(target.load(Ordering::Relaxed), 200);
-
-        // NUMA の CPU 群の数を越える増員は無視する。
-        std::fs::write(&control_path, r#"{"concurrency": 9}"#).unwrap();
-        apply_control(
-            &control_path,
-            &history_path,
-            &mut applied,
-            &target,
-            &mut desired,
-            50,
-            Some(8),
-        );
-        assert_eq!(desired, 8);
-    }
-
-    #[test]
-    fn nps_scaling_requires_fischer_clock_and_flags_need_it() {
-        let ok = clock_cli(&["--btime", "20000", "--binc", "2500", "--nps-scaling"]);
-        assert!(super::validate_nps_scaling(&ok, &[None, None]).is_ok());
-        for args in [
-            &["--byoyomi", "1000", "--nps-scaling"][..],
-            &["--btime", "20000", "--depth", "10", "--nps-scaling"],
-            &["--btime", "20000", "--nps-scaling", "--reference-nps", "0"],
-            &[
-                "--btime",
-                "20000",
-                "--nps-scaling",
-                "--min-nps-ratio",
-                "1.5",
-            ],
-            &["--btime", "20000", "--reference-nps", "350000"],
-            &["--btime", "20000", "--min-nps-ratio", "0.5"],
-        ] {
-            let cli = clock_cli(args);
-            assert!(super::validate_nps_scaling(&cli, &[None, None]).is_err(), "{args:?}");
-        }
-        assert!(super::validate_nps_scaling(&ok, &[Some(1000), None]).is_err());
-    }
-
-    #[test]
-    fn nps_bench_engine_is_the_sprt_base() {
-        let labels = ["base".to_owned(), "test".to_owned()];
-        let cli = clock_cli(&["--btime", "20000", "--nps-scaling", "--base-label", "test"]);
-        assert_eq!(super::nps_bench_engine_index(&cli, &labels).unwrap(), 1);
-        let cli = clock_cli(&[
-            "--btime",
-            "20000",
-            "--nps-scaling",
-            "--base-label",
-            "test",
-            "--sprt",
-            "--sprt-base-label",
-            "base",
-        ]);
-        assert_eq!(super::nps_bench_engine_index(&cli, &labels).unwrap(), 0);
-        let cli = clock_cli(&["--btime", "20000", "--nps-scaling"]);
-        assert!(super::nps_bench_engine_index(&cli, &labels).is_err());
-        let cli = clock_cli(&[
-            "--btime",
-            "20000",
-            "--nps-scaling",
-            "--base-label",
-            "missing",
-        ]);
-        assert!(super::nps_bench_engine_index(&cli, &labels).is_err());
-    }
-
-    #[test]
-    fn cpu_slots_hand_out_lowest_free_group_and_take_it_back() {
-        let slots = Arc::new(super::CpuSlots::new(vec![vec![0, 1], vec![2, 3]]));
-        let shutdown = super::AtomicBool::new(false);
-        let first = slots.acquire(&shutdown).unwrap();
-        let second = slots.acquire(&shutdown).unwrap();
-        assert_eq!((first.cpus(), second.cpus()), (&[0, 1][..], &[2, 3][..]));
-        drop(first);
-        assert_eq!(slots.acquire(&shutdown).unwrap().cpus(), &[0, 1]);
-        shutdown.store(true, Ordering::Relaxed);
-        assert!(slots.acquire(&shutdown).is_none());
     }
 
     #[test]
     fn ticket_source_swap_game_reuses_start_position() {
         // 複数開始局面でも、ペアの 2 局目は 1 局目と同じ開始局面を使う。
         let target = Arc::new(AtomicU32::new(1));
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 8, target.clone(), 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(vec![(0, 1)], 8, target.clone(), 0);
         let tickets = drain_source(&mut source);
         assert_eq!(tickets.len(), 2);
         assert_eq!(
@@ -4063,8 +2652,7 @@ mod tests {
     #[test]
     fn error_pair_retries_twice_without_consuming_target() {
         let target = Arc::new(AtomicU32::new(1));
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 8, target, 42, super::StartposOrder::Random);
+        let mut source = TicketSource::new(vec![(0, 1)], 8, target, 42);
         let initial = drain_source(&mut source);
         assert_eq!(initial.len(), 2);
         let startpos_idx = initial[0].startpos_idx;
@@ -4090,7 +2678,7 @@ mod tests {
             source.observe_result(&result(ticket, super::GameOutcome::Draw, true));
         }
 
-        assert!(source.peek_ticket().is_none());
+        assert!(!source.has_next());
         assert_eq!(source.current_target_total(), 2);
         let summary = source.retry_summary();
         assert_eq!(summary.error_pairs, 1);
@@ -4104,8 +2692,7 @@ mod tests {
         let params = super::SprtParameters::new(0.0, 5.0, 0.05, 0.05).unwrap();
         let mut state = SprtState::new(params, 0, 1, 10, "base".into(), "test".into());
         let target = Arc::new(AtomicU32::new(1));
-        let mut source =
-            TicketSource::new(vec![(0, 1)], 1, target, 0, super::StartposOrder::Random);
+        let mut source = TicketSource::new(vec![(0, 1)], 1, target, 0);
         let initial = drain_source(&mut source);
         state.observe(&result(initial[0].clone(), super::GameOutcome::WhiteWin, false));
         state.observe(&result(initial[1].clone(), super::GameOutcome::Draw, true));
@@ -4136,7 +2723,6 @@ mod tests {
                 id: 0,
                 black_idx,
                 white_idx,
-                cycle_position: None,
                 startpos_idx: pair_index as usize,
                 pair_index,
                 pair_slot,
@@ -4304,75 +2890,5 @@ mod tests {
         let merged = build_engine_usi_options(&common, Some(per_engine), false);
 
         assert_eq!(merged, strings(&["Threads=2", "EvalFile=last.bin"]));
-    }
-    #[test]
-    fn sequential_balances_and_survives_target_changes_and_retries() {
-        for seed in [0, 42, u64::MAX] {
-            let target = Arc::new(AtomicU32::new(3));
-            let mut source = TicketSource::new(
-                vec![(0, 1), (0, 2)],
-                3,
-                target.clone(),
-                seed,
-                super::StartposOrder::Sequential,
-            );
-            let first = pull(&mut source).unwrap();
-            target.store(0, Ordering::Relaxed);
-            let second = pull(&mut source).unwrap();
-            assert_eq!(first.startpos_idx, second.startpos_idx);
-            target.store(6, Ordering::Relaxed);
-            let mut tickets = vec![first.clone(), second.clone()];
-            tickets.extend(drain_source(&mut source));
-            for matchup in [(0, 1), (0, 2)] {
-                let indices: Vec<_> = tickets
-                    .iter()
-                    .filter(|t| {
-                        (t.black_idx.min(t.white_idx), t.black_idx.max(t.white_idx)) == matchup
-                    })
-                    .map(|t| t.startpos_idx)
-                    .collect();
-                assert_eq!(indices, vec![0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2]);
-            }
-            source.observe_result(&result(first.clone(), super::GameOutcome::Draw, true));
-            source.observe_result(&result(second, super::GameOutcome::Draw, false));
-            let retries = drain_source(&mut source);
-            assert_eq!(retries.len(), 2);
-            assert!(retries.iter().all(|t| t.attempt == 1 && t.startpos_idx == first.startpos_idx));
-        }
-    }
-    #[test]
-    fn random_startpos_golden_values_are_unchanged() {
-        let actual: Vec<_> =
-            (0..8).map(|i| deterministic_startpos_index(42, (0, 1), i, 65521)).collect();
-        assert_eq!(actual, vec![28243, 37729, 28526, 3240, 12894, 28843, 53384, 8534]);
-    }
-}
-
-#[cfg(test)]
-mod ponder_cli_tests {
-    use super::*;
-
-    #[test]
-    fn engine_ponder_indices_and_overrides() {
-        assert_eq!(parse_ponder(&[], 2).unwrap(), [false, false]);
-        let values = ["0:true", "1:true", "1:false"].map(str::to_owned);
-        assert_eq!(parse_ponder(&values, 2).unwrap(), [true, false]);
-        for invalid in ["true", "2:true", "-1:true", "0:yes", "x:false"] {
-            assert!(parse_ponder(&[invalid.into()], 2).is_err(), "{invalid}");
-        }
-        let cli = Cli::try_parse_from([
-            "tournament",
-            "--engine",
-            "a",
-            "--engine",
-            "b",
-            "--out-dir",
-            "out",
-            "--ponder",
-            "0:true",
-            "1:false",
-        ])
-        .unwrap();
-        assert_eq!(parse_ponder(&cli.ponder, 2).unwrap(), [true, false]);
     }
 }

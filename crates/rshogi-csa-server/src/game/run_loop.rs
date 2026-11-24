@@ -27,8 +27,7 @@ const TIMEUP_GRACE_MS: u64 = 250;
 
 /// `GameRoom` を `tokio` で回すランループ。
 ///
-/// `now_ms` は `GameRoom` の手番開始時刻と同じ単調時計域のミリ秒時刻を返す。
-/// テストでは部屋の開始時刻と同期した仮想時計を渡す。
+/// `now_ms` は単調増加するミリ秒時刻を返すクロージャ（テストでは仮想時計を渡す）。
 /// 対局終了まで処理し、最終結果を返す。
 ///
 /// # 配信規約
@@ -88,15 +87,8 @@ where
         };
 
         // 4. broadcasts を物理経路に落とし込む。
-        dispatch_broadcasts(
-            &handle_result.broadcasts,
-            sente_io,
-            gote_io,
-            broadcaster,
-            room_id,
-            matches!(handle_result.outcome, HandleOutcome::GameEnded(_)),
-        )
-        .await?;
+        dispatch_broadcasts(&handle_result.broadcasts, sente_io, gote_io, broadcaster, room_id)
+            .await?;
 
         // 5. 終局を検出したら結果を返す。
         if let HandleOutcome::GameEnded(result) = handle_result.outcome {
@@ -112,15 +104,24 @@ enum Event {
     TimeUp,
 }
 
-// 受信のたびに猶予を付け直さず、手番開始時刻と再接続補償から固定した期限を使う。
-fn compute_deadline(room: &GameRoom, now_ms: u64) -> Instant {
-    let Some(deadline_ms) = room.current_turn_deadline_ms() else {
+/// 手番側の予算（本体 + byoyomi）+ 通信マージン + 通信猶予から
+/// `tokio::time::Instant` を計算する。
+///
+/// `handle_move` 側は `consume(elapsed_ms - time_margin_ms)` で時計を進めるため、
+/// 物理時間が `turn_budget_ms + time_margin_ms` 以内に届く着手は合法。`run_loop` は
+/// この境界に `TIMEUP_GRACE_MS` を足した時刻まで `recv_line` を待機する
+/// （時間切れ確定と通信マージンの両立）。
+///
+/// 旧実装は本体残時間のみを渡していたため、既定設定 `byoyomi=10` でも本体切れで
+/// 即 time-up していた。本版は
+/// [`GameRoom::clock_turn_budget_ms`] で秒読みを含めた予算を取得する。
+fn compute_deadline(room: &GameRoom, _now_ms: u64) -> Instant {
+    if !matches!(room.status(), GameStatus::Playing) {
         return Instant::now() + NEAR_INFINITE;
-    };
-    let wait_ms = deadline_ms
-        .saturating_add(room.time_margin_ms())
-        .saturating_add(TIMEUP_GRACE_MS)
-        .saturating_sub(now_ms);
+    }
+    let side: Color = room.position().side_to_move().into();
+    let turn_budget_ms = room.clock_turn_budget_ms(side).max(0) as u64;
+    let wait_ms = turn_budget_ms + room.time_margin_ms() + TIMEUP_GRACE_MS;
     Instant::now() + Duration::from_millis(wait_ms)
 }
 
@@ -130,7 +131,6 @@ async fn dispatch_broadcasts<TBlack, TWhite, B>(
     gote_io: &mut TWhite,
     broadcaster: &B,
     room_id: &RoomId,
-    game_ended: bool,
 ) -> Result<(), ServerError>
 where
     TBlack: ClientTransport,
@@ -138,25 +138,25 @@ where
     B: Broadcaster,
 {
     for entry in entries {
-        // 終局確定後は切断側への送信失敗で、相手への通知と結果の返却を止めない。
-        if matches!(
-            entry.target,
-            BroadcastTarget::Black | BroadcastTarget::Players | BroadcastTarget::All
-        ) && let Err(error) = sente_io.send_line(&entry.line).await
-            && !game_ended
-        {
-            return Err(ServerError::Transport(error));
-        }
-        if matches!(
-            entry.target,
-            BroadcastTarget::White | BroadcastTarget::Players | BroadcastTarget::All
-        ) && let Err(error) = gote_io.send_line(&entry.line).await
-            && !game_ended
-        {
-            return Err(ServerError::Transport(error));
-        }
-        if matches!(entry.target, BroadcastTarget::Spectators | BroadcastTarget::All) {
-            broadcaster.broadcast_tag(room_id, BroadcastTag::Spectator, &entry.line).await?;
+        match entry.target {
+            BroadcastTarget::Black => {
+                sente_io.send_line(&entry.line).await?;
+            }
+            BroadcastTarget::White => {
+                gote_io.send_line(&entry.line).await?;
+            }
+            BroadcastTarget::Players => {
+                sente_io.send_line(&entry.line).await?;
+                gote_io.send_line(&entry.line).await?;
+            }
+            BroadcastTarget::Spectators => {
+                broadcaster.broadcast_tag(room_id, BroadcastTag::Spectator, &entry.line).await?;
+            }
+            BroadcastTarget::All => {
+                sente_io.send_line(&entry.line).await?;
+                gote_io.send_line(&entry.line).await?;
+                broadcaster.broadcast_tag(room_id, BroadcastTag::Spectator, &entry.line).await?;
+            }
         }
     }
     Ok(())
@@ -165,7 +165,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::clock::{ClockSpec, SecondsCountdownClock};
+    use crate::game::clock::SecondsCountdownClock;
     use crate::game::room::GameRoomConfig;
     use crate::types::{CsaLine, GameId, IpKey, PlayerName};
     use rshogi_core::types::EnteringKingRule;
@@ -185,7 +185,6 @@ mod tests {
         rx: UnboundedReceiver<Result<CsaLine, TransportError>>,
         outbox: Outbox,
         peer: IpKey,
-        closed: bool,
     }
 
     struct MockHandles {
@@ -202,7 +201,6 @@ mod tests {
                 rx,
                 outbox: outbox.clone(),
                 peer: IpKey::new(label),
-                closed: false,
             };
             MockHandles {
                 transport,
@@ -214,20 +212,13 @@ mod tests {
 
     impl ClientTransport for MockTransport {
         async fn recv_line(&mut self, _timeout: Duration) -> Result<CsaLine, TransportError> {
-            let result = match self.rx.recv().await {
+            match self.rx.recv().await {
                 Some(item) => item,
                 None => Err(TransportError::Closed),
-            };
-            if matches!(result, Err(TransportError::Closed)) {
-                self.closed = true;
             }
-            result
         }
 
         async fn send_line(&mut self, line: &CsaLine) -> Result<(), TransportError> {
-            if self.closed {
-                return Err(TransportError::Closed);
-            }
             self.outbox.borrow_mut().push(line.clone());
             Ok(())
         }
@@ -322,10 +313,7 @@ mod tests {
         };
 
         let room_id = RoomId::new("g1");
-        let start = Instant::now();
-        let runner = run_room(&mut room, &mut sente, &mut gote, &bcast, &room_id, || {
-            start.elapsed().as_millis() as u64
-        });
+        let runner = run_room(&mut room, &mut sente, &mut gote, &bcast, &room_id, || 0u64);
         let (_, result) = tokio::join!(driver, runner);
         let result = result.unwrap();
 
@@ -379,10 +367,7 @@ mod tests {
         };
 
         let room_id = RoomId::new("g1");
-        let start = Instant::now();
-        let runner = run_room(&mut room, &mut sente, &mut gote, &bcast, &room_id, || {
-            start.elapsed().as_millis() as u64
-        });
+        let runner = run_room(&mut room, &mut sente, &mut gote, &bcast, &room_id, || 0u64);
         let (_, result) = tokio::join!(driver, runner);
         let result = result.unwrap();
 
@@ -397,6 +382,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn run_allows_byoyomi_after_main_time_exhausted() {
+        // 本体持ち時間切れ後も byoyomi の範囲内なら
+        // time-up にならず、秒読みで指した手が正しく受理されること。
+        // 旧実装は `compute_deadline` が本体残時間のみを参照していたため、本体 2 秒 +
+        // 秒読み 10 秒設定でも 2.25 秒で勝手に time-up していた。
         let config = GameRoomConfig {
             game_id: GameId::new("g1"),
             black: PlayerName::new("alice"),
@@ -426,6 +415,8 @@ mod tests {
             sente_tx.send(Ok(line("AGREE"))).unwrap();
             advance().await;
             gote_tx.send(Ok(line("AGREE"))).unwrap();
+            // 本体 2 秒を超える 8 秒経過してから sente が着手。旧実装ではこの時点で
+            // time-up していた。新実装は 2 + 10 + 0.25 = 12.25 秒が deadline なので合法。
             tokio::time::sleep(Duration::from_secs(8)).await;
             sente_tx.send(Ok(line("+7776FU"))).unwrap();
             advance().await;
@@ -449,7 +440,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn run_returns_abnormal_when_disconnected_transport_rejects_writes() {
+    async fn run_returns_abnormal_when_player_disconnects() {
         let mut room = make_room();
         let MockHandles {
             transport: mut sente,
@@ -459,7 +450,7 @@ mod tests {
         let MockHandles {
             transport: mut gote,
             tx: gote_tx,
-            outbox: gote_out,
+            outbox: _gote_out,
         } = MockHandles::build("gote");
         let bcast = MockBroadcaster {
             sent: Rc::new(RefCell::new(Vec::new())),
@@ -475,10 +466,7 @@ mod tests {
         };
 
         let room_id = RoomId::new("g1");
-        let start = Instant::now();
-        let runner = run_room(&mut room, &mut sente, &mut gote, &bcast, &room_id, || {
-            start.elapsed().as_millis() as u64
-        });
+        let runner = run_room(&mut room, &mut sente, &mut gote, &bcast, &room_id, || 0u64);
         let (_, result) = tokio::join!(driver, runner);
         let result = result.unwrap();
 
@@ -489,12 +477,12 @@ mod tests {
                 winner: Some(Color::White),
             }
         ));
-        assert!(gote_out.borrow().iter().any(|line| line.as_str() == "#WIN"));
-        assert!(bcast.sent.borrow().iter().any(|(_, line)| line.as_str() == "#ABNORMAL"));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn run_charges_real_elapsed_even_within_communication_margin() {
+    async fn run_does_not_time_out_within_communication_margin() {
+        // 通信マージン内に届いた手は時間切れ扱いしないこと。
+        // 残時間 1 秒 + マージン 5 秒。物理時間 4 秒経過後に着手 → 合法（消費は max(0, 4-5)=0 秒）。
         let config = GameRoomConfig {
             game_id: GameId::new("g"),
             black: PlayerName::new("a"),
@@ -525,11 +513,10 @@ mod tests {
             sente_tx.send(Ok(line("AGREE"))).unwrap();
             advance().await;
             gote_tx.send(Ok(line("AGREE"))).unwrap();
-            // Playing 開始を 0 として 4 秒待機後に着手。deadline は 7.249 秒なので手は
-            // handle_line まで届くが、実時間 4 秒課金で 1 秒予算を超過して time-up する。
+            // Playing 開始時刻を 0 とすると、4 秒待機して着手 → 物理経過 4 秒 < 1+5=6 秒 = OK。
             tokio::time::sleep(Duration::from_secs(4)).await;
             sente_tx.send(Ok(line("+7776FU"))).unwrap();
-            // sente が既に time-up 済みなので、この %TORYO は届く前に対局が終わる。
+            // 続いて gote が即時 %TORYO で対局終了。
             advance().await;
             gote_tx.send(Ok(line("%TORYO"))).unwrap();
         };
@@ -543,295 +530,12 @@ mod tests {
         let (_, result) = tokio::join!(driver, runner);
         let result = result.unwrap();
 
-        // sente の +7776FU は deadline 内で届くが、実時間 4 秒課金で 1 秒予算を超過 → time-up。
+        // sente の +7776FU は通信マージン内なので合法。最終的に gote の TORYO で sente が勝つ。
         assert!(matches!(
             result,
-            GameResult::TimeUp {
-                loser: Color::Black
+            GameResult::Toryo {
+                winner: Color::Black
             }
         ));
-    }
-
-    fn ready_room(clock: ClockSpec, margin_ms: u64, started_ms: u64) -> GameRoom {
-        let config = GameRoomConfig {
-            game_id: GameId::new("g1"),
-            black: PlayerName::new("alice"),
-            white: PlayerName::new("bob"),
-            max_moves: 256,
-            time_margin_ms: margin_ms,
-            entering_king_rule: EnteringKingRule::Point24,
-            initial_sfen: None,
-        };
-        let mut room = GameRoom::new(config, clock.build_clock()).unwrap();
-        room.handle_line(Color::Black, &line("AGREE"), started_ms).unwrap();
-        room.handle_line(Color::White, &line("AGREE"), started_ms).unwrap();
-        room
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn keepalives_preserve_deadline_including_margin_and_reconnect_credit() {
-        let mut room = ready_room(
-            ClockSpec::Countdown {
-                total_time_sec: 1,
-                byoyomi_sec: 0,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
-            },
-            500,
-            10_000,
-        );
-        room.restore_current_turn_reconnect_credit_ms(700, 700);
-        let mut sente = MockHandles::build("sente");
-        let mut gote = MockHandles::build("gote");
-        let bcast = MockBroadcaster {
-            sent: Rc::new(RefCell::new(Vec::new())),
-        };
-        let room_id = RoomId::new("g1");
-        let start = Instant::now();
-        let driver = async {
-            for at_ms in [500, 1_000, 2_000, 3_000, 3_400] {
-                sleep_until(start + Duration::from_millis(at_ms)).await;
-                sente.tx.send(Ok(line(""))).unwrap();
-                gote.tx.send(Ok(line(""))).unwrap();
-            }
-        };
-        let runner = async {
-            let result = run_room(
-                &mut room,
-                &mut sente.transport,
-                &mut gote.transport,
-                &bcast,
-                &room_id,
-                || 10_000 + start.elapsed().as_millis() as u64,
-            )
-            .await;
-            (result, start.elapsed())
-        };
-        let (_, (result, elapsed)) = tokio::join!(driver, runner);
-        assert!(matches!(
-            result.unwrap(),
-            GameResult::TimeUp {
-                loser: Color::Black
-            }
-        ));
-        // 秒切り捨て猶予999ms、通信マージン500ms、再接続補償700ms、通信猶予250ms。
-        assert!(
-            (Duration::from_millis(3_449)..=Duration::from_millis(3_450)).contains(&elapsed),
-            "{elapsed:?}"
-        );
-        assert!(sente.outbox.borrow().iter().any(|line| line.as_str() == "#TIME_UP"));
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn turn_changes_reset_byoyomi_and_preserve_fischer_increment() {
-        for (clock, expected_ms) in [
-            (
-                ClockSpec::Countdown {
-                    total_time_sec: 2,
-                    byoyomi_sec: 3,
-                    black_total_time_sec: None,
-                    white_total_time_sec: None,
-                },
-                8_249,
-            ),
-            (
-                ClockSpec::Fischer {
-                    total_time_sec: 3,
-                    increment_sec: 3,
-                    black_total_time_sec: None,
-                    white_total_time_sec: None,
-                },
-                12_249,
-            ),
-        ] {
-            let mut room = ready_room(clock, 0, 0);
-            let mut sente = MockHandles::build("sente");
-            let mut gote = MockHandles::build("gote");
-            let bcast = MockBroadcaster {
-                sent: Rc::new(RefCell::new(Vec::new())),
-            };
-            let room_id = RoomId::new("g1");
-            let start = Instant::now();
-            let driver = async {
-                sleep_until(start + Duration::from_millis(1_500)).await;
-                sente.tx.send(Ok(line("+7776FU"))).unwrap();
-                sleep_until(start + Duration::from_millis(3_000)).await;
-                gote.tx.send(Ok(line("-3334FU"))).unwrap();
-                sleep_until(start + Duration::from_millis(4_000)).await;
-                sente.tx.send(Ok(line(""))).unwrap();
-            };
-            let runner = async {
-                let result = run_room(
-                    &mut room,
-                    &mut sente.transport,
-                    &mut gote.transport,
-                    &bcast,
-                    &room_id,
-                    || start.elapsed().as_millis() as u64,
-                )
-                .await;
-                (result, start.elapsed())
-            };
-            let (_, (result, elapsed)) = tokio::join!(driver, runner);
-            assert!(matches!(
-                result.unwrap(),
-                GameResult::TimeUp {
-                    loser: Color::Black
-                }
-            ));
-            assert!(
-                (Duration::from_millis(expected_ms)..=Duration::from_millis(expected_ms + 2))
-                    .contains(&elapsed),
-                "{elapsed:?}"
-            );
-            let outbox = sente.outbox.borrow();
-            assert!(outbox.iter().any(|line| line.as_str() == "+7776FU,T1"));
-            assert!(outbox.iter().any(|line| line.as_str() == "-3334FU,T1"));
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn expired_deadline_does_not_grant_margin_or_grace_again() {
-        let mut room = ready_room(
-            ClockSpec::Countdown {
-                total_time_sec: 1,
-                byoyomi_sec: 0,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
-            },
-            500,
-            10_000,
-        );
-        let mut sente = MockHandles::build("sente");
-        let mut gote = MockHandles::build("gote");
-        let bcast = MockBroadcaster {
-            sent: Rc::new(RefCell::new(Vec::new())),
-        };
-        let room_id = RoomId::new("g1");
-        let start = Instant::now();
-        let result = run_room(
-            &mut room,
-            &mut sente.transport,
-            &mut gote.transport,
-            &bcast,
-            &room_id,
-            || 13_000 + start.elapsed().as_millis() as u64,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            result,
-            GameResult::TimeUp {
-                loser: Color::Black
-            }
-        ));
-        assert!(start.elapsed() <= Duration::from_millis(1));
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn invalid_input_returns_error_without_restarting_turn_clock() {
-        let mut room = ready_room(
-            ClockSpec::Countdown {
-                total_time_sec: 1,
-                byoyomi_sec: 0,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
-            },
-            0,
-            0,
-        );
-        let deadline = room.current_turn_deadline_ms();
-        let mut sente = MockHandles::build("sente");
-        let mut gote = MockHandles::build("gote");
-        let bcast = MockBroadcaster {
-            sent: Rc::new(RefCell::new(Vec::new())),
-        };
-        let room_id = RoomId::new("g1");
-        let start = Instant::now();
-        for at_ms in [500, 1_000, 1_500] {
-            let driver = async {
-                sleep_until(start + Duration::from_millis(at_ms)).await;
-                sente.tx.send(Ok(line("AGREE"))).unwrap();
-            };
-            let runner = run_room(
-                &mut room,
-                &mut sente.transport,
-                &mut gote.transport,
-                &bcast,
-                &room_id,
-                || start.elapsed().as_millis() as u64,
-            );
-            let (_, result) = tokio::join!(driver, runner);
-            assert!(matches!(result, Err(ServerError::State(_))));
-            assert_eq!(room.current_turn_deadline_ms(), deadline);
-            assert!(start.elapsed() <= Duration::from_millis(at_ms + 1));
-        }
-        let result = run_room(
-            &mut room,
-            &mut sente.transport,
-            &mut gote.transport,
-            &bcast,
-            &room_id,
-            || start.elapsed().as_millis() as u64,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            result,
-            GameResult::TimeUp {
-                loser: Color::Black
-            }
-        ));
-        assert!(
-            (Duration::from_millis(2_249)..=Duration::from_millis(2_250))
-                .contains(&start.elapsed())
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn color_totals_expire_on_each_players_deadline() {
-        for loser in [Color::Black, Color::White] {
-            let mut room = ready_room(
-                ClockSpec::CountdownMsec {
-                    total_time_ms: 8_000,
-                    black_total_time_ms: Some(3_000),
-                    white_total_time_ms: None,
-                    byoyomi_ms: 0,
-                },
-                0,
-                0,
-            );
-            let base = if loser == Color::White {
-                room.handle_line(Color::Black, &line("+7776FU"), 1_000).unwrap();
-                assert_eq!(room.clock_remaining_main_ms(Color::Black), 2_000);
-                1_000
-            } else {
-                0
-            };
-            let mut sente = MockHandles::build("sente");
-            let mut gote = MockHandles::build("gote");
-            let bcast = MockBroadcaster {
-                sent: Rc::new(RefCell::new(Vec::new())),
-            };
-            let start = Instant::now();
-            let result = run_room(
-                &mut room,
-                &mut sente.transport,
-                &mut gote.transport,
-                &bcast,
-                &RoomId::new("g1"),
-                || base + start.elapsed().as_millis() as u64,
-            )
-            .await
-            .unwrap();
-            assert!(matches!(result, GameResult::TimeUp { loser: actual } if actual == loser));
-            let expected = if loser == Color::Black { 3_000 } else { 8_000 } + TIMEUP_GRACE_MS;
-            assert!(
-                (Duration::from_millis(expected)..=Duration::from_millis(expected + 2))
-                    .contains(&start.elapsed())
-            );
-            assert!(sente.outbox.borrow().iter().any(|entry| entry.as_str() == "#TIME_UP"));
-            assert!(gote.outbox.borrow().iter().any(|entry| entry.as_str() == "#TIME_UP"));
-        }
     }
 }

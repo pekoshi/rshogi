@@ -1,7 +1,6 @@
 //! viewer 配信 HTTP API (`/api/v1/games`) のルーティングと R2 アクセス。
 //!
-//! v3 設計 (https://github.com/SH11235/rshogi/issues/542 issuecomment-4338088406) に準拠する games API に加え、
-//! player ID 単位の集計 API を提供する:
+//! v3 設計 (Issue #542 issuecomment-4338088406) に準拠する 3 エンドポイント:
 //!
 //! - `GET /api/v1/games?cursor=<opaque>&limit=<N>` 一覧 (終局済)
 //!   `KIFU_BUCKET.list({prefix: "games-index/", cursor, limit})` を 1 回呼び、
@@ -11,22 +10,14 @@
 //! - `GET /api/v1/games/live?cursor=<opaque>&limit=<N>` 一覧 (進行中)
 //!   `KIFU_BUCKET.list({prefix: "live-games-index/", cursor, limit})` を 1 回呼び、
 //!   各オブジェクト本文 (= [`crate::live_games_index::LiveGamesIndexEntry`] の JSON)
-//!   を `live_games[]` に詰めて返す (https://github.com/SH11235/rshogi/issues/549)。終局済 list と同じ pagination
+//!   を `live_games[]` に詰めて返す (Issue #549)。終局済 list と同じ pagination
 //!   semantics、`/api/v1/games/<id>` のような単局エンドポイントは進行中対局には
 //!   設けない (= viewer 側は live entry を **発見手段** として扱い、行クリック時に
 //!   WS spectate 接続で実状態を確認する)。
-//! - `GET /api/v1/games/search` D1 検索 (終局済)
-//!   選手名・結果・source・終局日時で絞り込み、page pagination で返す。
-//! - `GET /api/v1/games/events` D1 集計 (終局済)
-//!   `event` (大会名・Floodgate のゲーム名などのタグ) を持つ対局を `(event, source)`
-//!   ごとに数え、件数の多い順に返す。
 //! - `GET /api/v1/games/<game_id>` 単局 (終局済)
 //!   `kifu-by-id/<encoded_game_id>.csa` を直接 get する。本文 (CSA V2) と
-//!   `kifu-by-id/<encoded_game_id>.meta.json` から取得した正準メタ (https://github.com/SH11235/rshogi/issues/551
+//!   `kifu-by-id/<encoded_game_id>.meta.json` から取得した正準メタ (Issue #551
 //!   設計 v3 §12) を合わせて返す。
-//! - `GET /api/v1/players?page=<N>&pageSize=<N>` D1 の active Elo snapshot から
-//!   paginationして返す選手一覧（全体件数・対局数・global leader付き）。
-//! - `GET /api/v1/players/<player_id>` 選手 summary と最近の対局一覧。
 //!
 //! いずれも GameRoom DO を経由せず、Worker 直 fetch のみで完結する (R2 read
 //! 1 ホップ)。CORS は staging では `WS_ALLOWED_ORIGINS` をそのまま流用して
@@ -36,98 +27,30 @@
 //!
 //! `try_handle` 配下に新しい `/api/v1/*` エンドポイントを追加する場合は、
 //! `check_origin` / `with_cors` の通過と `WS_ALLOWED_ORIGINS` allowlist 体系
-//! (https://github.com/SH11235/rshogi/issues/550 で強化予定) に確実に乗ることを必ずレビューする。allowlist 未設定
+//! (Issue #550 で強化予定) に確実に乗ることを必ずレビューする。allowlist 未設定
 //! 環境での挙動 (= Origin ヘッダなしで通る) も含めて回帰させない。
-//!
-//! # Cloudflare Cache API による R2 Class B ops 削減 (https://github.com/SH11235/rshogi/issues/636)
-//!
-//! 1 リクエストで `bucket.list` (1 RTT) + 各 entry `bucket.get` (最大 N=100 RTT)
-//! を消費する N+1 パターンを Cloudflare の `caches.default` で短期キャッシュする。
-//! cache miss 時は各 entry の `bucket.get` を並列実行し、R2 待ち時間を重ねる。
-//! cache key は **request URL 完全一致** (= path + query + method)。同一 cursor +
-//! 同一 limit の重複アクセスのみが hit する。
-//!
-//! 重要な不変条件 (round-2 review で確定):
-//! - cache に保存する `Response` は **origin-neutral**。`Access-Control-Allow-Origin`
-//!   と `Vary: Origin, ...` を含めず、`Cache-Control: public, s-maxage=<TTL>,
-//!   max-age=0, must-revalidate` と `Content-Type: application/json` のみを残す。
-//! - cache hit / miss いずれの返却経路でも、最終ステップで [`with_cors`] により
-//!   現在 request の Origin に対する ACAO + Vary を被せる。
-//! - エラー応答 (400 / 403 / 404 / 502 / 503) は cache しない。`Cache-Control: no-store`
-//!   を明示して edge cache が誤って保持しないように倒す。
-//! - `ALLOW_VIEWER_API` kill-switch は [`try_handle`] 冒頭で評価されるため、
-//!   無効化中は cache lookup に到達しない。既存 cache entry は s-maxage 経過まで
-//!   edge に残るが viewer から参照されない (browser は max-age=0 + must-revalidate
-//!   により毎回 worker に再検証を投げるため、kill-switch / allowlist 変更は即時に
-//!   ブラウザにも反映される)。
-//!
-//! ## Cache-Control directive 設計
-//!
-//! 初期実装では `public, max-age=<TTL>` を採用していたが、これだと
-//! `caches.default` だけでなくブラウザ・共有 HTTP cache にも `max-age` が効いて
-//! しまう。`WS_ALLOWED_ORIGINS` から Origin を除外したり `ALLOW_VIEWER_API` を
-//! 落としても、すでに 200 を取得済みのブラウザは worker に再到達せず TTL 満了まで
-//! cache を返し続ける (`check_origin` / kill-switch は worker 到達時にしか効かない)。
-//!
-//! 現行設計: `public, s-maxage=<TTL>, max-age=0, must-revalidate`
-//! - `s-maxage=<TTL>`: shared cache (Cloudflare edge `caches.default` を含む) は
-//!   TTL 秒保存する。worker `Cache` API も `cache-control` の `max-age` か
-//!   `s-maxage` のいずれかが必要 (worker 0.8 の `Cache::put` 契約) で、
-//!   `s-maxage` 単独でも `cache.put` は受理される。
-//! - `max-age=0, must-revalidate`: ブラウザ・private HTTP cache は毎リクエスト
-//!   worker に再検証を要求する (origin = worker)。これにより allowlist / kill-switch
-//!   の変更が即時に効く。
-//! - 留意点: `s-maxage` は Cloudflare edge 専用ではなく、一般の shared proxy にも
-//!   TTL 秒キャッシュを許す。HTTPS 前提なので実害は限定的だが、仕様上はそう。
-//!   さらに Cloudflare 側で「Browser Cache TTL」や「Cache Rules」を設定している
-//!   と `max-age=0` を上書きされる可能性がある。本 worker と同居する staging /
-//!   production の Cache Rules では override しない運用前提。
-//!
-//! TTL は path 種別ごとに 2 値固定 (測定なし最適化禁止に従い細分化しない):
-//! - 終局済 list / live list: **60 秒**
-//! - 単局 GET (CSA + meta): **600 秒** (CSA / meta は immutable、edge 退避時の
-//!   再 fetch コストを下げるためやや長めに置く)
-//!
-//! ## live list の 60 秒キャッシュが意味すること
-//!
-//! `live-games-index/` の整合性モデル (`live_games_index.rs` 冒頭参照) はもとより
-//! best-effort eventual で、対局開始 / 終局のいずれでも瞬間整合は保証しない。
-//! cache 60 秒を被せたことで以下の 2 点が **最大 60 秒** 遅延しうるが、live list
-//! は viewer が候補発見に使うのみで、行クリック時に WS spectate で実状態確認する
-//! 設計のため許容範囲とみなす。
-//!
-//! - 対局開始 → live list に現れるまで (R2 put 反映遅延 + 最大 60 秒 cache stale)
-//! - 終局 → live list から消えるまで (R2 delete 反映遅延 + 最大 60 秒 cache stale)
 
 use serde::Serialize;
 use worker::{Env, Headers, Method, Request, Response, Result, Url};
 
 use crate::client_kind::normalize_client_kind;
 use crate::config::{ConfigKeys, OriginAllowList, is_viewer_api_enabled};
-use crate::event_meta::{EVENT_META_SELECT_SQL, EventMetaRow, attach_event_meta};
 use crate::games_index::KEY_PREFIX as GAMES_INDEX_PREFIX;
-use crate::games_search_index::{
-    DEFAULT_PAGE_SIZE, EVENT_TAGS_SQL, EventTag, MAX_PAGE_SIZE, QueryValue, SEARCH_ROW_COLUMNS,
-    SearchGameSummary, SearchParams, SearchRow, build_search_query, parse_source_filter,
-    player_games_predicate, validate_pagination,
-};
 use crate::live_games_index::LIVE_KEY_PREFIX;
 use crate::origin::{OriginDecision, evaluate};
-use crate::player_rating_materialization::{MAX_PAGES_PER_RUN, run_player_rating_materialization};
-use crate::player_ratings::PlayerSummary;
 use crate::x1_paths::{kifu_by_id_meta_key, kifu_by_id_object_key};
 
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 100;
 const MIN_LIMIT: u32 = 1;
 
-/// `/api/v1/games[/...]` / `/api/v1/players[/...]` を判定してハンドラに振り分ける。
+/// `/api/v1/games[/...]` 配下のリクエストを判定して該当ハンドラに振り分ける。
 ///
 /// 戻り値 `Some(_)` はマッチしたことを示す。`None` の場合は既存ルーティングに
 /// 引き継ぐ (404 までの fallthrough)。
 ///
 /// `OPTIONS` は CORS preflight として viewer API 配下のパスでのみ受理する
-/// (https://github.com/SH11235/rshogi/issues/564 設計 v4 §3)。`X-Client` を custom request header として送る
+/// (Issue #564 設計 v4 §3)。`X-Client` を custom request header として送る
 /// クライアント (ramu-shogi web / desktop) のために `Access-Control-Allow-Headers`
 /// を返す必要がある。`ALLOW_VIEWER_API` 無効時は GET と同様 404 へフォールスルー
 /// し、preflight の段階で kill-switch を効かせる。
@@ -143,32 +66,6 @@ pub async fn try_handle(req: &Request, env: &Env) -> Result<Option<Response>> {
         return Ok(Some(handle_options(req, env)?));
     }
 
-    if method == Method::Post {
-        let url = req.url()?;
-        return match url.path() {
-            "/api/v1/admin/player-ratings/warmup" => {
-                Ok(Some(handle_player_ratings_warmup(req, env).await?))
-            }
-            "/api/v1/admin/games/import-wdoor" => {
-                Ok(Some(crate::kifu_import_api::handle_import_wdoor(req, env).await?))
-            }
-            "/api/v1/admin/games/upload" => {
-                Ok(Some(crate::kifu_import_api::handle_upload(req, env).await?))
-            }
-            _ => Ok(None),
-        };
-    }
-
-    if method == Method::Put {
-        let url = req.url()?;
-        return match url.path().strip_prefix("/api/v1/admin/events/") {
-            Some(segment) => {
-                Ok(Some(crate::event_meta_api::handle_put_event_meta(req, env, segment).await?))
-            }
-            None => Ok(None),
-        };
-    }
-
     if method != Method::Get {
         return Ok(None);
     }
@@ -181,40 +78,18 @@ pub async fn try_handle(req: &Request, env: &Env) -> Result<Option<Response>> {
     let url = req.url()?;
     let path = url.path().to_owned();
 
-    if path == "/api/v1/players" {
-        return Ok(Some(handle_players(req, env, &url).await?));
-    }
-    if let Some(player_id) = path.strip_prefix("/api/v1/players/") {
-        if player_id.is_empty() || player_id.contains('/') {
-            let resp = no_store_error("Not Found", 404)?;
-            return Ok(Some(with_cors(resp, req, env)?));
-        }
-        return Ok(Some(handle_player_detail(req, env, &url, player_id).await?));
-    }
     if path == "/api/v1/games" {
         return Ok(Some(handle_list(req, env, &url).await?));
-    }
-    if path == "/api/v1/games/search" {
-        return Ok(Some(handle_search(req, env, &url).await?));
     }
     // `/api/v1/games/live` は `/api/v1/games/<game_id>` より先にマッチさせる
     // (`live` という ID の単局取得を 1 件目で誤って受けないため)。
     if path == "/api/v1/games/live" {
         return Ok(Some(handle_list_live(req, env, &url).await?));
     }
-    // `/api/v1/games/events` も `live` / `search` と同じく単局より先にマッチさせる。
-    if path == "/api/v1/games/events" {
-        return Ok(Some(handle_events(req, env).await?));
-    }
     if let Some(rest) = path.strip_prefix("/api/v1/games/") {
         if rest.is_empty() || rest.contains('/') {
             // 余分な階層 (`/api/v1/games/x/y`) や末尾 `/` は 404 で扱う。
-            // viewer API 配下のエラー応答は一律 `Cache-Control: no-store` を
-            // 付け、edge cache が誤って 404 を保持しないように倒す
-            // (https://github.com/SH11235/rshogi/issues/636 review v1)。with_cors も通して ACAO + Vary を
-            // 揃える。
-            let resp = no_store_error("Not Found", 404)?;
-            return Ok(Some(with_cors(resp, req, env)?));
+            return Ok(Some(Response::error("Not Found", 404)?));
         }
         return Ok(Some(handle_get(req, env, rest).await?));
     }
@@ -225,21 +100,11 @@ pub async fn try_handle(req: &Request, env: &Env) -> Result<Option<Response>> {
 /// viewer 配信 API 配下のパスかどうかを判定する純粋ロジック。
 ///
 /// `OPTIONS` preflight 経路で対象パスをゲートするためにも使用する。
-/// games 一覧 / live / 検索 / イベントタグ / 単局、および players 一覧 / 詳細のみ
-/// true とする。
+/// `/api/v1/games` (一覧)、`/api/v1/games/live` (live 一覧)、
+/// `/api/v1/games/<id>` (単局) のみを true とする。
 fn is_viewer_api_path(path: &str) -> bool {
-    if matches!(
-        path,
-        "/api/v1/games"
-            | "/api/v1/games/live"
-            | "/api/v1/games/search"
-            | "/api/v1/games/events"
-            | "/api/v1/players"
-    ) {
+    if path == "/api/v1/games" || path == "/api/v1/games/live" {
         return true;
-    }
-    if let Some(rest) = path.strip_prefix("/api/v1/players/") {
-        return !rest.is_empty() && !rest.contains('/');
     }
     if let Some(rest) = path.strip_prefix("/api/v1/games/") {
         return !rest.is_empty() && !rest.contains('/');
@@ -285,7 +150,10 @@ fn extract_client_kind(req: &Request) -> String {
 /// 一覧 API (`/api/v1/games`) レスポンスの wire 形状。
 #[derive(Debug, Serialize)]
 struct ListResponse {
-    /// R2 meta の公開フィールド。保存時の内部整合性用 digest は検索 API と同様に除く。
+    /// `games-index/` のオブジェクト本文をそのまま吐き出すのが契約 (本モジュールでは
+    /// meta の再構築をしない)。MVP では `serde_json::Value` でラウンドトリップ parse
+    /// する素朴実装。要素数 1 ページ最大 100 件のため性能影響は許容。`RawValue` 化は
+    /// レイテンシが顕在化したときの将来拡張で検討する。
     games: Vec<serde_json::Value>,
     next_cursor: Option<String>,
 }
@@ -301,599 +169,30 @@ struct LiveListResponse {
     next_cursor: Option<String>,
 }
 
-// 他のレスポンス (`ListResponse` の `next_cursor` 等) と同じく wire は snake_case
-// のまま返す (client 側の decode 層が snake_case → camelCase 変換を担う規約)。
-#[derive(Debug, Serialize)]
-struct SearchResponse {
-    games: Vec<SearchGameSummary>,
-    page: u32,
-    page_size: u32,
-    total_count: u64,
-}
-
-/// イベントタグ一覧 API (`/api/v1/games/events`) レスポンスの wire 形状。
-#[derive(Debug, Serialize)]
-struct EventsResponse {
-    events: Vec<EventTag>,
-}
-
-#[derive(Debug, Serialize)]
-struct PlayersResponse {
-    players: Vec<PlayerSummary>,
-    page: u32,
-    page_size: u32,
-    total_count: u64,
-    total_games: u64,
-    leader: Option<PlayerSummary>,
-}
-
-#[derive(Debug, Serialize)]
-struct PlayerDetailResponse {
-    player: PlayerSummary,
-    games: Vec<SearchGameSummary>,
-    page: u32,
-    page_size: u32,
-    total_count: u64,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ActiveGenerationRow {
-    active_generation: Option<i64>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct MaterializedPlayerRow {
-    player_id: String,
-    display_name: String,
-    rating: f64,
-    wins: u64,
-    losses: u64,
-    draws: u64,
-    games: u64,
-    last_played_at_ms: u64,
-    legacy: i64,
-}
-
-impl From<MaterializedPlayerRow> for PlayerSummary {
-    fn from(row: MaterializedPlayerRow) -> Self {
-        Self {
-            player_id: row.player_id,
-            display_name: row.display_name,
-            rating: row.rating,
-            wins: row.wins,
-            losses: row.losses,
-            draws: row.draws,
-            games: row.games,
-            last_played_at_ms: row.last_played_at_ms,
-            legacy: row.legacy != 0,
-        }
-    }
-}
-
-fn parse_page_params(url: &Url) -> std::result::Result<(u32, u32), String> {
-    let mut page = 1;
-    let mut page_size = DEFAULT_PAGE_SIZE;
-    for (key, value) in url.query_pairs() {
-        match key.as_ref() {
-            "page" => {
-                page = value.parse().map_err(|_| "page must be a positive integer")?;
-            }
-            "pageSize" => {
-                page_size =
-                    value.parse().map_err(|_| format!("pageSize must be 1..={MAX_PAGE_SIZE}"))?;
-            }
-            _ => {}
-        }
-    }
-    validate_pagination(page, page_size)?;
-    Ok((page, page_size))
-}
-
-async fn active_generation(db: &worker::D1Database) -> std::result::Result<Option<i64>, String> {
-    db.prepare("SELECT active_generation FROM player_rating_state WHERE singleton = 1")
-        .first::<ActiveGenerationRow>(None)
-        .await
-        .map(|row| row.and_then(|row| row.active_generation))
-        .map_err(|e| e.to_string())
-}
-
-async fn handle_players(req: &Request, env: &Env, url: &Url) -> Result<Response> {
-    if let Some(blocked) = check_origin(req, env)? {
-        return Ok(blocked);
-    }
-    let (page, page_size) = match parse_page_params(url) {
-        Ok(values) => values,
-        Err(message) => return with_cors(no_store_error(message, 400)?, req, env),
-    };
-    let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
-        Ok(db) => db,
-        Err(e) => {
-            log_viewer_api_failed("players_binding", &extract_client_kind(req), &e.to_string());
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let generation = match active_generation(&db).await {
-        Ok(Some(generation)) => generation,
-        Ok(None) => return with_cors(no_store_error("Ratings warming up", 503)?, req, env),
-        Err(e) => {
-            log_viewer_api_failed("players_state", &extract_client_kind(req), &e);
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    #[derive(serde::Deserialize)]
-    struct PlayerTotalsRow {
-        total_count: u64,
-        total_games: u64,
-    }
-    let generation_values = [worker::wasm_bindgen::JsValue::from_f64(generation as f64)];
-    let totals = match db
-        .prepare("SELECT COUNT(*) AS total_count, CAST(COALESCE(SUM(games), 0) / 2 AS INTEGER) AS total_games FROM player_rating_generations WHERE generation = ?")
-        .bind(&generation_values)?
-        .first::<PlayerTotalsRow>(None)
-        .await
-    {
-        Ok(Some(row)) => row,
-        Ok(None) => PlayerTotalsRow {
-            total_count: 0,
-            total_games: 0,
-        },
-        Err(e) => {
-            log_viewer_api_failed("players_totals", &extract_client_kind(req), &e.to_string());
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let leader = match db
-        .prepare("SELECT player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy FROM player_rating_generations WHERE generation = ? ORDER BY rating DESC, player_id ASC LIMIT 1")
-        .bind(&generation_values)?
-        .first::<MaterializedPlayerRow>(None)
-        .await
-    {
-        Ok(row) => row.map(PlayerSummary::from),
-        Err(e) => {
-            log_viewer_api_failed("players_leader", &extract_client_kind(req), &e.to_string());
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let offset = u64::from(page - 1) * u64::from(page_size);
-    let values = [
-        worker::wasm_bindgen::JsValue::from_f64(generation as f64),
-        worker::wasm_bindgen::JsValue::from_f64(f64::from(page_size)),
-        worker::wasm_bindgen::JsValue::from_f64(offset as f64),
-    ];
-    let rows = match db
-        .prepare("SELECT player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy FROM player_rating_generations WHERE generation = ? ORDER BY rating DESC, player_id ASC LIMIT ? OFFSET ?")
-        .bind(&values)?
-        .all()
-        .await
-        .and_then(|result| result.results::<MaterializedPlayerRow>())
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            log_viewer_api_failed("players_query", &extract_client_kind(req), &e.to_string());
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let mut response = Response::from_json(&PlayersResponse {
-        players: rows.into_iter().map(PlayerSummary::from).collect(),
-        page,
-        page_size,
-        total_count: totals.total_count,
-        total_games: totals.total_games,
-        leader,
-    })?;
-    set_cache_control(&mut response, CacheableKind::List.cache_control_header())?;
-    with_cors(response, req, env)
-}
-
-async fn handle_player_detail(
-    req: &Request,
-    env: &Env,
-    url: &Url,
-    player_id: &str,
-) -> Result<Response> {
-    if let Some(blocked) = check_origin(req, env)? {
-        return Ok(blocked);
-    }
-    let (page, page_size) = match parse_page_params(url) {
-        Ok(values) => values,
-        Err(message) => return with_cors(no_store_error(message, 400)?, req, env),
-    };
-    let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
-        Ok(db) => db,
-        Err(e) => {
-            log_viewer_api_failed(
-                "player_detail_binding",
-                &extract_client_kind(req),
-                &e.to_string(),
-            );
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let generation = match active_generation(&db).await {
-        Ok(Some(generation)) => generation,
-        Ok(None) => return with_cors(no_store_error("Ratings warming up", 503)?, req, env),
-        Err(e) => {
-            log_viewer_api_failed("player_detail_state", &extract_client_kind(req), &e);
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let canonical = resolve_canonical_player_id(&db, player_id).await?;
-    let player = match load_materialized_player(&db, generation, &canonical).await? {
-        Some(player) => player,
-        None => return with_cors(no_store_error("Not Found", 404)?, req, env),
-    };
-
-    // Keep bind count constant even after many rotations. The canonical alias
-    // index resolves the family inside D1 instead of loading every alias into
-    // Worker memory and binding it twice.
-    let predicate = player_games_predicate();
-    let family_values = [
-        worker::wasm_bindgen::JsValue::from_str(&canonical),
-        worker::wasm_bindgen::JsValue::from_str(&canonical),
-        worker::wasm_bindgen::JsValue::from_str(&canonical),
-        worker::wasm_bindgen::JsValue::from_str(&canonical),
-    ];
-    #[derive(serde::Deserialize)]
-    struct CountRow {
-        total_count: u64,
-    }
-    let count_sql =
-        format!("SELECT COUNT(*) AS total_count FROM games_search_index WHERE {predicate}");
-    let total_count = db
-        .prepare(&count_sql)
-        .bind(&family_values)?
-        .first::<CountRow>(None)
-        .await?
-        .map(|row| row.total_count)
-        .unwrap_or(0);
-    let offset = u64::from(page - 1) * u64::from(page_size);
-    let rows_sql = format!(
-        "SELECT {SEARCH_ROW_COLUMNS} FROM games_search_index WHERE {predicate} ORDER BY ended_at_ms DESC, game_id ASC LIMIT ? OFFSET ?"
-    );
-    let mut row_values = family_values.to_vec();
-    row_values.push(worker::wasm_bindgen::JsValue::from_f64(f64::from(page_size)));
-    row_values.push(worker::wasm_bindgen::JsValue::from_f64(offset as f64));
-    let rows = db.prepare(&rows_sql).bind(&row_values)?.all().await?.results::<SearchRow>()?;
-    let games: std::result::Result<Vec<_>, _> =
-        rows.into_iter().map(SearchRow::into_summary).collect();
-    let games = match games {
-        Ok(games) => games,
-        Err(e) => {
-            log_viewer_api_failed(
-                "player_detail_clock_parse",
-                &extract_client_kind(req),
-                &e.to_string(),
-            );
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let mut response = Response::from_json(&PlayerDetailResponse {
-        player,
-        games,
-        page,
-        page_size,
-        total_count,
-    })?;
-    set_cache_control(&mut response, CacheableKind::List.cache_control_header())?;
-    with_cors(response, req, env)
-}
-
-async fn resolve_canonical_player_id(db: &worker::D1Database, player_id: &str) -> Result<String> {
-    #[derive(serde::Deserialize)]
-    struct AliasRow {
-        canonical_id: String,
-    }
-    let values = [worker::wasm_bindgen::JsValue::from_str(player_id)];
-    Ok(db
-        .prepare("SELECT canonical_id FROM player_id_aliases WHERE alias_id = ?")
-        .bind(&values)?
-        .first::<AliasRow>(None)
-        .await?
-        .map(|row| row.canonical_id)
-        .unwrap_or_else(|| player_id.to_owned()))
-}
-
-async fn load_materialized_player(
-    db: &worker::D1Database,
-    generation: i64,
-    canonical_id: &str,
-) -> Result<Option<PlayerSummary>> {
-    // rebuild 中は active snapshot が旧 canonical を持つ場合があるため、canonical
-    // または任意の旧 alias を固定 bind の subquery で選ぶ。partial building
-    // generation は読まない。
-    let values = [
-        worker::wasm_bindgen::JsValue::from_f64(generation as f64),
-        worker::wasm_bindgen::JsValue::from_str(canonical_id),
-        worker::wasm_bindgen::JsValue::from_str(canonical_id),
-        worker::wasm_bindgen::JsValue::from_str(canonical_id),
-    ];
-    Ok(db
-        .prepare("SELECT player_id, display_name, rating, wins, losses, draws, games, last_played_at_ms, legacy FROM player_rating_generations WHERE generation = ? AND (player_id = ? OR player_id IN (SELECT alias_id FROM player_id_aliases WHERE canonical_id = ?)) ORDER BY CASE WHEN player_id = ? THEN 0 ELSE 1 END LIMIT 1")
-        .bind(&values)?
-        .first::<MaterializedPlayerRow>(None)
-        .await?
-        .map(PlayerSummary::from))
-}
-
-/// `Authorization: Bearer <ADMIN_API_TOKEN>` が正しい管理リクエストか。
-///
-/// ヘッダ欠落・token 不一致・secret 未設定のいずれも `false` (呼び出し側は 403)。
-pub(crate) fn is_admin_request(req: &Request, env: &Env) -> Result<bool> {
-    let authorization = req.headers().get("Authorization")?.unwrap_or_default();
-    let token = authorization.strip_prefix("Bearer ").unwrap_or("");
-    Ok(crate::admin_auth::verify_admin_token_str(token, env).is_ok())
-}
-
-async fn handle_player_ratings_warmup(req: &Request, env: &Env) -> Result<Response> {
-    if !is_admin_request(req, env)? {
-        return no_store_error("Forbidden", 403);
-    }
-    // Admin warmup is an independent HTTP invocation and does not share the
-    // scheduled handler's 25-second budget.
-    let outcome = run_player_rating_materialization(env, MAX_PAGES_PER_RUN, None).await?;
-    let mut response = Response::from_json(&serde_json::json!({
-        "processed_games": outcome.processed_games,
-        "ready": outcome.active_generation.is_some() && !outcome.rebuild_in_progress,
-        "active_generation": outcome.active_generation,
-        "rebuild_in_progress": outcome.rebuild_in_progress,
-        "lease_acquired": outcome.lease_acquired,
-        "deadline_reached": outcome.deadline_reached,
-    }))?;
-    set_cache_control(&mut response, "no-store")?;
-    Ok(response)
-}
-
-fn parse_search_params(url: &Url) -> std::result::Result<SearchParams, String> {
-    let mut params = SearchParams {
-        name: None,
-        result: None,
-        source: Vec::new(),
-        event: None,
-        from: None,
-        to: None,
-        page: 1,
-        page_size: DEFAULT_PAGE_SIZE,
-    };
-    for (key, value) in url.query_pairs() {
-        let value = value.into_owned();
-        match key.as_ref() {
-            "name" => params.name = Some(value),
-            "result" => params.result = Some(value),
-            "source" => params.source = parse_source_filter(&value)?,
-            // `event=` (空文字) は絞り込みなしとして扱う。
-            "event" => params.event = Some(value).filter(|event| !event.is_empty()),
-            "from" => {
-                params.from =
-                    Some(value.parse().map_err(|_| "from must be an epoch millisecond integer")?)
-            }
-            "to" => {
-                params.to =
-                    Some(value.parse().map_err(|_| "to must be an epoch millisecond integer")?)
-            }
-            "page" => params.page = value.parse().map_err(|_| "page must be a positive integer")?,
-            "pageSize" => {
-                params.page_size =
-                    value.parse().map_err(|_| format!("pageSize must be 1..={MAX_PAGE_SIZE}"))?
-            }
-            _ => {}
-        }
-    }
-    validate_pagination(params.page, params.page_size)?;
-    Ok(params)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn d1_bind_values(values: &[QueryValue]) -> Vec<worker::wasm_bindgen::JsValue> {
-    values
-        .iter()
-        .map(|value| match value {
-            QueryValue::Text(value) => worker::wasm_bindgen::JsValue::from_str(value),
-            QueryValue::Integer(value) => worker::wasm_bindgen::JsValue::from_f64(*value),
-        })
-        .collect()
-}
-
-async fn handle_search(req: &Request, env: &Env, url: &Url) -> Result<Response> {
-    if let Some(blocked) = check_origin(req, env)? {
-        return Ok(blocked);
-    }
-    let params = match parse_search_params(url) {
-        Ok(params) => params,
-        Err(message) => return with_cors(no_store_error(message, 400)?, req, env),
-    };
-    let query = build_search_query(&params);
-    let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
-        Ok(db) => db,
-        Err(e) => {
-            log_viewer_api_failed(
-                "games_search_d1_binding",
-                &extract_client_kind(req),
-                &e.to_string(),
-            );
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let filter_values = d1_bind_values(&query.filter_values);
-    #[derive(serde::Deserialize)]
-    struct CountRow {
-        total_count: u64,
-    }
-    let count_statement = match db.prepare(&query.count_sql).bind(&filter_values) {
-        Ok(statement) => statement,
-        Err(e) => {
-            log_viewer_api_failed(
-                "games_search_count_prepare",
-                &extract_client_kind(req),
-                &e.to_string(),
-            );
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let count = match count_statement.first::<CountRow>(None).await {
-        Ok(Some(row)) => row.total_count,
-        Ok(None) => 0,
-        Err(e) => {
-            log_viewer_api_failed("games_search_count", &extract_client_kind(req), &e.to_string());
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let mut row_values = filter_values;
-    row_values.push(worker::wasm_bindgen::JsValue::from_f64(f64::from(query.limit)));
-    row_values.push(worker::wasm_bindgen::JsValue::from_f64(query.offset as f64));
-    let rows_statement = match db.prepare(&query.rows_sql).bind(&row_values) {
-        Ok(statement) => statement,
-        Err(e) => {
-            log_viewer_api_failed(
-                "games_search_rows_prepare",
-                &extract_client_kind(req),
-                &e.to_string(),
-            );
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let rows = match rows_statement.all().await.and_then(|result| result.results::<SearchRow>()) {
-        Ok(rows) => rows,
-        Err(e) => {
-            log_viewer_api_failed("games_search_rows", &extract_client_kind(req), &e.to_string());
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let games: std::result::Result<Vec<_>, _> =
-        rows.into_iter().map(SearchRow::into_summary).collect();
-    let games = match games {
-        Ok(games) => games,
-        Err(e) => {
-            log_viewer_api_failed(
-                "games_search_clock_parse",
-                &extract_client_kind(req),
-                &e.to_string(),
-            );
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let mut response = Response::from_json(&SearchResponse {
-        games,
-        page: params.page,
-        page_size: params.page_size,
-        total_count: count,
-    })?;
-    set_cache_control(&mut response, CacheableKind::List.cache_control_header())?;
-    with_cors(response, req, env)
-}
-
-/// イベントタグ一覧ハンドラ。D1 から `(event, source)` ごとの対局数を集計し、
-/// 登録済みのイベントメタ (`event_meta`) を各要素の `meta` に付ける。
-///
-/// 検索 API と同じく D1 を直接読み、応答に一覧系と同じ 60 秒の `Cache-Control`
-/// を付ける。
-async fn handle_events(req: &Request, env: &Env) -> Result<Response> {
-    if let Some(blocked) = check_origin(req, env)? {
-        return Ok(blocked);
-    }
-    let db = match env.d1(ConfigKeys::GAMES_SEARCH_DB_BINDING) {
-        Ok(db) => db,
-        Err(e) => {
-            log_viewer_api_failed(
-                "games_events_binding",
-                &extract_client_kind(req),
-                &e.to_string(),
-            );
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    let mut events = match db
-        .prepare(EVENT_TAGS_SQL)
-        .all()
-        .await
-        .and_then(|result| result.results::<EventTag>())
-    {
-        Ok(events) => events,
-        Err(e) => {
-            log_viewer_api_failed("games_events_query", &extract_client_kind(req), &e.to_string());
-            return with_cors(no_store_error("Storage error", 502)?, req, env);
-        }
-    };
-    // メタは表示の補足なので、読めないとき (migration 未適用の環境など) は一覧だけ返す。
-    match db
-        .prepare(EVENT_META_SELECT_SQL)
-        .all()
-        .await
-        .and_then(|result| result.results::<EventMetaRow>())
-    {
-        Ok(metas) => attach_event_meta(&mut events, metas),
-        Err(e) => log_viewer_api_failed(
-            "games_events_meta_query",
-            &extract_client_kind(req),
-            &e.to_string(),
-        ),
-    }
-    let mut response = Response::from_json(&EventsResponse { events })?;
-    set_cache_control(&mut response, CacheableKind::List.cache_control_header())?;
-    with_cors(response, req, env)
-}
-
 /// 単局 API レスポンスの wire 形状。
 #[derive(Debug, Serialize)]
 struct GameResponse<'a> {
     game_id: &'a str,
     csa: String,
-    /// `kifu-by-id/<id>.meta.json` から取得した正準メタ (https://github.com/SH11235/rshogi/issues/551 設計 v3 §12)。
+    /// `kifu-by-id/<id>.meta.json` から取得した正準メタ (Issue #551 設計 v3 §12)。
     /// meta 不在時は 404 を返す前提なので、ここは常に `Some` 相当だが JSON 上は
     /// serde 既定で field として出る。
     meta: serde_json::Value,
 }
 
-/// cache TTL を path 種別から決める純粋ロジック。
-///
-/// https://github.com/SH11235/rshogi/issues/636 で導入した `caches.default` per-URL cache の TTL 値固定化。
-/// 値は `viewer_api` モジュール doc に書いた契約と一致させ、テストで固定する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheableKind {
-    /// 終局済 / live いずれの一覧も 60 秒
-    List,
-    /// 単局 (CSA + meta は immutable) は 600 秒
-    SingleGame,
-}
-
-impl CacheableKind {
-    /// `Cache-Control` ヘッダ値 (200 OK 用) を返す。
-    ///
-    /// `s-maxage` は Cloudflare edge (`caches.default`) を含む shared cache で
-    /// TTL 秒保存させる。`max-age=0, must-revalidate` でブラウザ・private cache は
-    /// 毎回 worker に再検証要求を投げ、`check_origin` / `ALLOW_VIEWER_API` の
-    /// 変更を即時に反映できる。worker 0.8 `Cache` API は
-    /// `max-age` か `s-maxage` のいずれかがあれば `cache.put` を受理する。
-    pub(crate) fn cache_control_header(self) -> &'static str {
-        match self {
-            CacheableKind::List => "public, s-maxage=60, max-age=0, must-revalidate",
-            CacheableKind::SingleGame => "public, s-maxage=600, max-age=0, must-revalidate",
-        }
-    }
-}
-
 /// 終局済一覧ハンドラ。`games-index/` を 1 ページ list する。
-///
-/// https://github.com/SH11235/rshogi/issues/636 の cache 経路:
-/// 1. allowlist チェック → 403 origin block の場合は no-store で即返却
-/// 2. cache.get (key = request URL) → hit なら ACAO 被せて返す
-/// 3. miss なら collect_index_page で R2 list + N×get → origin-neutral Response
-///    を生成して cache.put、ACAO 被せて返す
 async fn handle_list(req: &Request, env: &Env, url: &Url) -> Result<Response> {
-    if let Some(blocked) = check_origin(req, env)? {
-        return Ok(blocked);
-    }
-    let client_kind = extract_client_kind(req);
-    let config = ListCacheConfig {
-        kind: CacheableKind::List,
-        prefix: GAMES_INDEX_PREFIX,
-        event_root: "games_index",
-        client_kind: &client_kind,
+    let entries = match collect_index_page(req, env, url, GAMES_INDEX_PREFIX, "games_index").await?
+    {
+        CollectOutcome::Page(p) => p,
+        CollectOutcome::ErrorResponse(r) => return Ok(r),
     };
-    serve_cached_list(req, env, url, &config, |entries, next_cursor| ListResponse {
-        games: entries,
-        next_cursor,
-    })
-    .await
+    let payload = ListResponse {
+        games: entries.entries,
+        next_cursor: entries.next_cursor,
+    };
+    let resp = Response::from_json(&payload)?;
+    with_cors(resp, req, env)
 }
 
 /// 進行中対局一覧ハンドラ。`live-games-index/` を 1 ページ list する。
@@ -901,84 +200,25 @@ async fn handle_list(req: &Request, env: &Env, url: &Url) -> Result<Response> {
 /// 終局済の `handle_list` と同じ pagination semantics を持ち、prefix と
 /// レスポンス key (`live_games`) のみが異なる。
 async fn handle_list_live(req: &Request, env: &Env, url: &Url) -> Result<Response> {
-    if let Some(blocked) = check_origin(req, env)? {
-        return Ok(blocked);
-    }
-    let client_kind = extract_client_kind(req);
-    let config = ListCacheConfig {
-        kind: CacheableKind::List,
-        prefix: LIVE_KEY_PREFIX,
-        event_root: "live_games_index",
-        client_kind: &client_kind,
+    let entries =
+        match collect_index_page(req, env, url, LIVE_KEY_PREFIX, "live_games_index").await? {
+            CollectOutcome::Page(p) => p,
+            CollectOutcome::ErrorResponse(r) => return Ok(r),
+        };
+    let payload = LiveListResponse {
+        live_games: entries.entries,
+        next_cursor: entries.next_cursor,
     };
-    serve_cached_list(req, env, url, &config, |entries, next_cursor| LiveListResponse {
-        live_games: entries,
-        next_cursor,
-    })
-    .await
+    let resp = Response::from_json(&payload)?;
+    with_cors(resp, req, env)
 }
 
-/// 一覧系 (`/api/v1/games`, `/api/v1/games/live`) 共通の cache + R2 list 経路の
-/// 設定値をまとめる。`payload_builder` は generic 型パラメータのため別引数で
-/// 渡す (config に入れると `serve_cached_list` 全体に型パラメータが波及する)。
-struct ListCacheConfig<'a> {
-    /// edge cache TTL (List = 60 秒)。
-    kind: CacheableKind,
-    /// R2 list の prefix (`games-index/` / `live-games-index/`)。
-    prefix: &'a str,
-    /// logfmt event 名の root (`games_index` / `live_games_index`)。失敗時は
-    /// `<root>_list` / `<root>_get` 等に展開する。`*_cache_get` / `*_cache_put`
-    /// にも使う。
-    event_root: &'a str,
-    /// 呼出元クライアント識別 (`X-Client` 正規化済み)。
-    client_kind: &'a str,
-}
-
-/// 一覧系 (`/api/v1/games`, `/api/v1/games/live`) 共通の cache + R2 list 経路。
-///
-/// `payload_builder` は entries / next_cursor から最終 wire payload を組み立てる。
-/// 終局済 / 進行中で wire の root key (`games` / `live_games`) のみが異なるため、
-/// 関数オブジェクトで切り替える。
-async fn serve_cached_list<P, B>(
-    req: &Request,
-    env: &Env,
-    url: &Url,
-    config: &ListCacheConfig<'_>,
-    payload_builder: B,
-) -> Result<Response>
-where
-    P: Serialize,
-    B: FnOnce(Vec<serde_json::Value>, Option<String>) -> P,
-{
-    let cache_key = req.url()?.to_string();
-    let cache_get_event = format!("{}_cache_get", config.event_root);
-    if let Some(hit) =
-        cache_get_origin_neutral(&cache_key, &cache_get_event, config.client_kind).await
-    {
-        return with_cors(hit, req, env);
-    }
-
-    // miss: R2 list + N×get を実施し、origin-neutral Response を組み立てる。
-    let outcome =
-        collect_index_page(env, url, config.prefix, config.event_root, config.client_kind).await?;
-    match outcome {
-        BuildOutcome::Page(page) => {
-            let payload = payload_builder(page.entries, page.next_cursor);
-            let mut resp = Response::from_json(&payload)?;
-            set_cache_control(&mut resp, config.kind.cache_control_header())?;
-            cache_put_origin_neutral(&cache_key, &mut resp, config.event_root, config.client_kind)
-                .await;
-            with_cors(resp, req, env)
-        }
-        BuildOutcome::ErrorNoStore(resp) => with_cors(resp, req, env),
-    }
-}
-
-/// `collect_index_page` の戻り値。Page は cache 可能、ErrorNoStore は cache しない。
-enum BuildOutcome {
+/// `collect_index_page` の戻り値。原則 [`Self::Page`] を返すが、early return が
+/// 必要なエラー (Origin 拒否 / limit パース失敗 / R2 binding 失敗 / R2 list 失敗)
+/// は完成済 `Response` を [`Self::ErrorResponse`] に詰めて返す。
+enum CollectOutcome {
     Page(IndexPage),
-    /// 400 / 502 / 503 を `Cache-Control: no-store` 付きで返す。
-    ErrorNoStore(Response),
+    ErrorResponse(Response),
 }
 
 /// 1 ページぶんの index entry を bytes get → JSON value 化したもの。
@@ -989,19 +229,24 @@ struct IndexPage {
 
 /// `games-index/` / `live-games-index/` 共通の 1 ページ走査ロジック。
 ///
-/// Origin チェックは呼び出し側 (`handle_list` / `handle_list_live`) で
-/// 済ませる契約。本関数は R2 にしかアクセスしない (= cache miss でのみ走る)。
-///
 /// `event_root` はログ event 名の prefix (`games_index` / `live_games_index`)。
 /// 失敗時の logfmt event はこれを土台に `<root>_list` / `<root>_get` /
 /// `<root>_read` / `<root>_parse` を組み立てる。
 async fn collect_index_page(
+    req: &Request,
     env: &Env,
     url: &Url,
     prefix: &str,
     event_root: &str,
-    client_kind: &str,
-) -> Result<BuildOutcome> {
+) -> Result<CollectOutcome> {
+    if let Some(blocked) = check_origin(req, env)? {
+        return Ok(CollectOutcome::ErrorResponse(blocked));
+    }
+
+    // 失敗ログに付与する `client_kind` をハンドラ冒頭で 1 度だけ正規化する。
+    // 正常系では使わないので、エラー経路でのみ参照する (Issue #564 設計 v4 §3)。
+    let client_kind = extract_client_kind(req);
+
     // クエリパラメータを 1 度だけ走査して `cursor` / `limit` を取り出す。
     let mut cursor: Option<String> = None;
     let mut limit_raw: Option<String> = None;
@@ -1018,8 +263,12 @@ async fn collect_index_page(
         Some(s) => match s.parse::<u32>() {
             Ok(n) if (MIN_LIMIT..=MAX_LIMIT).contains(&n) => n,
             _ => {
-                let err = no_store_error(format!("limit must be {MIN_LIMIT}..={MAX_LIMIT}"), 400)?;
-                return Ok(BuildOutcome::ErrorNoStore(err));
+                let err = with_cors(
+                    Response::error(format!("limit must be {MIN_LIMIT}..={MAX_LIMIT}"), 400)?,
+                    req,
+                    env,
+                )?;
+                return Ok(CollectOutcome::ErrorResponse(err));
             }
         },
     };
@@ -1027,9 +276,9 @@ async fn collect_index_page(
     let bucket = match env.bucket(ConfigKeys::KIFU_BUCKET_BINDING) {
         Ok(b) => b,
         Err(e) => {
-            log_viewer_api_failed("kifu_bucket_binding", client_kind, &e.to_string());
-            let err = no_store_error("Storage unavailable", 503)?;
-            return Ok(BuildOutcome::ErrorNoStore(err));
+            console_log_failed("kifu_bucket_binding", &client_kind, &e.to_string());
+            let err = with_cors(Response::error("Storage unavailable", 503)?, req, env)?;
+            return Ok(CollectOutcome::ErrorResponse(err));
         }
     };
 
@@ -1041,73 +290,67 @@ async fn collect_index_page(
     let page = match builder.execute().await {
         Ok(p) => p,
         Err(e) => {
-            log_viewer_api_failed(&format!("{event_root}_list"), client_kind, &e.to_string());
-            let err = no_store_error("Storage error", 502)?;
-            return Ok(BuildOutcome::ErrorNoStore(err));
+            console_log_failed(&format!("{event_root}_list"), &client_kind, &e.to_string());
+            let err = with_cors(Response::error("Storage error", 502)?, req, env)?;
+            return Ok(CollectOutcome::ErrorResponse(err));
         }
     };
 
-    let objects = page.objects();
-    let fetches = objects.iter().map(|obj| async {
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(page.objects().len());
+    for obj in page.objects() {
         let key = obj.key();
         // 各 entry を取得 → bytes → JSON value。bytes 経由なのは本文が
         // そのまま `*IndexEntry` の JSON 形式である契約のため。
         let fetched = match bucket.get(&key).execute().await {
             Ok(o) => o,
             Err(e) => {
-                log_viewer_api_failed(
+                console_log_failed(
                     &format!("{event_root}_get"),
-                    client_kind,
+                    &client_kind,
                     &format!("key={key} err={e}"),
                 );
-                return None;
+                continue;
             }
         };
         let Some(fetched) = fetched else {
             // list と get の間に削除されたケース。live entry の場合は終局
             // (delete) と list のレースに該当する。pagination 整合の観点で
             // 落としても問題ない (= live は entry が瞬間的に消えうる契約)。
-            return None;
+            continue;
         };
-        let body = fetched.body()?;
+        let Some(body) = fetched.body() else {
+            continue;
+        };
         let bytes = match body.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                log_viewer_api_failed(
+                console_log_failed(
                     &format!("{event_root}_read"),
-                    client_kind,
+                    &client_kind,
                     &format!("key={key} err={e}"),
                 );
-                return None;
+                continue;
             }
         };
         match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(mut value) => {
-                if let Some(meta) = value.as_object_mut() {
-                    meta.remove("csa_sha256");
-                }
-                Some(value)
-            }
+            Ok(v) => entries.push(v),
             Err(e) => {
-                log_viewer_api_failed(
+                console_log_failed(
                     &format!("{event_root}_parse"),
-                    client_kind,
+                    &client_kind,
                     &format!("key={key} err={e}"),
                 );
                 // 1 件壊れても他を返す (best-effort)。
-                None
             }
         }
-    });
-    // `join_all` は結果を入力順で返すため、失敗 entry を除いても R2 list 順を保つ。
-    let entries = futures_util::future::join_all(fetches).await.into_iter().flatten().collect();
+    }
 
     let next_cursor = if page.truncated() {
         page.cursor()
     } else {
         None
     };
-    Ok(BuildOutcome::Page(IndexPage {
+    Ok(CollectOutcome::Page(IndexPage {
         entries,
         next_cursor,
     }))
@@ -1115,59 +358,20 @@ async fn collect_index_page(
 
 /// 単局ハンドラ。`<game_id>` (URL-decoded path 残部) を受け取り、kifu-by-id を
 /// 直接 get する。
-///
-/// 終局済棋譜は immutable のため Cache TTL を 600 秒で固定する (https://github.com/SH11235/rshogi/issues/636)。
 async fn handle_get(req: &Request, env: &Env, game_id: &str) -> Result<Response> {
     if let Some(blocked) = check_origin(req, env)? {
         return Ok(blocked);
     }
+
+    // 失敗ログに付与する `client_kind` をハンドラ冒頭で 1 度だけ正規化する
+    // (Issue #564 設計 v4 §3)。
     let client_kind = extract_client_kind(req);
-    let cache_key = req.url()?.to_string();
-    if let Some(hit) =
-        cache_get_origin_neutral(&cache_key, "kifu_by_id_cache_get", &client_kind).await
-    {
-        return with_cors(hit, req, env);
-    }
 
-    match build_single_game(env, game_id, &client_kind).await? {
-        SingleBuildOutcome::Game { game_id, csa, meta } => {
-            let payload = GameResponse {
-                game_id: game_id.as_str(),
-                csa,
-                meta,
-            };
-            let mut resp = Response::from_json(&payload)?;
-            set_cache_control(&mut resp, CacheableKind::SingleGame.cache_control_header())?;
-            cache_put_origin_neutral(&cache_key, &mut resp, "kifu_by_id", &client_kind).await;
-            with_cors(resp, req, env)
-        }
-        SingleBuildOutcome::ErrorNoStore(resp) => with_cors(resp, req, env),
-    }
-}
-
-/// 単局 build の結果。Game は cache する、それ以外は no-store。
-enum SingleBuildOutcome {
-    Game {
-        game_id: String,
-        csa: String,
-        meta: serde_json::Value,
-    },
-    ErrorNoStore(Response),
-}
-
-async fn build_single_game(
-    env: &Env,
-    game_id: &str,
-    client_kind: &str,
-) -> Result<SingleBuildOutcome> {
     let bucket = match env.bucket(ConfigKeys::KIFU_BUCKET_BINDING) {
         Ok(b) => b,
         Err(e) => {
-            log_viewer_api_failed("kifu_bucket_binding", client_kind, &e.to_string());
-            return Ok(SingleBuildOutcome::ErrorNoStore(no_store_error(
-                "Storage unavailable",
-                503,
-            )?));
+            console_log_failed("kifu_bucket_binding", &client_kind, &e.to_string());
+            return with_cors(Response::error("Storage unavailable", 503)?, req, env);
         }
     };
 
@@ -1175,33 +379,29 @@ async fn build_single_game(
     let csa_obj = match bucket.get(&by_id_key).execute().await {
         Ok(o) => o,
         Err(e) => {
-            log_viewer_api_failed(
-                "kifu_by_id_get",
-                client_kind,
-                &format!("key={by_id_key} err={e}"),
-            );
-            return Ok(SingleBuildOutcome::ErrorNoStore(no_store_error("Storage error", 502)?));
+            console_log_failed("kifu_by_id_get", &client_kind, &format!("key={by_id_key} err={e}"));
+            return with_cors(Response::error("Storage error", 502)?, req, env);
         }
     };
     let Some(csa_obj) = csa_obj else {
-        return Ok(SingleBuildOutcome::ErrorNoStore(no_store_error("Not Found", 404)?));
+        return with_cors(Response::error("Not Found", 404)?, req, env);
     };
     let Some(body) = csa_obj.body() else {
-        return Ok(SingleBuildOutcome::ErrorNoStore(no_store_error("Not Found", 404)?));
+        return with_cors(Response::error("Not Found", 404)?, req, env);
     };
     let csa_text = match body.text().await {
         Ok(t) => t,
         Err(e) => {
-            log_viewer_api_failed(
+            console_log_failed(
                 "kifu_by_id_read",
-                client_kind,
+                &client_kind,
                 &format!("key={by_id_key} err={e}"),
             );
-            return Ok(SingleBuildOutcome::ErrorNoStore(no_store_error("Storage error", 502)?));
+            return with_cors(Response::error("Storage error", 502)?, req, env);
         }
     };
 
-    // meta は `kifu-by-id/<id>.meta.json` を直接 get で取得する (https://github.com/SH11235/rshogi/issues/551
+    // meta は `kifu-by-id/<id>.meta.json` を直接 get で取得する (Issue #551
     // 設計 v3 §12)。primary meta が常設される契約なので、`games-index/` を
     // prefix list で走査する旧経路 (O(N) コスト) は廃止し、O(1) get に置換した。
     let meta = match find_meta_for(&bucket, game_id).await {
@@ -1210,28 +410,30 @@ async fn build_single_game(
             // primary meta が無い (backfill 未実施 or meta put 失敗)。本 issue
             // scope では legacy fallback を行わず 404 を返す (Non-goals 設計
             // v3 §10)。
-            return Ok(SingleBuildOutcome::ErrorNoStore(no_store_error("Not Found", 404)?));
+            return with_cors(Response::error("Not Found", 404)?, req, env);
         }
         Err(e) => {
-            log_viewer_api_failed(
+            console_log_failed(
                 "kifu_by_id_meta_lookup",
-                client_kind,
+                &client_kind,
                 &format!("game_id={game_id} err={e}"),
             );
-            return Ok(SingleBuildOutcome::ErrorNoStore(no_store_error("Storage error", 502)?));
+            return with_cors(Response::error("Storage error", 502)?, req, env);
         }
     };
 
-    Ok(SingleBuildOutcome::Game {
-        game_id: game_id.to_owned(),
+    let payload = GameResponse {
+        game_id,
         csa: csa_text,
         meta,
-    })
+    };
+    let resp = Response::from_json(&payload)?;
+    with_cors(resp, req, env)
 }
 
 /// `kifu-by-id/<id>.meta.json` を直接 get して `game_id` の meta を返す。
 ///
-/// https://github.com/SH11235/rshogi/issues/551 設計 v3 §12 で meta primary 化したことにより、`games-index/`
+/// Issue #551 設計 v3 §12 で meta primary 化したことにより、`games-index/`
 /// を prefix list で走査する旧経路 (O(N)) は廃止し O(1) get に統一した。
 /// meta が存在しない場合は `Ok(None)` を返し、呼び出し側で 404 を返す。
 async fn find_meta_for(
@@ -1247,10 +449,7 @@ async fn find_meta_for(
         return Ok(None);
     };
     let bytes = body.bytes().await.map_err(|e| e.to_string())?;
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if let Some(meta) = value.as_object_mut() {
-        meta.remove("csa_sha256");
-    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     Ok(Some(value))
 }
 
@@ -1262,9 +461,6 @@ async fn find_meta_for(
 /// 許可リストに含まれていれば通し、含まれない場合は 403。Origin ヘッダ未送信の
 /// クライアント (curl 等) は allowlist 非空のときのみ素通しする
 /// （[`evaluate`] の仕様）。
-///
-/// 403 origin block レスポンスには `Cache-Control: no-store` を付与し、
-/// edge / ブラウザ cache が誤って blocked 応答を保持しないようにする。
 fn check_origin(req: &Request, env: &Env) -> Result<Option<Response>> {
     let allow_csv = env
         .var(ConfigKeys::WS_ALLOWED_ORIGINS)
@@ -1275,12 +471,12 @@ fn check_origin(req: &Request, env: &Env) -> Result<Option<Response>> {
     if allow_list.is_empty() {
         // allowlist 未設定は viewer API では fail-closed。設定漏れを 403 で
         // 顕在化させ、無認可公開を防ぐ。
-        return Ok(Some(no_store_error("Forbidden Origin", 403)?));
+        return Ok(Some(Response::error("Forbidden Origin", 403)?));
     }
     let origin_header = req.headers().get("Origin")?;
     match evaluate(origin_header.as_deref(), allow_list.iter()) {
         OriginDecision::Allow => Ok(None),
-        OriginDecision::NotAllowed => Ok(Some(no_store_error("Forbidden Origin", 403)?)),
+        OriginDecision::NotAllowed => Ok(Some(Response::error("Forbidden Origin", 403)?)),
     }
 }
 
@@ -1292,14 +488,10 @@ fn check_origin(req: &Request, env: &Env) -> Result<Option<Response>> {
 /// Origin はリストに含まれている (もしくは Origin ヘッダなし)。
 ///
 /// `Vary` は `Origin, Access-Control-Request-Headers` を一括して設定する
-/// (https://github.com/SH11235/rshogi/issues/564 設計 v4 §3 review v1 (e))。preflight (OPTIONS) と GET の
+/// (Issue #564 設計 v4 §3 review v1 (e))。preflight (OPTIONS) と GET の
 /// 双方に適用することで、CDN / ブラウザキャッシュが Origin あるいは
 /// preflight で送られた `Access-Control-Request-Headers` を取り違えて
 /// レスポンスを共有する事故を防ぐ。
-///
-/// https://github.com/SH11235/rshogi/issues/636: cache から取り出した origin-neutral な Response も最終的に本関数で
-/// ACAO + Vary を被せる。cache に保存する側では ACAO を含めない (origin-neutral
-/// 化) ことで Origin ごとに cache が分散しないようにしている。
 fn with_cors(mut resp: Response, req: &Request, env: &Env) -> Result<Response> {
     let allow_csv = env
         .var(ConfigKeys::WS_ALLOWED_ORIGINS)
@@ -1326,181 +518,10 @@ fn with_cors(mut resp: Response, req: &Request, env: &Env) -> Result<Response> {
     Ok(resp)
 }
 
-/// `Cache-Control: no-store` を付けたエラー応答を組み立てる。
-///
-/// 400 / 403 / 404 / 502 / 503 等、cache してはいけない応答全てに使う共通ヘルパ。
-/// `with_cors` で ACAO + Vary を被せる前段の素レスポンスを返す。
-pub(crate) fn no_store_error<T: AsRef<str>>(msg: T, status: u16) -> Result<Response> {
-    let mut resp = Response::error(msg.as_ref().to_string(), status)?;
-    resp.headers_mut().set("Cache-Control", "no-store")?;
-    Ok(resp)
-}
-
-/// Response に `Cache-Control` ヘッダを上書きで設定する。
-fn set_cache_control(resp: &mut Response, value: &str) -> Result<()> {
-    resp.headers_mut().set("Cache-Control", value)?;
-    Ok(())
-}
-
-/// `caches.default` から URL key で hit を取り出す。miss は `None`。
-///
-/// 取り出した Response は origin-neutral なので、呼び出し側で `with_cors` を
-/// 被せて返却する契約。`Cache::get` が返す Response はヘッダ guard が immutable で
-/// `with_cors` の `headers.set` が必ず失敗する (= hit のたび 500) ため、ここで
-/// mutable な Response に作り直してから返す。
-///
-/// `cache.get` が `Err` を返した場合 (Cache API 自体の障害)、または mutable 化の
-/// body 読み出しに失敗した場合は `None` を返して miss と同じくフォールバック
-/// (R2 から再 fetch) させる。ただし運用上の観測性が必要なため、`event`
-/// (`<root>_cache_get`) と `client_kind` 付きの logfmt を `log_viewer_api_failed`
-/// で残す。サイレント抑制すると staging / 本番で Cache API が一切機能していない
-/// 事象に気付けない。
-async fn cache_get_origin_neutral(
-    cache_key: &str,
-    event: &str,
-    client_kind: &str,
-) -> Option<Response> {
-    let cache = worker::Cache::default();
-    match cache.get(cache_key.to_string(), true).await {
-        Ok(Some(resp)) => match into_mutable_response(resp).await {
-            Ok(resp) => Some(resp),
-            Err(e) => {
-                log_viewer_api_failed(event, client_kind, &e.to_string());
-                None
-            }
-        },
-        Ok(None) => None,
-        Err(e) => {
-            log_viewer_api_failed(event, client_kind, &e.to_string());
-            None
-        }
-    }
-}
-
-/// `Cache::get` が返す Response はヘッダ guard が immutable で、後段 `with_cors` の
-/// `headers.set` が `Err` になる。body / status / headers を複製した mutable な
-/// Response に作り直す。`Headers::clone` は `new Headers(...)` で guard=none の
-/// 複製を作るため、複製後のヘッダは書き換え可能になる。
-async fn into_mutable_response(mut resp: Response) -> Result<Response> {
-    let status = resp.status_code();
-    let headers = resp.headers().clone();
-    let bytes = resp.bytes().await?;
-    Ok(Response::from_bytes(bytes)?.with_status(status).with_headers(headers))
-}
-
-/// origin-neutral な Response を `caches.default` に put する。
-///
-/// `Response::cloned()` で put 用と返却用に分け、put が失敗しても元 Response は
-/// 返却できるようにする (best-effort、log のみ残す)。
-async fn cache_put_origin_neutral(
-    cache_key: &str,
-    resp: &mut Response,
-    event_root: &str,
-    client_kind: &str,
-) {
-    let put_response = match resp.cloned() {
-        Ok(c) => c,
-        Err(e) => {
-            log_viewer_api_failed(
-                &format!("{event_root}_cache_clone"),
-                client_kind,
-                &e.to_string(),
-            );
-            return;
-        }
-    };
-    let cache = worker::Cache::default();
-    if let Err(e) = cache.put(cache_key.to_string(), put_response).await {
-        // best-effort: cache.put に失敗しても元応答は返せる。log のみ残す。
-        log_viewer_api_failed(&format!("{event_root}_cache_put"), client_kind, &e.to_string());
-    }
-}
-
-/// 失敗ログを構造化 JSON で出す統一窓口。viewer API の経路別 event 名と、
+/// 失敗ログを logfmt で出す統一窓口。viewer API の経路別 event 名と、
 /// 呼出側クライアントを特定する `client_kind` を持たせる
-/// (https://github.com/SH11235/rshogi/issues/564 設計 v4 §3)。`client_kind` は [`normalize_client_kind`] により
+/// (Issue #564 設計 v4 §3)。`client_kind` は [`normalize_client_kind`] により
 /// `[a-z0-9-]{1,64}` に正規化済みの ASCII 文字列、または `unknown` / `invalid`。
-fn log_viewer_api_failed(event: &str, client_kind: &str, detail: &str) {
-    crate::structured_log!(
-        event: event,
-        component: "viewer_api",
-        client_kind: client_kind,
-        detail: detail,
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cache_control_header_for_list_kind() {
-        // edge は s-maxage で TTL 秒保存し、ブラウザ・private cache は
-        // max-age=0 + must-revalidate で毎回 worker に再検証要求を投げる。
-        assert_eq!(
-            CacheableKind::List.cache_control_header(),
-            "public, s-maxage=60, max-age=0, must-revalidate"
-        );
-    }
-
-    #[test]
-    fn cache_control_header_for_single_kind() {
-        assert_eq!(
-            CacheableKind::SingleGame.cache_control_header(),
-            "public, s-maxage=600, max-age=0, must-revalidate"
-        );
-    }
-
-    #[test]
-    fn is_viewer_api_path_accepts_root_paths() {
-        assert!(is_viewer_api_path("/api/v1/games"));
-        assert!(is_viewer_api_path("/api/v1/games/live"));
-        assert!(is_viewer_api_path("/api/v1/games/search"));
-        assert!(is_viewer_api_path("/api/v1/games/events"));
-        assert!(is_viewer_api_path("/api/v1/games/abc-123"));
-        assert!(is_viewer_api_path("/api/v1/players"));
-        assert!(is_viewer_api_path("/api/v1/players/p_v2_abc123"));
-    }
-
-    #[test]
-    fn parse_search_params_rejects_pagination_boundaries() {
-        for query in ["page=0", "pageSize=0", "pageSize=101"] {
-            let url =
-                Url::parse(&format!("https://example.com/api/v1/games/search?{query}")).unwrap();
-            assert!(parse_search_params(&url).is_err(), "query={query}");
-        }
-        let url =
-            Url::parse("https://example.com/api/v1/games/search?page=1&pageSize=100").unwrap();
-        assert!(parse_search_params(&url).is_ok());
-    }
-
-    #[test]
-    fn player_detail_pagination_uses_shared_bounds() {
-        for query in ["page=0", "pageSize=0", "pageSize=101"] {
-            let url =
-                Url::parse(&format!("https://example.com/api/v1/players/p_abc?{query}")).unwrap();
-            assert!(parse_page_params(&url).is_err(), "query={query}");
-        }
-        let url =
-            Url::parse("https://example.com/api/v1/players/p_abc?page=2&pageSize=100").unwrap();
-        assert_eq!(parse_page_params(&url), Ok((2, 100)));
-    }
-
-    #[test]
-    fn parse_search_params_rejects_invalid_time_bounds() {
-        for query in ["from=invalid", "to=-1", "to=1.5"] {
-            let url =
-                Url::parse(&format!("https://example.com/api/v1/games/search?{query}")).unwrap();
-            assert!(parse_search_params(&url).is_err(), "query={query}");
-        }
-    }
-
-    #[test]
-    fn is_viewer_api_path_rejects_extra_segments_and_trailing_slash() {
-        assert!(!is_viewer_api_path("/api/v1/games/"));
-        assert!(!is_viewer_api_path("/api/v1/games/x/y"));
-        assert!(!is_viewer_api_path("/api/v1/players/"));
-        assert!(!is_viewer_api_path("/api/v1/players/x/y"));
-        assert!(!is_viewer_api_path("/api/v2/games"));
-    }
+fn console_log_failed(event: &str, client_kind: &str, detail: &str) {
+    worker::console_log!("[viewer_api] event={event} client_kind={client_kind} detail={detail}");
 }

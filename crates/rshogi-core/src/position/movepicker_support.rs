@@ -8,17 +8,8 @@ use crate::bitboard::{
     knight_effect, lance_effect, pawn_effect, ray_effect, rook_effect, silver_effect,
 };
 use crate::movegen::{ExtMoveBuffer, GenType, generate_evasions, generate_with_type};
-use crate::types::{Color, Move, Piece, PieceType, Rank, Square, Value};
+use crate::types::{Color, Move, Piece, PieceType, Square, Value};
 
-// 未成の歩・香・桂が、その段で行き所のない駒になるか。
-#[inline]
-fn is_dead_piece(pt: PieceType, color: Color, to: Square) -> bool {
-    match pt {
-        PieceType::Pawn | PieceType::Lance => to.rank().relative(color) == Rank::Rank1,
-        PieceType::Knight => to.rank().relative(color) <= Rank::Rank2,
-        _ => false,
-    }
-}
 impl Position {
     // =========================================================================
     // 指し手の妥当性チェック
@@ -29,8 +20,8 @@ impl Position {
     /// 指し手が現在の局面で pseudo-legal かどうかを確認する。
     /// 完全な合法性（自玉への王手回避など）はチェックしない。
     ///
-    /// 王手中の不正な手を早期リジェクトする。
-    /// 行き所のない駒の打ち・不成は拒否する。合法な不成は探索用の省略をせず残す。
+    /// YaneuraOuの実装を参考に、王手中の不正な手を早期リジェクトする。
+    /// 成らない手の制限は行わない（特殊な詰み手順の発見を可能にするため）。
     ///
     /// ## パフォーマンスについて
     ///
@@ -53,10 +44,6 @@ impl Position {
         if m.is_drop() {
             // 駒打ち
             let pt = m.drop_piece_type();
-
-            if is_dead_piece(pt, us, to) {
-                return false;
-            }
 
             // 手駒にあるか
             if !self.hand(us).has(pt) {
@@ -110,9 +97,6 @@ impl Position {
 
             // 駒の動きとして正しいか
             let pt = pc.piece_type();
-            if !m.is_promote() && is_dead_piece(pt, us, to) {
-                return false;
-            }
             let occupied = self.occupied();
 
             // 成りフラグの検証
@@ -165,7 +149,7 @@ impl Position {
                 return false;
             }
 
-            // 全合法手生成モードでない場合の不成の制限
+            // 【参考実装】成らない手の制限（YaneuraOu の generate_all_legal_moves = false 相当）
             // 特殊な詰み手順（歩不成での打ち歩詰め回避、角不成での利き調整など）の
             // 発見を可能にするため、本実装では有効化しない。
             // NPS改善も誤差範囲内だったため、制限しないことによるデメリットはない。
@@ -252,7 +236,7 @@ impl Position {
     /// pseudo-legal判定（生成モード指定版）
     ///
     /// 互換性のため `generate_all_legal_moves` パラメータを受け取るが、
-    /// 合法な不成の省略は行わないため、常に `pseudo_legal()` と同じ動作をする。
+    /// 成らない手の制限は行わないため、常に `pseudo_legal()` と同じ動作をする。
     #[inline]
     pub fn pseudo_legal_with_all(&self, m: Move, _generate_all_legal_moves: bool) -> bool {
         self.pseudo_legal(m)
@@ -291,6 +275,17 @@ impl Position {
     }
 
     // =========================================================================
+    // 歩の陣形インデックス
+    // =========================================================================
+
+    /// PawnHistory 用のインデックスを計算
+    ///
+    /// 歩の配置に基づくハッシュ値からインデックスを計算する。
+    pub fn pawn_history_index(&self) -> usize {
+        (self.pawn_key() as usize) & (crate::search::PAWN_HISTORY_SIZE - 1)
+    }
+
+    // =========================================================================
     // 指し手生成（MovePicker用）
     // =========================================================================
 
@@ -325,7 +320,7 @@ impl Position {
         );
 
         let start_len = moves.len();
-        // 成りも含む静かな手を生成する
+        // YaneuraOu標準のQUIETS相当: 成りも含む静かな手を生成する
         generate_with_type(self, GenType::Quiets, moves, None);
         moves.len() - start_len
     }
@@ -345,7 +340,7 @@ impl Position {
 
     /// SEE >= threshold かどうかを判定（swap/resアルゴリズム）
     ///
-    /// 静的駒交換評価を判定する。
+    /// YaneuraOu/Stockfish と同じアルゴリズムで静的駒交換評価を判定する。
     /// 成りボーナスは考慮しない。
     pub fn see_ge(&self, m: Move, threshold: Value) -> bool {
         // PASSは駒交換が発生しないので >= 0
@@ -412,7 +407,7 @@ impl Position {
             // ピン処理 — ピンされた駒は攻撃に参加できない
             // pinners(~stm): stmの玉をピンしている(!stm側の)駒
             // rshogi の pinners[c] は「!c側の駒がc側の王をピンしている」という意味なので、
-            // stm の王をピンしている駒を取得するには pinners[stm] を使う
+            // stm の王をピンしている駒を取得するには pinners[stm] を使う（YOは pinners[~stm]）
             if !(self.state().pinners[stm.index()] & occupied).is_empty() {
                 stm_attackers &= !self.blockers_for_king(stm);
                 if stm_attackers.is_empty() {
@@ -475,6 +470,7 @@ impl Position {
     }
 
     /// 最も価値の低い攻撃駒を探す（成りは考慮しない）
+    #[inline]
     fn least_valuable_attacker(
         &self,
         attackers: Bitboard,
@@ -482,6 +478,7 @@ impl Position {
         _to: Square,
         _occupied: Bitboard,
     ) -> (Square, i32) {
+        let stm_pieces = self.pieces_c(stm);
         // 価値の低い順にチェック（成り考慮なし）
         // Pawn(90) → Lance(315) → Knight(405) → Silver(495)
         // → GOLDS(540): Gold,ProPawn,ProLance,ProKnight,ProSilver
@@ -489,63 +486,58 @@ impl Position {
         // 注: Rook(990)がHorse(945)より先は（価値昇順ではない）
 
         // Pawn
-        let bb = attackers & self.pieces(stm, PieceType::Pawn);
+        let bb = attackers & stm_pieces & self.pieces_pt(PieceType::Pawn);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::Pawn));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::Pawn));
         }
         // Lance
-        let bb = attackers & self.pieces(stm, PieceType::Lance);
+        let bb = attackers & stm_pieces & self.pieces_pt(PieceType::Lance);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::Lance));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::Lance));
         }
         // Knight
-        let bb = attackers & self.pieces(stm, PieceType::Knight);
+        let bb = attackers & stm_pieces & self.pieces_pt(PieceType::Knight);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::Knight));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::Knight));
         }
         // Silver (495 < Gold 540)
-        let bb = attackers & self.pieces(stm, PieceType::Silver);
+        let bb = attackers & stm_pieces & self.pieces_pt(PieceType::Silver);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::Silver));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::Silver));
         }
         // GOLDS (Gold, ProPawn, ProLance, ProKnight, ProSilver) — すべて540
         // 結合bitboardのLSBを選択する（個別駒種ごとにチェックすると
         // 異なるマスが選ばれ、x-ray discoveryが変わる）
-        let golds_bb = self.pieces_pt(PieceType::Gold)
-            | self.pieces_pt(PieceType::ProPawn)
-            | self.pieces_pt(PieceType::ProLance)
-            | self.pieces_pt(PieceType::ProKnight)
-            | self.pieces_pt(PieceType::ProSilver);
-        let bb = attackers & golds_bb & self.pieces_c(stm);
+        let bb = attackers & self.golds_c(stm);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::Gold));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::Gold));
         }
         // Bishop (855)
-        let bb = attackers & self.pieces(stm, PieceType::Bishop);
+        let bb = attackers & stm_pieces & self.pieces_pt(PieceType::Bishop);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::Bishop));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::Bishop));
         }
         // Rook(990) を Horse(945) より先に選択
-        // この順序は SEE の取り返し駒の選択に影響するため、固定した bench のノード数を保つよう変えない
+        // 価値昇順ではないが、YOとのノード数一致のために順序を合わせる
         // Rook (990)
-        let bb = attackers & self.pieces(stm, PieceType::Rook);
+        let bb = attackers & stm_pieces & self.pieces_pt(PieceType::Rook);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::Rook));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::Rook));
         }
         // Horse (945)
-        let bb = attackers & self.pieces(stm, PieceType::Horse);
+        let bb = attackers & stm_pieces & self.pieces_pt(PieceType::Horse);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::Horse));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::Horse));
         }
         // Dragon
-        let bb = attackers & self.pieces(stm, PieceType::Dragon);
+        let bb = attackers & stm_pieces & self.pieces_pt(PieceType::Dragon);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::Dragon));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::Dragon));
         }
         // King
-        let bb = attackers & self.pieces(stm, PieceType::King);
+        let bb = attackers & stm_pieces & self.pieces_pt(PieceType::King);
         if !bb.is_empty() {
-            return (bb.lsb().unwrap(), see_piece_value(PieceType::King));
+            return (bb.lsb_unchecked(), see_piece_value(PieceType::King));
         }
 
         unreachable!(
@@ -559,20 +551,26 @@ impl Position {
 // =============================================================================
 
 /// SEE用の駒価値
+#[inline]
 fn see_piece_value(pt: PieceType) -> i32 {
-    use PieceType::*;
-    match pt {
-        Pawn => 90,
-        Lance => 315,
-        Knight => 405,
-        Silver => 495,
-        Gold | ProPawn | ProLance | ProKnight | ProSilver => 540,
-        Bishop => 855,
-        Horse => 945,
-        Rook => 990,
-        Dragon => 1395,
-        King => 15000,
-    }
+    const VALUES: [i32; 15] = [
+        0,     // NoPieceType
+        90,    // Pawn
+        315,   // Lance
+        405,   // Knight
+        495,   // Silver
+        855,   // Bishop
+        990,   // Rook
+        540,   // Gold
+        15000, // King
+        540,   // ProPawn
+        540,   // ProLance
+        540,   // ProKnight
+        540,   // ProSilver
+        945,   // Horse
+        1395,  // Dragon
+    ];
+    VALUES[pt as usize]
 }
 
 // 【参考実装】成らない手の制限用ヘルパー関数
@@ -605,92 +603,6 @@ mod tests {
     use super::*;
     use crate::types::{File, Rank};
 
-    #[test]
-    fn test_input_drop_rank_constraints_match_all_legal_generation() {
-        use crate::movegen::{MoveList, generate_legal_all};
-        for (color, turn, hand) in [(Color::Black, "b", "NLP"), (Color::White, "w", "nlp")] {
-            let mut pos = Position::new();
-            pos.set_sfen(&format!("k8/9/9/9/9/9/9/9/8K {turn} {hand} 1")).unwrap();
-            let mut generated = MoveList::new();
-            generate_legal_all(&pos, &mut generated);
-            for (pt, first_legal_rank) in [
-                (PieceType::Pawn, 1),
-                (PieceType::Lance, 1),
-                (PieceType::Knight, 2),
-            ] {
-                for relative_rank in Rank::ALL {
-                    let to = Square::new(File::File5, relative_rank.relative(color));
-                    let mv = pos.to_move(Move::new_drop(pt, to)).unwrap();
-                    let expected = relative_rank.index() >= first_legal_rank;
-                    assert_eq!(pos.pseudo_legal(mv), expected, "{turn}: {mv:?}");
-                    for all in [false, true] {
-                        assert_eq!(pos.pseudo_legal_with_all(mv, all), expected);
-                    }
-                    assert_eq!(
-                        generated.iter().any(|candidate| candidate.raw() == mv.raw()),
-                        expected
-                    );
-                    if expected {
-                        assert!(pos.is_legal(mv));
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_input_non_promotion_rank_constraints_match_all_legal_generation() {
-        use crate::movegen::{MoveList, generate_legal_all};
-        // 座標は先手視点。後手は段を反転する。
-        for (piece, from, to, expected) in [
-            ('P', "5b", "5a", false),
-            ('L', "5b", "5a", false),
-            ('N', "5c", "4a", false),
-            ('N', "5d", "4b", false),
-            ('P', "5c", "5b", true),
-            ('L', "5d", "5b", true),
-            ('N', "5e", "4c", true),
-            ('B', "5d", "4c", true),
-            ('R', "5d", "5c", true),
-        ] {
-            for (color, turn) in [(Color::Black, "b"), (Color::White, "w")] {
-                let mirror = |usi: &str| {
-                    let sq = Square::from_usi(usi).unwrap();
-                    Square::new(sq.file(), sq.rank().relative(color))
-                };
-                let from = mirror(from);
-                let to = mirror(to);
-                let piece = if color == Color::Black {
-                    piece
-                } else {
-                    piece.to_ascii_lowercase()
-                };
-                let mut rows = vec!["9".to_string(); 9];
-                rows[0] = "k8".into();
-                rows[8] = "8K".into();
-                rows[from.rank().index()] = format!("4{piece}4");
-                let mut pos = Position::new();
-                pos.set_sfen(&format!("{} {turn} - 1", rows.join("/"))).unwrap();
-                let mut generated = MoveList::new();
-                generate_legal_all(&pos, &mut generated);
-                for promote in [false, true] {
-                    let mv = pos.to_move(Move::new_move(from, to, promote)).unwrap();
-                    let accepted = promote || expected;
-                    assert_eq!(pos.pseudo_legal(mv), accepted, "{turn}: {mv:?}");
-                    for all in [false, true] {
-                        assert_eq!(pos.pseudo_legal_with_all(mv, all), accepted);
-                    }
-                    assert_eq!(
-                        generated.iter().any(|candidate| candidate.raw() == mv.raw()),
-                        accepted
-                    );
-                    if accepted {
-                        assert!(pos.is_legal(mv));
-                    }
-                }
-            }
-        }
-    }
     #[test]
     fn test_moved_piece() {
         let mut pos = Position::new();
@@ -783,6 +695,15 @@ mod tests {
         let m = Move::new_move(sq55, sq54, false);
         assert!(pos.see_ge(m, Value::new(0)));
         assert!(pos.see_ge(m, Value::new(400))); // 金(540) - 歩(90) = 450 > 400
+    }
+
+    #[test]
+    fn test_pawn_history_index() {
+        let mut pos = Position::new();
+        pos.set_hirate();
+
+        let idx = pos.pawn_history_index();
+        assert!(idx < crate::search::PAWN_HISTORY_SIZE);
     }
 
     /// X-ray攻撃のテスト: to を占有から外さないと誤って得と判定されるケース

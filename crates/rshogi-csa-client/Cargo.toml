@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["SH11235"]
 description = "CSA protocol client (CLI bridge) that wires a USI engine to a CSA server (TCP / WebSocket)."
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 repository = "https://github.com/SH11235/rshogi"
 
 # crate を library + binary 構成に分割。consumer (Tauri 等) は lib を取り込み、
@@ -50,24 +50,21 @@ thiserror.workspace = true
 # 一部になっているため、feature gate 不可 (consumer から見える型のため常時必須)。
 toml.workspace = true
 
-# rshogi-core はルール型と読み筋の合法手検査に使い、NNUE / 探索には触れない。
-# default (edition-universal) を持ち込むと rshogi-usi の specific edition build と
-# 同じ cargo 呼び出しで build.rs の edition 排他チェックに落ちるため、default-features=false とする。
-rshogi-core = { path = "../rshogi-core", default-features = false }
+rshogi-core = { path = "../rshogi-core" }
 rshogi-csa = { path = "../rshogi-csa" }
 # CSA プロトコル送信側 serialize / 受信側 parse の単一ソース。
-# `default-features=false` で `tokio-transport` (tokio + granit-parser) を切り、
+# `default-features=false` で `tokio-transport` (tokio + serde_yaml) を切り、
 # protocol モジュールが必要とする pure な型 / 関数のみを取り込む。
 rshogi-csa-server = { path = "../rshogi-csa-server", default-features = false }
 
 # `libc` は engine.rs の `pre_exec` で `setpgid` を呼ぶ unix 経路、および
-# transport の TCP keepalive (`SO_KEEPALIVE`) と `TCP_USER_TIMEOUT` で使われる。どれも library
+# transport.rs の TCP keepalive (`SO_KEEPALIVE`) で使われる。両方とも library
 # コード側のため feature gate せず常時必須。
 libc = "0.2"
 
 # CSA-over-WebSocket 用の sync ハンドシェイク + フレーミング。
 # rustls + webpki ルートで TLS を実装し、native-tls 経由の OpenSSL 依存を避ける。
-tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
+tungstenite = { version = "0.27", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
 # rustls 0.23 は process-level の `CryptoProvider` を起動時に明示登録する必要がある
 # （`tungstenite` の rustls feature は cert source だけを切り替え、provider は選ばない）。
 # `ring` provider を `main()` 冒頭で `install_default()` 経由で登録する。
@@ -77,15 +74,3 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 clap = { workspace = true, optional = true }
 ctrlc = { version = "3.4", optional = true }
 env_logger = { workspace = true, optional = true }
-
-# `nix` は engine 死亡時の process group 単位 kill (`killpg`) を unsafe を
-# 使わず safe wrapper 経由で呼ぶために unix 限定で依存。`signal` feature だけ
-# あれば `killpg` / `Signal::SIGKILL` / `Pid::from_raw` が揃う。
-# version は workspace 上 (ctrlc 経由) で既に解決されている `0.31` 系に揃え、
-# Cargo.lock の dup を回避する。
-# NOTE: この target 固有セクションは必ずファイル末尾に置くこと。汎用
-# [dependencies] の途中 (後続の依存定義より上) に置くと、それ以降の依存
-# (tungstenite 等) がこのセクションに吸われて unix 限定になり、
-# Windows build が壊れる (#673 の regression)。
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal"] }

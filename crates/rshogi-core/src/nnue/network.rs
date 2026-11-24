@@ -1,16 +1,16 @@
 //! NNUEネットワーク全体の構造と評価関数
 //!
 //! 以下のアーキテクチャをサポート:
-//! - **HalfKP**: classic NNUE
-//! - **HalfKaSplit**: Non-mirror
-//! - **HalfKaHmMerged^**: Half-Mirror + Factorization
+//! - **HalfKP**: classic NNUE（水匠/tanuki互換）
+//! - **HalfKA**: nnue-pytorch互換（Non-mirror）
+//! - **HalfKA_hm^**: nnue-pytorch互換（Half-Mirror + Factorization）
 //!
 //! # 階層構造（4バリアント）
 //!
 //! ```text
 //! NNUENetwork
-//! ├── HalfKaSplit(HalfKaSplitNetwork)   // L256/L512/L1024 を内包
-//! ├── HalfKaHmMerged(HalfKaHmMergedNetwork)   // L256/L512/L1024 を内包
+//! ├── HalfKA(HalfKANetwork)   // L256/L512/L1024 を内包
+//! ├── HalfKA_hm(HalfKA_hmNetwork)   // L256/L512/L1024 を内包
 //! ├── HalfKP(HalfKPNetwork)   // L256/L512 を内包
 //! └── LayerStacks(Box<NetworkLayerStacks>)
 //! ```
@@ -18,47 +18,30 @@
 //! **「Accumulator は L1 だけで決まる」** を活用し、L2/L3/活性化の追加時に
 //! このファイルの変更は最小限で済む。
 
-#[cfg(feature = "halfkx-arch")]
-use super::accumulator::AccumulatorCacheGeneric;
-use super::accumulator_layer_stacks::LayerStacksAccCache;
-#[cfg(feature = "layerstack-arch")]
-use super::accumulator_layer_stacks::LayerStacksAccStack;
+use super::accumulator_layer_stacks::{LayerStacksAccCache, LayerStacksAccStack};
 use super::accumulator_stack_variant::AccumulatorStackVariant;
 use super::activation::detect_activation_from_arch;
 use super::bona_piece::BonaPiece;
-use super::bona_piece_halfka_hm_merged::FE_OLD_END;
-use super::constants::{
-    MAX_ARCH_LEN, MAX_LAYER_STACK_BUCKETS, NNUE_VERSION, NNUE_VERSION_HALFKA,
-    NNUE_VERSION_LAYERSTACK_NUM_BUCKETS,
-};
-#[cfg(feature = "nnue-runtime-dimensions")]
-use super::dynamic_halfkx::DynamicHalfKxNetwork;
-#[cfg(feature = "nnue-runtime-dimensions")]
-use super::dynamic_layer_stacks::DynamicLayerStacksNetwork;
-use super::halfka_hm_merged::{HalfKaHmMergedNetwork, HalfKaHmMergedStack};
-use super::halfka_hm_split::{HalfKaHmSplitNetwork, HalfKaHmSplitStack};
-use super::halfka_merged::{HalfKaMergedNetwork, HalfKaMergedStack};
-use super::halfka_split::{HalfKaSplitNetwork, HalfKaSplitStack};
+use super::bona_piece_halfka_hm::FE_OLD_END;
+use super::constants::{MAX_ARCH_LEN, NNUE_VERSION, NNUE_VERSION_HALFKA};
+use super::halfka::{HalfKANetwork, HalfKAStack};
+use super::halfka_hm::{HalfKA_hmNetwork, HalfKA_hmStack};
 use super::halfkp::{HalfKPNetwork, HalfKPStack};
-use super::net_delta::{
-    NetCoefficientId, NetDelta, NetDeltaError, NetDeltaReport, NetTensorKind, NetTensorShape,
-};
-#[cfg(feature = "layerstack-arch")]
-use super::network_layer_stacks::{LayerStacksNetwork, peek_layer_stacks_header};
+use super::network_layer_stacks::LayerStacksNetwork;
 use super::spec::{Activation, FeatureSet};
-#[cfg(feature = "halfkx-arch")]
+#[cfg(not(feature = "layerstack-only"))]
 use super::stats::{count_already_computed, count_refresh, count_update};
 use crate::eval::material;
 use crate::position::Position;
 use crate::types::{Color, PieceType, Value};
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
-use std::mem::size_of;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::{Arc, LazyLock, RwLock};
 
-/// グローバルなNNUEネットワーク（HalfKP/HalfKaSplit/HalfKaHmMerged^）
+/// グローバルなNNUEネットワーク（HalfKP/HalfKA/HalfKA_hm^）
 static NETWORK: LazyLock<RwLock<Option<Arc<NNUENetwork>>>> = LazyLock::new(|| RwLock::new(None));
 
 /// `is_nnue_initialized()` の高速パス用 AtomicBool キャッシュ
@@ -72,9 +55,31 @@ static NNUE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// 0 = 自動判定（Network 構造体の fv_scale を使用）
 /// 1以上 = 指定値でオーバーライド
 ///
-/// エンジンオプションで設定可能。
+/// YaneuraOuと同様にエンジンオプションで設定可能。
 /// 評価関数によって異なる値が必要な場合に使用。
-static FV_SCALE_OVERRIDE: AtomicI32 = AtomicI32::new(0);
+///
+/// **default = 16** (Suisho5 / YaneuraOu HalfKP と同 scale、 2026-05-23 user 指示で変更)。
+/// LayerStacks ckpt の本来 fv_scale は 24 だが、 cp 表示 scale を Suisho5 と揃えるため
+/// 起動時 default を 16 に固定。 USI option `FV_SCALE` で再上書き可能 (0 = ckpt 値 24 復帰)。
+static FV_SCALE_OVERRIDE: AtomicI32 = AtomicI32::new(16);
+
+/// LayerStacks bucket 境界補間の遷移ゾーン幅 ε（bucket 幅の %）。
+///
+/// `LS_BUCKET_INTERP` USI オプションで設定。0 = 完全 OFF（bit-exact 無変化）、
+/// 1..=40 で bucket 境界近傍 (frac < ε または frac > 1-ε) で隣接 bucket の eval と
+/// 線形補間する。進行度 bucket 境界での eval ジャンプ (平均 29-30cp) を平滑化する。
+static LS_BUCKET_INTERP: AtomicI32 = AtomicI32::new(0);
+
+/// `LS_BUCKET_INTERP` の遷移ゾーン幅（%）を取得（0 = OFF）
+#[inline]
+pub fn get_bucket_interp() -> i32 {
+    LS_BUCKET_INTERP.load(Ordering::Relaxed)
+}
+
+/// `LS_BUCKET_INTERP` の遷移ゾーン幅（%）を設定（0..=40 に clamp、0 = OFF）
+pub fn set_bucket_interp(value: i32) {
+    LS_BUCKET_INTERP.store(value.clamp(0, 40), Ordering::Relaxed);
+}
 
 /// NNUE アーキテクチャの明示指定
 ///
@@ -86,10 +91,11 @@ pub enum NNUEArchitectureOverride {
     Auto = 0,
     /// HalfKP
     HalfKP = 1,
-    /// HalfKaHmMerged
-    HalfKaHmMerged = 2,
-    /// HalfKaSplit
-    HalfKaSplit = 3,
+    /// HalfKA_hm
+    #[allow(non_camel_case_types)]
+    HalfKA_hm = 2,
+    /// HalfKA
+    HalfKA = 3,
     /// LayerStacks (PSQT なし)
     LayerStacks = 4,
     /// LayerStacks + PSQT
@@ -103,8 +109,8 @@ static NNUE_ARCHITECTURE_OVERRIDE: AtomicI32 =
 pub(crate) fn get_nnue_architecture_override() -> NNUEArchitectureOverride {
     match NNUE_ARCHITECTURE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         1 => NNUEArchitectureOverride::HalfKP,
-        2 => NNUEArchitectureOverride::HalfKaHmMerged,
-        3 => NNUEArchitectureOverride::HalfKaSplit,
+        2 => NNUEArchitectureOverride::HalfKA_hm,
+        3 => NNUEArchitectureOverride::HalfKA,
         4 => NNUEArchitectureOverride::LayerStacks,
         5 => NNUEArchitectureOverride::LayerStacksPSQT,
         _ => NNUEArchitectureOverride::Auto,
@@ -113,7 +119,6 @@ pub(crate) fn get_nnue_architecture_override() -> NNUEArchitectureOverride {
 
 /// NNUE アーキテクチャの明示指定を設定
 pub fn set_nnue_architecture_override(mode: NNUEArchitectureOverride) {
-    crate::eval::changed();
     NNUE_ARCHITECTURE_OVERRIDE.store(mode as i32, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -122,8 +127,8 @@ pub fn parse_nnue_architecture(value: &str) -> Option<NNUEArchitectureOverride> 
     match value.to_ascii_lowercase().as_str() {
         "auto" => Some(NNUEArchitectureOverride::Auto),
         "halfkp" => Some(NNUEArchitectureOverride::HalfKP),
-        "halfka_hm" | "halfka_hm_merged" => Some(NNUEArchitectureOverride::HalfKaHmMerged),
-        "halfka" | "halfka_split" => Some(NNUEArchitectureOverride::HalfKaSplit),
+        "halfka_hm" => Some(NNUEArchitectureOverride::HalfKA_hm),
+        "halfka" => Some(NNUEArchitectureOverride::HalfKA),
         "layerstacks" => Some(NNUEArchitectureOverride::LayerStacks),
         "layerstacks-psqt" | "layerstacks_psqt" => Some(NNUEArchitectureOverride::LayerStacksPSQT),
         _ => None,
@@ -131,105 +136,61 @@ pub fn parse_nnue_architecture(value: &str) -> Option<NNUEArchitectureOverride> 
 }
 
 /// LayerStacks の bucket 選択モード
+///
+/// 現在は `Progress8KPAbs`（YaneuraOu 互換 progress.bin）のみをサポートする。
+/// enum として残しているのは将来の bucket mode 追加に備えた前方互換性のため。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum LayerStackBucketMode {
-    /// 両玉の相対段で 9 バケットを選択する方式
-    KingRank9 = 0,
-    /// tatara モデル用の浮動小数点進行度方式 (KP-absolute)。bucket 数は推論設定で明示する。
-    ProgressKPAbs = 4,
-    /// YaneuraOu SFNN モデル用の Q16 整数進行度方式。
-    /// 256 段階に量子化する BulletOu 形式とは、バケット数が 256 の約数の場合に振り分けが一致する。
-    ProgressKPAbsQ16 = 5,
+    /// 進行度方式(KP-absolute): YaneuraOu 互換 progress.bin で 8 バケットへ分割（bucket8は未使用）
+    Progress8KPAbs = 4,
 }
 
 impl LayerStackBucketMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::KingRank9 => "kingrank9",
-            Self::ProgressKPAbs => "progresskpabs",
-            Self::ProgressKPAbsQ16 => "progresskpabsq16",
+            Self::Progress8KPAbs => "progress8kpabs",
         }
     }
 }
 
-/// progresskpabs で使用する重み数（81 king squares x FE_OLD_END BonaPiece）
+/// progress8kpabs で使用する重み数（81 king squares x FE_OLD_END BonaPiece）
 pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
 
-/// progresskpabs 用の進行度係数ファイルを読み込む。
-///
-/// ファイルは `f64` little-endian の生配列として読み、評価器で使う `f32` 重みへ変換する。
-/// サイズは [`SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS`] 個ぶんの `f64` と厳密一致する必要がある。
-pub fn load_progress_coeff_kpabs(path: impl AsRef<Path>) -> Result<Box<[f32]>, String> {
-    let path = path.as_ref();
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("failed to read progress coeff '{}': {e}", path.display()))?;
-    load_progress_coeff_kpabs_from_bytes(&bytes)
-}
+/// sigmoid(x)*8 = k となる x の閾値 (k=1..7)。
+/// x = ln(k / (8-k)) で事前計算。
+/// sum との比較のみで bucket index を決定でき、exp() が不要になる。
+const PROGRESS_BUCKET_THRESHOLDS: [f32; 7] = [
+    -1.945_910_1, // k=1: ln(1/7)
+    -1.098_612_3, // k=2: ln(1/3)
+    -0.510_825_6, // k=3: ln(3/5)
+    0.0,          // k=4: ln(1)
+    0.510_825_6,  // k=5: ln(5/3)
+    1.098_612_3,  // k=6: ln(3)
+    1.945_910_1,  // k=7: ln(7)
+];
 
-/// [`load_progress_coeff_kpabs`] のバイト列版。
-///
-/// 呼び出し側でファイル内容のハッシュ検証などを行う場合に、検証したバイト列と
-/// 同一の内容から重みを構築できる。
-pub fn load_progress_coeff_kpabs_from_bytes(bytes: &[u8]) -> Result<Box<[f32]>, String> {
-    let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * size_of::<f64>();
-    if bytes.len() != expected {
-        return Err(format!(
-            "progress coeff size mismatch: got {} bytes, expected {}",
-            bytes.len(),
-            expected
-        ));
-    }
-
-    let weights: Vec<f32> = bytes
-        .as_chunks::<{ size_of::<f64>() }>()
-        .0
-        .iter()
-        .map(|chunk| f64::from_le_bytes(*chunk) as f32)
-        .collect();
-    Ok(weights.into_boxed_slice())
-}
-
-// ターゲットの f32::ln の丸めを保つため、routing 設定時に閾値を計算する。
-static PROGRESS_BUCKET_THRESHOLDS: [OnceLock<Box<[f32]>>; MAX_LAYER_STACK_BUCKETS + 1] =
-    [const { OnceLock::new() }; MAX_LAYER_STACK_BUCKETS + 1];
-
-fn progress_thresholds(num_buckets: usize) -> impl Iterator<Item = f32> {
-    let n = num_buckets as f32;
-    (1..num_buckets).map(move |k| ((k as f32) / (n - k as f32)).ln())
-}
-
-#[cold]
-fn unconfigured_progress_sum_to_bucket(sum: f32, num_buckets: usize) -> usize {
-    progress_thresholds(num_buckets)
-        .take_while(|&threshold| sum >= threshold)
-        .count()
+// progress8kpabs の差分計算済み bucket index キャッシュ（スレッドローカル）
+//
+// `update_and_evaluate_layer_stacks` で差分計算した結果を格納し、
+// `compute_layer_stack_progress8kpabs_bucket_index` 内で消費する。
+// 一度消費されると None にリセットされる（1回限り）。
+thread_local! {
+    static CACHED_PROGRESS_BUCKET: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// LayerStacks bucket mode のグローバル設定
 static LAYER_STACK_BUCKET_MODE: AtomicI32 =
-    AtomicI32::new(LayerStackBucketMode::ProgressKPAbs as i32);
+    AtomicI32::new(LayerStackBucketMode::Progress8KPAbs as i32);
 
-/// progresskpabs の推論 bucket 数。0 は未設定。
-static LAYER_STACK_PROGRESS_BUCKETS: AtomicUsize = AtomicUsize::new(0);
-
-/// progresskpabs 重みのデフォルト（未設定時は全ゼロ）
+/// progress8kpabs 重みのデフォルト（未設定時は全ゼロ）
 static LAYER_STACK_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
     [0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
 
-static LAYER_STACK_PROGRESS_KP_ABS_WEIGHTS: RwLock<Option<Arc<[f32]>>> = RwLock::new(None);
-
-/// progresskpabs 係数の不変スナップショット。再設定・reset 後も取得時の係数を保持する。
-#[derive(Clone)]
-pub struct ProgressKpAbsWeights(Option<Arc<[f32]>>);
-
-impl std::ops::Deref for ProgressKpAbsWeights {
-    type Target = [f32];
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_deref().unwrap_or(&LAYER_STACK_PROGRESS_KP_ABS_ZERO_WEIGHTS)
-    }
-}
+/// progress8kpabs 重みのグローバル設定
+///
+/// `progress.bin` 読み込み時に Box を leak してポインタだけ差し替える。
+/// 設定は起動時の一度を想定し、評価ホットパスでは lock を取らない。
+static LAYER_STACK_PROGRESS_KP_ABS_PTR: AtomicPtr<f32> = AtomicPtr::new(std::ptr::null_mut());
 
 /// FV_SCALE オーバーライドを取得
 ///
@@ -246,591 +207,165 @@ pub fn get_fv_scale_override() -> Option<i32> {
 /// 引数:
 /// - `value`: 設定値（0 = 自動判定、1以上 = オーバーライド）
 pub fn set_fv_scale_override(value: i32) {
-    crate::eval::changed();
     FV_SCALE_OVERRIDE.store(value.max(0), Ordering::Relaxed);
 }
 
 /// LayerStacks bucket mode を取得
 pub fn get_layer_stack_bucket_mode() -> LayerStackBucketMode {
-    match LAYER_STACK_BUCKET_MODE.load(Ordering::Relaxed) {
-        0 => LayerStackBucketMode::KingRank9,
-        5 => LayerStackBucketMode::ProgressKPAbsQ16,
-        _ => LayerStackBucketMode::ProgressKPAbs,
-    }
+    // 現状は Progress8KPAbs のみ。int mapping は将来のモード追加用。
+    let _ = LAYER_STACK_BUCKET_MODE.load(Ordering::Relaxed);
+    LayerStackBucketMode::Progress8KPAbs
 }
 
 /// LayerStacks bucket mode を設定
-pub(crate) fn set_layer_stack_bucket_mode(mode: LayerStackBucketMode) {
-    crate::eval::changed();
+pub fn set_layer_stack_bucket_mode(mode: LayerStackBucketMode) {
     LAYER_STACK_BUCKET_MODE.store(mode as i32, Ordering::Relaxed);
 }
 
-/// LayerStacks progresskpabs の推論 bucket 数を取得する。
-pub fn get_layer_stack_progress_buckets() -> Option<usize> {
-    let configured = LAYER_STACK_PROGRESS_BUCKETS.load(Ordering::Acquire);
-    (configured != 0).then_some(configured)
-}
-
-/// LayerStacks の routing mode と格納 bucket 数の整合性を検証し、設定を反映する。
+/// 局面の bucket index (0..=7) を計算する（search 側から呼ぶ用）
 ///
-/// `progresskpabs` は学習時の routing bucket 数を必須とし、格納数以下でなければならない。
-/// `kingrank9` は格納数が 9 の場合だけ受理する。
-pub fn configure_layer_stack_routing(
-    mode: LayerStackBucketMode,
-    stored_bucket_count: usize,
-    progress_bucket_count: Option<usize>,
-) -> Result<(), String> {
-    validate_layer_stack_routing_configuration(mode, stored_bucket_count, progress_bucket_count)?;
-    let configured_progress_buckets = progress_bucket_count.unwrap_or(0);
-    if mode == LayerStackBucketMode::ProgressKPAbs {
-        PROGRESS_BUCKET_THRESHOLDS[configured_progress_buckets]
-            .get_or_init(|| progress_thresholds(configured_progress_buckets).collect());
-    }
-    LAYER_STACK_PROGRESS_BUCKETS.store(configured_progress_buckets, Ordering::Release);
-    set_layer_stack_bucket_mode(mode);
-    Ok(())
+/// `compute_layer_stacks_bucket_index` (network_layer_stacks.rs) の pub wrapper。
+/// bucket eval scale 適用のために search 側が bucket を取得する際に使用する。
+pub fn get_bucket_index_for_pos(pos: &crate::position::Position) -> usize {
+    let weights = get_layer_stack_progress_kpabs_weights();
+    compute_layer_stack_progress8kpabs_bucket_index(pos, pos.side_to_move(), weights)
 }
 
-/// LayerStacks の routing 設定と格納 bucket 数の構造的整合性を検証する。
-pub fn validate_layer_stack_routing_configuration(
-    mode: LayerStackBucketMode,
-    stored_bucket_count: usize,
-    progress_bucket_count: Option<usize>,
-) -> Result<(), String> {
-    match mode {
-        LayerStackBucketMode::ProgressKPAbs | LayerStackBucketMode::ProgressKPAbsQ16 => {
-            let routing_bucket_count = progress_bucket_count.ok_or_else(|| {
-                "progresskpabs requires an explicit progress bucket count".to_string()
-            })?;
-            // 1 は常に bucket 0 を選ぶ no-op routing として許可する。loader は
-            // 格納 1 bucket の net を受理するため、拒否すると routing を設定できる
-            // mode が存在しなくなる (kingrank9 は格納 9 固定)。
-            if routing_bucket_count == 0 {
-                return Err(format!(
-                    "progress bucket count {routing_bucket_count} is invalid; at least 1 bucket is required"
-                ));
-            }
-            if routing_bucket_count > MAX_LAYER_STACK_BUCKETS {
-                return Err(format!(
-                    "progress bucket count {routing_bucket_count} exceeds the supported maximum {MAX_LAYER_STACK_BUCKETS}"
-                ));
-            }
-            if routing_bucket_count > stored_bucket_count {
-                return Err(format!(
-                    "progress bucket count {routing_bucket_count} exceeds stored bucket count {stored_bucket_count}"
-                ));
-            }
-            Ok(())
-        }
-        LayerStackBucketMode::KingRank9 => {
-            if stored_bucket_count != 9 {
-                return Err(format!(
-                    "kingrank9 requires exactly 9 stored buckets, but the model stores {stored_bucket_count}"
-                ));
-            }
-            if let Some(routing_bucket_count) = progress_bucket_count {
-                return Err(format!(
-                    "kingrank9 conflicts with progress bucket count {routing_bucket_count}"
-                ));
-            }
-            Ok(())
-        }
-    }
-}
-
-/// LayerStacks routing の構造・係数検証エラー。
-#[derive(Debug, PartialEq, Eq)]
-pub enum LayerStackRoutingError {
-    /// 格納数・routing 数・mode の組合せが不正。
-    Configuration(String),
-    /// 係数を参照する routing に係数がない。
-    MissingCoefficients,
-    /// 係数を使わない mode に係数が指定された。
-    UnusedCoefficients,
-}
-
-/// routing の構造と係数の有無を、副作用なしで検証する。
-pub fn validate_layer_stack_routing_with_coefficients(
-    mode: LayerStackBucketMode,
-    stored_bucket_count: usize,
-    progress_bucket_count: Option<usize>,
-    coefficients_present: bool,
-) -> Result<(), LayerStackRoutingError> {
-    validate_layer_stack_routing_configuration(mode, stored_bucket_count, progress_bucket_count)
-        .map_err(LayerStackRoutingError::Configuration)?;
-    match mode {
-        LayerStackBucketMode::KingRank9 if coefficients_present => {
-            Err(LayerStackRoutingError::UnusedCoefficients)
-        }
-        LayerStackBucketMode::ProgressKPAbs | LayerStackBucketMode::ProgressKPAbsQ16
-            if !coefficients_present
-                && layer_stack_progress_coeff_required(progress_bucket_count) =>
-        {
-            Err(LayerStackRoutingError::MissingCoefficients)
-        }
-        _ => Ok(()),
-    }
-}
-
-/// progresskpabs routing が progress 係数を実際に参照するか。
+/// 局面の bucket index (0..=7) と bucket 内位置 frac を計算する（推論側補間用）
 ///
-/// routing bucket 数 1 は常に bucket 0 を選ぶ no-op routing のため係数を参照しない。
-/// 係数必須チェックはこの述語で判定を統一する。
-pub fn layer_stack_progress_coeff_required(progress_bucket_count: Option<usize>) -> bool {
-    progress_bucket_count != Some(1)
+/// `frac` は `progress*8` の小数部 (= `sigmoid(sum)*8 - bucket`) を `0..=255` の
+/// u8 に量子化した値。bucket 境界直後で 0、次の境界直前で 255 に近づく。
+/// `LS_BUCKET_INTERP` による隣接 bucket 線形補間の重み計算に使用する。
+///
+/// 注意: bucket index 自体は `compute_layer_stack_progress8kpabs_bucket_index` と
+/// 完全一致する（同じ progress_sum から導出するため）。
+pub fn get_bucket_index_and_frac_for_pos(pos: &crate::position::Position) -> (usize, u8) {
+    let weights = get_layer_stack_progress_kpabs_weights();
+    let sum = compute_progress8kpabs_sum(pos, weights);
+    progress_sum_to_bucket_and_frac(sum)
 }
 
-/// LayerStacks の progress routing bucket 数を未設定へ戻す。
-pub fn reset_layer_stack_progress_buckets() {
-    crate::eval::changed();
-    LAYER_STACK_PROGRESS_BUCKETS.store(0, Ordering::Relaxed);
+/// progress_sum から bucket index と bucket 内位置 frac (0..=255) を計算する
+///
+/// `progress_sum_to_bucket` と同じ bucket を返しつつ、bucket 内の連続位置を
+/// frac として返す。`p = sigmoid(sum)`、`bucket = floor(p*8)`、
+/// `frac = round((p*8 - bucket) * 256)` を 0..=255 に clamp する。
+#[inline]
+pub fn progress_sum_to_bucket_and_frac(sum: f32) -> (usize, u8) {
+    const NUM_BUCKETS: usize = 8;
+    let p = (1.0 / (1.0 + (-sum).exp())).clamp(0.0, 1.0);
+    let scaled = p * NUM_BUCKETS as f32;
+    let bucket = (scaled.floor() as i32).clamp(0, (NUM_BUCKETS - 1) as i32) as usize;
+    // bucket 内位置 (0..1)。最終 bucket では scaled - bucket が 1.0 に張り付くため clamp。
+    let frac = (scaled - bucket as f32).clamp(0.0, 1.0);
+    let frac_256 = (frac * 256.0).round().clamp(0.0, 255.0) as u8;
+    (bucket, frac_256)
 }
 
-/// routing の global 状態を触るテストを直列化する guard。並列テストで一方の reset が
-/// 他方の評価中に入ると "routing is not configured" panic になるため。
-#[cfg(test)]
-pub(crate) fn layer_stack_routing_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// LayerStacks progress8kpabs 重みを取得
+pub fn get_layer_stack_progress_kpabs_weights() -> &'static [f32] {
+    let ptr = LAYER_STACK_PROGRESS_KP_ABS_PTR.load(Ordering::Relaxed);
+    if ptr.is_null() {
+        &LAYER_STACK_PROGRESS_KP_ABS_ZERO_WEIGHTS
+    } else {
+        // SAFETY: `set_layer_stack_progress_kpabs_weights()` で leaked Box の先頭ポインタを保存している。
+        unsafe { std::slice::from_raw_parts(ptr.cast_const(), SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS) }
+    }
 }
 
-/// LayerStacks progresskpabs 係数の所有権付きスナップショットを取得する。
-/// 未設定時は全ゼロを参照し、set/reset 後も取得済みの値は変わらない。
-pub fn get_layer_stack_progress_kpabs_weights() -> ProgressKpAbsWeights {
-    ProgressKpAbsWeights(
-        LAYER_STACK_PROGRESS_KP_ABS_WEIGHTS
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone(),
-    )
-}
-
-/// LayerStacks progresskpabs 係数を設定する。既存の探索stackへの反映にはresetが必要。
+/// LayerStacks progress8kpabs 重みを設定
 pub fn set_layer_stack_progress_kpabs_weights(weights: Box<[f32]>) -> Result<(), String> {
     if weights.len() != SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS {
         return Err(format!(
-            "progresskpabs weights length mismatch: got {}, expected {}",
+            "progress8kpabs weights length mismatch: got {}, expected {}",
             weights.len(),
             SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS
         ));
     }
 
-    let snapshot = Arc::from(weights);
-    *LAYER_STACK_PROGRESS_KP_ABS_WEIGHTS
-        .write()
-        .map_err(|_| "progresskpabs weights lock poisoned")? = Some(snapshot);
-    crate::eval::changed();
+    let leaked = Box::leak(weights);
+    let old_ptr = LAYER_STACK_PROGRESS_KP_ABS_PTR.swap(leaked.as_mut_ptr(), Ordering::Relaxed);
+    // SAFETY: old_ptr は過去の同関数で Box::leak したスライスの先頭ポインタ（または null）。
+    // USI プロトコルにより設定変更中は評価パスが実行されないため、参照者は存在しない。
+    if !old_ptr.is_null() {
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                old_ptr,
+                SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
+            )));
+        }
+    }
     Ok(())
 }
 
-/// LayerStacks progresskpabs 係数を全ゼロへ戻す。取得済みのsnapshotは元の係数を保持する。
+/// LayerStacks progress8kpabs 重みを既定値（全ゼロ）へ戻す
 pub fn reset_layer_stack_progress_kpabs_weights() {
-    crate::eval::changed();
-    *LAYER_STACK_PROGRESS_KP_ABS_WEIGHTS.write().unwrap_or_else(|e| e.into_inner()) = None;
+    let old_ptr = LAYER_STACK_PROGRESS_KP_ABS_PTR.swap(std::ptr::null_mut(), Ordering::Relaxed);
+    // SAFETY: 同上。old_ptr は Box::leak 由来のポインタ（または null）。
+    if !old_ptr.is_null() {
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                old_ptr,
+                SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
+            )));
+        }
+    }
 }
 
 // =============================================================================
 // NNUENetwork - アーキテクチャを抽象化するenum
 // =============================================================================
 
-/// NNUEネットワークの runtime dispatch。
+/// NNUEネットワーク（4バリアント階層構造）
 ///
-/// 固定 edition は既存の const-generic variant、universal edition は header 駆動の
-/// `DynamicHalfKx` / `DynamicLayerStacks` を使う。
-#[non_exhaustive]
+/// **「Accumulator は L1 だけで決まる」** を活用した設計:
+/// - HalfKA(HalfKANetwork): L256/L512/L1024 を内包
+/// - HalfKA_hm(HalfKA_hmNetwork): L256/L512/L1024 を内包
+/// - HalfKP(HalfKPNetwork): L256/L512 を内包
+/// - LayerStacks: 1536次元 + 9バケット
+///
+/// L2/L3/活性化の追加時、このenumの変更は不要。
+/// 詳細は `halfka/` や `halfkp/` のモジュールで管理される。
 pub enum NNUENetwork {
-    /// Runtime-dimension HalfKX（universal edition 専用）
-    #[cfg(feature = "nnue-runtime-dimensions")]
-    DynamicHalfKx(Arc<DynamicHalfKxNetwork>),
-    /// Runtime-dimension LayerStacks（universal edition 専用）
-    #[cfg(feature = "nnue-runtime-dimensions")]
-    DynamicLayerStacks(Arc<DynamicLayerStacksNetwork>),
-    /// HalfKaSplit 特徴量セット（L256/L512/L1024）
-    HalfKaSplit(Arc<HalfKaSplitNetwork>),
-    /// HalfKaHmMerged 特徴量セット（L256/L512/L1024）
-    HalfKaHmMerged(Arc<HalfKaHmMergedNetwork>),
-    /// HalfKaMerged 特徴量セット（L256/L512/L1024）
-    HalfKaMerged(Arc<HalfKaMergedNetwork>),
-    /// HalfKaHmSplit 特徴量セット（L256/L512/L1024）
-    HalfKaHmSplit(Arc<HalfKaHmSplitNetwork>),
+    /// HalfKA 特徴量セット（L256/L512/L1024）
+    HalfKA(HalfKANetwork),
+    /// HalfKA_hm 特徴量セット（L256/L512/L1024）
+    #[allow(non_camel_case_types)]
+    HalfKA_hm(HalfKA_hmNetwork),
     /// HalfKP 特徴量セット（L256/L512）
-    HalfKP(Arc<HalfKPNetwork>),
-    /// LayerStacks（L1=1536/768、格納 bucket 数はファイル由来）
-    #[cfg(feature = "layerstack-arch")]
-    LayerStacks(Arc<LayerStacksNetwork>),
-}
-
-#[cfg(all(feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
-fn layer_stacks_uses_static_slot<R: Read + Seek>(
-    reader: &mut R,
-    arch_override: NNUEArchitectureOverride,
-    packed: bool,
-) -> io::Result<bool> {
-    // progress-diff と effect は静的側の評価が汎用側と異なり得る。
-    // override と packed は専用の読み込み経路で解釈する。
-    if cfg!(feature = "nnue-progress-diff")
-        || cfg!(feature = "nnue-effect-bucket")
-        || !matches!(arch_override, NNUEArchitectureOverride::Auto)
-        || packed
-    {
-        return Ok(false);
-    }
-    reader.seek(SeekFrom::Start(0))?;
-    let result = (|| {
-        let mut buf = [0; 4];
-        reader.read_exact(&mut buf)?;
-        let version = u32::from_le_bytes(buf);
-        reader.read_exact(&mut buf)?;
-        reader.read_exact(&mut buf)?;
-        let len = u32::from_le_bytes(buf) as usize;
-        if len == 0 || len > MAX_ARCH_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid architecture string length",
-            ));
-        }
-        let mut bytes = vec![0; len];
-        reader.read_exact(&mut bytes)?;
-        let arch = std::str::from_utf8(&bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let buckets = if version == NNUE_VERSION_LAYERSTACK_NUM_BUCKETS {
-            reader.read_exact(&mut buf)?;
-            u32::from_le_bytes(buf) as usize
-        } else {
-            super::constants::DEFAULT_NUM_BUCKETS
-        };
-        let routing = super::bucket_spec::BucketRouting::from_arch(arch, buckets)?;
-        let invalid = |e| io::Error::new(io::ErrorKind::InvalidData, e);
-        let threat = super::spec::validate_layer_stacks_architecture_header(arch)
-            .map_err(invalid)?
-            .unwrap_or(0);
-        let feature = super::spec::detect_layer_stacks_feature(arch).map_err(invalid)?;
-        let dims = super::spec::parse_arch_dimensions(arch);
-        // 汎用 reader が寸法省略を受理しない場合は静的側にも振り分けない。
-        if super::spec::validate_layer_stacks_dimensions(dims.0, dims.1, dims.2).is_err() {
-            return Ok(false);
-        }
-        // PSQT・Threat と header の routing は静的側で同じ評価を保証できない。
-        Ok(!arch.contains("PSQT=")
-            && !arch.contains("ThreatProfile=")
-            && threat == 0
-            && routing.spec().is_none()
-            && super::dynamic_layer_stacks::static_compatible_input_dimensions(arch, feature)
-            && super::network_layer_stacks::static_slot_available(feature, dims))
-    })();
-    reader.seek(SeekFrom::Start(0))?;
-    result
+    HalfKP(HalfKPNetwork),
+    /// LayerStacks（L1=1536/768 + 9バケット）
+    LayerStacks(LayerStacksNetwork),
 }
 
 impl NNUENetwork {
-    /// 重みを含めて丸ごと複製する。重みの確保に失敗したら abort せずに `OutOfMemory` を返す。
-    ///
-    /// 複製先は呼び出したスレッドが確保して書き込むので、Linux の first-touch により
-    /// そのスレッドが動いている NUMA node のメモリに載る。共有メモリや file mapping の
-    /// backing を持つ重みも私有ヒープへ写す。
-    pub fn try_deep_clone(&self) -> io::Result<Self> {
-        super::accumulator::try_clone_weights(|| match self {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicHalfKx(net) => Self::DynamicHalfKx(Arc::new((**net).clone())),
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicLayerStacks(net) => Self::DynamicLayerStacks(Arc::new((**net).clone())),
-            Self::HalfKaSplit(net) => Self::HalfKaSplit(Arc::new((**net).clone())),
-            Self::HalfKaHmMerged(net) => Self::HalfKaHmMerged(Arc::new((**net).clone())),
-            Self::HalfKaMerged(net) => Self::HalfKaMerged(Arc::new((**net).clone())),
-            Self::HalfKaHmSplit(net) => Self::HalfKaHmSplit(Arc::new((**net).clone())),
-            Self::HalfKP(net) => Self::HalfKP(Arc::new((**net).clone())),
-            #[cfg(feature = "layerstack-arch")]
-            Self::LayerStacks(net) => Self::LayerStacks(Arc::new((**net).clone())),
-        })
-    }
-
-    /// 読み込まれた net から対象テンソルの実行時形状を返す。
-    #[cfg(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
-    pub fn net_tensor_shape(&self, kind: NetTensorKind) -> Result<NetTensorShape, NetDeltaError> {
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        if let Self::DynamicLayerStacks(net) = self {
-            return Ok(net.net_tensor_shape(kind));
-        }
-        #[cfg(feature = "layerstack-arch")]
-        if let Self::LayerStacks(net) = self {
-            return Ok(net.net_tensor_shape(kind));
-        }
-        Err(NetDeltaError::UnsupportedArchitecture {
-            architecture: self.architecture_name(),
-        })
-    }
-
-    /// 読み込まれた net から対象テンソルの実行時形状を返す。
-    #[cfg(not(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch")))]
-    pub fn net_tensor_shape(&self, kind: NetTensorKind) -> Result<NetTensorShape, NetDeltaError> {
-        match kind {
-            NetTensorKind::OutputWeight
-            | NetTensorKind::OutputBias
-            | NetTensorKind::FtBias
-            | NetTensorKind::L2Weight => Err(NetDeltaError::UnsupportedArchitecture {
-                architecture: self.architecture_name(),
-            }),
-        }
-    }
-
-    /// ファイル格納順 ID で指定した係数の現在値を返す。
-    #[cfg(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
-    pub fn net_coefficient(&self, id: &NetCoefficientId) -> Result<i32, NetDeltaError> {
-        self.net_tensor_shape(id.kind)?.validate(id)?;
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        if let Self::DynamicLayerStacks(net) = self {
-            return Ok(net.net_coefficient(id));
-        }
-        #[cfg(feature = "layerstack-arch")]
-        if let Self::LayerStacks(net) = self {
-            return Ok(net.net_coefficient(id));
-        }
-        unreachable!("net_tensor_shape rejected non-LayerStacks architecture")
-    }
-
-    /// ファイル格納順 ID で指定した係数の現在値を返す。
-    #[cfg(not(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch")))]
-    pub fn net_coefficient(&self, id: &NetCoefficientId) -> Result<i32, NetDeltaError> {
-        match id.kind {
-            NetTensorKind::OutputWeight
-            | NetTensorKind::OutputBias
-            | NetTensorKind::FtBias
-            | NetTensorKind::L2Weight => Err(NetDeltaError::UnsupportedArchitecture {
-                architecture: self.architecture_name(),
-            }),
-        }
-    }
-
-    /// LayerStacks net の係数へ整数 delta を 1 回適用する。
-    ///
-    /// すべての ID を先に検証するため、エラー時は net を変更しない。
-    /// 探索などが重みを共有中の場合は `NetDeltaError::SharedNetwork` を返す。
-    #[cfg(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
-    pub fn apply_net_deltas(
-        &mut self,
-        deltas: &[NetDelta],
-    ) -> Result<NetDeltaReport, NetDeltaError> {
-        if deltas.is_empty() {
-            return Ok(NetDeltaReport::default());
-        }
-        for delta in deltas {
-            self.net_coefficient(&delta.id)?;
-        }
-
-        let mut report = NetDeltaReport {
-            applied: deltas.len(),
-            clamped: 0,
-        };
-        for delta in deltas {
-            let clamped = match self {
-                #[cfg(feature = "nnue-runtime-dimensions")]
-                Self::DynamicLayerStacks(net) => Arc::get_mut(net)
-                    .ok_or(NetDeltaError::SharedNetwork)?
-                    .apply_net_delta(&delta.id, delta.delta),
-                #[cfg(feature = "layerstack-arch")]
-                Self::LayerStacks(net) => Arc::get_mut(net)
-                    .ok_or(NetDeltaError::SharedNetwork)?
-                    .apply_net_delta(&delta.id, delta.delta),
-                _ => unreachable!("all deltas were validated against a LayerStacks network"),
-            };
-            report.clamped += usize::from(clamped);
-        }
-        Ok(report)
-    }
-
-    /// LayerStacks net の係数へ整数 delta を 1 回適用する。
-    #[cfg(not(any(feature = "nnue-runtime-dimensions", feature = "layerstack-arch")))]
-    pub fn apply_net_deltas(
-        &mut self,
-        deltas: &[NetDelta],
-    ) -> Result<NetDeltaReport, NetDeltaError> {
-        if deltas.is_empty() {
-            Ok(NetDeltaReport::default())
-        } else {
-            Err(NetDeltaError::UnsupportedArchitecture {
-                architecture: self.architecture_name(),
-            })
-        }
-    }
-
     /// HalfKP でサポートされているアーキテクチャ一覧
     pub fn supported_halfkp_specs() -> Vec<super::spec::ArchitectureSpec> {
         HalfKPNetwork::supported_specs()
     }
 
-    /// HalfKaHmMerged でサポートされているアーキテクチャ一覧
+    /// HalfKA_hm でサポートされているアーキテクチャ一覧
     pub fn supported_halfka_hm_specs() -> Vec<super::spec::ArchitectureSpec> {
-        HalfKaHmMergedNetwork::supported_specs()
+        HalfKA_hmNetwork::supported_specs()
     }
 
-    /// HalfKaSplit でサポートされているアーキテクチャ一覧
+    /// HalfKA でサポートされているアーキテクチャ一覧
     pub fn supported_halfka_specs() -> Vec<super::spec::ArchitectureSpec> {
-        HalfKaSplitNetwork::supported_specs()
+        HalfKANetwork::supported_specs()
     }
 
     /// ファイルから読み込み（バージョン自動判別）
     pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = File::open(path.as_ref())?;
+        let file = File::open(path)?;
         let mut reader = BufReader::new(file);
-        #[cfg(feature = "prepacked-nnue")]
-        if super::prepacked::PackedModel::is_packed(&mut reader)? {
-            let packed = super::prepacked::PackedModel::open(path.as_ref())?;
-            let net = Self::read_with_source(
-                &mut packed.metadata()?,
-                get_nnue_architecture_override(),
-                Some(&packed),
-            )?;
-            packed.finish()?;
-            return Ok(net);
-        }
         Self::read(&mut reader)
     }
 
-    /// 静的 (const-generic) LayerStacks network を直接読み込む。
+    /// リーダーから読み込み（ファイルサイズ優先の自動判別）
     ///
-    /// 汎用実装を含む build でも静的 `LayerStacksNetwork` を直接必要とする
-    /// 診断・解析系の呼び出し元はこの API を使う。
-    ///
-    /// 非 LayerStacks net を渡した場合は `InvalidData` エラーを返す。
-    #[cfg(feature = "layerstack-arch")]
-    pub fn load_static_layer_stacks<P: AsRef<Path>>(path: P) -> io::Result<LayerStacksNetwork> {
-        let arch_override = get_nnue_architecture_override();
-        let file = File::open(path.as_ref())?;
-        let mut reader = BufReader::new(file);
-        #[cfg(feature = "prepacked-nnue")]
-        if super::prepacked::PackedModel::is_packed(&mut reader)? {
-            let packed = super::prepacked::PackedModel::open(path.as_ref())?;
-            let net = Self::read_static_layer_stacks_with_source(
-                &mut packed.metadata()?,
-                arch_override,
-                Some(&packed),
-            )?;
-            packed.finish()?;
-            return Ok(net);
-        }
-        Self::read_static_layer_stacks_with_source(
-            &mut reader,
-            arch_override,
-            #[cfg(feature = "prepacked-nnue")]
-            None,
-        )
-    }
-
-    /// `load_static_layer_stacks` の reader 版。
-    ///
-    /// header の読み方と FeatureSet 判定は `read_with_source` と同じ規則にそろえ、
-    /// LayerStacks 以外の net は静的 reader に渡す前に明示エラーへ落とす。
-    #[cfg(feature = "layerstack-arch")]
-    fn read_static_layer_stacks_with_source<R: Read + Seek>(
-        reader: &mut R,
-        arch_override: NNUEArchitectureOverride,
-        #[cfg(feature = "prepacked-nnue")] packed: Option<&super::prepacked::PackedModel>,
-    ) -> io::Result<LayerStacksNetwork> {
-        reader.seek(SeekFrom::Start(0))?;
-        let (version, arch_str) = peek_layer_stacks_header(reader)?;
-
-        if !matches!(
-            version,
-            NNUE_VERSION | NNUE_VERSION_HALFKA | NNUE_VERSION_LAYERSTACK_NUM_BUCKETS
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Unknown NNUE version: {version:#x}. Expected {NNUE_VERSION:#x} (HalfKP), \
-                     {NNUE_VERSION_HALFKA:#x} (HalfKaHmMerged^ / legacy LayerStack), or \
-                     {NNUE_VERSION_LAYERSTACK_NUM_BUCKETS:#x} (LayerStack with num_buckets header)"
-                ),
-            ));
-        }
-        if !matches!(
-            arch_override,
-            NNUEArchitectureOverride::Auto
-                | NNUEArchitectureOverride::LayerStacks
-                | NNUEArchitectureOverride::LayerStacksPSQT
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "NNUE_ARCHITECTURE override が LayerStacks 系以外に設定されている。\
-                 静的 LayerStacks network を要求する呼び出し元では \
-                 `Auto` / `LayerStacks` / `LayerStacksPSQT` のいずれかにすること。",
-            ));
-        }
-
-        // LayerStack 専用 layout の version、override による LayerStacks 強制、または
-        // arch 文字列が LayerStacks 系 FeatureSet を示す場合のみ受け付ける
-        // (`read_with_source` の effective_feature_set 判定と同じ規則)。
-        let is_layer_stacks = version == NNUE_VERSION_LAYERSTACK_NUM_BUCKETS
-            || matches!(
-                arch_override,
-                NNUEArchitectureOverride::LayerStacks | NNUEArchitectureOverride::LayerStacksPSQT
-            )
-            || matches!(
-                super::spec::parse_feature_set_from_arch(&arch_str),
-                Ok(FeatureSet::LayerStacks | FeatureSet::HalfKaHmMergedEffectBucket)
-            );
-        if !is_layer_stacks {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "LayerStacks NNUE ではない (version {version:#x}, arch: {arch_str})。\
-                     静的 LayerStacks network を要求する呼び出し元では読み込めない。"
-                ),
-            ));
-        }
-        // PSQT オーバーライド: `read_with_source` の LayerStacks 分岐と同じ規則。
-        let psqt_override = match arch_override {
-            NNUEArchitectureOverride::LayerStacks => Some(false),
-            NNUEArchitectureOverride::LayerStacksPSQT => Some(true),
-            _ => None,
-        };
-        LayerStacksNetwork::read_auto_dims_with_source(
-            reader,
-            psqt_override,
-            #[cfg(feature = "prepacked-nnue")]
-            packed,
-        )
-    }
-
-    /// リーダーから読み込み、形式とビルドに合う評価経路を選ぶ。
-    ///
-    /// HalfKX は既知のファイルサイズを優先し、universal edition では未一致時に
-    /// ヘッダーの寸法を使う。HalfKX の特徴集合・活性化と、LayerStacks の寸法・FT・拡張は
-    /// ヘッダーから読む。
+    /// ファイルサイズからアーキテクチャを一意に検出し、適切なバリアントに委譲する。
+    /// ヘッダーの description 文字列は活性化関数の検出にのみ使用する。
     pub fn read<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
-        Self::read_with_architecture_override(reader, get_nnue_architecture_override())
-    }
-
-    fn read_with_architecture_override<R: Read + Seek>(
-        reader: &mut R,
-        arch_override: NNUEArchitectureOverride,
-    ) -> io::Result<Self> {
-        Self::read_with_source(
-            reader,
-            arch_override,
-            #[cfg(feature = "prepacked-nnue")]
-            None,
-        )
-    }
-    fn read_with_source<R: Read + Seek>(
-        reader: &mut R,
-        arch_override: NNUEArchitectureOverride,
-        #[cfg(feature = "prepacked-nnue")] packed: Option<&super::prepacked::PackedModel>,
-    ) -> io::Result<Self> {
-        let network = Self::read_search_network(
-            reader,
-            arch_override,
-            #[cfg(feature = "prepacked-nnue")]
-            packed,
-        )?;
-        super::search_evaluator::SearchNetwork::try_from(&network)?;
-        Ok(network)
-    }
-
-    fn read_search_network<R: Read + Seek>(
-        reader: &mut R,
-        arch_override: NNUEArchitectureOverride,
-        #[cfg(feature = "prepacked-nnue")] packed: Option<&super::prepacked::PackedModel>,
-    ) -> io::Result<Self> {
         // 1. ファイルサイズを取得
         let file_size = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
@@ -841,7 +376,7 @@ impl NNUENetwork {
         let version = u32::from_le_bytes(buf4);
 
         match version {
-            NNUE_VERSION | NNUE_VERSION_HALFKA | NNUE_VERSION_LAYERSTACK_NUM_BUCKETS => {
+            NNUE_VERSION | NNUE_VERSION_HALFKA => {
                 // 3. hash と arch_len を読む
                 reader.read_exact(&mut buf4)?; // ネットワークハッシュ
                 reader.read_exact(&mut buf4)?; // arch_len
@@ -866,150 +401,49 @@ impl NNUENetwork {
                     _ => Activation::CReLU,
                 };
 
-                // FeatureSet を決定: USI オプションが明示指定されていればそちらを優先。
-                // `NNUE_VERSION_LAYERSTACK_NUM_BUCKETS` は LayerStack 専用の
-                // self-describing layout。arch_str 直後に `num_buckets: u32` field を
-                // 持つため、非-LayerStack reader に渡すと file_size 検出が失敗 (ft_hash
-                // 等が 4 byte ずれる) するか、悪ければ別 arch として誤読する。誤読を
-                // 確実に防ぐため、当該 version + 非-LayerStack override の組合せをここで明示
-                // reject する。
-                if version == NNUE_VERSION_LAYERSTACK_NUM_BUCKETS
-                    && !matches!(
-                        arch_override,
-                        NNUEArchitectureOverride::Auto
-                            | NNUEArchitectureOverride::LayerStacks
-                            | NNUEArchitectureOverride::LayerStacksPSQT,
-                    )
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "NNUE (version {NNUE_VERSION_LAYERSTACK_NUM_BUCKETS:#x}, LayerStack \
-                             with num_buckets header) は LayerStack 専用 layout。\
-                             NNUE_ARCHITECTURE override の値 (LayerStack 以外) では読めない。\
-                             override を `Auto` / `LayerStacks` / `LayerStacksPSQT` のいずれかに \
-                             変更するか、対応する legacy net を使用すること。"
-                        ),
-                    ));
-                }
-                let effective_feature_set = if version == NNUE_VERSION_LAYERSTACK_NUM_BUCKETS
-                    && matches!(arch_override, NNUEArchitectureOverride::Auto)
-                {
-                    FeatureSet::LayerStacks
-                } else {
-                    match arch_override {
-                        NNUEArchitectureOverride::Auto => {
-                            // 自動検出: ヘッダーから FeatureSet を取得
-                            let parsed = super::spec::parse_architecture(&arch_str)
-                                .map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg))?;
-                            parsed.feature_set
-                        }
-                        NNUEArchitectureOverride::HalfKP => FeatureSet::HalfKP,
-                        NNUEArchitectureOverride::HalfKaHmMerged => FeatureSet::HalfKaHmMerged,
-                        NNUEArchitectureOverride::HalfKaSplit => FeatureSet::HalfKaSplit,
-                        NNUEArchitectureOverride::LayerStacks
-                        | NNUEArchitectureOverride::LayerStacksPSQT => FeatureSet::LayerStacks,
+                // FeatureSet を決定: USI オプションが明示指定されていればそちらを優先
+                let arch_override = get_nnue_architecture_override();
+                let effective_feature_set = match arch_override {
+                    NNUEArchitectureOverride::Auto => {
+                        // 自動検出: ヘッダーから FeatureSet を取得
+                        let parsed = super::spec::parse_architecture(&arch_str)
+                            .map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg))?;
+                        parsed.feature_set
                     }
+                    NNUEArchitectureOverride::HalfKP => FeatureSet::HalfKP,
+                    NNUEArchitectureOverride::HalfKA_hm => FeatureSet::HalfKA_hm,
+                    NNUEArchitectureOverride::HalfKA => FeatureSet::HalfKA,
+                    NNUEArchitectureOverride::LayerStacks
+                    | NNUEArchitectureOverride::LayerStacksPSQT => FeatureSet::LayerStacks,
+                };
+
+                // PSQT オーバーライド:
+                // LayerStacks → Some(false) (PSQT 強制 OFF)
+                // LayerStacksPSQT → Some(true) (PSQT 強制 ON)
+                // Auto → None (arch_str から自動検出)
+                let psqt_override = match arch_override {
+                    NNUEArchitectureOverride::LayerStacks => Some(false),
+                    NNUEArchitectureOverride::LayerStacksPSQT => Some(true),
+                    _ => None,
                 };
 
                 // LayerStacks は特殊処理（FT が LEB128 圧縮のためファイルサイズ検出の対象外）
-                if matches!(
-                    effective_feature_set,
-                    FeatureSet::LayerStacks | FeatureSet::HalfKaHmMergedEffectBucket
-                ) {
-                    #[cfg(all(feature = "nnue-runtime-dimensions", feature = "layerstack-arch"))]
-                    {
-                        reader.seek(SeekFrom::Start(0))?;
-                        #[cfg(feature = "prepacked-nnue")]
-                        let has_packed = packed.is_some();
-                        #[cfg(not(feature = "prepacked-nnue"))]
-                        let has_packed = false;
-                        if layer_stacks_uses_static_slot(reader, arch_override, has_packed)? {
-                            let network = LayerStacksNetwork::read_auto_dims_with_source(
-                                reader,
-                                None,
-                                #[cfg(feature = "prepacked-nnue")]
-                                packed,
-                            )?;
-                            return Ok(Self::LayerStacks(Arc::new(network)));
-                        }
-                    }
-                    if cfg!(feature = "nnue-runtime-dimensions") {
-                        #[cfg(feature = "nnue-runtime-dimensions")]
-                        {
-                            let psqt_override = match arch_override {
-                                NNUEArchitectureOverride::LayerStacks => Some(false),
-                                NNUEArchitectureOverride::LayerStacksPSQT => Some(true),
-                                _ => None,
-                            };
-                            reader.seek(SeekFrom::Start(0))?;
-                            return Ok(Self::DynamicLayerStacks(Arc::new(
-                                DynamicLayerStacksNetwork::read_with_source(
-                                    reader,
-                                    psqt_override,
-                                    #[cfg(feature = "prepacked-nnue")]
-                                    packed,
-                                )?,
-                            )));
-                        }
-                    }
-                    #[cfg(feature = "layerstack-arch")]
-                    {
-                        // PSQT オーバーライド:
-                        // LayerStacks → Some(false) (PSQT 強制 OFF)
-                        // LayerStacksPSQT → Some(true) (PSQT 強制 ON)
-                        // Auto → None (arch_str から自動検出)
-                        let psqt_override = match arch_override {
-                            NNUEArchitectureOverride::LayerStacks => Some(false),
-                            NNUEArchitectureOverride::LayerStacksPSQT => Some(true),
-                            _ => None,
-                        };
-                        let network = LayerStacksNetwork::read_auto_dims_with_source(
-                            reader,
-                            psqt_override,
-                            #[cfg(feature = "prepacked-nnue")]
-                            packed,
-                        )?;
-                        return Ok(Self::LayerStacks(Arc::new(network)));
-                    }
-                    #[cfg(not(feature = "layerstack-arch"))]
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            format!(
-                                "LayerStacks NNUE model ({effective_feature_set}) requires the \
-                                 `layerstack-arch` feature; rebuild rshogi-core with an Edition \
-                                 that enables it."
-                            ),
-                        ));
-                    }
-                }
-
-                // universal edition は HalfKX の次元をヘッダーから動的に構成する。
-                // 固定/family edition は従来どおり既知サイズの const-generic 経路を使う。
-                if cfg!(feature = "nnue-runtime-dimensions") {
-                    #[cfg(feature = "nnue-runtime-dimensions")]
-                    {
-                        reader.seek(SeekFrom::Start(0))?;
-                        return Ok(Self::DynamicHalfKx(Arc::new(DynamicHalfKxNetwork::read(
-                            reader,
-                            (!matches!(arch_override, NNUEArchitectureOverride::Auto))
-                                .then_some(effective_feature_set),
-                        )?)));
-                    }
-                }
-
-                // 以降は固定次元の HalfKX 経路。halfkx-arch 無効ビルドには HalfKX の評価経路
-                // (`evaluate_dispatch` 等) が存在しないため、読み込みを成功させると評価時に
-                // 初めて panic する。override で FeatureSet を強制した場合や prepacked 経由でも
-                // 必ずここを通るので、FeatureSet 確定直後のこの位置で拒否する。
-                if !cfg!(feature = "halfkx-arch") {
-                    return Err(halfkx_arch_disabled_error(
-                        effective_feature_set,
-                        &arch_str,
-                        file_size,
-                        arch_len,
-                    ));
+                if effective_feature_set == FeatureSet::LayerStacks {
+                    reader.seek(SeekFrom::Start(0))?;
+                    let (l1_from_arch, l2_from_arch, l3_from_arch) =
+                        super::spec::parse_arch_dimensions(&arch_str);
+                    let l1 = if l1_from_arch == 0 {
+                        1536
+                    } else {
+                        l1_from_arch
+                    };
+                    let (l2, l3) = match (l2_from_arch, l3_from_arch) {
+                        (0, 0) => (16, 32),
+                        dims => dims,
+                    };
+                    let network =
+                        LayerStacksNetwork::read_with_options(reader, l1, l2, l3, psqt_override)?;
+                    return Ok(Self::LayerStacks(network));
                 }
 
                 // 4. ファイルサイズからアーキテクチャを検出
@@ -1049,42 +483,32 @@ impl NNUENetwork {
                 let l3 = detection.spec.l3;
 
                 match detection.spec.feature_set {
-                    FeatureSet::HalfKaHmMerged => {
-                        let network = HalfKaHmMergedNetwork::read(reader, l1, l2, l3, activation)?;
-                        Ok(Self::HalfKaHmMerged(Arc::new(network)))
+                    FeatureSet::HalfKA_hm => {
+                        let network = HalfKA_hmNetwork::read(reader, l1, l2, l3, activation)?;
+                        Ok(Self::HalfKA_hm(network))
                     }
-                    FeatureSet::HalfKaSplit => {
-                        let network = HalfKaSplitNetwork::read(reader, l1, l2, l3, activation)?;
-                        Ok(Self::HalfKaSplit(Arc::new(network)))
-                    }
-                    FeatureSet::HalfKaMerged => {
-                        let network = HalfKaMergedNetwork::read(reader, l1, l2, l3, activation)?;
-                        Ok(Self::HalfKaMerged(Arc::new(network)))
-                    }
-                    FeatureSet::HalfKaHmSplit => {
-                        let network = HalfKaHmSplitNetwork::read(reader, l1, l2, l3, activation)?;
-                        Ok(Self::HalfKaHmSplit(Arc::new(network)))
+                    FeatureSet::HalfKA => {
+                        let network = HalfKANetwork::read(reader, l1, l2, l3, activation)?;
+                        Ok(Self::HalfKA(network))
                     }
                     FeatureSet::HalfKP => {
                         let network = HalfKPNetwork::read(reader, l1, l2, l3, activation)?;
-                        Ok(Self::HalfKP(Arc::new(network)))
+                        Ok(Self::HalfKP(network))
                     }
                     FeatureSet::LayerStacks => {
                         // 上で処理済みなのでここには来ない
                         unreachable!()
                     }
-                    FeatureSet::HalfKaHmMergedEffectBucket => {
-                        // effect bucket は LayerStacks reader で処理される。
-                        unreachable!()
+                    FeatureSet::Shogi2344 => {
+                        // shogi2344 系は 2026-05-12 削除 (HalfKAv2_hm 1536-8-96 に完全切替)
+                        unreachable!("Shogi2344 feature set is removed")
                     }
                 }
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Unknown NNUE version: {version:#x}. Expected {NNUE_VERSION:#x} (HalfKP), \
-                     {NNUE_VERSION_HALFKA:#x} (HalfKaHmMerged^ / legacy LayerStack), or \
-                     {NNUE_VERSION_LAYERSTACK_NUM_BUCKETS:#x} (LayerStack with num_buckets header)"
+                    "Unknown NNUE version: {version:#x}. Expected {NNUE_VERSION:#x} (HalfKP) or {NNUE_VERSION_HALFKA:#x} (HalfKA_hm^)"
                 ),
             )),
         }
@@ -1098,150 +522,50 @@ impl NNUENetwork {
 
     /// LayerStacks アーキテクチャかどうか
     pub fn is_layer_stacks(&self) -> bool {
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        if matches!(self, Self::DynamicLayerStacks(_)) {
-            return true;
-        }
-        #[cfg(feature = "layerstack-arch")]
-        {
-            matches!(self, Self::LayerStacks(_))
-        }
-        #[cfg(not(feature = "layerstack-arch"))]
-        {
-            false
-        }
+        matches!(self, Self::LayerStacks(_))
     }
 
-    /// LayerStacks ネットの bucket 数を返す。
-    ///
-    /// LayerStacks 以外、または LayerStacks feature 無効ビルドでは `None` を返す。
-    pub fn layer_stack_num_buckets(&self) -> Option<usize> {
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        if let Self::DynamicLayerStacks(network) = self {
-            return Some(network.num_buckets());
-        }
-        #[cfg(feature = "layerstack-arch")]
-        {
-            match self {
-                Self::LayerStacks(network) => Some(network.num_buckets()),
-                _ => None,
-            }
-        }
-        #[cfg(not(feature = "layerstack-arch"))]
-        {
-            None
-        }
-    }
-
-    /// LayerStacks ネットの駒 FT の格納形式を返す。
-    pub fn layer_stack_piece_ft_storage(&self) -> Option<&'static str> {
-        match self {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicLayerStacks(network) => Some(network.piece_ft_storage()),
-            #[cfg(feature = "layerstack-arch")]
-            Self::LayerStacks(network) => Some(network.piece_ft_storage()),
-            _ => None,
-        }
-    }
-
-    /// LayerStacks なら `"static"` または `"dynamic"`、それ以外なら `None` を返す。
-    pub fn layer_stack_implementation(&self) -> Option<&'static str> {
-        match self {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicLayerStacks(_) => Some("dynamic"),
-            #[cfg(feature = "layerstack-arch")]
-            Self::LayerStacks(_) => Some("static"),
-            _ => None,
-        }
-    }
-
-    /// LayerStacks ネットに記録された bucket spec を返す。
-    pub fn layer_stack_bucket_spec(&self) -> Option<super::LayerStackBucketSpec> {
-        match self {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicLayerStacks(network) => network.bucket_spec(),
-            #[cfg(feature = "layerstack-arch")]
-            Self::LayerStacks(network) => network.bucket_spec(),
-            _ => None,
-        }
-    }
-
-    /// HalfKaSplit アーキテクチャかどうか
+    /// HalfKA アーキテクチャかどうか
     pub fn is_halfka(&self) -> bool {
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        let dynamic = matches!(self, Self::DynamicHalfKx(net) if net.spec().feature_set == FeatureSet::HalfKaSplit);
-        #[cfg(not(feature = "nnue-runtime-dimensions"))]
-        let dynamic = false;
-        matches!(self, Self::HalfKaSplit(_)) || dynamic
+        matches!(self, Self::HalfKA(_))
     }
 
-    /// HalfKaHmMerged アーキテクチャかどうか
+    /// HalfKA_hm アーキテクチャかどうか
     pub fn is_halfka_hm(&self) -> bool {
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        let dynamic = matches!(self, Self::DynamicHalfKx(net) if net.spec().feature_set == FeatureSet::HalfKaHmMerged);
-        #[cfg(not(feature = "nnue-runtime-dimensions"))]
-        let dynamic = false;
-        matches!(self, Self::HalfKaHmMerged(_)) || dynamic
+        matches!(self, Self::HalfKA_hm(_))
     }
 
     /// HalfKP アーキテクチャかどうか
     pub fn is_halfkp(&self) -> bool {
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        let dynamic = matches!(self, Self::DynamicHalfKx(net) if net.is_halfkp());
-        #[cfg(not(feature = "nnue-runtime-dimensions"))]
-        let dynamic = false;
-        matches!(self, Self::HalfKP(_)) || dynamic
+        matches!(self, Self::HalfKP(_))
     }
 
     /// L1 サイズを取得
     pub fn l1_size(&self) -> usize {
         match self {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicHalfKx(net) => net.l1_size(),
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicLayerStacks(net) => net.spec().l1,
-            Self::HalfKaSplit(net) => net.l1_size(),
-            Self::HalfKaHmMerged(net) => net.l1_size(),
-            Self::HalfKaMerged(net) => net.l1_size(),
-            Self::HalfKaHmSplit(net) => net.l1_size(),
+            Self::HalfKA(net) => net.l1_size(),
+            Self::HalfKA_hm(net) => net.l1_size(),
             Self::HalfKP(net) => net.l1_size(),
-            #[cfg(feature = "layerstack-arch")]
             Self::LayerStacks(net) => net.l1_size(),
         }
     }
 
     /// アーキテクチャ名を取得
-    pub fn architecture_name(&self) -> String {
+    pub fn architecture_name(&self) -> &'static str {
         match self {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicHalfKx(net) => net.spec().name(),
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicLayerStacks(net) => net.spec().name(),
-            Self::HalfKaSplit(net) => net.architecture_name(),
-            Self::HalfKaHmMerged(net) => net.architecture_name(),
-            Self::HalfKaMerged(net) => net.architecture_name(),
-            Self::HalfKaHmSplit(net) => net.architecture_name(),
+            Self::HalfKA(net) => net.architecture_name(),
+            Self::HalfKA_hm(net) => net.architecture_name(),
             Self::HalfKP(net) => net.architecture_name(),
-            #[cfg(all(feature = "layerstack-arch", feature = "nnue-runtime-dimensions"))]
-            Self::LayerStacks(net) => net.architecture_spec().name(),
-            #[cfg(all(feature = "layerstack-arch", not(feature = "nnue-runtime-dimensions")))]
-            Self::LayerStacks(_) => "LayerStacks".to_string(),
+            Self::LayerStacks(_) => "LayerStacks",
         }
     }
 
     /// アーキテクチャ仕様を取得
     pub fn architecture_spec(&self) -> super::spec::ArchitectureSpec {
         match self {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicHalfKx(net) => net.spec(),
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            Self::DynamicLayerStacks(net) => net.spec(),
-            Self::HalfKaSplit(net) => net.architecture_spec(),
-            Self::HalfKaHmMerged(net) => net.architecture_spec(),
-            Self::HalfKaMerged(net) => net.architecture_spec(),
-            Self::HalfKaHmSplit(net) => net.architecture_spec(),
+            Self::HalfKA(net) => net.architecture_spec(),
+            Self::HalfKA_hm(net) => net.architecture_spec(),
             Self::HalfKP(net) => net.architecture_spec(),
-            #[cfg(feature = "layerstack-arch")]
             Self::LayerStacks(net) => net.architecture_spec(),
         }
     }
@@ -1249,7 +573,6 @@ impl NNUENetwork {
     /// LayerStacksNetwork への参照を取得
     ///
     /// LayerStacks アーキテクチャでない場合は panic。
-    #[cfg(feature = "layerstack-arch")]
     pub fn as_layer_stacks(&self) -> &LayerStacksNetwork {
         match self {
             Self::LayerStacks(net) => net,
@@ -1257,179 +580,89 @@ impl NNUENetwork {
         }
     }
 
-    /// HalfKaHmMerged アキュムレータをフル再計算
-    pub fn refresh_accumulator_halfka_hm(&self, pos: &Position, stack: &mut HalfKaHmMergedStack) {
+    /// HalfKA_hm アキュムレータをフル再計算
+    pub fn refresh_accumulator_halfka_hm(&self, pos: &Position, stack: &mut HalfKA_hmStack) {
         match self {
-            Self::HalfKaHmMerged(net) => net.refresh_accumulator(pos, stack),
-            _ => panic!("This method is only for HalfKaHmMerged architecture."),
+            Self::HalfKA_hm(net) => net.refresh_accumulator(pos, stack),
+            _ => panic!("This method is only for HalfKA_hm architecture."),
         }
     }
 
-    /// HalfKaSplit アキュムレータをフル再計算
-    pub fn refresh_accumulator_halfka(&self, pos: &Position, stack: &mut HalfKaSplitStack) {
+    /// HalfKA アキュムレータをフル再計算
+    pub fn refresh_accumulator_halfka(&self, pos: &Position, stack: &mut HalfKAStack) {
         match self {
-            Self::HalfKaSplit(net) => net.refresh_accumulator(pos, stack),
-            _ => panic!("This method is only for HalfKaSplit architecture."),
+            Self::HalfKA(net) => net.refresh_accumulator(pos, stack),
+            _ => panic!("This method is only for HalfKA architecture."),
         }
     }
 
-    /// HalfKaHmMerged 差分更新
+    /// HalfKA_hm 差分更新
     pub fn update_accumulator_halfka_hm(
         &self,
         pos: &Position,
         dirty: &super::accumulator::DirtyPiece,
-        stack: &mut HalfKaHmMergedStack,
+        stack: &mut HalfKA_hmStack,
         source_idx: usize,
     ) {
         match self {
-            Self::HalfKaHmMerged(net) => net.update_accumulator(pos, dirty, stack, source_idx),
-            _ => panic!("This method is only for HalfKaHmMerged architecture."),
+            Self::HalfKA_hm(net) => net.update_accumulator(pos, dirty, stack, source_idx),
+            _ => panic!("This method is only for HalfKA_hm architecture."),
         }
     }
 
-    /// HalfKaSplit 差分更新
+    /// HalfKA 差分更新
     pub fn update_accumulator_halfka(
         &self,
         pos: &Position,
         dirty: &super::accumulator::DirtyPiece,
-        stack: &mut HalfKaSplitStack,
+        stack: &mut HalfKAStack,
         source_idx: usize,
     ) {
         match self {
-            Self::HalfKaSplit(net) => net.update_accumulator(pos, dirty, stack, source_idx),
-            _ => panic!("This method is only for HalfKaSplit architecture."),
+            Self::HalfKA(net) => net.update_accumulator(pos, dirty, stack, source_idx),
+            _ => panic!("This method is only for HalfKA architecture."),
         }
     }
 
-    /// HalfKaHmMerged 前方差分更新
+    /// HalfKA_hm 前方差分更新
     pub fn forward_update_incremental_halfka_hm(
         &self,
         pos: &Position,
-        stack: &mut HalfKaHmMergedStack,
+        stack: &mut HalfKA_hmStack,
         source_idx: usize,
     ) -> bool {
         match self {
-            Self::HalfKaHmMerged(net) => net.forward_update_incremental(pos, stack, source_idx),
-            _ => panic!("This method is only for HalfKaHmMerged architecture."),
+            Self::HalfKA_hm(net) => net.forward_update_incremental(pos, stack, source_idx),
+            _ => panic!("This method is only for HalfKA_hm architecture."),
         }
     }
 
-    /// HalfKaSplit 前方差分更新
+    /// HalfKA 前方差分更新
     pub fn forward_update_incremental_halfka(
         &self,
         pos: &Position,
-        stack: &mut HalfKaSplitStack,
+        stack: &mut HalfKAStack,
         source_idx: usize,
     ) -> bool {
         match self {
-            Self::HalfKaSplit(net) => net.forward_update_incremental(pos, stack, source_idx),
-            _ => panic!("This method is only for HalfKaSplit architecture."),
+            Self::HalfKA(net) => net.forward_update_incremental(pos, stack, source_idx),
+            _ => panic!("This method is only for HalfKA architecture."),
         }
     }
 
-    /// HalfKaHmMerged 評価
-    pub fn evaluate_halfka_hm(&self, pos: &Position, stack: &HalfKaHmMergedStack) -> Value {
+    /// HalfKA_hm 評価
+    pub fn evaluate_halfka_hm(&self, pos: &Position, stack: &HalfKA_hmStack) -> Value {
         match self {
-            Self::HalfKaHmMerged(net) => net.evaluate(pos, stack),
-            _ => panic!("This method is only for HalfKaHmMerged architecture."),
+            Self::HalfKA_hm(net) => net.evaluate(pos, stack),
+            _ => panic!("This method is only for HalfKA_hm architecture."),
         }
     }
 
-    /// HalfKaSplit 評価
-    pub fn evaluate_halfka(&self, pos: &Position, stack: &HalfKaSplitStack) -> Value {
+    /// HalfKA 評価
+    pub fn evaluate_halfka(&self, pos: &Position, stack: &HalfKAStack) -> Value {
         match self {
-            Self::HalfKaSplit(net) => net.evaluate(pos, stack),
-            _ => panic!("This method is only for HalfKaSplit architecture."),
-        }
-    }
-
-    /// HalfKaMerged アキュムレータをフル再計算
-    pub fn refresh_accumulator_halfka_merged(&self, pos: &Position, stack: &mut HalfKaMergedStack) {
-        match self {
-            Self::HalfKaMerged(net) => net.refresh_accumulator(pos, stack),
-            _ => panic!("This method is only for HalfKaMerged architecture."),
-        }
-    }
-
-    /// HalfKaMerged 差分更新
-    pub fn update_accumulator_halfka_merged(
-        &self,
-        pos: &Position,
-        dirty: &super::accumulator::DirtyPiece,
-        stack: &mut HalfKaMergedStack,
-        source_idx: usize,
-    ) {
-        match self {
-            Self::HalfKaMerged(net) => net.update_accumulator(pos, dirty, stack, source_idx),
-            _ => panic!("This method is only for HalfKaMerged architecture."),
-        }
-    }
-
-    /// HalfKaMerged 前方差分更新
-    pub fn forward_update_incremental_halfka_merged(
-        &self,
-        pos: &Position,
-        stack: &mut HalfKaMergedStack,
-        source_idx: usize,
-    ) -> bool {
-        match self {
-            Self::HalfKaMerged(net) => net.forward_update_incremental(pos, stack, source_idx),
-            _ => panic!("This method is only for HalfKaMerged architecture."),
-        }
-    }
-
-    /// HalfKaMerged 評価
-    pub fn evaluate_halfka_merged(&self, pos: &Position, stack: &HalfKaMergedStack) -> Value {
-        match self {
-            Self::HalfKaMerged(net) => net.evaluate(pos, stack),
-            _ => panic!("This method is only for HalfKaMerged architecture."),
-        }
-    }
-
-    /// HalfKaHmSplit アキュムレータをフル再計算
-    pub fn refresh_accumulator_halfka_hm_split(
-        &self,
-        pos: &Position,
-        stack: &mut HalfKaHmSplitStack,
-    ) {
-        match self {
-            Self::HalfKaHmSplit(net) => net.refresh_accumulator(pos, stack),
-            _ => panic!("This method is only for HalfKaHmSplit architecture."),
-        }
-    }
-
-    /// HalfKaHmSplit 差分更新
-    pub fn update_accumulator_halfka_hm_split(
-        &self,
-        pos: &Position,
-        dirty: &super::accumulator::DirtyPiece,
-        stack: &mut HalfKaHmSplitStack,
-        source_idx: usize,
-    ) {
-        match self {
-            Self::HalfKaHmSplit(net) => net.update_accumulator(pos, dirty, stack, source_idx),
-            _ => panic!("This method is only for HalfKaHmSplit architecture."),
-        }
-    }
-
-    /// HalfKaHmSplit 前方差分更新
-    pub fn forward_update_incremental_halfka_hm_split(
-        &self,
-        pos: &Position,
-        stack: &mut HalfKaHmSplitStack,
-        source_idx: usize,
-    ) -> bool {
-        match self {
-            Self::HalfKaHmSplit(net) => net.forward_update_incremental(pos, stack, source_idx),
-            _ => panic!("This method is only for HalfKaHmSplit architecture."),
-        }
-    }
-
-    /// HalfKaHmSplit 評価
-    pub fn evaluate_halfka_hm_split(&self, pos: &Position, stack: &HalfKaHmSplitStack) -> Value {
-        match self {
-            Self::HalfKaHmSplit(net) => net.evaluate(pos, stack),
-            _ => panic!("This method is only for HalfKaHmSplit architecture."),
+            Self::HalfKA(net) => net.evaluate(pos, stack),
+            _ => panic!("This method is only for HalfKA architecture."),
         }
     }
 
@@ -1484,7 +717,7 @@ impl NNUENetwork {
 /// arch_str から fv_scale を抽出
 ///
 /// bullet-shogi で学習したモデルは arch_str に "fv_scale=N" を含む。
-/// 例: "Features=HalfKaHmMerged^[73305->256x2]-SCReLU,fv_scale=13,qa=127,qb=64,scale=600"
+/// 例: "Features=HalfKA_hm^[73305->256x2]-SCReLU,fv_scale=13,qa=127,qb=64,scale=600"
 ///
 /// 戻り値:
 /// - `Some(N)`: fv_scale=N が見つかり、妥当な範囲（1〜128）内の場合
@@ -1513,44 +746,74 @@ pub fn parse_fv_scale_from_arch(arch_str: &str) -> Option<i32> {
     None
 }
 
+/// arch_str から Feature Transformer の出力次元 (= L1 dim) を抽出
+///
+/// arch_str 例: `Features=HalfKA_hm(Friend)[73305->1536x2], PIN=2268, ...`
+/// このうち `[73305->1536x2]` パターンから **1536** を抽出する。
+///
+/// # Returns
+/// - `Some(N)`: FT dim が見つかり、 妥当な範囲 (256〜4096) 内の場合
+/// - `None`: pattern 不一致、 parse 失敗、 または範囲外
+///
+/// Plan P (= 1024 vs 1536 蒸留 pilot) で arch_str ベースの自動 detect に使用。
+pub fn parse_ft_dim_from_arch(arch_str: &str) -> Option<usize> {
+    /// FT dim 許容最小値 (= 256 dim でも理論上動くため許可)
+    const FT_DIM_MIN: usize = 256;
+    /// FT dim 許容最大値 (= SFNNwoP2048 variant までカバー、 4096 で余裕)
+    const FT_DIM_MAX: usize = 4096;
+
+    // pattern: "->N x2]" を探す (= [INPUT->FT_DIM x2])
+    let idx = arch_str.find("->")?;
+    let after = &arch_str[idx + 2..];
+    let end = after.find("x2]")?;
+    let dim: usize = after[..end].parse().ok()?;
+    if (FT_DIM_MIN..=FT_DIM_MAX).contains(&dim) {
+        Some(dim)
+    } else {
+        None
+    }
+}
+
 /// LayerStacks bucket mode をパース
 pub fn parse_layer_stack_bucket_mode(value: &str) -> Option<LayerStackBucketMode> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "kingrank9" => Some(LayerStackBucketMode::KingRank9),
-        "progresskpabs" => Some(LayerStackBucketMode::ProgressKPAbs),
-        "progresskpabsq16" => Some(LayerStackBucketMode::ProgressKPAbsQ16),
+        "progress8kpabs" => Some(LayerStackBucketMode::Progress8KPAbs),
         _ => None,
     }
 }
 
-/// progresskpabs 重みに基づいて LayerStacks bucket index `[0, num_buckets)` を計算
+/// progress8kpabs 重みに基づいて LayerStacks bucket index (0..=7) を計算
 ///
-/// `num_buckets` は学習時と一致する、明示設定済みの routing bucket 数を渡す。
-pub fn compute_layer_stack_progresskpabs_bucket_index(
+/// `CACHED_PROGRESS_BUCKET` にキャッシュされた値がある場合はそちらを消費する。
+pub fn compute_layer_stack_progress8kpabs_bucket_index(
     pos: &Position,
     _side_to_move: Color,
     weights: &[f32],
-    num_buckets: usize,
 ) -> usize {
-    let sum = compute_progresskpabs_sum(pos, weights);
-    progress_sum_to_bucket(sum, num_buckets)
+    // 差分計算済みキャッシュがあれば消費して返す
+    let cached = CACHED_PROGRESS_BUCKET.with(|c| c.replace(None));
+    if let Some(bucket) = cached {
+        return bucket;
+    }
+    // フォールバック: 全駒スキャン
+    let sum = compute_progress8kpabs_sum(pos, weights);
+    progress_sum_to_bucket(sum)
 }
 
-/// progresskpabs の重み付き和を全駒スキャンで計算（refresh 用）
-///
-/// # Panics
-/// 係数の長さが `SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS` と一致しない場合はpanicする。
-pub fn compute_progresskpabs_sum(pos: &Position, weights: &[f32]) -> f32 {
-    assert_eq!(
+/// progress8kpabs の重み付き和を全駒スキャンで計算（refresh 用）
+pub fn compute_progress8kpabs_sum(pos: &Position, weights: &[f32]) -> f32 {
+    debug_assert_eq!(
         weights.len(),
         SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
-        "progresskpabs weights length mismatch"
+        "progress8kpabs weights length mismatch"
     );
 
     let sq_bk = pos.king_square(Color::Black).index();
     let sq_wk = pos.king_square(Color::White).inverse().index();
-    let weights_b = &weights[sq_bk * FE_OLD_END..(sq_bk + 1) * FE_OLD_END];
-    let weights_w = &weights[sq_wk * FE_OLD_END..(sq_wk + 1) * FE_OLD_END];
+    // SAFETY: sq_bk, sq_wk は king_square().index() で 0..81 の範囲。
+    // weights の長さは 81 * FE_OLD_END であり、(sq + 1) * FE_OLD_END <= weights.len()。
+    let weights_b = unsafe { weights.get_unchecked(sq_bk * FE_OLD_END..(sq_bk + 1) * FE_OLD_END) };
+    let weights_w = unsafe { weights.get_unchecked(sq_wk * FE_OLD_END..(sq_wk + 1) * FE_OLD_END) };
 
     let mut sum = 0.0f32;
 
@@ -1597,10 +860,10 @@ pub fn compute_progresskpabs_sum(pos: &Position, weights: &[f32]) -> f32 {
 /// progress_sum から DirtyPiece の変化分を差分更新
 ///
 /// 玉が動いていない場合にのみ使用可能。
-/// DirtyPiece の ExtBonaPiece.fb/fw は progresskpabs と同じ BonaPiece 体系。
-#[cfg(all(feature = "nnue-progress-diff", any(feature = "layerstack-arch", test)))]
+/// DirtyPiece の ExtBonaPiece.fb/fw は progress8kpabs と同じ BonaPiece 体系。
+#[cfg(feature = "nnue-progress-diff")]
 #[inline]
-pub fn update_progresskpabs_sum_diff(
+pub fn update_progress8kpabs_sum_diff(
     prev_sum: f32,
     dirty_piece: &super::accumulator::DirtyPiece,
     sq_bk: usize,
@@ -1614,7 +877,7 @@ pub fn update_progresskpabs_sum_diff(
     debug_assert_eq!(
         weights.len(),
         SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
-        "progresskpabs weights length mismatch"
+        "progress8kpabs weights length mismatch"
     );
     let weights_b = unsafe { weights.get_unchecked(sq_bk * FE_OLD_END..(sq_bk + 1) * FE_OLD_END) };
     let weights_w = unsafe { weights.get_unchecked(sq_wk * FE_OLD_END..(sq_wk + 1) * FE_OLD_END) };
@@ -1660,101 +923,29 @@ pub fn update_progresskpabs_sum_diff(
 }
 
 /// progress_sum から bucket index を計算（閾値比較のみ）
-///
-/// 戻り値は `[0, num_buckets)`。
-/// `floor(sigmoid(sum) × num_buckets).clamp(0, num_buckets - 1)` と等価。
-/// `sum` 以下の閾値 `ln(k / (N - k))` を数える。routing 設定時に閾値を用意する。
 #[inline]
-pub fn progress_sum_to_bucket(sum: f32, num_buckets: usize) -> usize {
-    debug_assert!((1..=MAX_LAYER_STACK_BUCKETS).contains(&num_buckets));
-    match PROGRESS_BUCKET_THRESHOLDS[num_buckets].get() {
-        Some(thresholds) => thresholds.partition_point(|&threshold| sum >= threshold),
-        None => unconfigured_progress_sum_to_bucket(sum, num_buckets),
-    }
+pub fn progress_sum_to_bucket(sum: f32) -> usize {
+    PROGRESS_BUCKET_THRESHOLDS.partition_point(|&threshold| sum >= threshold)
 }
 
 /// NNUEを初期化（バージョン自動判別）
 pub fn init_nnue<P: AsRef<Path>>(path: P) -> io::Result<()> {
-    init_nnue_with_deltas(path, &[]).map(|_| ())
-}
-
-/// NNUE をロードし、`Arc` で公開する前に整数 delta を適用する。
-pub fn init_nnue_with_deltas<P: AsRef<Path>>(
-    path: P,
-    deltas: &[NetDelta],
-) -> io::Result<NetDeltaReport> {
-    let mut network = NNUENetwork::load(path)?;
-    let report = network.apply_net_deltas(deltas).map_err(net_delta_io_error)?;
-    let network = Arc::new(network);
+    let network = Arc::new(NNUENetwork::load(path)?);
     *NETWORK.write().expect("NNUE lock poisoned") = Some(network);
     NNUE_INITIALIZED.store(true, Ordering::Release);
-    crate::eval::changed();
-    Ok(report)
+    Ok(())
 }
 
 /// バイト列からNNUEを初期化（バージョン自動判別）
 pub fn init_nnue_from_bytes(bytes: &[u8]) -> io::Result<()> {
-    init_nnue_from_bytes_with_deltas(bytes, &[]).map(|_| ())
-}
-
-/// バイト列から NNUE をロードし、`Arc` で公開する前に整数 delta を適用する。
-pub fn init_nnue_from_bytes_with_deltas(
-    bytes: &[u8],
-    deltas: &[NetDelta],
-) -> io::Result<NetDeltaReport> {
-    let mut network = NNUENetwork::from_bytes(bytes)?;
-    let report = network.apply_net_deltas(deltas).map_err(net_delta_io_error)?;
-    let network = Arc::new(network);
+    let network = Arc::new(NNUENetwork::from_bytes(bytes)?);
     *NETWORK.write().expect("NNUE lock poisoned") = Some(network);
     NNUE_INITIALIZED.store(true, Ordering::Release);
-    crate::eval::changed();
-    Ok(report)
-}
-
-fn net_delta_io_error(error: NetDeltaError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, error)
-}
-
-/// halfkx-arch 無効ビルドで HalfKX 系モデルを読もうとしたときのエラーを作る。
-///
-/// 次元はファイルサイズから一意に決まればその値を、決まらなければ arch 文字列の
-/// 解析結果を使う。どちらからも得られない次元はメッセージに含めない。
-fn halfkx_arch_disabled_error(
-    feature_set: FeatureSet,
-    arch_str: &str,
-    file_size: u64,
-    arch_len: usize,
-) -> io::Error {
-    let (l1, l2, l3) =
-        super::spec::detect_architecture_from_size(file_size, arch_len, Some(feature_set))
-            .map(|detection| (detection.spec.l1, detection.spec.l2, detection.spec.l3))
-            .or_else(|| {
-                super::spec::parse_architecture(arch_str)
-                    .ok()
-                    .map(|parsed| (parsed.l1, parsed.l2, parsed.l3))
-            })
-            .unwrap_or((0, 0, 0));
-    let dims = if l1 == 0 {
-        String::new()
-    } else if l2 == 0 || l3 == 0 {
-        format!(", L1={l1}")
-    } else {
-        format!(", {l1}x{l2}x{l3}")
-    };
-    let activation = detect_activation_from_arch(arch_str);
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "HalfKX NNUE model ({feature_set}{dims}, {activation}) requires the `halfkx-arch` \
-             feature; rebuild rshogi-core with an Edition that enables it \
-             (e.g. edition-universal / edition-halfkx)."
-        ),
-    )
+    Ok(())
 }
 
 /// グローバル NNUE をクリアする
 pub fn clear_nnue() {
-    crate::eval::changed();
     // Safety: false を先に書いてから NETWORK をクリアすること。
     // 逆順にすると is_nnue_initialized() == true の直後に get_network() が None を返す
     // 短い窓が生じる。false-negative（ロード済みなのに false に見える瞬間）は安全。
@@ -1778,7 +969,7 @@ pub fn is_nnue_initialized() -> bool {
 /// NNUE フォーマット情報
 #[derive(Debug, Clone)]
 pub struct NnueFormatInfo {
-    /// アーキテクチャ名（例: "HalfKaSplit1024", "HalfKaHmMerged1024", "LayerStacks", "HalfKP256"）
+    /// アーキテクチャ名（例: "HalfKA1024", "HalfKA_hm1024", "LayerStacks", "HalfKP256"）
     pub architecture: String,
 
     /// L1 次元（例: 256, 512, 1024, 1536）
@@ -1848,7 +1039,7 @@ pub fn detect_format(bytes: &[u8], file_size: u64) -> io::Result<NnueFormatInfo>
     let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
     match version {
-        NNUE_VERSION | NNUE_VERSION_HALFKA | NNUE_VERSION_LAYERSTACK_NUM_BUCKETS => {
+        NNUE_VERSION | NNUE_VERSION_HALFKA => {
             // アーキテクチャ文字列長を読み取り
             let arch_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
 
@@ -1919,14 +1110,10 @@ pub fn detect_format(bytes: &[u8], file_size: u64) -> io::Result<NnueFormatInfo>
             // アーキテクチャ名を決定
             let architecture = match feature_set {
                 FeatureSet::LayerStacks => "LayerStacks".to_string(),
-                FeatureSet::HalfKaHmMerged => format!("HalfKaHmMerged{}", l1),
-                FeatureSet::HalfKaSplit => format!("HalfKaSplit{}", l1),
-                FeatureSet::HalfKaMerged => format!("HalfKaMerged{}", l1),
-                FeatureSet::HalfKaHmSplit => format!("HalfKaHmSplit{}", l1),
-                FeatureSet::HalfKaHmMergedEffectBucket => {
-                    format!("HalfKaHmMergedEffectBucket{}", l1)
-                }
+                FeatureSet::HalfKA_hm => format!("HalfKA_hm{}", l1),
+                FeatureSet::HalfKA => format!("HalfKA{}", l1),
                 FeatureSet::HalfKP => format!("HalfKP{}", l1),
+                FeatureSet::Shogi2344 => unreachable!("Shogi2344 feature set is removed"),
             };
 
             Ok(NnueFormatInfo {
@@ -1959,109 +1146,260 @@ pub fn get_network() -> Option<Arc<NNUENetwork>> {
 
 /// LayerStacks アキュムレータを更新して評価（キャッシュ対応版）
 ///
-/// `LayerStacksNetwork::update_accumulator()` と `evaluate_with_bucket()` に委譲する。
+/// `LayerStacksNetwork::update_accumulator()` と `evaluate()` に委譲する。
 /// AccumulatorCaches（Finny Tables）を使用して refresh を高速化する。
 ///
-/// `nnue-progress-diff` feature 有効時は progresskpabs モードで差分更新を試み、
-/// 得られた bucket をそのまま評価に渡す。
+/// `nnue-progress-diff` feature 有効時は progress8kpabs モードで差分更新を試み、
+/// 結果を `CACHED_PROGRESS_BUCKET` に格納して `evaluate()` 内の全駒スキャンを回避する。
 /// Threat なし環境では +3〜4% NPS、Threat あり環境では cache 圧迫で退行するため
 /// 運用モデルに応じて明示指定する。
-#[cfg(feature = "layerstack-arch")]
 #[inline(always)]
 pub(crate) fn update_and_evaluate_layer_stacks_cached(
     net: &LayerStacksNetwork,
-    pos: &Position,
+    pos: &mut Position,
     stack: &mut LayerStacksAccStack,
     acc_cache: &mut Option<LayerStacksAccCache>,
 ) -> Value {
-    // アキュムレータの更新
-    net.update_accumulator(pos, stack, acc_cache);
-    if let Some(bucket) = net.bucket_routing().bucket(pos) {
-        return net.evaluate_with_bucket(pos, stack, bucket);
+    // アキュムレータの更新 (read-only な pos に reborrow)
+    net.update_accumulator(&*pos, stack, acc_cache);
+
+    // progress8kpabs: 差分更新を試み、結果を CACHED_PROGRESS_BUCKET に格納
+    #[cfg(feature = "nnue-progress-diff")]
+    if matches!(get_layer_stack_bucket_mode(), LayerStackBucketMode::Progress8KPAbs) {
+        let bucket = match stack {
+            #[cfg(feature = "layerstacks-1536x16x32")]
+            LayerStacksAccStack::L1536x16x32(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-1536x32x32")]
+            LayerStacksAccStack::L1536x32x32(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-1536x8x96")]
+            LayerStacksAccStack::L1536x8x96(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-1536x16x96")]
+            LayerStacksAccStack::L1536x16x96(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-1536x32x96")]
+            LayerStacksAccStack::L1536x32x96(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-1536x48x96")]
+            LayerStacksAccStack::L1536x48x96(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-1536x64x96")]
+            LayerStacksAccStack::L1536x64x96(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-1536x16x48")]
+            LayerStacksAccStack::L1536x16x48(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-1024x16x48")]
+            LayerStacksAccStack::L1024x16x48(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-1024x8x64")]
+            LayerStacksAccStack::L1024x8x64(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-768x32x96")]
+            LayerStacksAccStack::L768x32x96(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-768x16x32")]
+            LayerStacksAccStack::L768x16x32(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-768x8x32")]
+            LayerStacksAccStack::L768x8x32(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(feature = "layerstacks-512x16x32")]
+            LayerStacksAccStack::L512x16x32(s) => ensure_progress_bucket(&*pos, s),
+            #[cfg(not(any(
+                feature = "layerstacks-1536x16x32",
+                feature = "layerstacks-1536x32x32",
+                feature = "layerstacks-1536x8x96",
+                feature = "layerstacks-1536x16x96",
+                feature = "layerstacks-1536x32x96",
+                feature = "layerstacks-1536x48x96",
+                feature = "layerstacks-1536x64x96",
+                feature = "layerstacks-1536x16x48",
+                feature = "layerstacks-1024x16x48",
+                feature = "layerstacks-1024x8x64",
+                feature = "layerstacks-768x32x96",
+                feature = "layerstacks-768x16x32",
+                feature = "layerstacks-768x8x32",
+                feature = "layerstacks-512x16x32"
+            )))]
+            _ => unreachable!("no LayerStacks variant enabled"),
+        };
+        CACHED_PROGRESS_BUCKET.with(|c| c.set(Some(bucket)));
     }
 
-    let bucket = match get_layer_stack_bucket_mode() {
-        LayerStackBucketMode::KingRank9 => {
-            super::network_layer_stacks::compute_layer_stack_kingrank9_bucket_index(
-                pos,
-                pos.side_to_move(),
-                net.num_buckets(),
-            )
+    // arm 7 + Refresh (= 2026-05-27): PV node 復帰時に dual_cross stale 解消。
+    // non-PV node では `non_pv_dual_skip()` が true で eval 側が dual_cross_value を
+    // 0 に gate するため stale 値は読まれない。 PV node に戻った瞬間に refresh する
+    // ことで stale 伝播による棋力大敗 (= -280 Elo) を断つ。
+    if !crate::nnue::ablation::non_pv_dual_skip() {
+        net.refresh_dual_cross_if_stale(&*pos, stack);
+    }
+
+    // LS_BUCKET_INTERP: bucket 境界補間。
+    //
+    // interp > 0 かつ progress8kpabs mode のとき、bucket 境界近傍 (frac < ε または
+    // frac > 1-ε) で隣接 bucket の eval と線形 blend する。bucket 境界での eval ジャンプ
+    // (平均 29-30cp) を平滑化する推論側対策。0 のときは下の `net.evaluate` のみ実行し
+    // bit-exact 無変化。
+    //
+    // 注意: lazy path (use-lazy-evaluate で TT eval 再利用時) はそもそもこの関数を
+    // 経由せず eval を recompute しないため、補間は eager 評価時のみ効く。
+    #[cfg(feature = "nnue-progress-diff")]
+    {
+        let interp = get_bucket_interp();
+        if interp > 0
+            && matches!(get_layer_stack_bucket_mode(), LayerStackBucketMode::Progress8KPAbs)
+            && let Some(blended) = maybe_interpolate_bucket_eval(net, pos, stack, interp)
+        {
+            return blended;
         }
-        LayerStackBucketMode::ProgressKPAbsQ16 => {
-            stack.ensure_progress_q16_bucket(pos, net.num_buckets())
-        }
-        LayerStackBucketMode::ProgressKPAbs => {
-            let num_buckets = get_layer_stack_progress_buckets()
-                .expect("LayerStacks progress routing is not configured");
-            let stored_buckets = net.num_buckets();
-            assert!(
-                num_buckets <= stored_buckets,
-                "LayerStacks progress routing uses {num_buckets} buckets, but the network stores only {stored_buckets}"
-            );
-            #[cfg(feature = "nnue-progress-diff")]
-            match stack {
-                #[cfg(feature = "layerstacks-1536x16x32")]
-                LayerStacksAccStack::L1536x16x32(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-1536x32x32")]
-                LayerStacksAccStack::L1536x32x32(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-768x16x32")]
-                LayerStacksAccStack::L768x16x32(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-768x8x32")]
-                LayerStacksAccStack::L768x8x32(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-512x16x32")]
-                LayerStacksAccStack::L512x16x32(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-1024x16x32")]
-                LayerStacksAccStack::L1024x16x32(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-3072x16x32")]
-                LayerStacksAccStack::L3072x16x32(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-1024x16x64")]
-                LayerStacksAccStack::L1024x16x64(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-2304x16x64")]
-                LayerStacksAccStack::L2304x16x64(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-3072x16x64")]
-                LayerStacksAccStack::L3072x16x64(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(feature = "layerstacks-1536x16x64")]
-                LayerStacksAccStack::L1536x16x64(s) => ensure_progress_bucket(pos, s, num_buckets),
-                #[cfg(not(any(
-                    feature = "layerstacks-1536x16x32",
-                    feature = "layerstacks-1536x32x32",
-                    feature = "layerstacks-768x16x32",
-                    feature = "layerstacks-768x8x32",
-                    feature = "layerstacks-512x16x32",
-                    feature = "layerstacks-1024x16x32",
-                    feature = "layerstacks-3072x16x32",
-                    feature = "layerstacks-1024x16x64",
-                    feature = "layerstacks-2304x16x64",
-                    feature = "layerstacks-3072x16x64",
-                    feature = "layerstacks-1536x16x64"
-                )))]
-                _ => unreachable!("no LayerStacks variant enabled"),
-            }
-            #[cfg(not(feature = "nnue-progress-diff"))]
-            compute_layer_stack_progresskpabs_bucket_index(
-                pos,
-                pos.side_to_move(),
-                stack.progress_kpabs_weights(),
-                num_buckets,
-            )
-        }
-    };
-    net.evaluate_with_bucket(pos, stack, bucket)
+    }
+
+    // 評価 (旧 LMAS API 互換で pos を &mut のまま渡す、 現在は state 不変)
+    net.evaluate(pos, stack)
 }
 
-/// progresskpabs の progress_sum を計算済みにして bucket index を返す
+/// bucket 境界補間を試みる (= LS_BUCKET_INTERP)。
+///
+/// 遷移ゾーン (frac < ε または frac > 1-ε) に居れば natural bucket と隣接 bucket の
+/// static eval を整数演算で線形 blend した値を返す。ゾーン外なら `None` を返し、
+/// 呼び出し側は通常の `net.evaluate` にフォールバックする。
+///
+/// 重み `w` (= 隣接 bucket への寄与) は境界で 0.5、ゾーン端で 0:
+/// - frac < ε:        `w = 0.5 * (1 - frac/ε)`、blend 先 = bucket-1
+/// - frac > 1-ε:      `w = 0.5 * (1 - (1-frac)/ε)`、blend 先 = bucket+1
+///
+/// `w` は frac_256 (0..256) ベースの整数演算で w_256 (0..128) として算出し、
+/// `eval = ((256-w_256)*natural + w_256*neighbor) / 256` で blend する。
+#[cfg(feature = "nnue-progress-diff")]
+fn maybe_interpolate_bucket_eval(
+    net: &LayerStacksNetwork,
+    pos: &mut Position,
+    stack: &mut LayerStacksAccStack,
+    interp: i32,
+) -> Option<Value> {
+    // natural bucket と frac を stack の progress_sum から取得 (cached path と同一 sum)。
+    let (bucket, frac_256) = match stack {
+        #[cfg(feature = "layerstacks-1536x16x32")]
+        LayerStacksAccStack::L1536x16x32(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-1536x32x32")]
+        LayerStacksAccStack::L1536x32x32(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-1536x8x96")]
+        LayerStacksAccStack::L1536x8x96(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-1536x16x96")]
+        LayerStacksAccStack::L1536x16x96(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-1536x32x96")]
+        LayerStacksAccStack::L1536x32x96(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-1536x48x96")]
+        LayerStacksAccStack::L1536x48x96(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-1536x64x96")]
+        LayerStacksAccStack::L1536x64x96(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-1536x16x48")]
+        LayerStacksAccStack::L1536x16x48(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-1024x16x48")]
+        LayerStacksAccStack::L1024x16x48(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-1024x8x64")]
+        LayerStacksAccStack::L1024x8x64(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-768x32x96")]
+        LayerStacksAccStack::L768x32x96(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-768x16x32")]
+        LayerStacksAccStack::L768x16x32(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-768x8x32")]
+        LayerStacksAccStack::L768x8x32(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(feature = "layerstacks-512x16x32")]
+        LayerStacksAccStack::L512x16x32(s) => {
+            progress_sum_to_bucket_and_frac(s.current().progress_sum)
+        }
+        #[cfg(not(any(
+            feature = "layerstacks-1536x16x32",
+            feature = "layerstacks-1536x32x32",
+            feature = "layerstacks-1536x8x96",
+            feature = "layerstacks-1536x16x96",
+            feature = "layerstacks-1536x32x96",
+            feature = "layerstacks-1536x48x96",
+            feature = "layerstacks-1536x64x96",
+            feature = "layerstacks-1536x16x48",
+            feature = "layerstacks-1024x16x48",
+            feature = "layerstacks-1024x8x64",
+            feature = "layerstacks-768x32x96",
+            feature = "layerstacks-768x16x32",
+            feature = "layerstacks-768x8x32",
+            feature = "layerstacks-512x16x32"
+        )))]
+        _ => unreachable!("no LayerStacks variant enabled"),
+    };
+
+    // ε を frac_256 スケール (0..256) に変換: eps_256 = interp% * 256 / 100。
+    let eps_256: i32 = interp * 256 / 100;
+    if eps_256 <= 0 {
+        return None;
+    }
+    let frac = i32::from(frac_256);
+
+    // 隣接 bucket と blend 重み w_256 (0..128) を決定。
+    // w = 0.5 * (1 - dist/ε) を 256 スケールで: w_256 = 128 * (eps_256 - dist) / eps_256。
+    let (neighbor, w_256) = if frac < eps_256 && bucket > 0 {
+        // 下端ゾーン: bucket-1 へ blend。dist = frac。
+        let w = 128 * (eps_256 - frac) / eps_256;
+        (bucket - 1, w)
+    } else if frac > 256 - eps_256 && bucket < 7 {
+        // 上端ゾーン: bucket+1 へ blend。dist = 256 - frac (= 1 - frac の 256 スケール)。
+        let dist = 256 - frac;
+        let w = 128 * (eps_256 - dist) / eps_256;
+        (bucket + 1, w)
+    } else {
+        // 遷移ゾーン外 → 補間しない。
+        return None;
+    };
+
+    if w_256 <= 0 {
+        // ゾーン端ちょうど (w=0) は natural と同値、補間 skip で natural path に委ねる。
+        return None;
+    }
+
+    // natural bucket と neighbor bucket を同一 accumulator で評価し blend。
+    //
+    // natural path (= `net.evaluate`) は immutable accumulator 経由で activity_risk を
+    // 非 cached (= per-eval full compute) 評価する。bit-exact 整合のため補間側も同じ
+    // immutable path (`evaluate_with_bucket_immut`) を使う。
+    //
+    // CACHED_PROGRESS_BUCKET は上流で set 済みだが、明示 bucket 評価では消費しないため
+    // ここでクリアして leak を防ぐ (= 後続 evaluate が誤った cached bucket を読まないよう)。
+    CACHED_PROGRESS_BUCKET.with(|c| c.set(None));
+    let nat_eval = net.evaluate_with_bucket_immut(pos, stack, bucket).raw();
+    let nbr_eval = net.evaluate_with_bucket_immut(pos, stack, neighbor).raw();
+
+    let blended = ((256 - w_256) * nat_eval + w_256 * nbr_eval) / 256;
+    Some(Value::new(blended))
+}
+
+/// progress8kpabs の progress_sum を計算済みにして bucket index を返す
 ///
 /// 差分更新が可能な場合（前局面が計算済み、玉移動なし）は DirtyPiece の差分で O(1) 更新。
 /// それ以外は全駒スキャンにフォールバック。
-#[cfg(all(feature = "nnue-progress-diff", feature = "layerstack-arch"))]
+#[cfg(feature = "nnue-progress-diff")]
 #[inline]
 fn ensure_progress_bucket<const L1: usize>(
     pos: &Position,
     stack: &mut super::accumulator_layer_stacks::AccumulatorStackLayerStacks<L1>,
-    num_buckets: usize,
 ) -> usize {
     if !stack.current().computed_progress {
+        let weights = get_layer_stack_progress_kpabs_weights();
         let current_entry = stack.current();
         let dirty = &current_entry.dirty_piece;
         let king_moved = dirty.king_moved[0] || dirty.king_moved[1];
@@ -2073,36 +1411,29 @@ fn ensure_progress_bucket<const L1: usize>(
             let prev_sum = stack.entry_at(prev_idx).progress_sum;
             let sq_bk = pos.king_square(Color::Black).index();
             let sq_wk = pos.king_square(Color::White).inverse().index();
-            let new_sum = update_progresskpabs_sum_diff(
-                prev_sum,
-                dirty,
-                sq_bk,
-                sq_wk,
-                stack.progress_kpabs_weights(),
-            );
+            let new_sum = update_progress8kpabs_sum_diff(prev_sum, dirty, sq_bk, sq_wk, weights);
             let entry = stack.current_mut();
             entry.progress_sum = new_sum;
             entry.computed_progress = true;
         }
 
         if !stack.current().computed_progress {
-            let sum = compute_progresskpabs_sum(pos, stack.progress_kpabs_weights());
+            let sum = compute_progress8kpabs_sum(pos, weights);
             let entry = stack.current_mut();
             entry.progress_sum = sum;
             entry.computed_progress = true;
         }
     }
-    progress_sum_to_bucket(stack.current().progress_sum, num_buckets)
+    progress_sum_to_bucket(stack.current().progress_sum)
 }
 
-/// HalfKaHmMerged アキュムレータを更新して評価（内部実装）
-#[cfg(feature = "halfkx-arch")]
+/// HalfKA_hm アキュムレータを更新して評価（内部実装）
+#[cfg(not(feature = "layerstack-only"))]
 #[inline]
-pub(crate) fn update_and_evaluate_halfka_hm(
-    net: &HalfKaHmMergedNetwork,
+fn update_and_evaluate_halfka_hm(
+    network: &NNUENetwork,
     pos: &Position,
-    stack: &mut HalfKaHmMergedStack,
-    cache: &mut Option<AccumulatorCacheGeneric>,
+    stack: &mut HalfKA_hmStack,
 ) -> Value {
     // アキュムレータの更新
     if !stack.is_current_computed() {
@@ -2113,41 +1444,32 @@ pub(crate) fn update_and_evaluate_halfka_hm(
             && stack.is_entry_computed(prev_idx)
         {
             let dirty = stack.current_dirty_piece();
-            if let Some(cache) = cache {
-                net.update_accumulator_with_cache(pos, &dirty, stack, prev_idx, cache);
-            } else {
-                net.update_accumulator(pos, &dirty, stack, prev_idx);
-            }
+            network.update_accumulator_halfka_hm(pos, &dirty, stack, prev_idx);
             updated = true;
         }
 
         // 2. 失敗なら祖先探索 + 複数手差分更新を試行
         if !updated && let Some((source_idx, _depth)) = stack.find_usable_accumulator() {
-            updated = net.forward_update_incremental(pos, stack, source_idx);
+            updated = network.forward_update_incremental_halfka_hm(pos, stack, source_idx);
         }
 
         // 3. それでも失敗なら全計算
         if !updated {
-            if let Some(cache) = cache {
-                net.refresh_accumulator_with_cache(pos, stack, cache);
-            } else {
-                net.refresh_accumulator(pos, stack);
-            }
+            network.refresh_accumulator_halfka_hm(pos, stack);
         }
     }
 
     // 評価
-    net.evaluate(pos, stack)
+    network.evaluate_halfka_hm(pos, stack)
 }
 
-/// HalfKaSplit アキュムレータを更新して評価（内部実装）
-#[cfg(feature = "halfkx-arch")]
+/// HalfKA アキュムレータを更新して評価（内部実装）
+#[cfg(not(feature = "layerstack-only"))]
 #[inline]
-pub(crate) fn update_and_evaluate_halfka(
-    net: &HalfKaSplitNetwork,
+fn update_and_evaluate_halfka(
+    network: &NNUENetwork,
     pos: &Position,
-    stack: &mut HalfKaSplitStack,
-    cache: &mut Option<AccumulatorCacheGeneric>,
+    stack: &mut HalfKAStack,
 ) -> Value {
     // アキュムレータの更新
     if !stack.is_current_computed() {
@@ -2158,117 +1480,32 @@ pub(crate) fn update_and_evaluate_halfka(
             && stack.is_entry_computed(prev_idx)
         {
             let dirty = stack.current_dirty_piece();
-            if let Some(cache) = cache {
-                net.update_accumulator_with_cache(pos, &dirty, stack, prev_idx, cache);
-            } else {
-                net.update_accumulator(pos, &dirty, stack, prev_idx);
-            }
+            network.update_accumulator_halfka(pos, &dirty, stack, prev_idx);
             updated = true;
         }
 
         // 2. 失敗なら祖先探索 + 複数手差分更新を試行
         if !updated && let Some((source_idx, _depth)) = stack.find_usable_accumulator() {
-            updated = net.forward_update_incremental(pos, stack, source_idx);
+            updated = network.forward_update_incremental_halfka(pos, stack, source_idx);
         }
 
         // 3. それでも失敗なら全計算
         if !updated {
-            if let Some(cache) = cache {
-                net.refresh_accumulator_with_cache(pos, stack, cache);
-            } else {
-                net.refresh_accumulator(pos, stack);
-            }
+            network.refresh_accumulator_halfka(pos, stack);
         }
     }
 
     // 評価
-    net.evaluate(pos, stack)
-}
-
-#[cfg(feature = "halfkx-arch")]
-pub(crate) fn update_and_evaluate_halfka_merged(
-    net: &HalfKaMergedNetwork,
-    pos: &Position,
-    stack: &mut HalfKaMergedStack,
-    cache: &mut Option<AccumulatorCacheGeneric>,
-) -> Value {
-    if !stack.is_current_computed() {
-        let mut updated = false;
-
-        if let Some(prev_idx) = stack.current_previous()
-            && stack.is_entry_computed(prev_idx)
-        {
-            let dirty = stack.current_dirty_piece();
-            if let Some(cache) = cache {
-                net.update_accumulator_with_cache(pos, &dirty, stack, prev_idx, cache);
-            } else {
-                net.update_accumulator(pos, &dirty, stack, prev_idx);
-            }
-            updated = true;
-        }
-
-        if !updated && let Some((source_idx, _depth)) = stack.find_usable_accumulator() {
-            updated = net.forward_update_incremental(pos, stack, source_idx);
-        }
-
-        if !updated {
-            if let Some(cache) = cache {
-                net.refresh_accumulator_with_cache(pos, stack, cache);
-            } else {
-                net.refresh_accumulator(pos, stack);
-            }
-        }
-    }
-
-    net.evaluate(pos, stack)
-}
-
-#[cfg(feature = "halfkx-arch")]
-pub(crate) fn update_and_evaluate_halfka_hm_split(
-    net: &HalfKaHmSplitNetwork,
-    pos: &Position,
-    stack: &mut HalfKaHmSplitStack,
-    cache: &mut Option<AccumulatorCacheGeneric>,
-) -> Value {
-    if !stack.is_current_computed() {
-        let mut updated = false;
-
-        if let Some(prev_idx) = stack.current_previous()
-            && stack.is_entry_computed(prev_idx)
-        {
-            let dirty = stack.current_dirty_piece();
-            if let Some(cache) = cache {
-                net.update_accumulator_with_cache(pos, &dirty, stack, prev_idx, cache);
-            } else {
-                net.update_accumulator(pos, &dirty, stack, prev_idx);
-            }
-            updated = true;
-        }
-
-        if !updated && let Some((source_idx, _depth)) = stack.find_usable_accumulator() {
-            updated = net.forward_update_incremental(pos, stack, source_idx);
-        }
-
-        if !updated {
-            if let Some(cache) = cache {
-                net.refresh_accumulator_with_cache(pos, stack, cache);
-            } else {
-                net.refresh_accumulator(pos, stack);
-            }
-        }
-    }
-
-    net.evaluate(pos, stack)
+    network.evaluate_halfka(pos, stack)
 }
 
 /// HalfKP アキュムレータを更新して評価（内部実装）
-#[cfg(feature = "halfkx-arch")]
+#[cfg(not(feature = "layerstack-only"))]
 #[inline]
-pub(crate) fn update_and_evaluate_halfkp(
-    net: &HalfKPNetwork,
+fn update_and_evaluate_halfkp(
+    network: &NNUENetwork,
     pos: &Position,
     stack: &mut HalfKPStack,
-    cache: &mut Option<AccumulatorCacheGeneric>,
 ) -> Value {
     // アキュムレータの更新
     if !stack.is_current_computed() {
@@ -2279,31 +1516,23 @@ pub(crate) fn update_and_evaluate_halfkp(
             && stack.is_entry_computed(prev_idx)
         {
             let dirty = stack.current_dirty_piece();
-            if let Some(cache) = cache {
-                net.update_accumulator_with_cache(pos, &dirty, stack, prev_idx, cache);
-            } else {
-                net.update_accumulator(pos, &dirty, stack, prev_idx);
-            }
+            network.update_accumulator_halfkp(pos, &dirty, stack, prev_idx);
             updated = true;
         }
 
         // 2. 失敗なら祖先探索 + 複数手差分更新を試行
         if !updated && let Some((source_idx, _depth)) = stack.find_usable_accumulator() {
-            updated = net.forward_update_incremental(pos, stack, source_idx);
+            updated = network.forward_update_incremental_halfkp(pos, stack, source_idx);
         }
 
         // 3. それでも失敗なら全計算
         if !updated {
-            if let Some(cache) = cache {
-                net.refresh_accumulator_with_cache(pos, stack, cache);
-            } else {
-                net.refresh_accumulator(pos, stack);
-            }
+            network.refresh_accumulator_halfkp(pos, stack);
         }
     }
 
     // 評価
-    net.evaluate(pos, stack)
+    network.evaluate_halfkp(pos, stack)
 }
 
 /// ロードされたNNUEがLayerStacksアーキテクチャかどうか
@@ -2311,32 +1540,32 @@ pub fn is_layer_stacks_loaded() -> bool {
     get_network().is_some_and(|n| n.is_layer_stacks())
 }
 
-/// ロードされたNNUEがHalfKaHmMerged256アーキテクチャかどうか
+/// ロードされたNNUEがHalfKA_hm256アーキテクチャかどうか
 pub fn is_halfka_hm_256_loaded() -> bool {
     get_network().is_some_and(|n| n.is_halfka_hm() && n.l1_size() == 256)
 }
 
-/// ロードされたNNUEがHalfKaSplit256アーキテクチャかどうか
+/// ロードされたNNUEがHalfKA256アーキテクチャかどうか
 pub fn is_halfka_256_loaded() -> bool {
     get_network().is_some_and(|n| n.is_halfka() && n.l1_size() == 256)
 }
 
-/// ロードされたNNUEがHalfKaHmMerged512アーキテクチャかどうか
+/// ロードされたNNUEがHalfKA_hm512アーキテクチャかどうか
 pub fn is_halfka_hm_512_loaded() -> bool {
     get_network().is_some_and(|n| n.is_halfka_hm() && n.l1_size() == 512)
 }
 
-/// ロードされたNNUEがHalfKaSplit512アーキテクチャかどうか
+/// ロードされたNNUEがHalfKA512アーキテクチャかどうか
 pub fn is_halfka_512_loaded() -> bool {
     get_network().is_some_and(|n| n.is_halfka() && n.l1_size() == 512)
 }
 
-/// ロードされたNNUEがHalfKaHmMerged1024アーキテクチャかどうか
+/// ロードされたNNUEがHalfKA_hm1024アーキテクチャかどうか
 pub fn is_halfka_hm_1024_loaded() -> bool {
     get_network().is_some_and(|n| n.is_halfka_hm() && n.l1_size() == 1024)
 }
 
-/// ロードされたNNUEがHalfKaSplit1024アーキテクチャかどうか
+/// ロードされたNNUEがHalfKA1024アーキテクチャかどうか
 pub fn is_halfka_1024_loaded() -> bool {
     get_network().is_some_and(|n| n.is_halfka() && n.l1_size() == 1024)
 }
@@ -2347,10 +1576,9 @@ pub fn is_halfka_1024_loaded() -> bool {
 ///
 /// # Panics
 /// NNUEが未ロードかつMaterial評価も無効の場合はパニックする。
-#[cfg(feature = "layerstack-arch")]
-pub fn evaluate_layer_stacks(pos: &Position, stack: &mut LayerStacksAccStack) -> Value {
+pub fn evaluate_layer_stacks(pos: &mut Position, stack: &mut LayerStacksAccStack) -> Value {
     if material::is_material_enabled() {
-        return material::evaluate_material(pos);
+        return material::evaluate_material(&*pos);
     }
 
     let Some(network) = get_network() else {
@@ -2375,32 +1603,12 @@ pub fn evaluate_layer_stacks(pos: &Position, stack: &mut LayerStacksAccStack) ->
 /// # Panics
 /// NNUEが未ロードかつMaterial評価も無効の場合はパニックする。
 pub fn evaluate_dispatch(
-    pos: &Position,
+    pos: &mut Position,
     stack: &mut AccumulatorStackVariant,
     acc_cache: &mut Option<LayerStacksAccCache>,
 ) -> Value {
-    evaluate_dispatch_with_caches(
-        pos,
-        stack,
-        acc_cache,
-        #[cfg(feature = "halfkx-arch")]
-        &mut None,
-    )
-}
-
-/// worker が所有するアーキテクチャ別の Finny cache を使って評価する。
-pub(crate) fn evaluate_dispatch_with_caches(
-    pos: &Position,
-    stack: &mut AccumulatorStackVariant,
-    acc_cache: &mut Option<LayerStacksAccCache>,
-    #[cfg(feature = "halfkx-arch")] halfkx_cache: &mut Option<AccumulatorCacheGeneric>,
-) -> Value {
-    // layerstack-arch 無効ビルドでは LayerStacks variant が存在せず acc_cache は使われない。
-    #[cfg(not(feature = "layerstack-arch"))]
-    let _ = acc_cache;
-
     if material::is_material_enabled() {
-        return material::evaluate_material(pos);
+        return material::evaluate_material(&*pos);
     }
 
     let Some(network) = get_network() else {
@@ -2409,90 +1617,33 @@ pub(crate) fn evaluate_dispatch_with_caches(
              Use 'setoption name EvalFile' or 'setoption name MaterialLevel'."
         );
     };
-    // architecture feature を 1 つも持たないビルドでは、下の match に network を参照する arm が無い。
-    #[cfg(not(any(
-        feature = "layerstack-arch",
-        feature = "halfkx-arch",
-        feature = "nnue-runtime-dimensions"
-    )))]
-    let _ = &network;
 
     // バリアントに応じて適切な評価関数を呼び出し
     match stack {
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        AccumulatorStackVariant::DynamicLayerStacks(s) => {
-            let NNUENetwork::DynamicLayerStacks(net) = &*network else {
-                unreachable!("Network/Stack type mismatch")
-            };
-            let stack = s.get_mut();
-            net.ensure(pos, stack);
-            net.evaluate(pos, stack)
-        }
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        AccumulatorStackVariant::DynamicHalfKx(s) => {
-            let NNUENetwork::DynamicHalfKx(net) = &*network else {
-                unreachable!("Network/Stack type mismatch")
-            };
-            let stack = s.get_mut();
-            net.ensure(pos, stack);
-            net.evaluate(pos, stack)
-        }
-        #[cfg(feature = "layerstack-arch")]
         AccumulatorStackVariant::LayerStacks(s) => {
             let net = network.as_layer_stacks();
             update_and_evaluate_layer_stacks_cached(net, pos, s, acc_cache)
         }
-        #[cfg(feature = "halfkx-arch")]
-        AccumulatorStackVariant::HalfKaSplit(s) => {
-            let NNUENetwork::HalfKaSplit(net) = &*network else {
-                unreachable!("Network/Stack type mismatch")
-            };
-            update_and_evaluate_halfka(net, pos, s, halfkx_cache)
-        }
-        #[cfg(feature = "halfkx-arch")]
-        AccumulatorStackVariant::HalfKaHmMerged(s) => {
-            let NNUENetwork::HalfKaHmMerged(net) = &*network else {
-                unreachable!("Network/Stack type mismatch")
-            };
-            update_and_evaluate_halfka_hm(net, pos, s, halfkx_cache)
-        }
-        #[cfg(feature = "halfkx-arch")]
-        AccumulatorStackVariant::HalfKaMerged(s) => {
-            let NNUENetwork::HalfKaMerged(net) = &*network else {
-                unreachable!("Network/Stack type mismatch")
-            };
-            update_and_evaluate_halfka_merged(net, pos, s, halfkx_cache)
-        }
-        #[cfg(feature = "halfkx-arch")]
-        AccumulatorStackVariant::HalfKaHmSplit(s) => {
-            let NNUENetwork::HalfKaHmSplit(net) = &*network else {
-                unreachable!("Network/Stack type mismatch")
-            };
-            update_and_evaluate_halfka_hm_split(net, pos, s, halfkx_cache)
-        }
-        #[cfg(feature = "halfkx-arch")]
-        AccumulatorStackVariant::HalfKP(s) => {
-            let NNUENetwork::HalfKP(net) = &*network else {
-                unreachable!("Network/Stack type mismatch")
-            };
-            update_and_evaluate_halfkp(net, pos, s, halfkx_cache)
-        }
-        #[cfg(not(feature = "halfkx-arch"))]
-        AccumulatorStackVariant::HalfKaSplit(_)
-        | AccumulatorStackVariant::HalfKaHmMerged(_)
-        | AccumulatorStackVariant::HalfKaMerged(_)
-        | AccumulatorStackVariant::HalfKaHmSplit(_)
+        #[cfg(not(feature = "layerstack-only"))]
+        AccumulatorStackVariant::HalfKA(s) => update_and_evaluate_halfka(&network, &*pos, s),
+        #[cfg(not(feature = "layerstack-only"))]
+        AccumulatorStackVariant::HalfKA_hm(s) => update_and_evaluate_halfka_hm(&network, &*pos, s),
+        #[cfg(not(feature = "layerstack-only"))]
+        AccumulatorStackVariant::HalfKP(s) => update_and_evaluate_halfkp(&network, &*pos, s),
+        #[cfg(feature = "layerstack-only")]
+        AccumulatorStackVariant::HalfKA(_)
+        | AccumulatorStackVariant::HalfKA_hm(_)
         | AccumulatorStackVariant::HalfKP(_) => {
-            unreachable!("halfkx-arch disabled: HalfKX variant cannot exist in this build")
+            unreachable!("layerstack-only build: only LayerStacks variant is supported")
         }
     }
 }
 
 /// アキュムレータを計算済みにする（評価値の計算はしない）
 ///
-/// 探索は評価値を計算しないノードでもこの関数を呼ばない。アキュムレータは評価時に
-/// 計算済みの祖先から差分適用するか refresh するので、未計算のまま残してよい。
-/// ライブラリ利用者が評価前にアキュムレータだけを用意したい場合に使う。
+/// TTヒット時など、評価値はTTから取得するが、
+/// 次のノードの差分更新のためにアキュムレータだけは計算しておく必要がある場合に使用。
+/// YaneuraOu/Stockfish互換の動作を実現する。
 ///
 /// `acc_cache` は LayerStacks 用 AccumulatorCaches（Finny Tables）。
 pub fn ensure_accumulator_computed(
@@ -2500,81 +1651,45 @@ pub fn ensure_accumulator_computed(
     stack: &mut AccumulatorStackVariant,
     acc_cache: &mut Option<LayerStacksAccCache>,
 ) {
-    // layerstack-arch 無効ビルドでは LayerStacks variant が存在せず acc_cache は使われない。
-    #[cfg(not(feature = "layerstack-arch"))]
-    let _ = acc_cache;
-
     // NNUEがなければ何もしない
     let Some(network) = get_network() else {
         return;
     };
-    // architecture feature を 1 つも持たないビルドでは、下の match に network / pos を参照する arm が無い。
-    #[cfg(not(any(
-        feature = "layerstack-arch",
-        feature = "halfkx-arch",
-        feature = "nnue-runtime-dimensions"
-    )))]
-    let _ = (&network, pos);
 
     // バリアントに応じてアキュムレータを更新（評価はしない）
     match stack {
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        AccumulatorStackVariant::DynamicLayerStacks(s) => {
-            let NNUENetwork::DynamicLayerStacks(net) = &*network else {
-                unreachable!("Network/Stack type mismatch")
-            };
-            net.ensure(pos, s.get_mut());
-        }
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        AccumulatorStackVariant::DynamicHalfKx(s) => {
-            let NNUENetwork::DynamicHalfKx(net) = &*network else {
-                unreachable!("Network/Stack type mismatch")
-            };
-            net.ensure(pos, s.get_mut());
-        }
-        #[cfg(feature = "layerstack-arch")]
         AccumulatorStackVariant::LayerStacks(s) => {
             let net = network.as_layer_stacks();
             net.update_accumulator(pos, s, acc_cache);
         }
-        #[cfg(feature = "halfkx-arch")]
-        AccumulatorStackVariant::HalfKaSplit(s) => {
+        #[cfg(not(feature = "layerstack-only"))]
+        AccumulatorStackVariant::HalfKA(s) => {
             update_accumulator_only_halfka(&network, pos, s);
         }
-        #[cfg(feature = "halfkx-arch")]
-        AccumulatorStackVariant::HalfKaHmMerged(s) => {
+        #[cfg(not(feature = "layerstack-only"))]
+        AccumulatorStackVariant::HalfKA_hm(s) => {
             update_accumulator_only_halfka_hm(&network, pos, s);
         }
-        #[cfg(feature = "halfkx-arch")]
-        AccumulatorStackVariant::HalfKaMerged(s) => {
-            update_accumulator_only_halfka_merged(&network, pos, s);
-        }
-        #[cfg(feature = "halfkx-arch")]
-        AccumulatorStackVariant::HalfKaHmSplit(s) => {
-            update_accumulator_only_halfka_hm_split(&network, pos, s);
-        }
-        #[cfg(feature = "halfkx-arch")]
+        #[cfg(not(feature = "layerstack-only"))]
         AccumulatorStackVariant::HalfKP(s) => {
             update_accumulator_only_halfkp(&network, pos, s);
         }
-        #[cfg(not(feature = "halfkx-arch"))]
-        AccumulatorStackVariant::HalfKaSplit(_)
-        | AccumulatorStackVariant::HalfKaHmMerged(_)
-        | AccumulatorStackVariant::HalfKaMerged(_)
-        | AccumulatorStackVariant::HalfKaHmSplit(_)
+        #[cfg(feature = "layerstack-only")]
+        AccumulatorStackVariant::HalfKA(_)
+        | AccumulatorStackVariant::HalfKA_hm(_)
         | AccumulatorStackVariant::HalfKP(_) => {
-            unreachable!("halfkx-arch disabled: HalfKX variant cannot exist in this build")
+            unreachable!("layerstack-only build: only LayerStacks variant is supported")
         }
     }
 }
 
-/// HalfKaHmMerged アキュムレータを更新のみ（評価なし）
-#[cfg(feature = "halfkx-arch")]
+/// HalfKA_hm アキュムレータを更新のみ（評価なし）
+#[cfg(not(feature = "layerstack-only"))]
 #[inline]
 fn update_accumulator_only_halfka_hm(
     network: &NNUENetwork,
     pos: &Position,
-    stack: &mut HalfKaHmMergedStack,
+    stack: &mut HalfKA_hmStack,
 ) {
     if stack.is_current_computed() {
         count_already_computed!();
@@ -2600,14 +1715,10 @@ fn update_accumulator_only_halfka_hm(
     }
 }
 
-/// HalfKaSplit アキュムレータを更新のみ（評価なし）
-#[cfg(feature = "halfkx-arch")]
+/// HalfKA アキュムレータを更新のみ（評価なし）
+#[cfg(not(feature = "layerstack-only"))]
 #[inline]
-fn update_accumulator_only_halfka(
-    network: &NNUENetwork,
-    pos: &Position,
-    stack: &mut HalfKaSplitStack,
-) {
+fn update_accumulator_only_halfka(network: &NNUENetwork, pos: &Position, stack: &mut HalfKAStack) {
     if stack.is_current_computed() {
         count_already_computed!();
         return;
@@ -2632,64 +1743,8 @@ fn update_accumulator_only_halfka(
     }
 }
 
-#[cfg(feature = "halfkx-arch")]
-fn update_accumulator_only_halfka_merged(
-    network: &NNUENetwork,
-    pos: &Position,
-    stack: &mut HalfKaMergedStack,
-) {
-    if stack.is_current_computed() {
-        count_already_computed!();
-        return;
-    }
-
-    let mut updated = false;
-
-    if let Some(prev_idx) = stack.current_previous()
-        && stack.is_entry_computed(prev_idx)
-    {
-        let dirty = stack.current_dirty_piece();
-        network.update_accumulator_halfka_merged(pos, &dirty, stack, prev_idx);
-        count_update!();
-        updated = true;
-    }
-
-    if !updated {
-        network.refresh_accumulator_halfka_merged(pos, stack);
-        count_refresh!();
-    }
-}
-
-#[cfg(feature = "halfkx-arch")]
-fn update_accumulator_only_halfka_hm_split(
-    network: &NNUENetwork,
-    pos: &Position,
-    stack: &mut HalfKaHmSplitStack,
-) {
-    if stack.is_current_computed() {
-        count_already_computed!();
-        return;
-    }
-
-    let mut updated = false;
-
-    if let Some(prev_idx) = stack.current_previous()
-        && stack.is_entry_computed(prev_idx)
-    {
-        let dirty = stack.current_dirty_piece();
-        network.update_accumulator_halfka_hm_split(pos, &dirty, stack, prev_idx);
-        count_update!();
-        updated = true;
-    }
-
-    if !updated {
-        network.refresh_accumulator_halfka_hm_split(pos, stack);
-        count_refresh!();
-    }
-}
-
 /// HalfKP アキュムレータを更新のみ（評価なし）
-#[cfg(feature = "halfkx-arch")]
+#[cfg(not(feature = "layerstack-only"))]
 #[inline]
 fn update_accumulator_only_halfkp(network: &NNUENetwork, pos: &Position, stack: &mut HalfKPStack) {
     if stack.is_current_computed() {
@@ -2719,328 +1774,39 @@ fn update_accumulator_only_halfkp(network: &NNUENetwork, pos: &Position, stack: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nnue::constants::DEFAULT_NUM_BUCKETS;
     use crate::position::SFEN_HIRATE;
 
-    #[cfg(all(
-        feature = "nnue-runtime-dimensions",
-        feature = "layerstack-arch",
-        feature = "layerstacks-1536x16x32",
-        feature = "ft-halfka_hm_merged"
-    ))]
+    /// NNUEが初期化されていない場合のフォールバック動作をテスト
     #[test]
-    fn static_dispatch_rejects_unsupported_headers() {
-        fn header(arch: &str) -> Cursor<Vec<u8>> {
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&NNUE_VERSION_LAYERSTACK_NUM_BUCKETS.to_le_bytes());
-            bytes.extend_from_slice(&0u32.to_le_bytes());
-            bytes.extend_from_slice(&(arch.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(arch.as_bytes());
-            bytes.extend_from_slice(&8u32.to_le_bytes());
-            Cursor::new(bytes)
-        }
-        let base = "Features=HalfKaHmMerged[73305->1536x2],LayerStacks,l2=16,l3=32";
-        for arch in [
-            base.replace("1536x2", "128x2"),
-            format!("{base},PSQT=8"),
-            format!("{base},ThreatProfile=0"),
-            format!("{base},ls_bucket=ownking:2/3/4/5/6/7/8"),
-        ] {
-            let mut reader = header(&arch);
-            assert!(
-                !layer_stacks_uses_static_slot(&mut reader, NNUEArchitectureOverride::Auto, false)
-                    .unwrap()
-            );
-            assert_eq!(reader.position(), 0);
-        }
-        let mut reader = header(base);
-        assert_eq!(
-            layer_stacks_uses_static_slot(&mut reader, NNUEArchitectureOverride::Auto, false)
-                .unwrap(),
-            !cfg!(feature = "nnue-progress-diff") && !cfg!(feature = "nnue-effect-bucket")
-        );
-        assert!(
-            !layer_stacks_uses_static_slot(
-                &mut reader,
-                NNUEArchitectureOverride::LayerStacks,
-                false
-            )
-            .unwrap()
-        );
-        assert!(
-            !layer_stacks_uses_static_slot(&mut reader, NNUEArchitectureOverride::Auto, true)
-                .unwrap()
-        );
-        assert!(
-            layer_stacks_uses_static_slot(
-                &mut Cursor::new(vec![0]),
-                NNUEArchitectureOverride::Auto,
-                false
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn progress_weights_snapshot_survives_replacement_and_reset() {
-        let _guard = layer_stack_routing_test_guard();
-        reset_layer_stack_progress_kpabs_weights();
-        let zero = get_layer_stack_progress_kpabs_weights();
-        set_layer_stack_progress_kpabs_weights(
-            vec![1.25; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS].into_boxed_slice(),
-        )
-        .unwrap();
-        let mut original = get_layer_stack_progress_kpabs_weights();
-        set_layer_stack_progress_kpabs_weights(
-            vec![-0.75; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS].into_boxed_slice(),
-        )
-        .unwrap();
-        let replacement = get_layer_stack_progress_kpabs_weights();
-        reset_layer_stack_progress_kpabs_weights();
-        assert!(zero.iter().all(|&v| v == 0.0));
-        assert!(original.iter().all(|&v| v == 1.25));
-        assert!(replacement.iter().all(|&v| v == -0.75));
-        assert!(get_layer_stack_progress_kpabs_weights().iter().all(|&v| v == 0.0));
-        // 他テストのstackが旧係数を保持していても、解放確認は単独所有の値で行う。
-        Arc::make_mut(original.0.as_mut().unwrap());
-        let weak = Arc::downgrade(original.0.as_ref().unwrap());
-        assert!(weak.upgrade().is_some());
-        drop(original);
-        assert!(weak.upgrade().is_none());
-    }
-
-    #[test]
-    fn progress_weights_snapshot_is_independent_of_other_threads() {
-        let _guard = layer_stack_routing_test_guard();
-        set_layer_stack_progress_kpabs_weights(
-            vec![0.25; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS].into_boxed_slice(),
-        )
-        .unwrap();
-        let snapshot = get_layer_stack_progress_kpabs_weights();
-        let reader = snapshot.clone();
-        std::thread::spawn(move || {
-            reset_layer_stack_progress_kpabs_weights();
-            set_layer_stack_progress_kpabs_weights(
-                vec![0.5; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS].into_boxed_slice(),
-            )
-            .unwrap();
-            assert!(reader.iter().all(|&v| v == 0.25));
-        })
-        .join()
-        .unwrap();
-        assert!(snapshot.iter().all(|&v| v == 0.25));
-        assert!(set_layer_stack_progress_kpabs_weights(vec![0.0].into_boxed_slice()).is_err());
-        assert!(get_layer_stack_progress_kpabs_weights().iter().all(|&v| v == 0.5));
-        reset_layer_stack_progress_kpabs_weights();
-    }
-
-    #[test]
-    fn progress_sum_rejects_incorrect_coefficient_lengths() {
+    fn test_evaluate_fallback() {
         let mut pos = Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
-        for len in [
-            0,
-            1,
-            SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS - 1,
-            SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS + 1,
-        ] {
-            let weights = vec![0.0; len];
-            let result = std::panic::catch_unwind(|| compute_progresskpabs_sum(&pos, &weights));
-            assert!(result.is_err(), "coefficient length {len} was accepted");
-        }
+        let mut stack = AccumulatorStackVariant::new_default();
+
+        // NNUEが初期化されていない場合はフォールバック
+        let value = evaluate_dispatch(&mut pos, &mut stack, &mut None);
+
+        // フォールバック評価が動作することを確認
+        assert!(value.raw().abs() < 1000);
     }
 
+    /// AccumulatorStackVariant を使った評価のテスト
+    /// NNUEが未初期化でもフォールバックで評価が動作することを確認
     #[test]
-    fn progress_sum_matches_q16_for_integral_coefficients() {
+    fn test_accumulator_stack_variant_fallback() {
         let mut pos = Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
-        let integers: Vec<i32> = (0..SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS)
-            .map(|index| (index % 17) as i32 - 8)
-            .collect();
-        let floats: Vec<f32> = integers.iter().map(|&value| value as f32).collect();
-        assert_eq!(
-            compute_progresskpabs_sum(&pos, &floats),
-            super::super::progress_q16::compute_progresskpabs_q16_sum(&pos, &integers) as f32,
-        );
-    }
+        let mut stack = AccumulatorStackVariant::new_default();
 
-    #[cfg(any(
-        feature = "nnue-runtime-dimensions",
-        all(
-            feature = "layerstack-arch",
-            feature = "nnue-effect-bucket",
-            feature = "layerstacks-512x16x32"
-        )
-    ))]
-    #[test]
-    fn effect_bucket_e4_alias_matches_canonical_header_evaluation() {
-        use crate::nnue::evaluator::NNUEEvaluator;
-        use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
+        // 1回目の evaluate: NNUEが未初期化なのでフォールバック評価
+        let value1 = evaluate_dispatch(&mut pos, &mut stack, &mut None);
 
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        const L1: usize = 2;
-        #[cfg(not(feature = "nnue-runtime-dimensions"))]
-        const L1: usize = 512;
+        // 2回目も動作することを確認
+        let value2 = evaluate_dispatch(&mut pos, &mut stack, &mut None);
 
-        fn replace_architecture(bytes: &mut Vec<u8>, architecture: &str) {
-            let original_len =
-                u32::from_le_bytes(bytes[8..12].try_into().expect("architecture size"));
-            let original_end = 12 + usize::try_from(original_len).expect("architecture length");
-            let replacement_len = u32::try_from(architecture.len()).expect("replacement length");
-            bytes.splice(
-                8..original_end,
-                replacement_len.to_le_bytes().into_iter().chain(architecture.bytes()),
-            );
-        }
-
-        fn evaluate(bytes: &[u8], pos: &Position) -> Value {
-            let network = NNUENetwork::from_bytes(bytes).expect("effect bucket network");
-            assert!(network.is_layer_stacks());
-            let mut evaluator = NNUEEvaluator::new_with_position(Arc::new(network), pos);
-            evaluator.evaluate(pos)
-        }
-
-        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
-        let input_dimensions = crate::nnue::EffectBucketConfig::KINGFIXED_2X2.dimensions();
-        let synthetic =
-            build_synthetic_layer_stacks("HalfKaHmMerged", input_dimensions, L1, 16, 32, 1);
-        let mut bytes = synthetic.bytes;
-        configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, 1, Some(1))
-            .expect("routing");
-        let mut pos = Position::new();
-        pos.set_sfen(SFEN_HIRATE).expect("hirate");
-
-        let canonical_arch = format!(
-            "Features=HalfKaHmMerged[{input_dimensions}->{L1}x2],EffectBucket=2x2fixed,l2=16,l3=32"
-        );
-        replace_architecture(&mut bytes, &canonical_arch);
-        let canonical_value = evaluate(&bytes, &pos);
-
-        let alias_arch =
-            format!("Features=HalfKaHmMerged[{input_dimensions}->{L1}x2],E4=4xfixed,l2=16,l3=32");
-        replace_architecture(&mut bytes, &alias_arch);
-        assert_eq!(evaluate(&bytes, &pos), canonical_value);
-
-        reset_layer_stack_progress_buckets();
-        drop(routing_guard);
-    }
-
-    #[cfg(all(
-        feature = "layerstack-arch",
-        feature = "ft-halfka_hm_merged",
-        feature = "layerstacks-512x16x32",
-        not(feature = "nnue-runtime-dimensions"),
-        not(feature = "nnue-psqt"),
-        not(feature = "nnue-threat"),
-        not(feature = "nnue-effect-bucket")
-    ))]
-    #[test]
-    fn const_generic_layer_stacks_applies_all_net_delta_kinds() {
-        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
-        use crate::nnue::constants::HALFKA_HM_DIMENSIONS;
-        use crate::nnue::evaluator::NNUEEvaluator;
-        use crate::nnue::net_bin_layout::apply_deltas;
-        use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
-        use crate::nnue::net_delta::{NetCoefficientId, NetDelta, NetTensorKind};
-
-        reset_layer_stack_progress_kpabs_weights();
-        configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, 4, Some(4))
-            .expect("routing");
-        let synthetic =
-            build_synthetic_layer_stacks("HalfKaHmMerged", HALFKA_HM_DIMENSIONS, 512, 16, 32, 4);
-        assert_eq!(synthetic.buckets.len(), 4);
-        assert!(synthetic.ft_biases < synthetic.buckets[0].l2_weights);
-        assert!(synthetic.buckets[0].l2_weights < synthetic.buckets[0].output_bias);
-        assert!(synthetic.buckets[0].output_bias < synthetic.buckets[0].output_weights);
-        let mut pos = Position::new();
-        pos.set_sfen(SFEN_HIRATE).expect("hirate");
-        let selected_bucket = compute_layer_stack_progresskpabs_bucket_index(
-            &pos,
-            pos.side_to_move(),
-            &get_layer_stack_progress_kpabs_weights(),
-            4,
-        );
-        assert_eq!(selected_bucket, 2);
-
-        let evaluate = |deltas: &[NetDelta]| {
-            let mut network = NNUENetwork::from_bytes(&synthetic.bytes).expect("synthetic net");
-            network.apply_net_deltas(deltas).expect("apply deltas");
-            let mut evaluator = NNUEEvaluator::new_with_position(Arc::new(network), &pos);
-            evaluator.evaluate(&pos)
-        };
-        let baseline = evaluate(&[]);
-        let cases = [
-            (
-                NetCoefficientId {
-                    kind: NetTensorKind::OutputWeight,
-                    bucket: Some(selected_bucket),
-                    index: 0,
-                },
-                64,
-            ),
-            (
-                NetCoefficientId {
-                    kind: NetTensorKind::OutputBias,
-                    bucket: Some(selected_bucket),
-                    index: 0,
-                },
-                256,
-            ),
-            (
-                NetCoefficientId {
-                    kind: NetTensorKind::FtBias,
-                    bucket: None,
-                    index: 0,
-                },
-                48,
-            ),
-            (
-                NetCoefficientId {
-                    kind: NetTensorKind::L2Weight,
-                    bucket: Some(selected_bucket),
-                    index: 15,
-                },
-                64,
-            ),
-        ];
-        let mut all_deltas = Vec::new();
-        for (id, delta) in cases {
-            let base_network = NNUENetwork::from_bytes(&synthetic.bytes).expect("synthetic net");
-            let base = base_network.net_coefficient(&id).expect("coefficient");
-            let net_delta = NetDelta {
-                id: id.clone(),
-                delta,
-            };
-            let mut network = NNUENetwork::from_bytes(&synthetic.bytes).expect("synthetic net");
-            let report =
-                network.apply_net_deltas(std::slice::from_ref(&net_delta)).expect("apply delta");
-            assert_eq!(report.applied, 1);
-            assert_eq!(report.clamped, 0);
-            assert_eq!(network.net_coefficient(&id).expect("coefficient"), base + delta);
-
-            let from_delta = evaluate(std::slice::from_ref(&net_delta));
-            assert_ne!(
-                from_delta,
-                baseline,
-                "{}: baseline={baseline:?}, from_delta={from_delta:?}",
-                id.usi_name()
-            );
-            all_deltas.push(net_delta);
-        }
-        let from_runtime_deltas = evaluate(&all_deltas);
-        let mut input = std::io::Cursor::new(&synthetic.bytes);
-        let mut patched = Vec::new();
-        let report = apply_deltas(&mut input, &mut patched, &all_deltas).expect("patch net bytes");
-        let patched_network = NNUENetwork::from_bytes(&patched).expect("patched net");
-        let mut patched_evaluator =
-            NNUEEvaluator::new_with_position(Arc::new(patched_network), &pos);
-        assert_eq!(patched_evaluator.evaluate(&pos), from_runtime_deltas);
-        assert_eq!(report.applied, all_deltas.len());
-        assert_eq!(report.clamped, 0);
-        reset_layer_stack_progress_buckets();
-        reset_layer_stack_progress_kpabs_weights();
-
-        drop(routing_guard);
+        // フォールバックの駒得評価は手番に依存して符号が変わる可能性があるが、
+        // ここでは「評価が成功した」ことのみ検証する。
+        let _ = (value1, value2);
     }
 
     /// NNUENetwork のアーキテクチャ自動検出テスト
@@ -3051,11 +1817,9 @@ mod tests {
     /// テスト結果 (epoch82.nnue):
     /// - LayerStacks として正しく認識される
     /// - 評価値: 0 (学習初期のモデル)
-    #[cfg(feature = "layerstack-arch")]
     #[test]
     #[ignore]
     fn test_nnue_network_auto_detect_layer_stacks() {
-        let routing_guard = crate::nnue::network::layer_stack_routing_test_guard();
         let path = std::env::var("NNUE_TEST_FILE")
             .unwrap_or_else(|_| "/path/to/your/layer_stacks.nnue".to_string());
         let network = match NNUENetwork::load(path) {
@@ -3070,12 +1834,6 @@ mod tests {
         assert!(network.is_layer_stacks(), "epoch82.nnue should be detected as LayerStacks");
         assert_eq!(network.architecture_name(), "LayerStacks");
 
-        // 評価前に routing の明示設定が必要。smoke 用に stored=routing の progresskpabs
-        // (係数ゼロ = 常に中央 bucket) を使う。
-        let stored = network.layer_stack_num_buckets().expect("LayerStacks checked above");
-        configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, stored, Some(stored))
-            .unwrap();
-
         // LayerStacks 用の評価が動作することを確認
         let mut pos = crate::position::Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
@@ -3084,13 +1842,11 @@ mod tests {
         let mut stack = ls_net.new_acc_stack();
         let mut acc_cache = Some(ls_net.new_acc_cache());
         ls_net.update_accumulator(&pos, &mut stack, &mut acc_cache);
-        let value = ls_net.evaluate(&pos, &stack);
+        let value = ls_net.evaluate(&mut pos, &stack);
         eprintln!("LayerStacks evaluate: {}", value.raw());
 
         // 評価値が妥当な範囲内
         assert!(value.raw().abs() < 1000);
-
-        drop(routing_guard);
     }
 
     /// detect_format のファイルサイズベース検出テスト
@@ -3155,7 +1911,7 @@ mod tests {
         bytes.extend_from_slice(&NNUE_VERSION_HALFKA.to_le_bytes()); // version
         bytes.extend_from_slice(&0u32.to_le_bytes()); // hash
 
-        let arch_str = "Features=HalfKaHmMerged[73305->512x2],l2=8,l3=96";
+        let arch_str = "Features=HalfKA_hm[73305->512x2],l2=8,l3=96";
         let arch_len = arch_str.len() as u32;
         bytes.extend_from_slice(&arch_len.to_le_bytes());
         bytes.extend_from_slice(arch_str.as_bytes());
@@ -3164,7 +1920,7 @@ mod tests {
             detect_format(&bytes, unknown_file_size).expect("Should fallback to header parsing");
 
         // ヘッダーからパースした値が使われることを確認
-        assert_eq!(info.architecture, "HalfKaHmMerged512");
+        assert_eq!(info.architecture, "HalfKA_hm512");
         assert_eq!(info.l1_dimension, 512);
         assert_eq!(info.l2_dimension, 8);
         assert_eq!(info.l3_dimension, 96);
@@ -3223,98 +1979,39 @@ mod tests {
         );
     }
 
-    // halfkx-arch 無効ビルドでは HalfKX モデルの load 自体が拒否される
-    // (`halfkx_model_rejected_without_halfkx_arch` で検証)。
-    #[cfg(any(feature = "halfkx-arch", feature = "nnue-runtime-dimensions"))]
-    #[test]
-    fn halfkp_loader_override_respects_payload() {
-        use super::super::network_halfkp::{HalfKP256CReLU, halfkp_loader_fixture};
-        use std::io::Cursor;
-        let arch = "Features=HalfKA(Friend)[125388->256x2],l2=32,l3=32";
-        let bytes = halfkp_loader_fixture(256, arch);
-        let network = NNUENetwork::read_with_architecture_override(
-            &mut Cursor::new(&bytes),
-            NNUEArchitectureOverride::HalfKP,
-        )
-        .expect("compatible HalfKP payload with wrong feature header");
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        assert!(matches!(network, NNUENetwork::DynamicHalfKx(_)));
-        let correct =
-            halfkp_loader_fixture(256, "Features=HalfKP(Friend)[125388->256x2],l2=32,l3=32");
-        assert!(
-            NNUENetwork::read_with_architecture_override(
-                &mut Cursor::new(&correct),
-                NNUEArchitectureOverride::Auto
-            )
-            .is_ok()
-        );
-
-        let mut pos = crate::position::Position::new();
-        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
-            .unwrap();
-        let fixed = HalfKP256CReLU::read(&mut Cursor::new(&bytes)).unwrap();
-        let mut fixed_acc = crate::nnue::network_halfkp::AccumulatorHalfKP::<256>::new();
-        fixed.refresh_accumulator(&pos, &mut fixed_acc);
-        let mut evaluator =
-            crate::nnue::NNUEEvaluator::new_with_position(std::sync::Arc::new(network), &pos);
-        assert_eq!(evaluator.evaluate(&pos), fixed.evaluate(&pos, &fixed_acc));
-        assert!(fixed.evaluate(&pos, &fixed_acc).raw() != 0);
-        assert!(
-            NNUENetwork::read_with_architecture_override(
-                &mut Cursor::new(&bytes),
-                NNUEArchitectureOverride::Auto
-            )
-            .is_err()
-        );
-        assert!(
-            NNUENetwork::read_with_architecture_override(
-                &mut Cursor::new(&bytes[..bytes.len() - 1]),
-                NNUEArchitectureOverride::HalfKP
-            )
-            .is_err()
-        );
-        assert!(
-            NNUENetwork::read_with_architecture_override(
-                &mut Cursor::new(&bytes),
-                NNUEArchitectureOverride::HalfKaSplit
-            )
-            .is_err()
-        );
-    }
-
     /// parse_fv_scale_from_arch のユニットテスト
     #[test]
     fn test_parse_fv_scale_from_arch() {
         // bullet-shogi 形式の arch_str
         assert_eq!(
             parse_fv_scale_from_arch(
-                "Features=HalfKaHmMerged^[73305->256x2]-SCReLU,fv_scale=13,qa=127,qb=64,scale=600"
+                "Features=HalfKA_hm^[73305->256x2]-SCReLU,fv_scale=13,qa=127,qb=64,scale=600"
             ),
             Some(13)
         );
         assert_eq!(
             parse_fv_scale_from_arch(
-                "Features=HalfKaHmMerged^[73305->512x2]-SCReLU,fv_scale=20,qa=127,qb=64,scale=400"
+                "Features=HalfKA_hm^[73305->512x2]-SCReLU,fv_scale=20,qa=127,qb=64,scale=400"
             ),
             Some(20)
         );
         assert_eq!(
             parse_fv_scale_from_arch(
-                "Features=HalfKaHmMerged^[73305->1024x2]-SCReLU,fv_scale=16,qa=127,qb=64,scale=508"
+                "Features=HalfKA_hm^[73305->1024x2]-SCReLU,fv_scale=16,qa=127,qb=64,scale=508"
             ),
             Some(16)
         );
 
         // fv_scale が含まれていない従来形式
         assert_eq!(parse_fv_scale_from_arch("Features=HalfKP[125388->256x2]"), None);
-        assert_eq!(parse_fv_scale_from_arch("Features=HalfKaHmMerged^[73305->512x2]"), None);
+        assert_eq!(parse_fv_scale_from_arch("Features=HalfKA_hm^[73305->512x2]"), None);
 
         // 空文字列
         assert_eq!(parse_fv_scale_from_arch(""), None);
 
         // 不正な fv_scale 値（文字列）
         assert_eq!(
-            parse_fv_scale_from_arch("Features=HalfKaHmMerged^[73305->256x2],fv_scale=abc"),
+            parse_fv_scale_from_arch("Features=HalfKA_hm^[73305->256x2],fv_scale=abc"),
             None
         );
     }
@@ -3360,114 +2057,22 @@ mod tests {
     #[test]
     fn test_parse_layer_stack_bucket_mode() {
         assert_eq!(
-            parse_layer_stack_bucket_mode("kingrank9"),
-            Some(LayerStackBucketMode::KingRank9)
+            parse_layer_stack_bucket_mode("progress8kpabs"),
+            Some(LayerStackBucketMode::Progress8KPAbs)
         );
         assert_eq!(
-            parse_layer_stack_bucket_mode(" KINGRANK9 "),
-            Some(LayerStackBucketMode::KingRank9)
+            parse_layer_stack_bucket_mode("PROGRESS8KPABS"),
+            Some(LayerStackBucketMode::Progress8KPAbs)
         );
         assert_eq!(
-            parse_layer_stack_bucket_mode("progresskpabs"),
-            Some(LayerStackBucketMode::ProgressKPAbs)
-        );
-        assert_eq!(
-            parse_layer_stack_bucket_mode("PROGRESSKPABS"),
-            Some(LayerStackBucketMode::ProgressKPAbs)
-        );
-        assert_eq!(
-            parse_layer_stack_bucket_mode(" progresskpabs "),
-            Some(LayerStackBucketMode::ProgressKPAbs)
+            parse_layer_stack_bucket_mode(" progress8kpabs "),
+            Some(LayerStackBucketMode::Progress8KPAbs)
         );
         assert_eq!(parse_layer_stack_bucket_mode("unknown"), None);
-        assert_eq!(parse_layer_stack_bucket_mode("progress8kpabs"), None);
         assert_eq!(parse_layer_stack_bucket_mode("progress8"), None);
         assert_eq!(parse_layer_stack_bucket_mode("progress8gikou"), None);
+        assert_eq!(parse_layer_stack_bucket_mode("kingrank9"), None);
         assert_eq!(parse_layer_stack_bucket_mode("ply9"), None);
-    }
-
-    #[test]
-    fn test_validate_layer_stack_routing_configuration() {
-        assert!(
-            validate_layer_stack_routing_configuration(
-                LayerStackBucketMode::ProgressKPAbs,
-                9,
-                Some(8),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(
-                LayerStackBucketMode::ProgressKPAbs,
-                8,
-                Some(8),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(LayerStackBucketMode::KingRank9, 9, None,)
-                .is_ok()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(
-                LayerStackBucketMode::ProgressKPAbs,
-                1,
-                Some(1),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(
-                LayerStackBucketMode::ProgressKPAbs,
-                9,
-                Some(1),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(
-                LayerStackBucketMode::ProgressKPAbs,
-                1,
-                Some(0),
-            )
-            .is_err()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(
-                LayerStackBucketMode::ProgressKPAbs,
-                8,
-                None,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(
-                LayerStackBucketMode::ProgressKPAbs,
-                MAX_LAYER_STACK_BUCKETS + 1,
-                Some(MAX_LAYER_STACK_BUCKETS + 1),
-            )
-            .is_err()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(
-                LayerStackBucketMode::ProgressKPAbs,
-                8,
-                Some(9),
-            )
-            .is_err()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(LayerStackBucketMode::KingRank9, 8, None,)
-                .is_err()
-        );
-        assert!(
-            validate_layer_stack_routing_configuration(
-                LayerStackBucketMode::KingRank9,
-                9,
-                Some(8),
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -3476,20 +2081,8 @@ mod tests {
         assert_eq!(parse_nnue_architecture("AUTO"), Some(NNUEArchitectureOverride::Auto));
         assert_eq!(parse_nnue_architecture("Auto"), Some(NNUEArchitectureOverride::Auto));
         assert_eq!(parse_nnue_architecture("halfkp"), Some(NNUEArchitectureOverride::HalfKP));
-        // 旧名 (underscore short form) と新名 (underscore long form) の両方を受理。
-        assert_eq!(
-            parse_nnue_architecture("halfka_hm"),
-            Some(NNUEArchitectureOverride::HalfKaHmMerged)
-        );
-        assert_eq!(
-            parse_nnue_architecture("halfka_hm_merged"),
-            Some(NNUEArchitectureOverride::HalfKaHmMerged)
-        );
-        assert_eq!(parse_nnue_architecture("halfka"), Some(NNUEArchitectureOverride::HalfKaSplit));
-        assert_eq!(
-            parse_nnue_architecture("halfka_split"),
-            Some(NNUEArchitectureOverride::HalfKaSplit)
-        );
+        assert_eq!(parse_nnue_architecture("halfka_hm"), Some(NNUEArchitectureOverride::HalfKA_hm));
+        assert_eq!(parse_nnue_architecture("halfka"), Some(NNUEArchitectureOverride::HalfKA));
         assert_eq!(
             parse_nnue_architecture("layerstacks"),
             Some(NNUEArchitectureOverride::LayerStacks)
@@ -3507,359 +2100,70 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_layer_stack_progresskpabs_bucket_index_range() {
+    fn test_compute_layer_stack_progress8kpabs_bucket_index_range() {
         let mut pos = Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
 
         let weights = vec![0.0f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS];
-        // routing N=9 で確認: sigmoid(0) = 0.5 →
-        // floor(0.5 * 9) = 4 (中間 bucket)。
-        let b = compute_layer_stack_progresskpabs_bucket_index(
-            &pos,
-            pos.side_to_move(),
-            &weights,
-            DEFAULT_NUM_BUCKETS,
-        );
-        assert_eq!(b, 4, "zero-weight progresskpabs at N=9 should map to bucket 4");
+        let b = compute_layer_stack_progress8kpabs_bucket_index(&pos, pos.side_to_move(), &weights);
+        assert_eq!(b, 4, "zero-weight progress8kpabs should map to the middle bucket");
+    }
 
-        // routing N=1 (no-op routing): 係数未ロード (ゼロ重み) でも常に bucket 0。
-        let b1 =
-            compute_layer_stack_progresskpabs_bucket_index(&pos, pos.side_to_move(), &weights, 1);
-        assert_eq!(b1, 0, "N=1 no-op routing should always map to bucket 0");
+    #[test]
+    fn test_progress_sum_to_bucket_and_frac_range() {
+        // 様々な sum で frac が 0..=255 に収まり、bucket が progress_sum_to_bucket と一致する
+        for i in -100..=100 {
+            let sum = i as f32 * 0.1;
+            let (bucket, frac) = progress_sum_to_bucket_and_frac(sum);
+            assert!(bucket <= 7, "bucket out of range: {bucket} (sum={sum})");
+            // frac は u8 なので型的に 0..=255。bucket が threshold 版と一致することを確認。
+            assert_eq!(
+                bucket,
+                progress_sum_to_bucket(sum),
+                "bucket mismatch with progress_sum_to_bucket at sum={sum}, frac={frac}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_bucket_index_and_frac_for_pos_consistency() {
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).unwrap();
+        // 重み未設定 (全ゼロ) なので sum=0 → progress=0.5 → bucket 4, frac=0。
+        let (bucket, frac) = get_bucket_index_and_frac_for_pos(&pos);
+        assert_eq!(bucket, get_bucket_index_for_pos(&pos), "bucket index 不一致");
+        assert_eq!(bucket, 4);
+        assert_eq!(frac, 0, "sum=0 では bucket 境界ちょうどなので frac=0");
     }
 
     #[test]
     fn test_progress_bucket_thresholds_match_sigmoid() {
-        // 浮動小数点演算の丸め差を含めて、sigmoid と閾値比較のバケット選択を照合する。
-        let sigmoid_bucket = |sum: f32, n: usize| -> usize {
+        const NUM_BUCKETS: usize = 8;
+        // テーブル引きが元の sigmoid 方式と一致することを確認
+        let sigmoid_bucket = |sum: f32| -> usize {
             let p = (1.0 / (1.0 + (-sum).exp())).clamp(0.0, 1.0);
-            let raw = (p * n as f32).floor() as i32;
-            raw.clamp(0, (n as i32) - 1) as usize
+            let raw = (p * NUM_BUCKETS as f32).floor() as i32;
+            raw.clamp(0, (NUM_BUCKETS - 1) as i32) as usize
         };
-        let sums = [
-            f32::NEG_INFINITY,
-            -10.0,
-            -5.0,
-            -3.0,
-            -2.5,
-            -1.5,
-            -0.8,
-            -0.3,
-            0.0,
-            0.3,
-            0.8,
-            1.5,
-            2.5,
-            3.0,
-            5.0,
-            10.0,
-            f32::INFINITY,
-        ];
-        for &n in &[
-            1usize,
-            2,
-            3,
-            4,
-            5,
-            8,
-            9,
-            12,
-            16,
-            32,
-            MAX_LAYER_STACK_BUCKETS,
-        ] {
-            for &sum in &sums {
-                let want = sigmoid_bucket(sum, n);
-                let got = progress_sum_to_bucket(sum, n);
-                assert_eq!(want, got, "mismatch at n={n}, sum={sum}");
-            }
-        }
-        // 閾値 t_k ちょうど での tie-break: sum = t_k ⇔ sigmoid(t_k) = k/N で
-        // floor(k) と partition_point の結果はいずれも k になる。
-        for n in 2..=MAX_LAYER_STACK_BUCKETS {
-            for k in 1..n {
-                let t_k = ((k as f32) / (n as f32 - k as f32)).ln();
-                assert_eq!(
-                    progress_sum_to_bucket(t_k, n),
-                    k,
-                    "tie-break failed at n={n}, k={k}, t_k={t_k}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn progresskpabs_routing_prepares_wide_thresholds() {
-        let _guard = layer_stack_routing_test_guard();
-        for (n, thresholds) in PROGRESS_BUCKET_THRESHOLDS.iter().enumerate().skip(33) {
-            configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, n, Some(n)).unwrap();
-            let thresholds = thresholds.get().unwrap();
-            assert_eq!(thresholds.len(), n - 1);
-            for (k, &threshold) in thresholds.iter().enumerate() {
-                assert_eq!(progress_sum_to_bucket(threshold, n), k + 1);
-            }
-        }
-        reset_layer_stack_progress_buckets();
-    }
-
-    #[test]
-    fn test_progress_sum_to_bucket_extremes() {
-        for n in 1..=MAX_LAYER_STACK_BUCKETS {
-            assert_eq!(progress_sum_to_bucket(f32::NEG_INFINITY, n), 0);
-            assert_eq!(progress_sum_to_bucket(f32::INFINITY, n), n - 1);
-        }
-        // N=1 は常に bucket 0
-        for &sum in &[-100.0, 0.0, 100.0] {
-            assert_eq!(progress_sum_to_bucket(sum, 1), 0);
-        }
-    }
-
-    /// LayerStack num_buckets-header layout の最小ヘッダを in-memory で作成
-    ///
-    /// `num_buckets` 検証や override 分岐の reject 経路を unit test するために、
-    /// FT/PSQT/LayerStack block を含まないヘッダだけの buffer を返す。
-    /// load 側は header 検証で reject する想定なので、それ以降の block は不要。
-    #[cfg(any(feature = "layerstack-arch", feature = "nnue-runtime-dimensions"))]
-    fn build_num_buckets_header_with_arch_suffix(num_buckets: u32, suffix: &str) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&NNUE_VERSION_LAYERSTACK_NUM_BUCKETS.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // network_hash (dummy)
-        let (l1, l2, l3) = [
-            (cfg!(feature = "layerstacks-1536x16x32"), (1536, 16, 32)),
-            (cfg!(feature = "layerstacks-1536x32x32"), (1536, 32, 32)),
-            (cfg!(feature = "layerstacks-768x16x32"), (768, 16, 32)),
-            (cfg!(feature = "layerstacks-768x8x32"), (768, 8, 32)),
-            (cfg!(feature = "layerstacks-512x16x32"), (512, 16, 32)),
-            (cfg!(feature = "layerstacks-1024x16x32"), (1024, 16, 32)),
-            (cfg!(feature = "layerstacks-3072x16x32"), (3072, 16, 32)),
-            (cfg!(feature = "layerstacks-1024x16x64"), (1024, 16, 64)),
-            (cfg!(feature = "layerstacks-2304x16x64"), (2304, 16, 64)),
-            (cfg!(feature = "layerstacks-3072x16x64"), (3072, 16, 64)),
-            (cfg!(feature = "layerstacks-1536x16x64"), (1536, 16, 64)),
-        ]
-        .into_iter()
-        .find_map(|(enabled, dims)| enabled.then_some(dims))
-        .unwrap_or((1536, 16, 32));
-        let (ft, input) = [
-            (cfg!(feature = "ft-halfka_hm_merged"), ("HalfKaHmMerged", 73305)),
-            (cfg!(feature = "ft-halfka_hm_split"), ("HalfKaHmSplit", 76950)),
-            (cfg!(feature = "ft-halfka_merged"), ("HalfKaMerged", 131949)),
-            (cfg!(feature = "ft-halfka_split"), ("HalfKaSplit", 138510)),
-            (cfg!(feature = "ft-halfkp"), ("HalfKP", 125388)),
-        ]
-        .into_iter()
-        .find_map(|(enabled, ft)| enabled.then_some(ft))
-        .unwrap_or(("HalfKaHmMerged", 73305));
-        let arch = format!(
-            "Features={ft}(Friend)[{input}->{l1}x2],LayerStacks,l2={l2},l3={l3},FV_SCALE=28{suffix}"
-        );
-        bytes.extend_from_slice(&(arch.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(arch.as_bytes());
-        bytes.extend_from_slice(&num_buckets.to_le_bytes());
-        bytes
-    }
-
-    #[cfg(any(feature = "layerstack-arch", feature = "nnue-runtime-dimensions"))]
-    fn build_num_buckets_header(num_buckets: u32) -> Vec<u8> {
-        build_num_buckets_header_with_arch_suffix(num_buckets, "")
-    }
-
-    #[cfg(any(
-        feature = "nnue-runtime-dimensions",
-        all(feature = "layerstack-arch", not(feature = "nnue-effect-bucket"))
-    ))]
-    #[test]
-    fn layer_stacks_rejects_psqt_above_32_buckets() {
-        for n in [33, 64] {
-            let bytes = build_num_buckets_header_with_arch_suffix(n, &format!(",PSQT={n}"));
-            let message = "LayerStacks nets with PSQT support at most 32 buckets";
-            let Err(err) = NNUENetwork::read_with_architecture_override(
-                &mut Cursor::new(&bytes),
-                NNUEArchitectureOverride::Auto,
-            ) else {
-                panic!("PSQT with {n} buckets must be rejected");
-            };
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-            assert_eq!(err.to_string(), message);
-            assert_eq!(
-                super::super::net_bin_layout::LayerStacksBinLayout::from_bytes(&bytes)
-                    .unwrap_err()
-                    .to_string(),
-                message
-            );
-
-            let bytes = build_num_buckets_header(n);
-            let Err(err) = NNUENetwork::read_with_architecture_override(
-                &mut Cursor::new(&bytes),
-                NNUEArchitectureOverride::LayerStacksPSQT,
-            ) else {
-                panic!("forced PSQT with {n} buckets must be rejected");
-            };
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-            assert_eq!(err.to_string(), message);
-        }
-    }
-
-    #[cfg(feature = "nnue-runtime-dimensions")]
-    #[test]
-    fn legacy_effect_bucket_auto_dispatches_to_dynamic_layer_stacks() {
-        let arch = b"Features=HalfKaHmMerged(Friend)[293220->2x2],EffectBucket=2x2fixed,l2=2,l3=1";
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&NNUE_VERSION_HALFKA.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&(arch.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(arch);
-
-        // The truncated payload must get as far as the LayerStacks reader. Before the dispatch
-        // fix it was rejected earlier by DynamicHalfKx as an unsupported feature set.
-        let err = match NNUENetwork::from_bytes(&bytes) {
-            Ok(_) => panic!("truncated legacy EffectBucket model must fail"),
-            Err(err) => err,
+        let threshold_bucket = |sum: f32| -> usize {
+            PROGRESS_BUCKET_THRESHOLDS
+                .iter()
+                .filter(|&&t| sum >= t)
+                .count()
+                .min(NUM_BUCKETS - 1)
         };
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
-    }
 
-    /// num_buckets-header layout で `num_buckets = 0` / 上限超過の値は
-    /// `InvalidData` で reject される
-    // effect bucket build の LayerStacks reader は `EffectBucket=` token を要求するため、
-    // 非 EffectBucket arch の num_buckets header はこのテスト対象外。
-    #[cfg(all(feature = "layerstack-arch", not(feature = "nnue-effect-bucket")))]
-    #[test]
-    fn test_layer_stack_num_buckets_out_of_range_rejected() {
-        for &n in &[0u32, (MAX_LAYER_STACK_BUCKETS as u32) + 1, 100, 1024] {
-            let bytes = build_num_buckets_header(n);
-            let err = match NNUENetwork::from_bytes(&bytes) {
-                Ok(_) => panic!(
-                    "num_buckets={n} は reject されるべき (許容範囲 1..={MAX_LAYER_STACK_BUCKETS})"
-                ),
-                Err(e) => e,
-            };
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "n={n}");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("num_buckets") || msg.contains(&n.to_string()),
-                "n={n} のエラーメッセージに num_buckets / 値が含まれていない: {msg}"
-            );
-        }
-    }
-
-    /// num_buckets-header layout を `NNUE_ARCHITECTURE=HalfKP` 等の
-    /// 非-LayerStack override で読むと早期 reject される (silent misread を防ぐ)
-    #[cfg(feature = "layerstack-arch")]
-    #[test]
-    fn test_layer_stack_num_buckets_header_with_non_layerstack_override_rejected() {
-        let bytes = build_num_buckets_header(9);
-        let previous_override = get_nnue_architecture_override();
-        for override_mode in [
-            NNUEArchitectureOverride::HalfKP,
-            NNUEArchitectureOverride::HalfKaHmMerged,
-            NNUEArchitectureOverride::HalfKaSplit,
+        // 閾値から離れた値では完全一致すべき
+        for &sum in &[
+            -10.0, -5.0, -3.0, -2.5, -1.5, -0.8, -0.3, 0.0, 0.3, 0.8, 1.5, 2.5, 3.0, 5.0, 10.0,
         ] {
-            set_nnue_architecture_override(override_mode);
-            let err = match NNUENetwork::from_bytes(&bytes) {
-                Ok(_) => panic!(
-                    "num_buckets-header net を {override_mode:?} override で読んだら reject されるべき"
-                ),
-                Err(e) => e,
-            };
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{override_mode:?}");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("LayerStack"),
-                "{override_mode:?} のエラーメッセージに LayerStack が含まれていない: {msg}"
-            );
-        }
-        set_nnue_architecture_override(previous_override);
-    }
-
-    /// HalfKP 256x32x32 (suisho5 系) のヘッダだけを持つ buffer を返す。
-    ///
-    /// FeatureSet 確定直後の reject 経路を検証するためのもので、本体 block は含まない。
-    #[cfg(not(any(
-        feature = "nnue-runtime-dimensions",
-        all(feature = "halfkx-arch", feature = "layerstack-arch")
-    )))]
-    fn build_halfkp_header() -> Vec<u8> {
-        let arch = b"Features=HalfKP(Friend)[125388->256x2],Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-32](ClippedReLU[32](AffineTransform[32<-512](InputSlice[512(0:512)])))))";
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&NNUE_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // network_hash (dummy)
-        bytes.extend_from_slice(&(arch.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(arch);
-        bytes
-    }
-
-    /// halfkx-arch 無効ビルドでは HalfKX モデルを load 時に `Unsupported` で拒否し、
-    /// 評価時の panic に到達させない (override で HalfKX FeatureSet を強制した場合も同様)。
-    #[cfg(not(any(feature = "halfkx-arch", feature = "nnue-runtime-dimensions")))]
-    #[test]
-    fn halfkx_model_rejected_without_halfkx_arch() {
-        let bytes = build_halfkp_header();
-        for (override_mode, feature_set) in [
-            (NNUEArchitectureOverride::Auto, FeatureSet::HalfKP),
-            (NNUEArchitectureOverride::HalfKP, FeatureSet::HalfKP),
-            (NNUEArchitectureOverride::HalfKaHmMerged, FeatureSet::HalfKaHmMerged),
-            (NNUEArchitectureOverride::HalfKaSplit, FeatureSet::HalfKaSplit),
-        ] {
-            let err = match NNUENetwork::read_with_architecture_override(
-                &mut Cursor::new(&bytes),
-                override_mode,
-            ) {
-                Ok(_) => panic!("{override_mode:?}: HalfKX model must be rejected"),
-                Err(err) => err,
-            };
-            assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{override_mode:?}: {err}");
-            let msg = err.to_string();
-            assert!(msg.contains("halfkx-arch"), "{override_mode:?}: {msg}");
-            assert!(msg.contains(feature_set.as_str()), "{override_mode:?}: {msg}");
-            assert!(msg.contains("256x32x32"), "{override_mode:?}: {msg}");
-        }
-    }
-
-    /// layerstack-arch 無効ビルドでは LayerStacks モデルを load 時に `Unsupported` で拒否する。
-    #[cfg(not(any(feature = "layerstack-arch", feature = "nnue-runtime-dimensions")))]
-    #[test]
-    fn layer_stacks_model_rejected_without_layerstack_arch() {
-        let mut num_buckets_header = Vec::new();
-        num_buckets_header.extend_from_slice(&NNUE_VERSION_LAYERSTACK_NUM_BUCKETS.to_le_bytes());
-        num_buckets_header.extend_from_slice(&0u32.to_le_bytes());
-        let (l1, l3) = if cfg!(feature = "layerstacks-1024x16x64") {
-            (1024, 64)
-        } else if cfg!(feature = "layerstacks-2304x16x64") {
-            (2304, 64)
-        } else if cfg!(feature = "layerstacks-3072x16x64") {
-            (3072, 64)
-        } else if cfg!(feature = "layerstacks-1536x16x64") {
-            (1536, 64)
-        } else {
-            (1536, 32)
-        };
-        let arch = format!(
-            "Features=HalfKaHmMerged(Friend)[73305->{l1}x2],LayerStacks,l2=16,l3={l3},FV_SCALE=28"
-        );
-        num_buckets_header.extend_from_slice(&(arch.len() as u32).to_le_bytes());
-        num_buckets_header.extend_from_slice(arch.as_bytes());
-        num_buckets_header.extend_from_slice(&9u32.to_le_bytes());
-
-        for (bytes, override_mode) in [
-            (num_buckets_header, NNUEArchitectureOverride::Auto),
-            (build_halfkp_header(), NNUEArchitectureOverride::LayerStacks),
-        ] {
-            let err = match NNUENetwork::read_with_architecture_override(
-                &mut Cursor::new(&bytes),
-                override_mode,
-            ) {
-                Ok(_) => panic!("{override_mode:?}: LayerStacks model must be rejected"),
-                Err(err) => err,
-            };
-            assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{override_mode:?}: {err}");
-            assert!(err.to_string().contains("layerstack-arch"), "{override_mode:?}: {err}");
+            assert_eq!(sigmoid_bucket(sum), threshold_bucket(sum), "mismatch at sum={sum}");
         }
     }
 
     #[cfg(feature = "nnue-progress-diff")]
     #[test]
-    fn test_progresskpabs_diff_update() {
+    fn test_progress8kpabs_diff_update() {
         use crate::types::Move;
 
         // ランダムな重みを生成（固定シード）
@@ -3877,7 +2181,7 @@ mod tests {
         pos.set_sfen(SFEN_HIRATE).unwrap();
 
         // 初期局面での全駒スキャン sum
-        let sum0 = compute_progresskpabs_sum(&pos, &weights);
+        let sum0 = compute_progress8kpabs_sum(&pos, &weights);
 
         // いくつかの手を実行して差分更新と全計算を比較
         let moves_usi = [
@@ -3891,8 +2195,8 @@ mod tests {
             let dirty = pos.do_move(mv, gives_check);
 
             // 全駒スキャンによる正解値
-            let expected_sum = compute_progresskpabs_sum(&pos, &weights);
-            let expected_bucket = progress_sum_to_bucket(expected_sum, DEFAULT_NUM_BUCKETS);
+            let expected_sum = compute_progress8kpabs_sum(&pos, &weights);
+            let expected_bucket = progress_sum_to_bucket(expected_sum);
 
             if dirty.king_moved[0] || dirty.king_moved[1] {
                 // 玉が動いた場合は差分更新不可（全計算にフォールバック）
@@ -3902,8 +2206,8 @@ mod tests {
                 let sq_bk = pos.king_square(Color::Black).index();
                 let sq_wk = pos.king_square(Color::White).inverse().index();
                 let diff_sum =
-                    update_progresskpabs_sum_diff(prev_sum, &dirty, sq_bk, sq_wk, &weights);
-                let diff_bucket = progress_sum_to_bucket(diff_sum, DEFAULT_NUM_BUCKETS);
+                    update_progress8kpabs_sum_diff(prev_sum, &dirty, sq_bk, sq_wk, &weights);
+                let diff_bucket = progress_sum_to_bucket(diff_sum);
 
                 assert!(
                     (diff_sum - expected_sum).abs() < 1e-5,
@@ -3981,7 +2285,7 @@ mod tests {
         assert!(value.raw().abs() < 10000, "Evaluation {} is out of expected range", value.raw());
     }
 
-    /// HalfKaHmMerged 256x2-32-32 ファイルの読み込みテスト
+    /// HalfKA_hm 256x2-32-32 ファイルの読み込みテスト
     ///
     /// nnue-pytorch 形式のファイルを FT hash を使って正しく読み込めることを確認する。
     ///
@@ -4009,8 +2313,8 @@ mod tests {
             }
         };
 
-        // HalfKaHmMerged として認識されることを確認
-        assert!(network.is_halfka_hm(), "File should be detected as HalfKaHmMerged");
+        // HalfKA_hm として認識されることを確認
+        assert!(network.is_halfka_hm(), "File should be detected as HalfKA_hm");
 
         // L1=256 が検出されることを確認
         assert_eq!(network.l1_size(), 256, "L1 should be 256");
@@ -4021,30 +2325,30 @@ mod tests {
         assert_eq!(spec.l2, 32, "spec.l2 should be 32");
         assert_eq!(spec.l3, 32, "spec.l3 should be 32");
 
-        eprintln!("Successfully loaded HalfKaHmMerged 256x2-32-32 network");
+        eprintln!("Successfully loaded HalfKA_hm 256x2-32-32 network");
         eprintln!("Architecture name: {}", network.architecture_name());
 
-        // HalfKaHmMerged 用の評価が動作することを確認
+        // HalfKA_hm 用の評価が動作することを確認
         let mut pos = crate::position::Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
 
-        // HalfKaHmMergedStack を作成して評価
-        use crate::nnue::halfka_hm_merged::HalfKaHmMergedStack;
-        let mut stack = HalfKaHmMergedStack::from_network(match &network {
-            NNUENetwork::HalfKaHmMerged(net) => net,
+        // HalfKA_hmStack を作成して評価
+        use crate::nnue::halfka_hm::HalfKA_hmStack;
+        let mut stack = HalfKA_hmStack::from_network(match &network {
+            NNUENetwork::HalfKA_hm(net) => net,
             _ => unreachable!(),
         });
 
         network.refresh_accumulator_halfka_hm(&pos, &mut stack);
         let value = network.evaluate_halfka_hm(&pos, &stack);
 
-        eprintln!("HalfKaHmMerged 256 evaluate: {}", value.raw());
+        eprintln!("HalfKA_hm 256 evaluate: {}", value.raw());
 
         // 評価値が妥当な範囲内
         assert!(value.raw().abs() < 10000, "Evaluation {} is out of expected range", value.raw());
     }
 
-    /// HalfKaHmMerged 1024x2-8-96 ファイルの読み込みテスト
+    /// HalfKA_hm 1024x2-8-96 ファイルの読み込みテスト
     ///
     /// 実行方法:
     /// ```bash
@@ -4070,8 +2374,8 @@ mod tests {
             }
         };
 
-        // HalfKaHmMerged として認識されることを確認
-        assert!(network.is_halfka_hm(), "File should be detected as HalfKaHmMerged");
+        // HalfKA_hm として認識されることを確認
+        assert!(network.is_halfka_hm(), "File should be detected as HalfKA_hm");
 
         // L1=1024 が検出されることを確認
         assert_eq!(network.l1_size(), 1024, "L1 should be 1024");
@@ -4082,24 +2386,24 @@ mod tests {
         assert_eq!(spec.l2, 8, "spec.l2 should be 8");
         assert_eq!(spec.l3, 96, "spec.l3 should be 96");
 
-        eprintln!("Successfully loaded HalfKaHmMerged 1024x2-8-96 network");
+        eprintln!("Successfully loaded HalfKA_hm 1024x2-8-96 network");
         eprintln!("Architecture name: {}", network.architecture_name());
 
-        // HalfKaHmMerged 用の評価が動作することを確認
+        // HalfKA_hm 用の評価が動作することを確認
         let mut pos = crate::position::Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
 
-        // HalfKaHmMergedStack を作成して評価
-        use crate::nnue::halfka_hm_merged::HalfKaHmMergedStack;
-        let mut stack = HalfKaHmMergedStack::from_network(match &network {
-            NNUENetwork::HalfKaHmMerged(net) => net,
+        // HalfKA_hmStack を作成して評価
+        use crate::nnue::halfka_hm::HalfKA_hmStack;
+        let mut stack = HalfKA_hmStack::from_network(match &network {
+            NNUENetwork::HalfKA_hm(net) => net,
             _ => unreachable!(),
         });
 
         network.refresh_accumulator_halfka_hm(&pos, &mut stack);
         let value = network.evaluate_halfka_hm(&pos, &stack);
 
-        eprintln!("HalfKaHmMerged 1024 evaluate: {}", value.raw());
+        eprintln!("HalfKA_hm 1024 evaluate: {}", value.raw());
 
         // 評価値が妥当な範囲内
         assert!(value.raw().abs() < 10000, "Evaluation {} is out of expected range", value.raw());

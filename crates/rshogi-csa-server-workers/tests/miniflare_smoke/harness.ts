@@ -1,15 +1,9 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import {
-  convertV4MiniflareOptions,
-  Miniflare,
-  type Request as MfRequest,
-  type Response as MfResponse,
-  type WebSocket,
-} from "miniflare";
+import { Miniflare, type WebSocket } from "miniflare";
 
-/// `mf.getR2Bucket(...)` の戻り値は miniflare が `ReplaceWorkersTypes<R2Bucket>`
+/// `mf.getR2Bucket(...)` の戻り値は miniflare 4 が `ReplaceWorkersTypes<R2Bucket>`
 /// (大きな conditional type) として返し、tsc の構造的推論で `Request_2` などに
 /// 潰れる既知のエッジケースがある。`R2Bucket` 自体は miniflare の barrel export
 /// 対象外でもあり、`@cloudflare/workers-types` を別途 devDep に入れたくない
@@ -17,7 +11,7 @@ import {
 /// 使わないため、duck-type interface を 1 か所定義して `getKifuBucket` で
 /// キャストを隠蔽する。
 ///
-/// 引数 / 戻り値を最小だけ広げてあるのは、将来 miniflare が `list()` の
+/// 引数 / 戻り値を最小だけ広げてあるのは、将来 miniflare 4 が `list()` の
 /// 既定挙動を変えても (例: page size 規定値変更 / `truncated` 必須化) 局所
 /// 改修で追随できるようにするため。
 export interface R2ListOptions {
@@ -68,23 +62,12 @@ const WORKER_ROOT = resolve(import.meta.dirname, "../..");
 const SHIM_PATH = resolve(WORKER_ROOT, "build/worker/shim.mjs");
 
 export interface HarnessOptions {
-  /** 障害注入テスト用の Worker エントリポイント。 */
-  scriptPath?: string;
   /// Miniflare の persist 先ディレクトリ。テスト並列実行や 2 回目の `vitest run`
   /// で R2 / DO storage が交差汚染しないよう、呼び出し側で一時ディレクトリを
   /// 切って必ず指定する契約。`makeTempPersistRoot()` のヘルパで作るのが基本経路。
   persistRoot: string;
   reconnectGraceSeconds?: number;
-  /// `%KACHI` 判定の入玉ルール (USI トークン、例 `CSARule24`)。未指定時は binding を
-  /// 出さず server 側 fallback (= 27点法) を使う。
-  enteringKingRule?: string;
-  /// AGREE 待ち TTL (秒)。`start_match` 直後に予約され、両者 AGREE で cancel
-  /// される (Issue #600)。テストで stuck 経路を再現する際は短めの値 (例: 1) を
-  /// 渡し、`alarm()` 発火で部屋解放されることを assert する。未指定時は server
-  /// 側既定 ([`config::DEFAULT_AGREE_TIMEOUT_SEC`] = 60) にフォールバック。
-  agreeTimeoutSeconds?: number;
   allowFloodgateFeatures?: boolean;
-  allowViewerApi?: boolean;
   totalTimeSec?: number;
   byoyomiSec?: number;
   totalTimeMs?: number;
@@ -93,83 +76,24 @@ export interface HarnessOptions {
   byoyomiMin?: number;
   clockKind?: "countdown" | "countdown_msec" | "fischer" | "stopwatch";
   wsAllowedOrigins?: string;
-  /// Worker が発行する外向き `fetch()` の差し替え先。外部棋譜の参照取り込み
-  /// (`import-wdoor`) が wdoor へ出す 1 リクエストを、実ネットワークに出さずに
-  /// テスト内の handler で受ける。未指定時は miniflare 既定 (実ネットワーク)。
-  outboundService?: (request: MfRequest) => MfResponse | Promise<MfResponse>;
-  adminApiToken?: string;
-  kifuBackup?: boolean;
-  kifuBackupAlertUrl?: string;
-  playerIdSecret?: string;
-  /// `WORKERS_HANDLE_AUTH` whitelist (issue #664) のオーバーライド。
-  /// 既定は空配列 (`"[]"`) で「whitelist 未宣言」として self-claim 既定挙動を
-  /// 維持する (一般 smoke は無影響)。検証時は
-  /// `[{"handle":"alice","password_sha256":"<lowercase hex 64 chars>"}, ...]`
-  /// 形式 JSON 文字列を渡す。env JSON 不正経路 (fail-closed) を確認したいとき
-  /// は `"broken"` 等を渡す。
-  workersHandleAuth?: string;
+  adminHandle?: string;
   lobbyQueueSizeLimit?: number;
-  /// 公開 lobby queue entry の TTL (秒、Issue #631)。`LOBBY_PONG` 受信から本値
-  /// を超えた entry は alarm で stale 判定され `LOGIN_LOBBY:incorrect queue_expired`
-  /// + WS close される。未指定時は server 既定 (300 秒) にフォールバック。
-  /// stale purge を smoke で再現するときは短い値 (例: 1) を渡す。
-  lobbyQueueEntryTtlSec?: number;
-  /// 私的対局 (`CHALLENGE_LOBBY` / `LOGIN_LOBBY+private-...+free`) feature gate
-  /// (Issue #635)。未指定時は production と同じ `"false"` (= 早期 reject)。
-  /// 私的対局経路を smoke で通電させるテストでは `true` を渡す。
-  privateChallengeEnabled?: boolean;
-  /// Rate limit 閾値オーバーライド (issue #622 PR3a, 1 IP / 1 handle あたり 1 分間)。
-  /// 未指定時は **緩和済 default** ([`DEFAULT_LOOSENED_RATE_LIMIT_PER_MIN`]) を
-  /// 全 6 keys に適用し、rate limit を検証していない既存 smoke (`smoke.test.ts`
-  /// 等) が偶発的に denial に当たらないようにする。`rate_limit.test.ts` のみ
-  /// 意図的に小さい値を渡してテストする。
-  rateLimitOverrides?: {
-    lobbyLoginPerIpPerMin?: number;
-    lobbyLoginPerHandlePerMin?: number;
-    lobbyChallengePerIpPerMin?: number;
-    lobbyChallengePerHandlePerMin?: number;
-    roomCreatePerIpPerMin?: number;
-    wsRoomUpgradePerIpPerMin?: number;
-  };
 }
 
-/// 緩和済 default 閾値 (`rateLimitOverrides` 未指定時に harness が注入する値)。
-/// 10_000/分 = 通常の smoke (1 test ~10 接続) では絶対に denial に当たらない上限。
-/// `rate_limit.test.ts` 側で意図的に小さな値 (`2`-`6` 程度) を渡してテストする。
-export const DEFAULT_LOOSENED_RATE_LIMIT_PER_MIN = 10_000;
-
-/// テスト用デフォルト CF-Connecting-IP (`CsaClient.connect` / `connectLobby` の
-/// 既定値)。CF-Connecting-IP 欠落で fail-closed に倒れる経路を rate_limit smoke
-/// test 以外では踏まないよう、harness 側で必ず注入する契約 (issue #622 PR3a)。
-/// IP 値そのものは任意 (本テスト環境では loopback 想定の `127.0.0.1`)。
-export const DEFAULT_TEST_CF_CONNECTING_IP = "127.0.0.1";
-
 export async function createMiniflare(opts: HarnessOptions): Promise<Miniflare> {
-  const rl = opts.rateLimitOverrides ?? {};
-  const modulePaths = new Set([
-    opts.scriptPath ?? SHIM_PATH,
-    SHIM_PATH,
-    resolve(WORKER_ROOT, "build/index.js"),
-  ]);
-  const mf = new Miniflare(convertV4MiniflareOptions({
-    modulesRoot: WORKER_ROOT,
-    modules: [
-      ...Array.from(modulePaths, path => ({ type: "ESModule" as const, path })),
-      { type: "CompiledWasm" as const, path: resolve(WORKER_ROOT, "build/index_bg.wasm") },
+  const mf = new Miniflare({
+    scriptPath: SHIM_PATH,
+    modules: true,
+    modulesRules: [
+      { type: "ESModule", include: ["**/*.js", "**/*.mjs"], fallthrough: true },
+      { type: "CompiledWasm", include: ["**/*.wasm"], fallthrough: true },
     ],
     compatibilityDate: "2026-04-21",
-    ...(opts.outboundService ? { outboundService: opts.outboundService } : {}),
     durableObjects: {
       GAME_ROOM: { className: "GameRoom", useSQLite: true },
       LOBBY: { className: "Lobby", useSQLite: true },
-      // RateLimiter (issue #622 PR3a): per-(kind, identifier) で sharding する
-      // atomic token bucket DO。`useSQLite: true` は production
-      // wrangler.toml の `[[migrations]] new_sqlite_classes = ["RateLimiter"]`
-      // (tag = "v3") と整合する。
-      RATE_LIMITER: { className: "RateLimiter", useSQLite: true },
     },
-    r2Buckets: ["KIFU_BUCKET", "FLOODGATE_HISTORY_BUCKET", ...(opts.kifuBackup ? ["KIFU_BACKUP_BUCKET"] : [])],
-    d1Databases: ["GAMES_SEARCH_DB"],
+    r2Buckets: ["KIFU_BUCKET", "FLOODGATE_HISTORY_BUCKET"],
     bindings: {
       CLOCK_KIND: opts.clockKind ?? "countdown",
       TOTAL_TIME_SEC: String(opts.totalTimeSec ?? 600),
@@ -178,94 +102,16 @@ export async function createMiniflare(opts: HarnessOptions): Promise<Miniflare> 
       BYOYOMI_MS: String(opts.byoyomiMs ?? 10_000),
       TOTAL_TIME_MIN: String(opts.totalTimeMin ?? 10),
       BYOYOMI_MIN: String(opts.byoyomiMin ?? 1),
-      // `ADMIN_API_TOKEN` 既定値は Worker 側 `wrangler.toml.example` の placeholder
-      // と同じで、Miniflare 配下では admin auth は **configured** な状態で動く。
-      // 既定のまま test を書くと `verify_admin_token_str` は提供 token と placeholder
-      // の比較結果 (`TokenMismatch` または `MissingCredential`) を返す経路に乗る。
-      // 強制的に `TokenNotConfigured` (fail-closed) 経路を確認したいときは
-      // `adminApiToken: ""` を明示すること。`%%ADMIN <token>` 成功 E2E の場合は
-      // 同 token を `adminApiToken` で揃えて binding する。
-      ADMIN_API_TOKEN: opts.adminApiToken ?? "local-dev-admin-token-placeholder",
-      KIFU_BACKUP_ALERT_URL: opts.kifuBackupAlertUrl ?? "",
-      PLAYER_ID_SECRET:
-        opts.playerIdSecret ?? "local-dev-player-id-secret-placeholder",
-      // `WORKERS_HANDLE_AUTH` 既定値は wrangler.toml.example と揃えた空配列で、
-      // whitelist 未宣言モードとして self-claim 既定挙動を維持する。既存 smoke
-      // が偶発的に handle_auth_failed に当たる経路を踏まないようにする。
-      // 検証時のみ `handle_auth.test.ts` 等から JSON 文字列を渡して whitelist
-      // を有効化する。
-      WORKERS_HANDLE_AUTH: opts.workersHandleAuth ?? "[]",
-      // `reconnectGraceSeconds: 0` 既定は production wrangler.production.toml の
-      // `RECONNECT_GRACE_SECONDS = "0"` と整合し、再接続プロトコル無効構成を表す。
-      // テストで `30` 等を明示する場合のみ Game_Summary に `Reconnect_Token:` 行が
-      // 出て reconnect 経路が有効化される。Issue #591 hotfix 後は server 側 token
-      // 配布も grace に応じた gate を通る。
+      ADMIN_HANDLE: opts.adminHandle ?? "admin",
       RECONNECT_GRACE_SECONDS: String(opts.reconnectGraceSeconds ?? 0),
-      // 未指定時は空文字を渡して server 側 fallback (= DEFAULT_ENTERING_KING_RULE
-      // = 27点法) を使う。24点法インスタンスの検証時のみ `CSARule24` を明示する。
-      ENTERING_KING_RULE: opts.enteringKingRule ?? "",
-      // 未指定時は空文字を渡して server 側 fallback (= 60 秒既定) を使う。
-      // 数値を指定したテストでは start_match 直後に AGREE 待ち alarm が予約される。
-      AGREE_TIMEOUT_SECONDS:
-        opts.agreeTimeoutSeconds === undefined ? "" : String(opts.agreeTimeoutSeconds),
       ALLOW_FLOODGATE_FEATURES: opts.allowFloodgateFeatures ? "true" : "false",
-      ALLOW_VIEWER_API: opts.allowViewerApi ? "true" : "false",
       WS_ALLOWED_ORIGINS: opts.wsAllowedOrigins ?? "https://example.com",
       LOBBY_QUEUE_SIZE_LIMIT: String(opts.lobbyQueueSizeLimit ?? 100),
-      // 未指定時は空文字を渡して server 側 fallback (= 300 秒既定) を使う。
-      // 数値を指定したテストでは alarm 経路で stale entry が purge される。
-      LOBBY_QUEUE_ENTRY_TTL_SEC:
-        opts.lobbyQueueEntryTtlSec === undefined ? "" : String(opts.lobbyQueueEntryTtlSec),
-      PRIVATE_CHALLENGE_ENABLED: opts.privateChallengeEnabled ? "true" : "false",
-      // Rate limit (issue #622 PR3a): 全 6 keys に緩和済 default を入れて、
-      // 既存 smoke が偶発的に denial に当たる経路を踏まないようにする。
-      // 個別テストは `rateLimitOverrides` で意図的に小さな値を上書きする。
-      LOBBY_LOGIN_RATE_PER_IP_PER_MIN: String(
-        rl.lobbyLoginPerIpPerMin ?? DEFAULT_LOOSENED_RATE_LIMIT_PER_MIN,
-      ),
-      LOBBY_LOGIN_RATE_PER_HANDLE_PER_MIN: String(
-        rl.lobbyLoginPerHandlePerMin ?? DEFAULT_LOOSENED_RATE_LIMIT_PER_MIN,
-      ),
-      LOBBY_CHALLENGE_RATE_PER_IP_PER_MIN: String(
-        rl.lobbyChallengePerIpPerMin ?? DEFAULT_LOOSENED_RATE_LIMIT_PER_MIN,
-      ),
-      LOBBY_CHALLENGE_RATE_PER_HANDLE_PER_MIN: String(
-        rl.lobbyChallengePerHandlePerMin ?? DEFAULT_LOOSENED_RATE_LIMIT_PER_MIN,
-      ),
-      ROOM_CREATE_RATE_PER_IP_PER_MIN: String(
-        rl.roomCreatePerIpPerMin ?? DEFAULT_LOOSENED_RATE_LIMIT_PER_MIN,
-      ),
-      WS_ROOM_UPGRADE_RATE_PER_IP_PER_MIN: String(
-        rl.wsRoomUpgradePerIpPerMin ?? DEFAULT_LOOSENED_RATE_LIMIT_PER_MIN,
-      ),
     },
-    resourcePersistencePath: opts.persistRoot,
-  }));
+    defaultPersistRoot: opts.persistRoot,
+  });
   await mf.ready;
-  await applyGamesSearchMigrations(mf);
   return mf;
-}
-
-async function applyGamesSearchMigrations(mf: Miniflare): Promise<void> {
-  const db = await mf.getD1Database("GAMES_SEARCH_DB");
-  const existing = await db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
-    .bind("player_rating_state")
-    .first();
-  if (existing) return;
-  for (const name of [
-    "0001_games_search_index.sql",
-    "0002_games_index_backfill_state.sql",
-    "0003_games_search_index_player_ids.sql",
-    "0004_player_rating_materialization.sql",
-    "0005_games_search_index_event.sql",
-    "0006_event_meta.sql",
-  ]) {
-    const sql = await readFile(resolve(WORKER_ROOT, "migrations", name), "utf8");
-    for (const statement of sql.split(";").map((part) => part.trim()).filter(Boolean)) {
-      await db.prepare(statement).run();
-    }
-  }
 }
 
 export async function makeTempPersistRoot(): Promise<{
@@ -342,23 +188,12 @@ export class CsaClient {
   private closed = false;
   private closeReason: { code?: number; reason?: string } | undefined;
 
-  static async connect(
-    mf: Miniflare,
-    roomId: string,
-    origin = "https://example.com",
-    /// CF-Connecting-IP のテスト注入。issue #622 PR3a で `/ws/<room_id>` upgrade
-    /// は本ヘッダ必須 (欠落で 503 fail-closed)。Miniflare は edge proxy を
-    /// シミュレートしないため、test 側で必ず注入する。同 IP からの連続接続は
-    /// `WS_ROOM_UPGRADE_RATE_PER_IP_PER_MIN` / `ROOM_CREATE_RATE_PER_IP_PER_MIN`
-    /// バケットを共有する点に注意 (test ごとに異なる IP を渡せば bucket 隔離)。
-    cfConnectingIp: string = DEFAULT_TEST_CF_CONNECTING_IP,
-  ): Promise<CsaClient> {
+  static async connect(mf: Miniflare, roomId: string, origin = "https://example.com"): Promise<CsaClient> {
     const url = `https://example.com/ws/${encodeURIComponent(roomId)}`;
     const res = await mf.dispatchFetch(url, {
       headers: {
         Upgrade: "websocket",
         Origin: origin,
-        "CF-Connecting-IP": cfConnectingIp,
       },
     });
     if (res.status !== 101 || !res.webSocket) {
@@ -432,7 +267,7 @@ export class CsaClient {
     // へ遷移しており、close event は再 dispatch されずに `Promise` が timeout
     // 一杯を空待ちすることがある。`readyState` で早期 return して 2000ms の
     // 浪費を防ぐ。`READY_STATE_CLOSING = 2` / `READY_STATE_CLOSED = 3` は
-    // miniflare の static 定数。
+    // miniflare 4 の static 定数。
     const state = this.ws.readyState;
     if (state === 2 /* CLOSING */ || state === 3 /* CLOSED */) {
       return;

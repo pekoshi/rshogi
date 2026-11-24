@@ -1,11 +1,11 @@
 //! 駒（Piece）
 //!
-//! 内部表現は駒種と色を格納する 5bit ラッパー。
+//! 内部表現は YaneuraOu の `Piece` に準拠した 5bit ラッパー。
 //! - bit 0-3: `PieceType`（1..=14）。0 は `Piece::NONE` のみで使用される。
 //! - bit 4: `Color`（0 = Black, 1 = White）。
 //!
 //! `Piece::NONE` 以外の値は常に有効な `PieceType` / `Color` の組み合わせであることを前提とする。
-//! `Piece::NONE` に対して駒種の取得・成り・生駒への変換を呼ばないのが契約 (探索の速度のため release では検査しない)。
+//! `piece_type()` を呼び出す前に `is_none()` を避けるのが契約。
 
 use std::ops::{Index, IndexMut};
 
@@ -68,13 +68,12 @@ impl Piece {
     }
 
     /// 駒種を取得
-    ///
-    /// `Piece::NONE` に対して呼ばないこと。
-    // 探索の最内ループで通るため release では検査しない (理由は `Index<Square> for [T]` と同じ)。
+    /// `Piece::NONE` (= self.0 == 0) に対して呼ぶと `PieceType` の有効範囲外
+    /// (= 0) を transmute して UB になる。 呼び出し側で `is_none()` check を必須とする。
     #[inline]
     pub const fn piece_type(self) -> PieceType {
-        debug_assert!(!self.is_none(), "piece_type() called on Piece::NONE");
-        // SAFETY: Piece は {0, 1..=14, 17..=30} で、NONE を除く下位4bitは 1..=14。NONE でないことは呼び出し側の前提。
+        // SAFETY: self.0 & 0x0F は 0..=14 なので有効なPieceType値
+        // ただし0の場合はNONEなので呼び出し側で判定が必要
         unsafe { std::mem::transmute(self.0 & 0x0F) }
     }
 
@@ -98,8 +97,6 @@ impl Piece {
     }
 
     /// 成り駒を返す
-    ///
-    /// `Piece::NONE` に対して呼ばないこと。
     #[inline]
     pub const fn promote(self) -> Option<Piece> {
         match self.piece_type().promote() {
@@ -109,8 +106,6 @@ impl Piece {
     }
 
     /// 生駒を返す
-    ///
-    /// `Piece::NONE` に対して呼ばないこと。
     #[inline]
     pub const fn unpromote(self) -> Piece {
         Piece::new(self.color(), self.piece_type().unpromote())
@@ -148,15 +143,14 @@ impl Default for Piece {
     }
 }
 
-// Piece で添字にする配列は [T; Piece::NUM] (31 要素) 以上という前提で、境界検査を省く。
-// 探索の最内ループで通るため release では検査しない (理由は `Index<Square> for [T]` と同じ)。
 impl<T> Index<Piece> for [T] {
     type Output = T;
 
     #[inline]
     fn index(&self, pc: Piece) -> &T {
         debug_assert!(pc.index() < self.len());
-        // SAFETY: Piece の値域は 0..=30。Piece で添字にする配列は [T; Piece::NUM] (31 要素) 以上。
+        // SAFETY: Piece(0..=30) は [T; Piece::NUM] (31要素) の有効なインデックス。
+        // Piece の構築時に値域が保証されている。
         unsafe { self.get_unchecked(pc.index()) }
     }
 }
@@ -165,7 +159,8 @@ impl<T> IndexMut<Piece> for [T] {
     #[inline]
     fn index_mut(&mut self, pc: Piece) -> &mut T {
         debug_assert!(pc.index() < self.len());
-        // SAFETY: Piece の値域は 0..=30。Piece で添字にする配列は [T; Piece::NUM] (31 要素) 以上。
+        // SAFETY: Piece(0..=30) は [T; Piece::NUM] (31要素) の有効なインデックス。
+        // Piece の構築時に値域が保証されている。
         unsafe { self.get_unchecked_mut(pc.index()) }
     }
 }

@@ -229,8 +229,7 @@ fn main() -> Result<()> {
                 ));
                 continue;
             };
-            let expected = yo_to_rshogi_value(yo.value, m.sign_flip)
-                .with_context(|| format!("{} -> {}", m.yo, m.rshogi))?;
+            let expected = yo_to_rshogi_value(yo.value, m.sign_flip);
             if expected != r.value {
                 value_mismatches.push(format!(
                     "{} ↔ {} (sign_flip={}): YO={} → 期待 rshogi={} だが実際は {}",
@@ -336,6 +335,14 @@ mod tests {
                 "option name correction_value_1 type spin default 9536 min 0 max 17734"
             ),
             Some("correction_value_1")
+        );
+    }
+
+    #[test]
+    fn parse_usi_option_name_handles_multiword_name() {
+        assert_eq!(
+            parse_usi_option_name("option name USI_Hash type spin default 16"),
+            Some("USI_Hash")
         );
     }
 

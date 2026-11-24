@@ -1,10 +1,10 @@
 //! BonaPiece - 駒の種類と位置を一意に表現するインデックス
 //!
-//! 駒の種類・所有者・位置を表す特徴量インデックスの定義。
+//! YaneuraOu の NNUE 実装で用いられる BonaPiece に準拠した定義。
 //! - `PieceType` / 升 / 手番（視点）により一意なインデックスに写像する。
 //! - 玉は特徴量に含めないため、BonaPiece としては常に `ZERO` を返す。
 //!
-//! ## BonaPiece定義（成金を金に統合）
+//! ## YaneuraOu BonaPiece定義 (DISTINGUISH_GOLDS無効時)
 //!
 //! ### 手駒 (1〜89)
 //! - f_hand_pawn = 1, e_hand_pawn = 20 (各18枚分)
@@ -31,7 +31,7 @@
 use crate::types::{Color, Piece, PieceType, Square};
 
 // =============================================================================
-// 手駒BonaPiece定数
+// YaneuraOu形式の手駒BonaPiece定数
 // =============================================================================
 
 /// 手駒領域の終端
@@ -56,7 +56,7 @@ pub const E_HAND_BISHOP: u16 = 82;
 pub const E_HAND_ROOK: u16 = 88;
 
 // =============================================================================
-// 盤上駒BonaPiece定数
+// YaneuraOu形式の盤上駒BonaPiece定数
 // =============================================================================
 
 pub const F_PAWN: u16 = 90;
@@ -160,6 +160,7 @@ const _: () = {
 
 /// fe_end: BonaPieceの最大値
 ///
+/// YaneuraOu の HalfKP 用定義に基づく。
 /// fe_end = e_dragon + 81 = 1467 + 81 = 1548
 pub const FE_END: usize = 1548;
 
@@ -169,6 +170,7 @@ pub const FE_END: usize = 1548;
 
 /// 先手視点(fb)と後手視点(fw)の BonaPiece をペアで保持する構造体
 ///
+/// YaneuraOu の ExtBonaPiece に相当。
 /// PieceList の各エントリおよび DirtyPiece の変化情報に使用する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExtBonaPiece {
@@ -177,35 +179,6 @@ pub struct ExtBonaPiece {
     /// 後手視点の BonaPiece
     pub fw: BonaPiece,
 }
-
-/// 所有者・駒種ごとの手駒1枚目の両視点インデックス。
-/// 玉・成駒と未使用の要素はゼロ。各ペアは隙間なく4バイトに収まる。
-const HAND_BASE: [[ExtBonaPiece; 16]; 2] = make_hand_base();
-
-const fn make_hand_base() -> [[ExtBonaPiece; 16]; 2] {
-    let pieces = [
-        (PieceType::Pawn, F_HAND_PAWN, E_HAND_PAWN),
-        (PieceType::Lance, F_HAND_LANCE, E_HAND_LANCE),
-        (PieceType::Knight, F_HAND_KNIGHT, E_HAND_KNIGHT),
-        (PieceType::Silver, F_HAND_SILVER, E_HAND_SILVER),
-        (PieceType::Gold, F_HAND_GOLD, E_HAND_GOLD),
-        (PieceType::Bishop, F_HAND_BISHOP, E_HAND_BISHOP),
-        (PieceType::Rook, F_HAND_ROOK, E_HAND_ROOK),
-    ];
-    let mut table = [[ExtBonaPiece::ZERO; 16]; 2];
-    let mut i = 0;
-    while i < pieces.len() {
-        let (pt, friend, enemy) = pieces[i];
-        table[Color::Black as usize][pt as usize] =
-            ExtBonaPiece::new(BonaPiece::new(friend), BonaPiece::new(enemy));
-        table[Color::White as usize][pt as usize] =
-            ExtBonaPiece::new(BonaPiece::new(enemy), BonaPiece::new(friend));
-        i += 1;
-    }
-    table
-}
-
-const _: () = assert!(std::mem::size_of::<ExtBonaPiece>() == std::mem::size_of::<u32>());
 
 impl ExtBonaPiece {
     /// ゼロ値（無効）
@@ -223,7 +196,7 @@ impl ExtBonaPiece {
     /// 盤上駒から ExtBonaPiece を生成
     ///
     /// Piece と Square から、先手/後手両視点の BonaPiece を計算する。
-    /// King の場合は `bona_piece_halfka_hm_merged` の定数を使用して King 用 BonaPiece を生成。
+    /// King の場合は `bona_piece_halfka_hm` の定数を使用して King 用 BonaPiece を生成。
     #[inline]
     pub fn from_board(piece: Piece, sq: Square) -> Self {
         if piece.is_none() {
@@ -233,8 +206,8 @@ impl ExtBonaPiece {
         let color = piece.color();
 
         if pt == PieceType::King {
-            // King 用 BonaPiece: HalfKaHmMerged の F_KING / E_KING を使用
-            use super::bona_piece_halfka_hm_merged::{E_KING, F_KING};
+            // King 用 BonaPiece: HalfKA_hm の F_KING / E_KING を使用
+            use super::bona_piece_halfka_hm::{E_KING, F_KING};
             let (fb, fw) = if color == Color::Black {
                 // 先手玉: fb = F_KING + sq, fw = E_KING + sq.inverse()
                 (
@@ -270,31 +243,9 @@ impl ExtBonaPiece {
         if count == 0 {
             return Self::ZERO;
         }
-        let b = HAND_BASE[owner as usize][pt as usize];
-        let packed = u32::from(b.fb.0) | (u32::from(b.fw.0) << 16);
-        if packed == 0 {
-            // 玉・成駒・未使用要素では ZERO を返す。
-            return Self::ZERO;
-        }
-        // 各基点は FE_HAND_END 未満、count は u8 なので半語間の桁上がりはない。
-        let packed = packed + (u32::from(count) - 1) * 0x0001_0001;
-        let bp = Self {
-            fb: BonaPiece::new(packed as u16),
-            fw: BonaPiece::new((packed >> 16) as u16),
-        };
-        debug_assert!(
-            (bp.fb.0 as usize) < FE_HAND_END,
-            "Hand piece BonaPiece {} exceeds FE_HAND_END {}",
-            bp.fb.0,
-            FE_HAND_END
-        );
-        debug_assert!(
-            (bp.fw.0 as usize) < FE_HAND_END,
-            "Hand piece BonaPiece {} exceeds FE_HAND_END {}",
-            bp.fw.0,
-            FE_HAND_END
-        );
-        bp
+        let fb = BonaPiece::from_hand_piece(Color::Black, owner, pt, count);
+        let fw = BonaPiece::from_hand_piece(Color::White, owner, pt, count);
+        Self { fb, fw }
     }
 }
 
@@ -322,6 +273,7 @@ impl BonaPiece {
 
     /// 盤上の駒からBonaPieceを計算
     ///
+    /// YaneuraOuの定義に従う（evaluate.h参照）
     /// 視点（perspective）に応じて駒の位置とインデックスを変換
     pub fn from_piece_square(piece: Piece, sq: Square, perspective: Color) -> BonaPiece {
         if piece.is_none() {
@@ -341,7 +293,7 @@ impl BonaPiece {
         // 駒の色が視点と同じかどうか
         let is_friend = pc_color == perspective;
 
-        // 基本オフセット
+        // 基本オフセット（YaneuraOuの定義に準拠）
         // 盤上駒は fe_hand_end (90) から始まる
         let base = match pt {
             PieceType::Pawn => {
@@ -419,53 +371,13 @@ impl BonaPiece {
 
     /// 手駒からBonaPieceを計算
     ///
+    /// YaneuraOuの手駒BonaPiece定義に従う。
     /// 手駒は (駒種, 枚数) でインデックスが決まる。
     /// 枚数が増えると新しいBonaPieceになる（0→1枚でbase, 1→2枚でbase+1, ...）
     ///
     /// 注意: countは「現在の枚数」であり、「追加する枚数」ではない。
     /// count=1 のとき base が返る（1枚目のBonaPiece）。
-    #[inline]
     pub fn from_hand_piece(
-        perspective: Color,
-        owner: Color,
-        pt: PieceType,
-        count: u8,
-    ) -> BonaPiece {
-        if count == 0 {
-            return BonaPiece::ZERO;
-        }
-        let b = HAND_BASE[owner as usize][pt as usize];
-        let base = if perspective == Color::Black {
-            b.fb
-        } else {
-            b.fw
-        };
-        if base == BonaPiece::ZERO {
-            return BonaPiece::ZERO;
-        }
-        let bp = BonaPiece::new(base.0 + count as u16 - 1);
-        debug_assert!(
-            (bp.0 as usize) < FE_HAND_END,
-            "Hand piece BonaPiece {} exceeds FE_HAND_END {}",
-            bp.0,
-            FE_HAND_END
-        );
-        bp
-    }
-}
-
-/// HalfKP特徴量のインデックスを計算
-#[inline]
-pub fn halfkp_index(king_sq: Square, bona_piece: BonaPiece) -> usize {
-    king_sq.index() * FE_END + bona_piece.0 as usize
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{File, Rank};
-
-    fn from_hand_piece_match(
         perspective: Color,
         owner: Color,
         pt: PieceType,
@@ -477,7 +389,7 @@ mod tests {
 
         let is_friend = owner == perspective;
 
-        // 手駒オフセット（1から始まる）
+        // YaneuraOu形式の手駒オフセット（1から始まる）
         // 手駒は盤上駒より前に配置されている
         let base = match pt {
             PieceType::Pawn => {
@@ -546,62 +458,31 @@ mod tests {
 
         bp
     }
+}
+
+/// HalfKP特徴量のインデックスを計算
+#[inline]
+pub fn halfkp_index(king_sq: Square, bona_piece: BonaPiece) -> usize {
+    king_sq.index() * FE_END + bona_piece.0 as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{File, Rank};
 
     #[test]
-    fn test_hand_base_matches_reference() {
-        for owner in [Color::Black, Color::White] {
-            for pt_index in 1..=PieceType::NUM {
-                let pt = PieceType::from_u8(pt_index as u8).unwrap();
-                let max_count = match pt {
-                    PieceType::Pawn => 18,
-                    PieceType::Lance | PieceType::Knight | PieceType::Silver | PieceType::Gold => 4,
-                    PieceType::Bishop | PieceType::Rook => 2,
-                    // 手駒にならない駒種は、枚数に関係なくゼロを返す。
-                    _ => u8::MAX,
-                };
-                for count in 1..=max_count {
-                    let pair = ExtBonaPiece::from_hand(owner, pt, count);
-                    for perspective in [Color::Black, Color::White] {
-                        let expected = from_hand_piece_match(perspective, owner, pt, count);
-                        let actual = if perspective == Color::Black {
-                            pair.fb
-                        } else {
-                            pair.fw
-                        };
-                        assert_eq!(actual, expected, "{owner:?} {perspective:?} {pt:?} {count}");
-                        assert_eq!(
-                            BonaPiece::from_hand_piece(perspective, owner, pt, count),
-                            expected,
-                            "{owner:?} {perspective:?} {pt:?} {count}"
-                        );
-                    }
-                }
-            }
-        }
+    fn test_bona_piece_zero() {
+        assert_eq!(BonaPiece::ZERO.value(), 0);
     }
 
     #[test]
-    fn test_hand_zero_count() {
-        for owner in [Color::Black, Color::White] {
-            for pt_index in 1..=PieceType::NUM {
-                let pt = PieceType::from_u8(pt_index as u8).unwrap();
-                assert_eq!(ExtBonaPiece::from_hand(owner, pt, 0), ExtBonaPiece::ZERO);
-                for perspective in [Color::Black, Color::White] {
-                    assert_eq!(
-                        BonaPiece::from_hand_piece(perspective, owner, pt, 0),
-                        from_hand_piece_match(perspective, owner, pt, 0)
-                    );
-                }
-            }
-        }
-    }
+    fn test_bona_piece_from_piece_square() {
+        let sq = Square::new(File::File7, Rank::Rank7);
+        let piece = Piece::new(Color::Black, PieceType::Pawn);
 
-    #[test]
-    fn test_hand_base_padding() {
-        for row in HAND_BASE {
-            assert_eq!(row[0], ExtBonaPiece::ZERO);
-            assert_eq!(row[15], ExtBonaPiece::ZERO);
-        }
+        let bp = BonaPiece::from_piece_square(piece, sq, Color::Black);
+        assert_ne!(bp, BonaPiece::ZERO);
     }
 
     #[test]
@@ -615,14 +496,11 @@ mod tests {
 
     #[test]
     fn test_halfkp_index() {
-        let king = Square::new(File::File5, Rank::Rank9);
-        assert_eq!(halfkp_index(king, BonaPiece::new(100)), 68_212);
-        let pawn = BonaPiece::from_piece_square(
-            Piece::B_PAWN,
-            Square::new(File::File7, Rank::Rank7),
-            Color::Black,
-        );
-        assert_eq!(pawn.value(), 150);
+        let king_sq = Square::new(File::File5, Rank::Rank9);
+        let bp = BonaPiece::new(100);
+
+        let index = halfkp_index(king_sq, bp);
+        assert_eq!(index, king_sq.index() * FE_END + 100);
     }
 
     #[test]

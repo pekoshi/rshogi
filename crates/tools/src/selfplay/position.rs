@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rshogi_core::movegen::{MoveList, generate_legal_all_with_pass};
+use rshogi_core::movegen::is_legal_with_pass;
 use rshogi_core::position::{Position, SFEN_HIRATE};
 use rshogi_core::types::Move;
 
@@ -145,28 +145,7 @@ where
     }
 }
 
-// core の is_legal は生成済みの疑似合法手を前提とするため、外部入力には直接使わない。
-// スタック上の完全合法手集合で検査し、空き升からの移動・持駒不足・行き所のない駒も排除する。
-pub(crate) fn is_legal_game_move(pos: &Position, mv: Move) -> bool {
-    let mut legal_moves = MoveList::new();
-    generate_legal_all_with_pass(pos, &mut legal_moves);
-    // 生成手の上位ビットには駒情報があるが、USI から読んだ手にはない。
-    legal_moves.iter().any(|legal| legal.raw() == mv.raw())
-}
-
 pub fn build_position(
-    parsed: &ParsedPosition,
-    pass_rights_black: Option<u8>,
-    pass_rights_white: Option<u8>,
-) -> Result<Position> {
-    let mut pos = build_base_position(parsed, pass_rights_black, pass_rights_white)?;
-    for mv in &parsed.moves {
-        apply_start_move(&mut pos, mv)?;
-    }
-    Ok(pos)
-}
-
-pub(crate) fn build_base_position(
     parsed: &ParsedPosition,
     pass_rights_black: Option<u8>,
     pass_rights_white: Option<u8>,
@@ -185,43 +164,20 @@ pub(crate) fn build_base_position(
         let white = pass_rights_white.unwrap_or(0);
         pos.enable_pass_rights(black, white);
     }
-    Ok(pos)
-}
-
-pub(crate) fn apply_start_move(pos: &mut Position, mv_str: &str) -> Result<(Move, bool)> {
-    let mv = Move::from_usi(mv_str)
-        .ok_or_else(|| anyhow!("invalid move in start position: {mv_str}"))?;
-    if !is_legal_game_move(pos, mv) {
-        bail!("illegal move '{mv_str}' in start position");
-    }
-    let gives_check = !mv.is_pass() && pos.gives_check(mv);
-    pos.do_move(mv, gives_check);
-    Ok((mv, gives_check))
-}
-
-/// 開始局面までに指された手数。SFEN の手数欄は次に指す手の番号なので 1 を引く。
-pub fn plies_before_start(pos: &Position) -> u32 {
-    u32::try_from(pos.game_ply().saturating_sub(1)).unwrap_or(0)
-}
-
-/// 総手数で数えた `max_moves` に対し、対局で 1 手も指せない開始局面を拒否する。
-pub fn ensure_start_positions_within_max_moves(
-    positions: &[ParsedPosition],
-    max_moves: u32,
-) -> Result<()> {
-    for parsed in positions {
-        let pos = build_position(parsed, None, None)?;
-        let before = plies_before_start(&pos);
-        if before >= max_moves {
-            let origin =
-                parsed.source_line.map_or_else(String::new, |line| format!(" (line {line})"));
-            bail!(
-                "start position{origin} has {before} plies played before it, not below --max-moves {max_moves}: {}",
-                describe_position(parsed)
-            );
+    for mv_str in &parsed.moves {
+        let mv = Move::from_usi(mv_str)
+            .ok_or_else(|| anyhow!("invalid move in start position: {mv_str}"))?;
+        if !is_legal_with_pass(&pos, mv) {
+            bail!("illegal move '{mv_str}' in start position");
         }
+        let gives_check = if mv.is_pass() {
+            false
+        } else {
+            pos.gives_check(mv)
+        };
+        pos.do_move(mv, gives_check);
     }
-    Ok(())
+    Ok(pos)
 }
 
 pub fn describe_position(parsed: &ParsedPosition) -> String {
@@ -260,39 +216,6 @@ mod tests {
                 .unwrap();
         assert!(parsed_sfen_only.sfen.is_some());
         assert!(parsed_sfen_only.moves.is_empty());
-    }
-
-    #[test]
-    fn invalid_opening_moves_are_rejected_without_applying_them() {
-        for line in [
-            "startpos moves 7g7f 7g7f",
-            "startpos moves R*5e",
-            "startpos moves none",
-            "sfen 4k4/9/9/9/9/9/9/9/4K4 b P 1 moves P*4a",
-        ] {
-            let parsed = parse_position_line(line).unwrap();
-            assert!(build_position(&parsed, None, None).is_err(), "{line}");
-        }
-    }
-
-    #[test]
-    fn plies_before_start_counts_sfen_ply_and_opening_moves() {
-        let plies = |line: &str| {
-            plies_before_start(
-                &build_position(&parse_position_line(line).unwrap(), None, None).unwrap(),
-            )
-        };
-        assert_eq!(plies("startpos"), 0);
-        assert_eq!(plies("startpos moves 7g7f 3c3d"), 2);
-        assert_eq!(plies("sfen 4k4/9/9/9/9/9/9/9/4K4 w R 37 moves 5a4a"), 37);
-        assert_eq!(plies("sfen 4k4/9/9/9/9/9/9/9/4K4 b R 0"), 0);
-    }
-
-    #[test]
-    fn start_positions_at_or_beyond_max_moves_are_rejected() {
-        let positions = [parse_position_line("startpos moves 7g7f 3c3d").unwrap()];
-        assert!(ensure_start_positions_within_max_moves(&positions, 3).is_ok());
-        assert!(ensure_start_positions_within_max_moves(&positions, 2).is_err());
     }
 
     #[test]

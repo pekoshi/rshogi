@@ -188,7 +188,7 @@ pub fn can_king_escape(
     let escape = king_effect(king_sq) & !(bb_avoid | Bitboard::from_square(to) | pos.pieces_c(us));
 
     for dest in escape.iter() {
-        let attacked = pos.attackers_to_color_occ(!us, dest, slide);
+        let attacked = pos.attackers_to_occ(dest, slide) & pos.pieces_c(!us);
         if attacked.is_empty() {
             return true;
         }
@@ -223,7 +223,7 @@ pub fn can_king_escape_with_from(
     let escape = king_effect(king_sq) & !(bb_avoid | Bitboard::from_square(to) | pos.pieces_c(us));
 
     for dest in escape.iter() {
-        let attacked = pos.attackers_to_color_occ(!us, dest, slide);
+        let attacked = pos.attackers_to_occ(dest, slide) & pos.pieces_c(!us);
         let attacked_wo_from = attacked & !Bitboard::from_square(from);
         if attacked_wo_from.is_empty() {
             return true;
@@ -251,7 +251,7 @@ pub fn can_piece_capture(
     slide: Bitboard,
 ) -> bool {
     let king_sq = pos.king_square(us);
-    let mut attackers = pos.attackers_to_color_occ(us, to, slide);
+    let mut attackers = pos.attackers_to_occ(to, slide) & pos.pieces_c(us);
     attackers &= !Bitboard::from_square(king_sq);
 
     for from in attackers.iter() {
@@ -285,7 +285,7 @@ pub fn can_piece_capture_avoiding(
 ) -> bool {
     let king_sq = pos.king_square(us);
     let avoid_bb = Bitboard::from_square(avoid);
-    let mut attackers = pos.attackers_to_color_occ(us, to, slide);
+    let mut attackers = pos.attackers_to_occ(to, slide) & pos.pieces_c(us);
     attackers &= !avoid_bb;
     attackers &= !Bitboard::from_square(king_sq);
 
@@ -367,4 +367,12 @@ fn attacks_around_king_non_slider_in_avoiding(
     }
 
     sum
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_helper_functions_compile() {
+        // ヘルパー関数がコンパイルされることを確認
+    }
 }

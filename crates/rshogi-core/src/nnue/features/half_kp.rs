@@ -1,7 +1,7 @@
 //! HalfKP 特徴量
 //!
 //! 自玉位置×駒配置（BonaPiece）の組み合わせで特徴量を表現する。
-//! 自玉の位置と両軍の玉以外の駒を組み合わせる。
+//! YaneuraOu の HalfKP<Friend> に相当する。
 
 use super::Feature;
 use super::TriggerEvent;
@@ -11,7 +11,7 @@ use crate::nnue::piece_list::PieceNumber;
 use crate::position::Position;
 use crate::types::{Color, Square};
 
-/// `HalfKP<Friend>` 特徴量
+/// HalfKP<Friend> 特徴量
 ///
 /// 自玉位置×駒配置（BonaPiece）の組み合わせで特徴量を表現する。
 /// 自玉が動いた場合にアキュムレータの全計算が必要になる。
@@ -50,12 +50,11 @@ impl Feature for HalfKP {
             pos.piece_list().piece_list_fw()
         };
 
-        active.extend(
-            pieces[..PieceNumber::KING as usize]
-                .iter()
-                .filter(|bp| **bp != BonaPiece::ZERO)
-                .map(|bp| halfkp_index(king_sq, *bp)),
-        );
+        for bp in &pieces[..PieceNumber::KING as usize] {
+            if *bp != BonaPiece::ZERO {
+                let _ = active.push(halfkp_index(king_sq, *bp));
+            }
+        }
     }
 
     /// 変化した特徴量インデックスを追記
@@ -76,22 +75,27 @@ impl Feature for HalfKP {
             king_sq.inverse()
         };
 
-        removed.extend_pairs(
-            added,
-            (0..dirty_piece.dirty_num as usize).map(|i| {
-                let cp = &dirty_piece.changed_piece[i];
-                let (old_bp, new_bp) = if perspective == Color::Black {
-                    (cp.old_piece.fb, cp.new_piece.fb)
-                } else {
-                    (cp.old_piece.fw, cp.new_piece.fw)
-                };
-                let index = |bp: BonaPiece| {
-                    (bp != BonaPiece::ZERO && (bp.value() as usize) < FE_END)
-                        .then(|| halfkp_index(king_sq, bp))
-                };
-                (index(old_bp), index(new_bp))
-            }),
-        );
+        for i in 0..dirty_piece.dirty_num as usize {
+            let cp = &dirty_piece.changed_piece[i];
+            let old_bp = if perspective == Color::Black {
+                cp.old_piece.fb
+            } else {
+                cp.old_piece.fw
+            };
+            let new_bp = if perspective == Color::Black {
+                cp.new_piece.fb
+            } else {
+                cp.new_piece.fw
+            };
+
+            // HalfKP: King の BonaPiece (>= FE_END) は除外
+            if old_bp != BonaPiece::ZERO && (old_bp.value() as usize) < FE_END {
+                let _ = removed.push(halfkp_index(king_sq, old_bp));
+            }
+            if new_bp != BonaPiece::ZERO && (new_bp.value() as usize) < FE_END {
+                let _ = added.push(halfkp_index(king_sq, new_bp));
+            }
+        }
     }
 }
 
@@ -103,6 +107,23 @@ mod tests {
     use crate::nnue::piece_list::PieceNumber;
     use crate::position::Position;
     use crate::types::{Color, File, Piece, PieceType, Rank, Square};
+
+    #[test]
+    fn test_halfkp_dimensions() {
+        // HALFKP_DIMENSIONS と一致することを確認
+        assert_eq!(HalfKP::DIMENSIONS, 81 * FE_END);
+    }
+
+    #[test]
+    fn test_halfkp_max_active() {
+        // MAX_ACTIVE_FEATURES と一致することを確認
+        assert_eq!(HalfKP::MAX_ACTIVE, 52);
+    }
+
+    #[test]
+    fn test_halfkp_refresh_trigger() {
+        assert_eq!(HalfKP::REFRESH_TRIGGER, TriggerEvent::FriendKingMoved);
+    }
 
     #[test]
     fn test_append_active_indices_startpos() {
@@ -144,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_bona_piece_values() {
-        // BonaPiece のオフセットを確認
+        // BonaPieceの値がやねうら王の定義と一致することを確認
         use crate::nnue::bona_piece::{E_DRAGON, E_GOLD, E_PAWN, F_DRAGON, F_GOLD, F_PAWN};
 
         // 盤上駒のベース値
@@ -333,32 +354,78 @@ mod tests {
         assert_eq!(added.len(), 1);
     }
 
-    /// 駒成り + 駒台手駒ありの ply32 局面でも `append_active_indices` が玉スロット
-    /// (`[..PieceNumber::KING]`) を除外し、全 index が `81 * FE_END` 範囲内であることを保証する。
     #[test]
-    fn test_halfkp_active_indices_in_range_with_promoted_and_hand() {
+    fn test_debug_feature_indices() {
         use crate::nnue::accumulator::{IndexList, MAX_ACTIVE_FEATURES};
+        use crate::nnue::bona_piece::{E_PAWN, F_PAWN};
 
         let mut pos = Position::new();
-        pos.set_sfen(
-            "+B1sg1gsnl/2+N2k1b1/pP2pp2p/2p3p2/9/2PpP4/P1+p2PP1P/7R1/LN1GKGSNL w RLs3p 32",
-        )
-        .unwrap();
+        pos.set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1")
+            .unwrap();
 
+        // 先手玉と後手玉の位置
+        let king_sq_b = pos.king_square(Color::Black);
+        let king_sq_w = pos.king_square(Color::White);
+        let king_sq_w_inv = king_sq_w.inverse();
+
+        eprintln!("Black King: {:?} (index={})", king_sq_b, king_sq_b.index());
+        eprintln!(
+            "White King: {:?} (index={}), inverted: {:?} (index={})",
+            king_sq_w,
+            king_sq_w.index(),
+            king_sq_w_inv,
+            king_sq_w_inv.index()
+        );
+
+        // 7七の歩（先手）のBonaPiece
+        let sq_77 = Square::new(File::File7, Rank::Rank7);
+        let bp_77_black = crate::nnue::bona_piece::BonaPiece::from_piece_square(
+            Piece::B_PAWN,
+            sq_77,
+            Color::Black,
+        );
+        let bp_77_white = crate::nnue::bona_piece::BonaPiece::from_piece_square(
+            Piece::B_PAWN,
+            sq_77,
+            Color::White,
+        );
+        eprintln!(
+            "7七先手歩: sq_index={}, Black view BP={}, White view BP={}",
+            sq_77.index(),
+            bp_77_black.value(),
+            bp_77_white.value()
+        );
+        eprintln!(
+            "  Expected Black: F_PAWN({}) + {} = {}",
+            F_PAWN,
+            sq_77.index(),
+            F_PAWN as usize + sq_77.index()
+        );
+        eprintln!(
+            "  Expected White: E_PAWN({}) + {} = {}",
+            E_PAWN,
+            sq_77.inverse().index(),
+            E_PAWN as usize + sq_77.inverse().index()
+        );
+
+        // 先手視点の特徴量
+        let mut active_b: IndexList<MAX_ACTIVE_FEATURES> = IndexList::new();
+        HalfKP::append_active_indices(&pos, Color::Black, &mut active_b);
+        let mut active_w: IndexList<MAX_ACTIVE_FEATURES> = IndexList::new();
+        HalfKP::append_active_indices(&pos, Color::White, &mut active_w);
+
+        eprintln!("Black perspective: {} features", active_b.len());
+        eprintln!("White perspective: {} features", active_w.len());
+
+        // インデックスの範囲確認
+        let max_b = active_b.iter().max().unwrap_or(0);
+        let max_w = active_w.iter().max().unwrap_or(0);
         let max_valid = 81 * FE_END - 1;
-        for perspective in [Color::Black, Color::White] {
-            let mut active: IndexList<MAX_ACTIVE_FEATURES> = IndexList::new();
-            HalfKP::append_active_indices(&pos, perspective, &mut active);
-            for (i, idx) in active.iter().enumerate() {
-                assert!(
-                    idx <= max_valid,
-                    "{:?} slot {} idx {} > {}",
-                    perspective,
-                    i,
-                    idx,
-                    max_valid
-                );
-            }
-        }
+        eprintln!("Max index (Black): {}", max_b);
+        eprintln!("Max index (White): {}", max_w);
+        eprintln!("Max valid index: {}", max_valid);
+
+        assert!(max_b <= max_valid, "Black max index out of range");
+        assert!(max_w <= max_valid, "White max index out of range");
     }
 }

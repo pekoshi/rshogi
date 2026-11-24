@@ -1,7 +1,6 @@
-import { request } from "node:http";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import type { Miniflare, WebSocket } from "miniflare";
-import { DEFAULT_TEST_CF_CONNECTING_IP, createMiniflare, makeTempPersistRoot } from "./harness";
+import { createMiniflare, makeTempPersistRoot } from "./harness";
 
 /**
  * Origin allowlist が WS Upgrade route で正しく機能するかを route レベルで固定する。
@@ -11,68 +10,102 @@ import { DEFAULT_TEST_CF_CONNECTING_IP, createMiniflare, makeTempPersistRoot } f
  * Miniflare 経由で 101 / 403 ステータスを直接確認する。
  */
 function closeAcceptedSocket(ws: WebSocket | null | undefined): void {
-  // Miniflare は `accept()` を呼ばずに `close()` すると例外を投げる。Origin
+  // Miniflare 4 は `accept()` を呼ばずに `close()` すると例外を投げる。Origin
   // 許可ケースで Upgrade を確認した後の cleanup を 1 行に揃えるためのヘルパ。
   ws?.accept();
   ws?.close();
 }
 
-/**
- * Upgrade を拒否する応答を読み、その接続を閉じてから返す。`mf.dispatchFetch` は 101 以外の応答の後も
- * 接続を開いたまま残し、dispose で workerd が終わるときに Windows で ECONNRESET の未処理例外になる。
- */
-function fetchRejectedUpgrade(
-  url: URL,
-  headers: Record<string, string>,
-): Promise<{ status: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    const options = { agent: false, headers: { ...headers, Connection: "Upgrade" } };
-    const req = request(url, options, (res) => {
-      const { socket } = res;
-      let body = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk) => { body += chunk; });
-      res.once("error", reject);
-      res.once("end", () => {
-        socket.destroy();
-        resolve({ status: res.statusCode!, body });
-      });
-    });
-    req.once("upgrade", (res, socket) => {
-      socket.destroy();
-      reject(new Error(`expected the upgrade to be rejected, got ${res.statusCode}`));
-    });
-    req.once("error", reject);
-    req.end();
-  });
-}
-
-describe.each(["https://example.com", ""])("Origin allowlist %j", (allowlist) => {
+describe("Origin allowlist route behavior", () => {
   let mf: Miniflare;
   let cleanup: () => Promise<void>;
+
   beforeEach(async () => {
     const persist = await makeTempPersistRoot();
     cleanup = persist.cleanup;
-    mf = await createMiniflare({ persistRoot: persist.path, wsAllowedOrigins: allowlist });
+    mf = await createMiniflare({
+      persistRoot: persist.path,
+      wsAllowedOrigins: "https://example.com",
+    });
   });
-  afterEach(async () => { await mf.dispose(); await cleanup(); });
 
-  test("native access and browser allow/deny use the configured policy", async () => {
-    for (const [index, origin] of [undefined, "https://example.com", "https://evil.example"].entries()) {
-      const headers: Record<string, string> = {
-        Upgrade: "websocket", "CF-Connecting-IP": DEFAULT_TEST_CF_CONNECTING_IP,
-      };
-      if (origin) headers.Origin = origin;
-      const allowed = origin === undefined || origin === allowlist;
-      if (allowed) {
-        const res = await mf.dispatchFetch(`https://example.com/ws/origin-${index}`, { headers });
-        expect(res.status).toBe(101);
-        expect(res.webSocket).toBeTruthy(); closeAcceptedSocket(res.webSocket);
-      } else {
-        const res = await fetchRejectedUpgrade(new URL(`/ws/origin-${index}`, await mf.ready), headers);
-        expect(res.status).toBe(403);
-        expect(res.body).toContain("Forbidden Origin");
-      }
-    }
+  afterEach(async () => {
+    await mf.dispose();
+    await cleanup();
+  });
+
+  test("Origin ヘッダ欠落 → 素通しで 101 Upgrade を返す（ネイティブクライアント経路）", async () => {
+    const res = await mf.dispatchFetch("https://example.com/ws/origin-missing-room", {
+      headers: {
+        Upgrade: "websocket",
+      },
+    });
+    expect(res.status).toBe(101);
+    expect(res.webSocket).toBeTruthy();
+    closeAcceptedSocket(res.webSocket);
+  });
+
+  test("Origin が allowlist に完全一致 → 101 Upgrade", async () => {
+    const res = await mf.dispatchFetch("https://example.com/ws/origin-match-room", {
+      headers: {
+        Upgrade: "websocket",
+        Origin: "https://example.com",
+      },
+    });
+    expect(res.status).toBe(101);
+    expect(res.webSocket).toBeTruthy();
+    closeAcceptedSocket(res.webSocket);
+  });
+
+  test("Origin が allowlist に含まれない → 403 Forbidden Origin", async () => {
+    const res = await mf.dispatchFetch("https://example.com/ws/origin-mismatch-room", {
+      headers: {
+        Upgrade: "websocket",
+        Origin: "https://evil.example",
+      },
+    });
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("Forbidden Origin");
+  });
+});
+
+describe("Origin allowlist route behavior (空 allowlist)", () => {
+  let mf: Miniflare;
+  let cleanup: () => Promise<void>;
+
+  beforeEach(async () => {
+    const persist = await makeTempPersistRoot();
+    cleanup = persist.cleanup;
+    mf = await createMiniflare({
+      persistRoot: persist.path,
+      wsAllowedOrigins: "",
+    });
+  });
+
+  afterEach(async () => {
+    await mf.dispose();
+    await cleanup();
+  });
+
+  test("空 allowlist + Origin 欠落 → 101 Upgrade（production 既定でネイティブが通る）", async () => {
+    const res = await mf.dispatchFetch("https://example.com/ws/empty-allow-missing-room", {
+      headers: {
+        Upgrade: "websocket",
+      },
+    });
+    expect(res.status).toBe(101);
+    expect(res.webSocket).toBeTruthy();
+    closeAcceptedSocket(res.webSocket);
+  });
+
+  test("空 allowlist + Origin 付き → 403（ブラウザ経由は CSRF 防御で全拒否）", async () => {
+    const res = await mf.dispatchFetch("https://example.com/ws/empty-allow-origin-room", {
+      headers: {
+        Upgrade: "websocket",
+        Origin: "https://example.com",
+      },
+    });
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("Forbidden Origin");
   });
 });

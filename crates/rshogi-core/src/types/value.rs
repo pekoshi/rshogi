@@ -1,6 +1,6 @@
 //! 評価値（Value）
 //!
-//! `Value::MATE` 付近を詰みスコアとして予約している。
+//! 値のスケールは YaneuraOu 準拠で、`Value::MATE` 付近を詰みスコアとして予約している。
 //! 通常の評価値は主に [-MATE_IN_MAX_PLY, MATE_IN_MAX_PLY] の範囲で用いる。
 
 /// 評価値
@@ -27,12 +27,12 @@ impl Value {
     /// この値を変更する場合は pruning.rs の安全性を再検証すること。
     pub const NONE: Value = Value(32002);
 
-    /// 最大探索深度内での詰みスコア
+    /// 最大探索深度内での詰みスコア (YaneuraOu準拠: MATE - MAX_PLY)
     pub const MATE_IN_MAX_PLY: Value = Value(Self::MATE.0 - crate::types::depth::MAX_PLY);
     /// 最大探索深度内での詰まされスコア
     pub const MATED_IN_MAX_PLY: Value = Value(-Self::MATE_IN_MAX_PLY.0);
 
-    /// 歩の内部評価値
+    /// 歩の内部評価値（YaneuraOu準拠: PawnValue = 90）
     ///
     /// USI `score cp` 出力時に `100 * value / PAWN_VALUE` で正規化するために使用。
     /// NNUEの内部スケールにおいて歩1枚 ≈ 90 に対応する。
@@ -92,7 +92,7 @@ impl Value {
         }
     }
 
-    /// 内部値をUSI centipawn値に変換
+    /// 内部値をUSI centipawn値に変換（YaneuraOu準拠）
     ///
     /// `100 * value / PAWN_VALUE` で正規化。詰みスコアはそのまま返す。
     #[inline]
@@ -238,10 +238,40 @@ mod tests {
     }
 
     #[test]
+    fn test_value_neg() {
+        assert_eq!(-Value::new(100), Value::new(-100));
+        assert_eq!(-Value::ZERO, Value::ZERO);
+    }
+
+    #[test]
+    fn test_value_add_sub() {
+        let a = Value::new(100);
+        let b = Value::new(50);
+        assert_eq!(a + b, Value::new(150));
+        assert_eq!(a - b, Value::new(50));
+    }
+
+    #[test]
+    fn test_value_mul_div() {
+        let v = Value::new(100);
+        assert_eq!(v * 3, Value::new(300));
+        assert_eq!(v / 2, Value::new(50));
+    }
+
+    #[test]
     fn test_value_ordering() {
         assert!(Value::MATE > Value::ZERO);
         assert!(Value::ZERO > Value::mated_in(1));
         assert!(Value::mate_in(1) > Value::mate_in(10));
         assert!(Value::mated_in(10) > Value::mated_in(1));
+    }
+
+    #[test]
+    fn test_value_from() {
+        let v: Value = 100.into();
+        assert_eq!(v.raw(), 100);
+
+        let i: i32 = v.into();
+        assert_eq!(i, 100);
     }
 }

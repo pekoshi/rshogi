@@ -42,7 +42,7 @@ pub enum GameStatus {
 /// 各受信者は自分が属するカテゴリ宛のエントリだけを 1 回受け取る前提で
 /// フロントエンドがフィルタする（受信者ごとに 1 回ずつ「理由→勝敗」が届くよう
 /// 宛先は重複しない区分にしている）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastTarget {
     /// 先手対局者だけに送る。
     Black,
@@ -50,10 +50,7 @@ pub enum BroadcastTarget {
     White,
     /// 両対局者に送る（観戦者は含めない）。
     Players,
-    /// 観戦者だけに送る（対局者には送らない）。終局理由の観戦者向けメッセージ
-    /// や、指し手に付随する Floodgate 評価値コメント `'<comment>` の配信に使う。
-    /// 評価値コメントを対局者へ送らないのは、エンジン解析が相手に漏れないように
-    /// するため。
+    /// 観戦者だけに送る（観戦機能未実装の本構成でも経路だけ用意しておく）。
     Spectators,
     /// 両対局者 + 同一ルームの全観戦者に送る（引き分け・無勝負時の同報）。
     All,
@@ -118,11 +115,9 @@ pub struct GameRoomConfig {
     pub white: PlayerName,
     /// 最大手数（既定 256）。これに達したら `#MAX_MOVES`。
     pub max_moves: u32,
-    /// 通信マージン（ミリ秒）。deadline 側の猶予にのみ使う (#857)。
-    /// `compute_deadline` / turn alarm の予約で加算し、`consume`（課金）からは
-    /// 差し引かない。
+    /// 通信マージン（ミリ秒）。`consume` 呼び出し前に減算される。
     pub time_margin_ms: u64,
-    /// `%KACHI` 判定に使う入玉ルール（本番配備は 27 点法 = `Point27`）。
+    /// `%KACHI` 判定に使う入玉ルール（既定は 24 点法 = `Point24`）。
     pub entering_king_rule: EnteringKingRule,
     /// 対局の開始局面を表す SFEN。`None` なら平手（`SFEN_HIRATE`）を使う。
     ///
@@ -161,13 +156,6 @@ pub struct GameRoom {
     moves_played: u32,
     /// 現在の手番が開始した瞬間の単調時刻（ミリ秒）。`Playing` 中のみ意味を持つ。
     turn_started_at_ms: Option<u64>,
-    /// 現手番で再接続により課金対象外とした時間（ミリ秒）。
-    ///
-    /// raw elapsed から本値を差し引いた実効経過時間を時計消費・`T` 行・alarm
-    /// 残時間で共通利用する。frontend が同一手番の累積上限を管理し、cold-start
-    /// replay 時は永続化済みの値を [`Self::restore_current_turn_reconnect_credit_ms`]
-    /// で戻す。
-    turn_reconnect_credit_ms: u64,
 }
 
 impl fmt::Debug for GameRoom {
@@ -177,7 +165,6 @@ impl fmt::Debug for GameRoom {
             .field("status", &self.status)
             .field("moves_played", &self.moves_played)
             .field("turn_started_at_ms", &self.turn_started_at_ms)
-            .field("turn_reconnect_credit_ms", &self.turn_reconnect_credit_ms)
             .finish()
     }
 }
@@ -218,7 +205,6 @@ impl GameRoom {
             status: GameStatus::AgreeWaiting,
             moves_played: 0,
             turn_started_at_ms: None,
-            turn_reconnect_credit_ms: 0,
         })
     }
 
@@ -235,11 +221,6 @@ impl GameRoom {
     /// 既消費手数。
     pub fn moves_played(&self) -> u32 {
         self.moves_played
-    }
-
-    /// 着手通知の T をミリ秒へ換算する単位。時計の Time_Unit と一致する。
-    pub fn clock_time_unit_ms(&self) -> u64 {
-        self.clock.time_unit_ms()
     }
 
     /// 現在手番色。`initial_sfen` の `side_to_move` を起点に指し手で交代するため、
@@ -302,9 +283,7 @@ impl GameRoom {
                 self.verify_game_id(game_id.as_ref())?;
                 self.handle_reject(from)
             }
-            ClientCommand::Move { token, comment } => {
-                self.handle_move(from, &token, comment.as_deref(), now_ms)
-            }
+            ClientCommand::Move { token, .. } => self.handle_move(from, &token, now_ms),
             ClientCommand::Toryo => self.handle_toryo(from),
             ClientCommand::Kachi => self.handle_kachi(from),
             ClientCommand::Chudan => self.handle_chudan(from),
@@ -335,78 +314,6 @@ impl GameRoom {
         }
         let result = GameResult::TimeUp { loser };
         self.finish(result)
-    }
-
-    /// 現在手番が `now_ms` 時点で残している持ち時間 (ms)。`0` は時間切れ。
-    /// `Playing` 以外は `None`。
-    ///
-    /// turn alarm 発火時に「まだ残時間があるか、実際の時間切れか」を区別する
-    /// ために使う。計時起点 `turn_started_at_ms` は「直前の指し手の at_ms（初手前は
-    /// play_started_at_ms）」で統一されており、cold-start 復元後も張り直さない
-    /// (<https://github.com/SH11235/rshogi/issues/852>)。休眠を跨いだ長考が予算を
-    /// 超えていれば `0`（= 時間切れ）が返り、alarm 側は force_time_up する。実時間が
-    /// まだ予算内なら残時間が正で返り、alarm は残時間ぶん貼り直す。
-    pub fn current_turn_remaining_ms(&self, now_ms: u64) -> Option<u64> {
-        if !matches!(self.status, GameStatus::Playing) {
-            return None;
-        }
-        let elapsed = self.current_turn_elapsed_ms(now_ms);
-        let budget = self.clock.turn_budget_ms(self.current_turn()).max(0) as u64;
-        Some(budget.saturating_sub(elapsed))
-    }
-
-    /// 現手番の時計 deadline（通信マージンを含まない単調時刻、ミリ秒）。
-    ///
-    /// 再接続後の alarm は「以前の alarm + 今回の差分」ではなく、この絶対値から
-    /// 再構成する。これにより credit 永続化直後に frontend が再起動しても、復元
-    /// 済みの累積 credit が deadline に必ず反映される。
-    pub fn current_turn_deadline_ms(&self) -> Option<u64> {
-        if !matches!(self.status, GameStatus::Playing) {
-            return None;
-        }
-        let started = self.turn_started_at_ms?;
-        let budget = self.clock.turn_budget_ms(self.current_turn()).max(0) as u64;
-        Some(started.saturating_add(budget).saturating_add(self.turn_reconnect_credit_ms))
-    }
-
-    /// 現手番に既に付与済みの再接続時計補償（ミリ秒）。
-    pub fn current_turn_reconnect_credit_ms(&self) -> u64 {
-        self.turn_reconnect_credit_ms
-    }
-
-    /// `now_ms` 時点の残時間を `minimum_remaining_ms` まで戻すために必要な追加補償を
-    /// 返す。同一手番の累積補償は `maximum_total_credit_ms` を超えない。
-    ///
-    /// 本メソッドは状態を変更しない。frontend は戻り値を永続化してから
-    /// [`Self::restore_current_turn_reconnect_credit_ms`] で反映することで、storage
-    /// 書き込みと DO isolate 消失の間でも補償を失わないようにできる。
-    pub fn additional_reconnect_credit_ms(
-        &self,
-        now_ms: u64,
-        minimum_remaining_ms: u64,
-        maximum_total_credit_ms: u64,
-    ) -> Option<u64> {
-        let remaining = self.current_turn_remaining_ms(now_ms)?;
-        let needed = minimum_remaining_ms.saturating_sub(remaining);
-        let available = maximum_total_credit_ms.saturating_sub(self.turn_reconnect_credit_ms);
-        Some(needed.min(available))
-    }
-
-    /// cold-start replay または再接続成立時に、現手番の累積時計補償を復元する。
-    /// 呼び出し側が時計方式に応じた上限を渡し、過大な永続値はここでも clamp する。
-    pub fn restore_current_turn_reconnect_credit_ms(
-        &mut self,
-        total_credit_ms: u64,
-        maximum_total_credit_ms: u64,
-    ) {
-        if matches!(self.status, GameStatus::Playing) {
-            self.turn_reconnect_credit_ms = total_credit_ms.min(maximum_total_credit_ms);
-        }
-    }
-
-    fn current_turn_elapsed_ms(&self, now_ms: u64) -> u64 {
-        let started = self.turn_started_at_ms.unwrap_or(now_ms);
-        now_ms.saturating_sub(started).saturating_sub(self.turn_reconnect_credit_ms)
     }
 
     /// 切断を検出したときに呼ぶ。再接続猶予 0 秒で即時 `#ABNORMAL` 確定。
@@ -459,7 +366,6 @@ impl GameRoom {
                 self.status = GameStatus::Playing;
                 self.moves_played = 0;
                 self.turn_started_at_ms = Some(now_ms);
-                self.turn_reconnect_credit_ms = 0;
                 let line = CsaLine::new(format!("START:{}", self.config.game_id));
                 Ok(HandleResult {
                     outcome: HandleOutcome::GameStarted,
@@ -491,7 +397,6 @@ impl GameRoom {
             let result = GameResult::Abnormal { winner: None };
             self.status = GameStatus::Finished(result.clone());
             self.turn_started_at_ms = None;
-            self.turn_reconnect_credit_ms = 0;
             Ok(HandleResult {
                 outcome: HandleOutcome::GameEnded(result),
                 broadcasts: vec![BroadcastEntry {
@@ -511,7 +416,6 @@ impl GameRoom {
         &mut self,
         from: Color,
         token: &CsaMoveToken,
-        comment: Option<&str>,
         now_ms: u64,
     ) -> Result<HandleResult, ServerError> {
         if !matches!(self.status, GameStatus::Playing) {
@@ -529,7 +433,7 @@ impl GameRoom {
         }
 
         match self.validator.validate_move(&self.pos, token) {
-            Ok(mv) => self.apply_move(from, token, comment, mv, now_ms),
+            Ok(mv) => self.apply_move(from, token, mv, now_ms),
             Err(violation) => {
                 // 構文・手番不一致は protocol error（状態変更なし）。
                 // それ以外の合法性違反は反則負けとして終局。
@@ -559,17 +463,13 @@ impl GameRoom {
         &mut self,
         from: Color,
         token: &CsaMoveToken,
-        comment: Option<&str>,
         mv: rshogi_core::types::Move,
         now_ms: u64,
     ) -> Result<HandleResult, ServerError> {
-        // 1. 経過時間を計算して時計を消費。通信マージン (`time_margin_ms`) は
-        //    deadline 側の猶予 (`compute_deadline` / turn alarm の予約) にのみ効かせ、
-        //    **課金 (`consume`) からは差し引かない**。margin を毎手の課金控除に使うと
-        //    fischer では実効予算が「total + (inc + margin)×手数」に膨張し、ライブ台帳
-        //    と終局棋譜の T が 1 秒/手ずれる (#857)。秒単位への切り捨ては clock 実装
-        //    (`SecondsCountdownClock` / `FischerClock`) 側で行われる。
-        let elapsed_ms = self.current_turn_elapsed_ms(now_ms);
+        // 1. 経過時間を計算し通信マージンを差し引いて時計を消費。
+        let started = self.turn_started_at_ms.unwrap_or(now_ms);
+        let raw_elapsed_ms = now_ms.saturating_sub(started);
+        let elapsed_ms = raw_elapsed_ms.saturating_sub(self.config.time_margin_ms);
         let clock_result = self.clock.consume(from, elapsed_ms);
 
         // 2. 時間切れなら盤面を進めず終局（手は受理しない）。
@@ -581,32 +481,17 @@ impl GameRoom {
         let gives_check = self.pos.gives_check(mv);
         self.pos.do_move(mv, gives_check);
         self.moves_played += 1;
-        let elapsed_units = elapsed_ms / self.clock.time_unit_ms();
+        let elapsed_sec = elapsed_ms / 1000;
 
-        // 4. 関係者に `<token>,T<units>` を Time_Unit 単位で配信。手数は 1 始まりで、本手の
+        // 4. 関係者に `<token>,T<sec>` を配信。手数は 1 始まりで、本手の
         //    `do_move` 後 (= `moves_played` インクリメント後) の値をそのまま
         //    乗せる。観戦者 snapshot 送信中に到着した broadcast を「snapshot
         //    に含めた最終 ply より大きい行のみ」flush する判定で使う。
         let mut broadcasts = vec![BroadcastEntry {
             target: BroadcastTarget::All,
-            line: CsaLine::new(format!("{},T{}", token.as_str(), elapsed_units)),
+            line: CsaLine::new(format!("{},T{}", token.as_str(), elapsed_sec)),
             ply: Some(self.moves_played),
         }];
-
-        // 4.5 指し手にコメント (Floodgate 評価値 PV 等) が付いていれば、観戦者
-        //     だけに `'<comment>` 行を追加配信する。対局者へは送らない
-        //     (エンジン解析が相手に漏れないようにするため)。ply は本手と同一に
-        //     して、観戦者 snapshot の pending-queue dedup
-        //     (`ply > last_ply_in_snapshot`) が本手行と揃うようにする。終局手
-        //     (千日手 / 連続王手千日手 / 最大手数) でも本手 broadcast は残るので、
-        //     ここで push しておけば終局経路でもコメントが配信される。
-        if let Some(c) = comment {
-            broadcasts.push(BroadcastEntry {
-                target: BroadcastTarget::Spectators,
-                line: CsaLine::new(format!("'{c}")),
-                ply: Some(self.moves_played),
-            });
-        }
 
         // 5. 千日手・連続王手千日手判定。
         match self.validator.classify_repetition(&self.pos) {
@@ -620,7 +505,7 @@ impl GameRoom {
                 });
             }
             RepetitionVerdict::OuteSennichiteLose => {
-                // 対局全履歴の4回目に `OuteSennichiteLose` と判定されたとき、
+                // `OuteSennichiteLose` ⇔ `Position::repetition_state` の `Lose` で、
                 // 「手番側 (= side-to-move after the last move = from.opposite()) が
                 // 連続王手していた側で反則負け」を意味する。循環の最終手 (from) が
                 // 非王手 (=受け手の escape) で閉じ、from.opposite() がサイクル中ずっと
@@ -635,7 +520,7 @@ impl GameRoom {
                 });
             }
             RepetitionVerdict::OuteSennichiteWin => {
-                // 対局全履歴の4回目に `OuteSennichiteWin` と判定されたとき、
+                // `OuteSennichiteWin` ⇔ `Position::repetition_state` の `Win` で、
                 // 「手番側 (from.opposite()) が勝ち」= 直前に指した from が連続王手
                 // していた側で反則負け。循環の最終手が from による王手で閉じた場合に発火。
                 let mut result = self.finish(GameResult::OuteSennichite { loser: from });
@@ -659,7 +544,6 @@ impl GameRoom {
 
         // 7. 続行 → 次手番開始時刻を更新。
         self.turn_started_at_ms = Some(now_ms);
-        self.turn_reconnect_credit_ms = 0;
         let next_turn = from.opposite();
         let core_next: rshogi_core::types::Color = next_turn.into();
         let remaining_main_ms = self.clock.remaining_main_ms(core_next.into());
@@ -743,7 +627,6 @@ impl GameRoom {
         }
         self.status = GameStatus::Finished(result.clone());
         self.turn_started_at_ms = None;
-        self.turn_reconnect_credit_ms = 0;
         HandleResult {
             outcome: HandleOutcome::GameEnded(result),
             broadcasts,
@@ -780,7 +663,7 @@ fn command_static_name(cmd: &ClientCommand) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::clock::{FischerClock, SecondsCountdownClock};
+    use crate::game::clock::SecondsCountdownClock;
 
     fn make_room() -> GameRoom {
         let config = GameRoomConfig {
@@ -841,68 +724,6 @@ mod tests {
     }
 
     #[test]
-    fn current_turn_remaining_ms_is_none_before_start() {
-        let room = make_room();
-        assert_eq!(room.current_turn_remaining_ms(0), None);
-    }
-
-    #[test]
-    fn current_turn_remaining_ms_reflects_elapsed_and_zero_on_timeup() {
-        let mut room = make_room();
-        agree_both(&mut room); // now=0 で START → 現手番の計測起点も 0、満額 budget
-        let budget = room.clock_turn_budget_ms(room.current_turn()).max(0) as u64;
-        assert!(budget > 0);
-        // 経過 0 → 残 == budget（起点は手番開始時刻のまま。まだ実時間を消費していない）
-        assert_eq!(room.current_turn_remaining_ms(0), Some(budget));
-        // 経過 < budget → 残 = budget - elapsed
-        assert_eq!(room.current_turn_remaining_ms(budget / 2), Some(budget - budget / 2));
-        // budget 到達/超過 → 0（実時間が予算を超えた時間切れ。alarm は force_time_up する）
-        assert_eq!(room.current_turn_remaining_ms(budget), Some(0));
-        assert_eq!(room.current_turn_remaining_ms(budget + 5_000), Some(0));
-    }
-
-    #[test]
-    fn reconnect_credit_restores_byoyomi_and_keeps_t_line_consistent() {
-        let mut room = room_with(0, 0, 10);
-        agree_both(&mut room);
-
-        // 秒読み 10 秒 + 秒粒度の端数 999ms のうち 6 秒が経過済み。
-        assert_eq!(room.current_turn_remaining_ms(6_000), Some(4_999));
-        assert_eq!(room.current_turn_deadline_ms(), Some(10_999));
-        let granted = room.additional_reconnect_credit_ms(6_000, 10_000, 10_000).unwrap();
-        assert_eq!(granted, 5_001);
-        room.restore_current_turn_reconnect_credit_ms(granted, 10_000);
-        assert_eq!(room.current_turn_remaining_ms(6_000), Some(10_000));
-        assert_eq!(room.current_turn_deadline_ms(), Some(16_000));
-
-        // 再接続後さらに 8 秒で着手しても受理される。T 行は raw 14 秒ではなく、
-        // 補償 5,001ms を除いた実効経過 8,999ms と同じ T8 を出す。
-        let result = room.handle_line(Color::Black, &line("+7776FU"), 14_000).unwrap();
-        assert!(matches!(result.outcome, HandleOutcome::MoveAccepted { .. }));
-        assert_eq!(result.broadcasts[0].line.as_str(), "+7776FU,T8");
-        assert_eq!(room.current_turn_reconnect_credit_ms(), 0, "次手番では補償を reset");
-    }
-
-    #[test]
-    fn reconnect_credit_is_capped_across_repeated_disconnects_in_same_turn() {
-        let mut room = room_with(0, 0, 10);
-        agree_both(&mut room);
-
-        let first = room.additional_reconnect_credit_ms(6_000, 10_000, 10_000).unwrap();
-        room.restore_current_turn_reconnect_credit_ms(first, 10_000);
-        assert_eq!(first, 5_001);
-
-        // さらに時間を使って再切断しても、同一手番の残枠 4,999ms までしか付与しない。
-        let second = room.additional_reconnect_credit_ms(12_000, 10_000, 10_000).unwrap();
-        assert_eq!(second, 4_999);
-        room.restore_current_turn_reconnect_credit_ms(first + second, 10_000);
-        assert_eq!(room.current_turn_reconnect_credit_ms(), 10_000);
-
-        // 累積上限到達後の再切断では追加補償 0。切断ループで時間は増えない。
-        assert_eq!(room.additional_reconnect_credit_ms(13_000, 10_000, 10_000), Some(0));
-    }
-
-    #[test]
     fn move_accepted_broadcasts_with_elapsed_time() {
         let mut room = make_room();
         agree_both(&mut room);
@@ -918,40 +739,6 @@ mod tests {
         assert_eq!(r.broadcasts.len(), 1);
         assert_eq!(r.broadcasts[0].target, BroadcastTarget::All);
         assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T3");
-    }
-
-    #[test]
-    fn move_with_comment_broadcasts_spectator_only_comment_line() {
-        let mut room = make_room();
-        agree_both(&mut room);
-        // Floodgate 形式の評価値コメント付き指し手。
-        let r = room
-            .handle_line(Color::Black, &line("+7776FU,'* 123 +7776FU -3334FU"), 3_000)
-            .unwrap();
-        assert!(matches!(r.outcome, HandleOutcome::MoveAccepted { .. }));
-        // 本手 broadcast (全員宛) + 観戦者専用コメント broadcast の 2 件。
-        assert_eq!(r.broadcasts.len(), 2);
-        let mv = &r.broadcasts[0];
-        assert_eq!(mv.target, BroadcastTarget::All);
-        assert_eq!(mv.line.as_str(), "+7776FU,T3");
-        assert_eq!(mv.ply, Some(1));
-        let cmt = &r.broadcasts[1];
-        // 観戦者だけに送る (対局者には漏らさない)。
-        assert_eq!(cmt.target, BroadcastTarget::Spectators);
-        assert_eq!(cmt.line.as_str(), "'* 123 +7776FU -3334FU");
-        // ply は本手と同一 (snapshot pending-queue dedup を本手行と揃えるため)。
-        assert_eq!(cmt.ply, Some(1));
-    }
-
-    #[test]
-    fn move_without_comment_has_no_spectator_comment_broadcast() {
-        let mut room = make_room();
-        agree_both(&mut room);
-        let r = room.handle_line(Color::Black, &line("+7776FU,T3"), 3_000).unwrap();
-        assert!(matches!(r.outcome, HandleOutcome::MoveAccepted { .. }));
-        // コメントが無ければ本手 broadcast の 1 件のみ (余分な観戦者行を出さない)。
-        assert_eq!(r.broadcasts.len(), 1);
-        assert!(!r.broadcasts.iter().any(|b| b.line.as_str().starts_with('\'')));
     }
 
     #[test]
@@ -1008,10 +795,21 @@ mod tests {
     }
 
     #[test]
-    fn time_margin_does_not_discount_consume() {
-        // #857: 通信マージンは deadline 猶予にのみ効かせ、課金 (consume) からは
-        // 差し引かない。margin=1500 でも経過 4000ms はそのまま consume(4000ms) され、
-        // 整数秒切り捨てで 4 秒課金される (旧実装は 2500ms→T2 に割り引いていた)。
+    fn time_up_when_elapsed_exceeds_total() {
+        let mut room = make_room();
+        agree_both(&mut room);
+        // 60 秒 + 5 秒 = 65 秒 持つので 70 秒経過後の手で TimeUp。
+        let r = room.handle_line(Color::Black, &line("+7776FU"), 70_000).unwrap();
+        match &r.outcome {
+            HandleOutcome::GameEnded(GameResult::TimeUp {
+                loser: Color::Black,
+            }) => {}
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn time_margin_is_subtracted_before_consume() {
         let config = GameRoomConfig {
             game_id: GameId::new("g"),
             black: PlayerName::new("a"),
@@ -1024,10 +822,9 @@ mod tests {
         let clock = Box::new(SecondsCountdownClock::new(60, 0));
         let mut room = GameRoom::new(config, clock).expect("valid test config");
         agree_both(&mut room);
+        // 経過 4000ms, margin 1500ms → consume(2500ms)。整数秒切り捨てで 2 秒消費。
         let r = room.handle_line(Color::Black, &line("+7776FU"), 4_000).unwrap();
-        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T4");
-        // 本体持ち時間も実時間ぶん (4 秒) 減っている (60 → 56 秒)。
-        assert_eq!(room.clock_remaining_main_ms(Color::Black), 56_000);
+        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T2");
     }
 
     // ---- 通信マージン境界値テスト ----
@@ -1047,25 +844,24 @@ mod tests {
     }
 
     #[test]
-    fn time_margin_does_not_absorb_short_move_elapsed() {
-        // #857: margin > elapsed でも課金は割り引かない。margin=5000 でも経過 1000ms は
-        //     consume(1000ms) されて 1 秒課金される (旧実装は saturating_sub で 0 秒に
-        //     吸収し T0 にしていた)。margin は deadline 側の猶予にのみ残す。
+    fn time_margin_larger_than_elapsed_clamps_to_zero_consume() {
+        // (a) time_margin_ms > elapsed_ms の場合、saturating_sub で consume 引数が 0
+        //     になり、手番は時間消費ゼロで受理される（margin が elapsed を完全吸収）。
         let mut room = room_with(5_000, 60, 0);
         agree_both(&mut room);
         let r = room.handle_line(Color::Black, &line("+7776FU"), 1_000).unwrap();
-        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T1");
+        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T0");
     }
 
     #[test]
     fn move_at_exact_main_time_boundary_enters_byoyomi_without_timeup() {
         // (c) 秒読み突入直前: 本体 5 秒を使い切って consume(5000ms) を渡すと
         //     ClockResult::Continue で秒読み区間に乗り換える。時間切れにならず、
-        //     対局は続行。`consume` 単体の境界は clock.rs::turn_budget_is_byoyomi_only_after_main_exhausted
+        //     対局は続行。`consume` 単体の境界は clock.rs::enters_byoyomi_when_main_exhausted
         //     でカバーされているが、`GameRoom` 層での挙動もここで固定する。
         let mut room = room_with(0, 5, 10);
         agree_both(&mut room);
-        // elapsed_ms は margin の値に関わらず常にそのまま consume に渡る (#857)。
+        // margin=0 なので elapsed_ms がそのまま consume に渡る。
         let r = room.handle_line(Color::Black, &line("+7776FU"), 5_000).unwrap();
         assert!(matches!(
             r.outcome,
@@ -1112,80 +908,25 @@ mod tests {
     }
 
     #[test]
-    fn delayed_move_within_margin_is_charged_real_time_and_times_up() {
-        // #857 test (b): 本体 5 秒 + margin 1500ms。物理経過 6500ms の遅延着手は、
-        //   deadline 側では救済される (turn_budget + margin が 6500ms を覆うので alarm は
-        //   発火しない) が、課金は実時間どおり: consume(6500ms) は 6 秒に切り捨てられ
-        //   5 秒予算を超過するため TimeUp になる。旧実装は margin を差し引いて
-        //   consume(5000ms) とし「本体ぴったり使い切り」で受理していた (課金割引バグ)。
+    fn move_at_main_plus_margin_boundary_is_accepted() {
+        // (e) 本体 + margin の合算ちょうど: 本体 5 秒 + margin 1500ms のとき
+        //     elapsed 6500ms で着手 → consume(5000ms) → Black の本体を使い切って 0 に
+        //     落ちる（Continue 扱いで対局続行）。MoveAccepted.remaining_main_ms は
+        //     「次手番側 (White) の本体残り」なので、White 未消費の 5000ms が返る。
+        //     Black 側が実際に 0 まで落ちたことは broadcast の `,T5` で確認する。
         let mut room = room_with(1_500, 5, 0);
         agree_both(&mut room);
-        // deadline 猶予: turn_budget(本体5s + grain999ms) + margin1500ms は 6500ms を覆う。
-        let turn_budget_ms = room.clock_turn_budget_ms(Color::Black).max(0) as u64;
-        assert!(turn_budget_ms + room.time_margin_ms() >= 6_500);
-        // しかし課金は実時間 (6 秒) で、5 秒予算を超過するため時間切れ。
         let r = room.handle_line(Color::Black, &line("+7776FU"), 6_500).unwrap();
         assert!(matches!(
             r.outcome,
-            HandleOutcome::GameEnded(GameResult::TimeUp {
-                loser: Color::Black
-            })
+            HandleOutcome::MoveAccepted {
+                next_turn: Color::White,
+                remaining_main_ms: 5_000,
+            }
         ));
-    }
-
-    #[test]
-    fn fischer_budget_invariant_no_margin_inflation() {
-        // #857 test (a): fischer(total=3, inc=1) + margin=1000。Black が毎手 (inc+1)=2 秒
-        //   使うと、実効予算 total + inc×手数 = 3 + 1×手数 を実時間どおり食い潰し、
-        //   4 手目で時間切れになる。旧実装は margin=1000 を毎手課金から割り引いて
-        //   consume(1000ms)=inc ちょうどにし、予算が減らず永久に時間切れしなかった
-        //   (fischer 予算膨張バグ)。ライブ T の合計が予算 total + inc×手数 を超えない
-        //   ことも確認する。
-        let config = GameRoomConfig {
-            game_id: GameId::new("g"),
-            black: PlayerName::new("a"),
-            white: PlayerName::new("b"),
-            max_moves: 256,
-            time_margin_ms: 1_000,
-            entering_king_rule: EnteringKingRule::Point24,
-            initial_sfen: None,
-        };
-        let clock = Box::new(FischerClock::new(3, 1));
-        let mut room = GameRoom::new(config, clock).expect("valid test config");
-        agree_both(&mut room);
-
-        // Black は 2 秒/手、White は 0 秒/手で交互に指す。turn_started は「直前の指し手の
-        // now_ms」なので、now を 2000 刻みで進めれば Black の各手の経過は 2000ms になる。
-        let black_moves = ["+7776FU", "+2726FU", "+2625FU"];
-        let white_moves = ["-3334FU", "-8384FU", "-8485FU"];
-        let mut black_t_total: u32 = 0;
-        for (i, (bm, wm)) in black_moves.iter().zip(white_moves.iter()).enumerate() {
-            let now = (i as u64 + 1) * 2_000;
-            let rb = room.handle_line(Color::Black, &line(bm), now).unwrap();
-            assert!(
-                matches!(rb.outcome, HandleOutcome::MoveAccepted { .. }),
-                "black move {i} should be accepted"
-            );
-            // ライブ T (broadcast) は実時間 2 秒。
-            assert_eq!(rb.broadcasts[0].line.as_str(), format!("{bm},T2"));
-            black_t_total += 2;
-            // White は同 now で即応 (経過 0 秒)。
-            let rw = room.handle_line(Color::White, &line(wm), now).unwrap();
-            assert!(matches!(rw.outcome, HandleOutcome::MoveAccepted { .. }));
-        }
-        // 4 手目の Black は予算超過で時間切れ。
-        let r = room.handle_line(Color::Black, &line("+2524FU"), 8_000).unwrap();
-        assert!(matches!(
-            r.outcome,
-            HandleOutcome::GameEnded(GameResult::TimeUp {
-                loser: Color::Black
-            })
-        ));
-        // 予算不変条件: 課金できた Black の T 合計 (6 秒) は total + inc×手数 = 3 + 1×3 = 6
-        // 以内に収まる (margin による水増しが無い)。
-        let total_sec = 3u32;
-        let inc_sec = 1u32;
-        assert!(black_t_total <= total_sec + inc_sec * black_moves.len() as u32);
+        assert_eq!(r.broadcasts[0].line.as_str(), "+7776FU,T5");
+        // Black 側の本体持ち時間が 0 まで落ちていることを直接確認。
+        assert_eq!(room.clock_remaining_main_ms(Color::Black), 0);
     }
 
     #[test]
@@ -1430,24 +1171,13 @@ mod tests {
         }
         assert!(last.broadcasts.iter().any(|b| b.line.as_str() == "#SENNICHITE"));
         assert!(last.broadcasts.iter().any(|b| b.line.as_str() == "#DRAW"));
-        // 終局手 (盤面を進めた最終手) の move broadcast が HandleResult に残る
-        // ことを固定する。workers 側 `finalize` はこの entry を検出して moves
-        // テーブルへ永続化するため、消えると終局手が棋譜から欠落する
-        // (https://github.com/SH11235/rshogi/issues/853 系の欠損)。
-        assert!(
-            last.broadcasts
-                .iter()
-                .any(|b| { b.ply.is_some() && b.line.as_str().starts_with(['+', '-']) }),
-            "final move broadcast must be present: {:?}",
-            last.broadcasts
-        );
     }
 
     #[test]
     fn oute_sennichite_win_variant_loses_the_last_checker() {
         // Win variant: 開始 SFEN で白が既に黒飛の王手下にある (side=W)。
         // 4 手 1 サイクル (白退避 → 黒再王手 → 白退避 → 黒再王手) で開始 SFEN に復帰。
-        // 3 サイクル後の同一局面4回目で反則確定。
+        // 連続王手は反則行為なので 1 サイクルで反則確定 (競技将棋ルール準拠)。
         // 循環最終手 (+4838HI) は黒の王手手なので from=Black、連続王手側の黒が敗者。
         let mut room = room_with_sfen(EnteringKingRule::Point24, "9/6k2/9/9/9/9/9/6R2/K8 w - 1");
         agree_both(&mut room);
@@ -1456,12 +1186,6 @@ mod tests {
             (Color::Black, "+3848HI"),
             (Color::White, "-4232OU"),
         ];
-        for _ in 0..2 {
-            for (c, tok) in prefix.iter().chain(std::iter::once(&(Color::Black, "+4838HI"))) {
-                let r = room.handle_line(*c, &line(tok), 0).unwrap();
-                assert!(matches!(r.outcome, HandleOutcome::MoveAccepted { .. }));
-            }
-        }
         for (c, tok) in &prefix {
             let r = room.handle_line(*c, &line(tok), 0).unwrap();
             assert!(matches!(r.outcome, HandleOutcome::MoveAccepted { .. }));
@@ -1490,12 +1214,6 @@ mod tests {
             (Color::White, "-4232OU"),
             (Color::Black, "+4838HI"),
         ];
-        for _ in 0..2 {
-            for (c, tok) in prefix.iter().chain(std::iter::once(&(Color::White, "-3242OU"))) {
-                let r = room.handle_line(*c, &line(tok), 0).unwrap();
-                assert!(matches!(r.outcome, HandleOutcome::MoveAccepted { .. }));
-            }
-        }
         for (c, tok) in &prefix {
             let r = room.handle_line(*c, &line(tok), 0).unwrap();
             assert!(matches!(r.outcome, HandleOutcome::MoveAccepted { .. }));

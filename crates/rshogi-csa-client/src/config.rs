@@ -25,7 +25,7 @@ pub struct CsaClientConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
-    /// 接続先。ホスト名、`tcp://host`、`ws://host[:port]/ws/<room>`、
+    /// 接続先。`host:port` 直書き、`tcp://host`、`ws://host[:port]/ws/<room>`、
     /// `wss://host[:port]/ws/<room>` のいずれか。`ws://` / `wss://` の場合は
     /// `port` 設定は無視される（URL に含めること）。
     pub host: String,
@@ -34,8 +34,9 @@ pub struct ServerConfig {
     pub password: String,
     pub floodgate: bool,
     pub keepalive: KeepaliveConfig,
-    /// WebSocket Upgrade 時に送る `Origin` ヘッダ値。`None` なら送信しない。
-    /// 指定する場合は接続先の `WS_ALLOWED_ORIGINS` に含まれる値を使う。
+    /// WebSocket Upgrade 時に送る `Origin` ヘッダ値。`None` のとき
+    /// `tungstenite` の既定値（URL から導出）に任せる。Cloudflare Workers の
+    /// `WS_ALLOWED_ORIGINS` allowlist 通過のため、運用時は明示する。
     #[serde(default)]
     pub ws_origin: Option<String>,
 }
@@ -59,28 +60,15 @@ impl Default for ServerConfig {
 pub struct KeepaliveConfig {
     /// TCP SO_KEEPALIVE を有効化
     pub tcp: bool,
-    /// CSA 空行 / ロビーの `LOBBY_PONG` 間隔（秒）。0 で周期送信なし。
+    /// CSAレベル空行ping間隔（秒）。0で無効
     pub ping_interval_sec: u64,
-    /// 送ったデータへの確認応答が来ないまま、この秒数を超えたら接続を切れたとみなす
-    /// (Linux の `TCP_USER_TIMEOUT`)。0 で OS 既定 (再送をあきらめるまで約 15 分)。
-    /// 他の OS では設定しない。
-    pub unacked_timeout_sec: u64,
-}
-
-impl KeepaliveConfig {
-    /// `unacked_timeout_sec` を接続オプションの値にする。0 は OS 既定のまま。
-    pub fn unacked_timeout(&self) -> Option<std::time::Duration> {
-        (self.unacked_timeout_sec > 0)
-            .then(|| std::time::Duration::from_secs(self.unacked_timeout_sec))
-    }
 }
 
 impl Default for KeepaliveConfig {
     fn default() -> Self {
         Self {
             tcp: true,
-            ping_interval_sec: 30,
-            unacked_timeout_sec: 60,
+            ping_interval_sec: 60,
         }
     }
 }
@@ -93,11 +81,6 @@ pub struct EngineConfig {
     /// USIオプション (key → value)
     #[serde(default)]
     pub options: HashMap<String, toml::Value>,
-    /// engine の stderr 出力を csa_client log に多重化する (`log::info!`)。
-    /// debug / 初期セットアップで engine 出力を即時確認したいときに有効化する。
-    /// default は false (既存の ring buffer 末尾捕捉のみ)。
-    #[serde(default)]
-    pub stderr_passthrough: bool,
 }
 
 impl Default for EngineConfig {
@@ -106,7 +89,6 @@ impl Default for EngineConfig {
             path: PathBuf::new(),
             startup_timeout_sec: 30,
             options: HashMap::new(),
-            stderr_passthrough: false,
         }
     }
 }
@@ -120,7 +102,7 @@ pub struct TimeConfig {
 
 impl Default for TimeConfig {
     fn default() -> Self {
-        Self { margin_msec: 1500 }
+        Self { margin_msec: 2500 }
     }
 }
 
@@ -176,17 +158,11 @@ pub struct RecordConfig {
     pub filename_template: String,
     pub save_csa: bool,
     pub save_sfen: bool,
-    /// `tools::analyze_selfplay` 互換 JSONL を保存するか。CSA 棋譜から復元できない
-    /// ms 単位の消費時間や nodes / nps / seldepth を含むため既定 ON。
-    pub save_jsonl: bool,
-    /// JSONL 出力先ディレクトリの上書き。`None` のとき `dir/jsonl/` に保存する。
+    /// JSONL 出力先ディレクトリ。`None` のとき JSONL は生成しない。
+    /// 指定すると `<datetime>_<sente>_vs_<gote>.jsonl` を出力し、
+    /// `tools::analyze_selfplay` で読み込めるスキーマで meta / move / result 行を書き込む。
     #[serde(default)]
     pub jsonl_out: Option<PathBuf>,
-    /// 対局中に JSONL を手単位で live 追記する（`kifu_player --live` での自局
-    /// リアルタイム観戦用）。追記中のファイルには result 行が無く、終局時に
-    /// canonical な全内容へ置き換わる。`save_jsonl` が無効なら効果なし。
-    #[serde(default)]
-    pub live_jsonl: bool,
 }
 
 impl Default for RecordConfig {
@@ -197,21 +173,8 @@ impl Default for RecordConfig {
             filename_template: "{datetime}_{sente}_vs_{gote}".to_string(),
             save_csa: true,
             save_sfen: true,
-            save_jsonl: true,
             jsonl_out: None,
-            live_jsonl: false,
         }
-    }
-}
-
-impl RecordConfig {
-    /// JSONL の出力先を返す。記録自体が無効 (`enabled = false`) か
-    /// `save_jsonl = false` のときは `None`（= JSONL を出力しない）。
-    pub fn jsonl_dir(&self) -> Option<PathBuf> {
-        if !self.enabled || !self.save_jsonl {
-            return None;
-        }
-        Some(self.jsonl_out.clone().unwrap_or_else(|| self.dir.join("jsonl")))
     }
 }
 
@@ -254,90 +217,6 @@ impl CsaClientConfig {
         {
             bail!("keepalive.ping_interval_sec must be >= 30 (CSA protocol requirement)");
         }
-        // 数秒だと損失のある回線で再送が数回重なるだけで満了し、生きている接続を切ってしまう。
-        if self.server.keepalive.unacked_timeout_sec > 0
-            && self.server.keepalive.unacked_timeout_sec < 10
-        {
-            bail!("keepalive.unacked_timeout_sec must be 0 or >= 10");
-        }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unacked_timeout_defaults_to_60s_and_zero_keeps_os_default() {
-        let config: CsaClientConfig = toml::from_str("").unwrap();
-        assert_eq!(
-            config.server.keepalive.unacked_timeout(),
-            Some(std::time::Duration::from_secs(60))
-        );
-        let config: CsaClientConfig =
-            toml::from_str("[server.keepalive]\nunacked_timeout_sec = 0\n").unwrap();
-        assert_eq!(config.server.keepalive.unacked_timeout(), None);
-    }
-
-    #[test]
-    fn validate_rejects_unacked_timeout_below_10s() {
-        let mut config: CsaClientConfig = toml::from_str(
-            "[server]\nid = \"x\"\n[engine]\npath = \"/bin/true\"\n[server.keepalive]\nunacked_timeout_sec = 5\n",
-        )
-        .unwrap();
-        assert!(config.validate().is_err());
-        config.server.keepalive.unacked_timeout_sec = 10;
-        assert!(config.validate().is_ok());
-        config.server.keepalive.unacked_timeout_sec = 0;
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn jsonl_dir_defaults_under_record_dir() {
-        let config = RecordConfig::default();
-        assert_eq!(config.jsonl_dir(), Some(PathBuf::from("./records/jsonl")));
-    }
-
-    #[test]
-    fn jsonl_dir_honors_explicit_override() {
-        let config = RecordConfig {
-            jsonl_out: Some(PathBuf::from("/tmp/csa-jsonl")),
-            ..RecordConfig::default()
-        };
-        assert_eq!(config.jsonl_dir(), Some(PathBuf::from("/tmp/csa-jsonl")));
-    }
-
-    #[test]
-    fn jsonl_dir_none_when_save_jsonl_off() {
-        let config = RecordConfig {
-            save_jsonl: false,
-            ..RecordConfig::default()
-        };
-        assert_eq!(config.jsonl_dir(), None);
-    }
-
-    #[test]
-    fn jsonl_dir_none_when_record_disabled() {
-        let config = RecordConfig {
-            enabled: false,
-            ..RecordConfig::default()
-        };
-        assert_eq!(config.jsonl_dir(), None);
-    }
-
-    #[test]
-    fn record_live_jsonl_defaults_off() {
-        let config: CsaClientConfig = toml::from_str("[record]\nenabled = true\n").unwrap();
-        assert!(!config.record.live_jsonl);
-        let config: CsaClientConfig = toml::from_str("[record]\nlive_jsonl = true\n").unwrap();
-        assert!(config.record.live_jsonl);
-    }
-
-    #[test]
-    fn record_toml_without_save_jsonl_defaults_on() {
-        let config: CsaClientConfig = toml::from_str("[record]\nenabled = true\n").unwrap();
-        assert!(config.record.save_jsonl);
-        assert_eq!(config.record.jsonl_dir(), Some(PathBuf::from("./records/jsonl")));
     }
 }

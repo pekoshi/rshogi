@@ -1,56 +1,53 @@
-use anyhow::{Context, Result};
-use rshogi_core::types::{Color, Move};
+use anyhow::Result;
+use rshogi_core::movegen::is_legal_with_pass;
+use rshogi_core::types::{Color, Move, RepetitionState};
 
-use super::adjudication::{DrawRule, ResignRule, RuleAdjudicator, ScoreAdjudicator};
-use super::engine::{EngineProcess, PonderStats};
-use super::position::{
-    ParsedPosition, apply_start_move, build_base_position, build_position, is_legal_game_move,
-    plies_before_start,
-};
+use rshogi_core::position::Position;
+
+use super::engine::EngineProcess;
+use super::position::{ParsedPosition, build_position};
 use super::time_control::TimeControl;
 use super::types::{EvalLog, GameOutcome, InfoCallback, SearchRequest};
 
-/// 対局の通常結果や局面エラーと区別するエンジン通信障害。
-#[derive(Debug)]
-pub struct EngineFailure;
-
-impl std::fmt::Display for EngineFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("engine infrastructure error")
+/// 千日手の裁定。`pos` は最後の `do_move` 直後の局面を渡す。
+///
+/// 🚨2026-10-08 修正: 通常千日手は **同一局面 4 回目の出現** で成立する (競技将棋のルール)。
+///   旧コードは `pos.repetition_state(plies_played)` を呼んでいた。`repetition_state` は
+///   `rep != 0 && rep < ply` で判定するので、対局手数 (大きな値) を渡すと
+///   `rep > 0` (= まだ 2 回目の再来) でも `Draw` になり、**2 回目の再来で対局を打ち切って**いた。
+///   実測 (NEWH_FG02_m492_n200000、600 局): 千日手で終わった 53 局が **全局とも**
+///   「最終局面の 2 回目の出現」で終了していて、4 回目は 0 局。うち 8 局は我々の評価値が
+///   +100cp 以上 (最大 +2047cp) で、勝勢の局を引き分けに変えていた。
+///   エンジン側は 4 回目で正しく draw 値を返す (陽性対照で確認済み) ので、器だけの不整合。
+///
+/// 判定規則は `rshogi-csa-server` の `GameValidator::classify_repetition` と同一:
+/// - 通常千日手 (`Draw`): `repetition < 0` (= 4 回目以降) のときだけ成立。
+/// - 連続王手の千日手 (`Win` / `Lose`): 反則なので 1 循環目の再来でも成立させる。
+/// - `Superior` / `Inferior`: 対局の裁定には使わない。
+fn adjudicate_repetition(pos: &Position) -> RepetitionState {
+    let st = pos.state();
+    if st.repetition == 0 {
+        return RepetitionState::None;
+    }
+    match st.repetition_type {
+        // 非決定的な再来 (rep > 0) では打ち切らず対局続行。
+        RepetitionState::Draw if st.repetition >= 0 => RepetitionState::None,
+        RepetitionState::Superior | RepetitionState::Inferior => RepetitionState::None,
+        other => other,
     }
 }
 
-impl std::error::Error for EngineFailure {}
-
 /// ゲーム設定
 pub struct GameConfig {
-    /// 評価値による投了裁定。既定は無効。
-    pub resign_rule: Option<ResignRule>,
-    /// 自己視点の優勢評価による勝ち裁定。None で無効。
-    pub win_rule: Option<ResignRule>,
-    /// 評価値による引分裁定。既定は無効。
-    pub draw_rule: Option<DrawRule>,
-    /// 両側の自己視点の評価の一致による勝敗の裁定 (`ScoreAdjudicator::with_agreement`)。None で無効。
-    pub agreement_rule: Option<ResignRule>,
-    /// 引分とする総手数。開始局面までの手数 (SFEN の手数欄と開始手順) を含めて数える。
     pub max_moves: u32,
-    /// 開始手順を USI 探索と千日手裁定に引き継ぐ。
-    pub preserve_start_history: bool,
     pub timeout_margin_ms: u64,
-    /// 時間制御なしの nodes/depth 探索の期限（1 手、正のミリ秒）。
-    pub limit_only_timeout_ms: Option<u64>,
-    /// 1 局の壁時計の上限 (ms)。各手の探索の前後に確かめ、超えていれば reason `game_time_limit` で打ち切る。
-    /// 時計の時間切れとは別の、hang を検知するための運用上の上限。
-    pub game_time_limit_ms: Option<u64>,
-    /// 各手の開始前に確認する停止要求。探索中の割り込みは行わない。
-    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// パス権利の初期値 (先手, 後手)。None の場合はパス権なし。
     pub pass_rights: Option<(u8, u8)>,
     /// Some(n) の場合は `go depth n` を使用（byoyomi より優先）
     pub go_depth: Option<u32>,
-    /// 先手に適用するノード数。Some(n) の場合は `go nodes n` を使用。
+    /// 先手に適用するノード数。 Some(n) の場合は `go nodes n` を使用。
     pub go_nodes_black: Option<u64>,
-    /// 後手に適用するノード数。Some(n) の場合は `go nodes n` を使用。
+    /// 後手に適用するノード数。 Some(n) の場合は `go nodes n` を使用。
     pub go_nodes_white: Option<u64>,
 }
 
@@ -74,8 +71,6 @@ pub struct GameResult {
     pub outcome: GameOutcome,
     pub reason: String,
     pub plies: u32,
-    /// 先手・後手の ponder 統計。両者無効なら None。
-    pub ponder: Option<[PonderStats; 2]>,
 }
 
 /// 1局を実行する。
@@ -95,115 +90,27 @@ pub fn run_game(
     config: &GameConfig,
     game_id: u32,
     on_move: &mut dyn FnMut(&MoveEvent),
-    info_cb: Option<Box<InfoCallback<'_>>>,
-) -> Result<GameResult> {
-    black.ponder_stats = PonderStats::default();
-    white.ponder_stats = PonderStats::default();
-    let result = run_game_inner(black, white, start_pos, tc, config, game_id, on_move, info_cb);
-    let black_cleanup = black.stop_ponder();
-    let white_cleanup = white.stop_ponder();
-    black.turn_start = None;
-    white.turn_start = None;
-    let mut result = result;
-    for cleanup in [black_cleanup, white_cleanup] {
-        if let Err(cleanup) = cleanup {
-            result = match result {
-                Err(original) => {
-                    Err(original.context(format!("ponder cleanup failed: {cleanup:#}")))
-                }
-                Ok(result) => {
-                    eprintln!("ponder cleanup failed: {cleanup:#}");
-                    Ok(result)
-                }
-            };
-        }
-    }
-    result.map(|mut result| {
-        if black.ponder_enabled || white.ponder_enabled {
-            result.ponder = Some([black.ponder_stats, white.ponder_stats]);
-        }
-        result
-    })
-}
-
-fn run_game_inner(
-    black: &mut EngineProcess,
-    white: &mut EngineProcess,
-    start_pos: &ParsedPosition,
-    tc: TimeControl,
-    config: &GameConfig,
-    game_id: u32,
-    on_move: &mut dyn FnMut(&MoveEvent),
     mut info_cb: Option<Box<InfoCallback<'_>>>,
 ) -> Result<GameResult> {
-    anyhow::ensure!(
-        config.limit_only_timeout_ms != Some(0),
-        "limit_only_timeout_ms must be positive"
-    );
     let pass_black = config.pass_rights.map(|(b, _)| b);
     let pass_white = config.pass_rights.map(|(_, w)| w);
-    let mut pos = if config.preserve_start_history {
-        build_base_position(start_pos, pass_black, pass_white)?
-    } else {
-        build_position(start_pos, pass_black, pass_white)?
-    };
-    let initial_sfen = pos.to_sfen();
-    let initial_pass_rights = config
-        .pass_rights
-        .map(|_| (pos.pass_rights(Color::Black), pos.pass_rights(Color::White)));
-    let mut moves = String::new();
-    let mut rules = RuleAdjudicator::new(&pos);
-    let mut history_plies = 0;
-    if config.preserve_start_history {
-        for mv in &start_pos.moves {
-            let mover = pos.side_to_move();
-            let (mv, gives_check) = apply_start_move(&mut pos, mv)?;
-            if !moves.is_empty() {
-                moves.push(' ');
-            }
-            moves.push_str(&mv.to_usi());
-            history_plies += 1;
-            anyhow::ensure!(
-                rules.after_move(&pos, mover, gives_check, history_plies).is_none(),
-                "start history already ended by repetition at history ply {history_plies}"
-            );
-        }
-    }
-    let mut scores = ScoreAdjudicator::new(config.resign_rule, config.win_rule, config.draw_rule)
-        .with_agreement(config.agreement_rule);
-    let game_start = std::time::Instant::now();
-    let over_game_time_limit = || {
-        config
-            .game_time_limit_ms
-            .is_some_and(|limit| game_start.elapsed() >= std::time::Duration::from_millis(limit))
-    };
+    let mut pos = build_position(start_pos, pass_black, pass_white)?;
     let mut tc = tc;
     let mut outcome = GameOutcome::InProgress;
     let mut outcome_reason = "max_moves".to_string();
     let mut plies_played = 0u32;
+    // 2026-10-07: 棋譜履歴。 開始局面の moves から始めて、 指した手を足していく。
+    //   🚨これをエンジンに渡さないと千日手を検出できない (実測 -0.38pt)。
+    let root_cmd: String = if start_pos.startpos {
+        "position startpos".to_string()
+    } else {
+        format!("position sfen {}", start_pos.sfen.as_deref().unwrap_or(""))
+    };
+    let mut played: Vec<String> = start_pos.moves.clone();
 
-    let game_moves_limit = config.max_moves.saturating_sub(plies_before_start(&pos));
-    for ply_idx in 0..game_moves_limit {
-        if config
-            .cancel
-            .as_ref()
-            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
-        {
-            return Ok(GameResult {
-                outcome: GameOutcome::InProgress,
-                reason: "cancelled".into(),
-                plies: plies_played,
-                ponder: None,
-            });
-        }
-        if over_game_time_limit() {
-            return Ok(GameResult {
-                outcome: GameOutcome::InProgress,
-                reason: "game_time_limit".into(),
-                plies: plies_played,
-                ponder: None,
-            });
-        }
+    let pass_rights_enabled = config.pass_rights.is_some();
+
+    for ply_idx in 0..config.max_moves {
         plies_played = ply_idx + 1;
         let side = pos.side_to_move();
         let engine = if side == Color::Black {
@@ -214,18 +121,27 @@ fn run_game_inner(
         let engine_label = engine.label.clone();
         let sfen_before = pos.to_sfen();
         let think_limit_ms = tc.think_limit_ms(side);
+        let pass_rights = if pass_rights_enabled {
+            Some((pos.pass_rights(Color::Black), pos.pass_rights(Color::White)))
+        } else {
+            None
+        };
+        let pos_cmd = if played.is_empty() {
+            root_cmd.clone()
+        } else {
+            format!("{} moves {}", root_cmd, played.join(" "))
+        };
         let req = SearchRequest {
-            sfen: &initial_sfen,
-            moves: &moves,
+            position_cmd: Some(pos_cmd),
+            sfen: &sfen_before,
             time_args: tc.time_args(),
             think_limit_ms,
             timeout_margin_ms: config.timeout_margin_ms,
-            limit_only_timeout_ms: config.limit_only_timeout_ms,
             game_id,
             ply: plies_played,
             side,
             engine_label: engine_label.clone(),
-            pass_rights: initial_pass_rights,
+            pass_rights,
             go_depth: config.go_depth,
             go_nodes: if side == Color::Black {
                 config.go_nodes_black
@@ -234,26 +150,8 @@ fn run_game_inner(
             },
         };
         let cb = info_cb.as_mut().map(|b| b.as_mut() as &mut dyn FnMut(&str, &SearchRequest<'_>));
-        let search = engine.search(&req, cb).context(EngineFailure)?;
-        let opponent_turn_start = std::time::Instant::now();
+        let search = engine.search(&req, cb)?;
 
-        if search.watchdog_fired {
-            return Ok(GameResult {
-                outcome: GameOutcome::InProgress,
-                reason: "watchdog".into(),
-                plies: plies_played,
-                ponder: None,
-            });
-        }
-        // 上限を越えた探索の結果 (終局手を含む) は勝敗に使わない。
-        if over_game_time_limit() {
-            return Ok(GameResult {
-                outcome: GameOutcome::InProgress,
-                reason: "game_time_limit".into(),
-                plies: plies_played,
-                ponder: None,
-            });
-        }
         let timed_out = search.timed_out;
         let mut move_usi = search.bestmove.clone().unwrap_or_else(|| "none".to_string());
         let mut raw_move_usi = None;
@@ -296,29 +194,51 @@ fn run_game_inner(
                     terminal = true;
                 }
                 _ => match Move::from_usi(mv_str) {
-                    Some(mv) if is_legal_game_move(&pos, mv) => {
+                    Some(mv) if is_legal_with_pass(&pos, mv) => {
                         let gives_check = if mv.is_pass() {
                             false
                         } else {
                             pos.gives_check(mv)
                         };
                         pos.do_move(mv, gives_check);
-                        // 特殊応答や不正手は追加しない。受信文字列の余分な末尾なども引き継がない。
-                        move_usi = mv.to_usi();
-                        if !moves.is_empty() {
-                            moves.push(' ');
-                        }
-                        moves.push_str(&move_usi);
-                        if let Some(verdict) = rules
-                            .after_move(&pos, side, gives_check, history_plies + plies_played)
-                            .or_else(|| scores.after_move(side, eval_log.as_ref(), plies_played))
-                        {
-                            outcome = verdict.outcome;
-                            outcome_reason = verdict.reason.to_string();
-                            terminal = true;
-                        }
                         tc.update_after_move(side, search.elapsed_ms);
-                        raw_move_usi = (move_usi != *mv_str).then(|| mv_str.clone());
+                        played.push(mv_str.clone()); // 2026-10-07: 棋譜履歴に足す
+                        move_usi = mv_str.clone();
+                        raw_move_usi = None;
+                        // 2026-06-05 千日手検出追加 = rshogi-core RepetitionState
+                        // (= 過去 SPRT で偽 draw 計上 noise 削減)
+                        // 🚨2026-10-08: 旧 `pos.repetition_state(plies_played as i32)` は
+                        //   2 回目の再来で Draw を返していた。adjudicate_repetition を参照。
+                        let rep = adjudicate_repetition(&pos);
+                        match rep {
+                            RepetitionState::Draw => {
+                                outcome = GameOutcome::Draw;
+                                outcome_reason = "sennichite".to_string();
+                                terminal = true;
+                            }
+                            RepetitionState::Win => {
+                                // 連続王手 を続けた側が負け、 受けた側 (= 現 side_to_move) が win
+                                let win_side = pos.side_to_move();
+                                outcome = if win_side == Color::Black {
+                                    GameOutcome::BlackWin
+                                } else {
+                                    GameOutcome::WhiteWin
+                                };
+                                outcome_reason = "perpetual_check_win".to_string();
+                                terminal = true;
+                            }
+                            RepetitionState::Lose => {
+                                let lose_side = pos.side_to_move();
+                                outcome = if lose_side == Color::Black {
+                                    GameOutcome::WhiteWin
+                                } else {
+                                    GameOutcome::BlackWin
+                                };
+                                outcome_reason = "perpetual_check_lose".to_string();
+                                terminal = true;
+                            }
+                            _ => {}
+                        }
                     }
                     _ => {
                         outcome = if side == Color::Black {
@@ -352,42 +272,12 @@ fn run_game_inner(
             think_limit_ms,
             timed_out,
             eval: eval_log,
-            engine_label: engine_label.clone(),
+            engine_label,
         };
         on_move(&event);
 
         if terminal || outcome != GameOutcome::InProgress {
             break;
-        }
-        if ply_idx + 2 < game_moves_limit {
-            let ponder_req = SearchRequest {
-                sfen: &initial_sfen,
-                moves: &moves,
-                time_args: tc.time_args(),
-                think_limit_ms: tc.think_limit_ms(side),
-                timeout_margin_ms: config.timeout_margin_ms,
-                limit_only_timeout_ms: config.limit_only_timeout_ms,
-                game_id,
-                ply: plies_played + 2,
-                side,
-                engine_label,
-                pass_rights: initial_pass_rights,
-                go_depth: config.go_depth,
-                go_nodes: if side == Color::Black {
-                    config.go_nodes_black
-                } else {
-                    config.go_nodes_white
-                },
-            };
-            engine.start_ponder(&ponder_req, &pos).context(EngineFailure)?;
-        }
-        let opponent = if side == Color::Black {
-            &mut *white
-        } else {
-            &mut *black
-        };
-        if opponent.ponder_enabled {
-            opponent.turn_start = Some(opponent_turn_start);
         }
     }
 
@@ -400,6 +290,67 @@ fn run_game_inner(
         outcome,
         reason: outcome_reason,
         plies: plies_played,
-        ponder: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rshogi_core::position::{Position, SFEN_HIRATE};
+
+    /// USI の指し手列を適用する。
+    fn apply(pos: &mut Position, moves: &[&str]) {
+        for s in moves {
+            let mv = Move::from_usi(s).unwrap_or_else(|| panic!("不正な USI 手 {s}"));
+            assert!(is_legal_with_pass(pos, mv), "非合法手 {s}");
+            let gc = pos.gives_check(mv);
+            pos.do_move(mv, gc);
+        }
+    }
+
+    fn hirate() -> Position {
+        let mut pos = Position::new();
+        pos.set_sfen(SFEN_HIRATE).expect("平手 SFEN");
+        pos
+    }
+
+    /// 🎯陽性対照: 同一局面 **4 回目** では千日手を成立させる。
+    ///   平手から両者の左金を 4 九 ⇔ 4 八 / 4 一 ⇔ 4 二 と 3 循環 (12 手) させると
+    ///   平手局面がちょうど 4 回目の出現になる。
+    #[test]
+    fn adjudicate_repetition_draws_on_fourth_occurrence() {
+        let mut pos = hirate();
+        let cycle = ["4i4h", "4a4b", "4h4i", "4b4a"];
+        for _ in 0..3 {
+            apply(&mut pos, &cycle);
+        }
+        assert_eq!(adjudicate_repetition(&pos), RepetitionState::Draw);
+    }
+
+    /// 🚨陰性対照 (今回のバグ本体): 同一局面 **2 回目 / 3 回目** では成立させない。
+    ///   旧実装 `pos.repetition_state(plies_played)` はここで Draw を返していたため、
+    ///   勝勢の局まで 2 回目の再来で打ち切られていた。
+    #[test]
+    fn adjudicate_repetition_does_not_draw_before_fourth_occurrence() {
+        let cycle = ["4i4h", "4a4b", "4h4i", "4b4a"];
+        for cycles in 1..=2 {
+            let mut pos = hirate();
+            for _ in 0..cycles {
+                apply(&mut pos, &cycle);
+            }
+            // 1 循環 = 平手 2 回目、 2 循環 = 3 回目。 どちらも千日手ではない。
+            assert_eq!(
+                adjudicate_repetition(&pos),
+                RepetitionState::None,
+                "{cycles} 循環 (= 同一局面 {} 回目) で千日手にしてはいけない",
+                cycles + 1
+            );
+            // 旧実装の再現: 対局手数を渡すと 2 回目で Draw になってしまうことを固定する。
+            assert_eq!(
+                pos.repetition_state(pos.game_ply()),
+                RepetitionState::Draw,
+                "旧実装はここで Draw を返していた (この assert が落ちたら前提が変わった)"
+            );
+        }
+    }
 }

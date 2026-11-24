@@ -4,24 +4,9 @@
 //! 分離してテスト可能にする。値取得の実体は wasm32 ビルドでのみ行い、
 //! 本モジュールが返すのは「取得結果から導出した純粋データ」に閉じる。
 
-#[cfg(any(target_arch = "wasm32", test))]
-use std::time::Duration;
-
 use rshogi_csa_server::ClockSpec;
-#[cfg(any(target_arch = "wasm32", test))]
-use rshogi_csa_server::config::{
-    FloodgateFeatureIntent, parse_allow_floodgate_features, validate_floodgate_feature_gate,
-};
 
 use crate::origin;
-
-/// `%KACHI` 判定に使う入玉ルールの既定値。`ENTERING_KING_RULE` env 未設定・空・
-/// 不正トークン時のフォールバックに使う。27 点法は電竜戦・従来の世界コンピュータ将棋
-/// 選手権・wdoor floodgate と同じ標準宣言ルールで、エンジン USI 既定 `CSARule27` とも
-/// 一致する。実際に使う値は対局開始時に env から解決して `PersistedConfig` に焼き込む
-/// ため、判定 (CoreRoom) と広告 (Game_Summary) は常に同じ永続値を参照する。
-pub const DEFAULT_ENTERING_KING_RULE: rshogi_core::types::EnteringKingRule =
-    rshogi_core::types::EnteringKingRule::Point27;
 
 /// 起動時にバインディング名として参照する環境変数キー群。
 ///
@@ -35,8 +20,8 @@ pub const DEFAULT_ENTERING_KING_RULE: rshogi_core::types::EnteringKingRule =
 /// - production / staging では Cloudflare secret 経由、local dev では `[vars]`
 ///   で動かす値: [`ConfigKeys::LOCAL_DEV_ONLY_VARS_KEYS`]
 ///
-/// `tests/integration/wrangler_template_consistency.rs` (template) と
-/// `tests/integration/wrangler_environment_toml_consistency.rs` (production / staging) が
+/// `tests/wrangler_template_consistency.rs` (template) と
+/// `tests/wrangler_environment_toml_consistency.rs` (production / staging) が
 /// これら配列と該当 toml ファイルの双方向整合を検証する。配列追加を忘れると
 /// template / 各環境 toml 更新忘れも検出できなくなる。
 pub struct ConfigKeys;
@@ -48,68 +33,11 @@ impl ConfigKeys {
     pub const GAME_ROOM_BINDING: &'static str = "GAME_ROOM";
     /// Durable Object バインディング名（Lobby マッチング待機キュー、1 instance 固定）。
     pub const LOBBY_BINDING: &'static str = "LOBBY";
-    /// Durable Object バインディング名（Rate limiter / abuse protection、issue
-    /// [#622](https://github.com/SH11235/rshogi/issues/622) PR3a）。
-    /// `id_from_name(format!("{kind}:{identifier}"))` で per-(kind, identifier)
-    /// に sharding し、1 DO instance に 1 token bucket を保持する。詳細は
-    /// [`crate::rate_limit`] と `docs/csa-server/rate_limit.md` を参照。
-    pub const RATE_LIMITER_BINDING: &'static str = "RATE_LIMITER";
-    /// Rate limit (issue [#622](https://github.com/SH11235/rshogi/issues/622)
-    /// PR3a) — 公開 + 私的 LOGIN_LOBBY の 1 IP あたり 1 分間の最大試行回数。
-    /// 設定不正値（空 / `0` / 非数値 / `u32` 範囲外）は安全側既定 (10) に
-    /// フォールバックする。閾値の根拠は `docs/csa-server/rate_limit_design.md`
-    /// §3 Q3 表参照。
-    pub const LOBBY_LOGIN_RATE_PER_IP_PER_MIN: &'static str = "LOBBY_LOGIN_RATE_PER_IP_PER_MIN";
-    /// Rate limit (issue [#622](https://github.com/SH11235/rshogi/issues/622)
-    /// PR3a) — 公開 LOGIN_LOBBY の 1 handle あたり 1 分間の最大試行回数。
-    /// 設定不正値は既定 (5) にフォールバック。
-    pub const LOBBY_LOGIN_RATE_PER_HANDLE_PER_MIN: &'static str =
-        "LOBBY_LOGIN_RATE_PER_HANDLE_PER_MIN";
-    /// Rate limit (issue [#622](https://github.com/SH11235/rshogi/issues/622)
-    /// PR3a) — CHALLENGE_LOBBY (private 招待発行) の 1 IP あたり 1 分間の最大試行
-    /// 回数。設定不正値は既定 (5) にフォールバック。
-    pub const LOBBY_CHALLENGE_RATE_PER_IP_PER_MIN: &'static str =
-        "LOBBY_CHALLENGE_RATE_PER_IP_PER_MIN";
-    /// Rate limit (issue [#622](https://github.com/SH11235/rshogi/issues/622)
-    /// PR3a) — CHALLENGE_LOBBY (private 招待発行) の 1 inviter handle あたり
-    /// 1 分間の最大試行回数。設定不正値は既定 (3) にフォールバック。
-    pub const LOBBY_CHALLENGE_RATE_PER_HANDLE_PER_MIN: &'static str =
-        "LOBBY_CHALLENGE_RATE_PER_HANDLE_PER_MIN";
-    /// Rate limit (issue [#622](https://github.com/SH11235/rshogi/issues/622)
-    /// PR3a) — `/ws/<room_id>` (player route) upgrade の 1 IP あたり 1 分間の
-    /// 最大回数。新規 GameRoom DO 起動の代理指標として使う (room 起動を厳密に
-    /// 数えるには DO 内 state を追う必要があるため、player route upgrade
-    /// 回数で近似する)。設定不正値は既定 (20) にフォールバック。
-    pub const ROOM_CREATE_RATE_PER_IP_PER_MIN: &'static str = "ROOM_CREATE_RATE_PER_IP_PER_MIN";
-    /// Rate limit (issue [#622](https://github.com/SH11235/rshogi/issues/622)
-    /// PR3a) — `/ws/<room_id>(/spectate)` upgrade 全般の 1 IP あたり 1 分間の
-    /// 最大回数。player + spectator 両 route が共有する looser cap で、
-    /// `ROOM_CREATE_RATE_PER_IP_PER_MIN` (player のみ tighter cap) と二段
-    /// チェックに使う。設定不正値は既定 (60) にフォールバック。
-    /// Lobby upgrade も同じ閾値を使用するが、bucket は GameRoom と分離する。
-    pub const WS_ROOM_UPGRADE_RATE_PER_IP_PER_MIN: &'static str =
-        "WS_ROOM_UPGRADE_RATE_PER_IP_PER_MIN";
     /// LobbyDO 内 in-memory queue の総数上限。超過時 LOGIN_LOBBY を `queue_full`
     /// で reject する。未設定時は 100 が既定値。
     pub const LOBBY_QUEUE_SIZE_LIMIT: &'static str = "LOBBY_QUEUE_SIZE_LIMIT";
-    /// 公開マッチング queue (`LobbyQueue`) の entry TTL (秒)。`LOBBY_PONG`
-    /// 受信から本値を超えると LobbyDO の Alarm purge で stale 判定され、
-    /// `LOGIN_LOBBY:incorrect queue_expired` 送信 + WS close される
-    /// (https://github.com/SH11235/rshogi/issues/631)。
-    /// network 分断や WS close 遅延で残った stale entry を一定時間で掃除し、
-    /// 後続ユーザの誤マッチを防ぐ目的。未設定時は 300 秒 (5 分) が既定値。
-    pub const LOBBY_QUEUE_ENTRY_TTL_SEC: &'static str = "LOBBY_QUEUE_ENTRY_TTL_SEC";
-    /// 私的対局 (`CHALLENGE_LOBBY`) で発行された token の TTL (秒)。期限超過した
-    /// 未消費 token は LobbyDO の Alarm ハンドラで `purge_expired` され、保留中の
-    /// WS 接続がいれば切断される。未設定時は 3600 秒 (1 時間)。https://github.com/SH11235/rshogi/issues/582 の
-    /// Workers 経路で参照する。
-    pub const CHALLENGE_TTL_SEC: &'static str = "CHALLENGE_TTL_SEC";
     /// R2 バケットバインディング名（CSA V2 棋譜保存）。
     pub const KIFU_BUCKET_BINDING: &'static str = "KIFU_BUCKET";
-    /// 任意の棋譜バックアップ先。未設定環境ではバックアップは無効。
-    pub const KIFU_BACKUP_BUCKET_BINDING: &'static str = "KIFU_BACKUP_BUCKET";
-    /// バックアップ異常通知先の HTTPS webhook。公開環境では secret として設定する。
-    pub const KIFU_BACKUP_ALERT_URL: &'static str = "KIFU_BACKUP_ALERT_URL";
     /// R2 バケットバインディング名（Floodgate 履歴保存）。1 対局 = 1 オブジェクト
     /// （単一行 JSON）を `floodgate-history/YYYY/MM/DD/HHMMSS-<game_id>.json` キーで
     /// 保存し、`list_recent` は day shard を新しい順に走査して N 件取得する。
@@ -128,158 +56,49 @@ impl ConfigKeys {
     pub const TOTAL_TIME_MIN: &'static str = "TOTAL_TIME_MIN";
     /// StopWatch 用の秒読み（分）。
     pub const BYOYOMI_MIN: &'static str = "BYOYOMI_MIN";
-    /// 持ち時間プリセット宣言（JSON 配列文字列）。`game_name` 別に `ClockSpec` を
-    /// 切り替えるために使う。値の例:
-    /// ```jsonc
-    /// [
-    ///   {"game_name":"byoyomi-600-10","kind":"countdown","total_time_sec":600,"byoyomi_sec":10},
-    ///   {"game_name":"fischer-300-10F","kind":"fischer","total_time_sec":300,"increment_sec":10}
-    /// ]
-    /// ```
-    /// 未設定 / 空文字 / 空配列のときは「プリセット未宣言」となり、`CLOCK_KIND`
-    /// 等から導出する global clock を全 `game_name` に適用する後方互換動作にとどまる。
-    /// 1 件以上登録された場合は strict mode となり、未登録 `game_name` の LOGIN は
-    /// `LOGIN_LOBBY:incorrect unknown_game_name` で拒否される。
+    /// 運営権限を持つハンドル名（`%%SETBUOY` / `%%DELETEBUOY`）。
     ///
-    /// 各 entry は時計仕様に加えて省略可能な `max_moves` (手数上限、到達で
-    /// `%MAX_MOVES` 引き分け) を持てる。省略時は `DEFAULT_MAX_MOVES` (256)。
-    pub const CLOCK_PRESETS: &'static str = "CLOCK_PRESETS";
-    /// 管理 API トークン (Floodgate audit https://github.com/SH11235/rshogi/issues/560
-    /// 由来)。WS 内 admin command (`%%ADMIN <token>`,
-    /// https://github.com/SH11235/rshogi/issues/621) や将来の HTTP admin endpoint の
-    /// 認可基盤として [`crate::admin_auth`] から参照される 1 本の static API
-    /// token。HMAC は overkill 判定 (replay/canonical string 設計コスト > 利得)、
-    /// Cloudflare Access (Zero Trust) は運用層で別管理する。
-    ///
-    /// **production / staging**: Cloudflare secret として
-    /// `wrangler secret put ADMIN_API_TOKEN` で配置する (rotation 手順は
-    /// `docs/csa-server/admin_auth.md` 参照)。secret 経由なので OSS repo にも
-    /// CI ログにも値は残らない。
+    /// **production**: Cloudflare secret として `wrangler secret put ADMIN_HANDLE`
+    /// で設定する。OSS repo に handle 名が出ない経路で defense-in-depth を保つ。
     /// **local dev**: `wrangler.toml.example` の `[vars]` に placeholder を残し、
     /// `wrangler dev` を friction なく動かせるようにする。Worker code は
-    /// `env.var(ConfigKeys::ADMIN_API_TOKEN)` で var/secret どちらも読む。
-    pub const ADMIN_API_TOKEN: &'static str = "ADMIN_API_TOKEN";
-    /// LOGIN handle 自称防止用 whitelist (Floodgate audit
-    /// [#664](https://github.com/SH11235/rshogi/issues/664)、親 [#621](https://github.com/SH11235/rshogi/issues/621))。
-    /// JSON 配列文字列で `[{"handle":"...","password_sha256":"..."}, ...]` 形式を
-    /// 受け取り、ここに登録された handle で `LOGIN` / `LOGIN_LOBBY` した
-    /// session に対して **password の SHA256 比較** を要求する。詳細は
-    /// [`crate::handle_auth`] と `docs/csa-server/admin_auth.md` §LOGIN handle
-    /// whitelist 節を参照。
-    ///
-    /// - whitelist に **無い** handle: 従来通り self-claim で素通し (Floodgate
-    ///   互換 client / 一般対局者の挙動を変えないため後方互換最優先)。
-    /// - whitelist に **ある** handle: SHA256(password) が登録 hash と一致した
-    ///   ときのみ LOGIN 受理、不一致は `LOGIN:incorrect handle_auth_failed` で reject。
-    /// - whitelist JSON 不正: fail-closed で **全 LOGIN reject** + structured_log
-    ///   警告 (不正設定で admin 自称が通る経路を絶つ)。
-    ///
-    /// **production / staging**: Cloudflare secret として
-    /// `wrangler secret put WORKERS_HANDLE_AUTH` で配置する (password hash を
-    /// 含むため公開 toml には書かない)。secret 未配置 / 空文字 / `"[]"` は
-    /// 「whitelist 未宣言」として self-claim 既定挙動を維持する。
-    /// **local dev**: `wrangler.toml.example` の `[vars]` に空配列 placeholder
-    /// (`"[]"`) を残し、friction なく `wrangler dev` を動かせるようにする。
-    pub const WORKERS_HANDLE_AUTH: &'static str = "WORKERS_HANDLE_AUTH";
-    /// 公開用 player ID を LOGIN の handle + password から HMAC-SHA256 で導出する鍵。
-    /// 32 bytes 以上の単一 string、または `active_version` と version 別 `keys` を
-    /// 持つ JSON string を受ける。production / staging では
-    /// `wrangler secret put PLAYER_ID_SECRET` で配置し、API・R2・D1・ログへ値を
-    /// 出してはならない。未設定・不正時は対局を止めず、handle 由来の legacy
-    /// opaque ID にフォールバックして secret 値を含まない構造化警告を残す。
-    pub const PLAYER_ID_SECRET: &'static str = "PLAYER_ID_SECRET";
+    /// `env.var(ConfigKeys::ADMIN_HANDLE)` で var/secret どちらも読む（Cloudflare
+    /// 仕様で同じ namespace に展開される）。
+    pub const ADMIN_HANDLE: &'static str = "ADMIN_HANDLE";
     /// 切断時の再接続猶予秒数。`0` または未設定なら再接続プロトコルを無効化し、
     /// WebSocket close を即時 `#ABNORMAL` に流す（保守的既定）。`> 0` を指定する
     /// 構成は `--allow-floodgate-features` (Workers では `ALLOW_FLOODGATE_FEATURES`)
     /// を要求する Floodgate features の opt-in 経路に乗る。
     pub const RECONNECT_GRACE_SECONDS: &'static str = "RECONNECT_GRACE_SECONDS";
-    /// `%KACHI` 判定に使う入玉ルールを USI トークンで指定する (`CSARule27` /
-    /// `CSARule24` 等、`EnteringKingRule::from_usi` が受理する値)。未設定・空・
-    /// 不正トークンは [`DEFAULT_ENTERING_KING_RULE`] にフォールバックする。
-    /// 配備インスタンス単位でルールを切替える (電竜戦=27点法 / WCSC 2028=24点法) 用途。
-    pub const ENTERING_KING_RULE: &'static str = "ENTERING_KING_RULE";
-    /// LOGIN OK 後の AGREE 待ち TTL (秒)。`start_match` で Game_Summary を送信した
-    /// 直後に予約し、両者 AGREE 受領 (`HandleOutcome::GameStarted`) で cancel する。
-    /// 発火時は対局が成立する前に部屋を解放する (https://github.com/SH11235/rshogi/issues/600)。
-    /// `0` または未設定は安全側既定 [`DEFAULT_AGREE_TIMEOUT_SEC`] にフォールバック
-    /// する (TTL 0 = 無効化は memory / room 枠の長期占有リスクを再現するため許容しない)。
-    pub const AGREE_TIMEOUT_SECONDS: &'static str = "AGREE_TIMEOUT_SECONDS";
     /// Floodgate 機能群を opt-in 有効化するブール変数。`true` / `1` / `yes` / `on`
     /// で有効。`reconnect_protocol` 等の Floodgate 系を要求する構成で必須。
     pub const ALLOW_FLOODGATE_FEATURES: &'static str = "ALLOW_FLOODGATE_FEATURES";
-    /// viewer 配信 API (`/api/v1/games*` / `/api/v1/players*` HTTP,
-    /// `/ws/<id>/spectate` WS) を opt-in
+    /// viewer 配信 API (`/api/v1/games*` HTTP, `/ws/<id>/spectate` WS) を opt-in
     /// 有効化するブール変数。`true` / `1` / `yes` / `on` で有効、`false` / `0`
     /// / `no` / `off` または未設定で無効（= 該当 endpoint は 404 で既存ルーティング
     /// にフォールスルー）。production rollout 時の kill-switch を兼ね、本値を
     /// `"0"` に切り替えて redeploy することで viewer API を即時無効化できる。
-    /// 設定不正値は安全側に倒し（無効化）、[`structured_log!`](crate::structured_log)
-    /// で警告ログを出す。
+    /// 設定不正値は安全側に倒し（無効化）、`worker::console_log!` で警告ログを
+    /// 出す。
     pub const ALLOW_VIEWER_API: &'static str = "ALLOW_VIEWER_API";
-    /// 私的対局 (`CHALLENGE_LOBBY` および `LOGIN_LOBBY <handle>+private-<token>+free`)
-    /// 経路を opt-in 有効化するブール変数 (https://github.com/SH11235/rshogi/issues/635)。
-    /// `true` / `1` / `yes` / `on` で有効、`false` / `0` / `no` / `off` または
-    /// 未設定で無効化。
-    ///
-    /// 無効時 (= production の既定) は LobbyDO の `dispatch_pending_line` 入口で
-    /// 早期 reject し、`CHALLENGE_LOBBY:incorrect unsupported` /
-    /// `LOGIN_LOBBY:incorrect unsupported` を返す (private LOGIN_LOBBY は加えて
-    /// 1003 close)。両者揃った後の対局起動経路 (consume → GameRoom DO 起動 +
-    /// clock_spec / initial_sfen バトンパス) が未実装のため、production client が
-    /// 誤って使うと pending state でハマるのを防ぐ feature gate。
-    ///
-    /// staging では起動経路実装の動作確認時のみ `"true"` に切り替える。
-    /// 設定不正値 (`true` / `false` / 数字 / yes/no/on/off 以外) は `ALLOW_VIEWER_API`
-    /// と同じく安全側 (= 無効化) に倒し、[`structured_log!`](crate::structured_log)
-    /// で警告ログを出す。
-    pub const PRIVATE_CHALLENGE_ENABLED: &'static str = "PRIVATE_CHALLENGE_ENABLED";
 
-    /// deploy 対象コードの provenance commit sha (`DEPLOY_TRIGGER_SHA`)。
-    ///
-    /// CI deploy 時に `wrangler deploy --var DEPLOYED_SHA:<sha>` 経由で runtime に
-    /// 注入される。ここでの `<sha>` は `github.sha` ではなく
-    /// `.github/workflows/deploy-workers.yml` の `push.paths` にマッチする main 上の
-    /// **最新 commit sha** (`git log -1 --format=%H -- <paths>`)。docs-only commit が
-    /// main HEAD にあっても本値は変わらないため、https://github.com/SH11235/rshogi/issues/639 の drift detection
-    /// workflow で「deploy 対象コードの commit ↔ Cloudflare 上の current version」を
-    /// 突合する基準として使える。
-    ///
-    /// `/health` JSON の `deployed_sha` フィールドとして外部に公開する。未設定
-    /// (local dev / 古い deploy) では `"unknown"` を返す。
-    ///
-    /// 本値は env toml (`wrangler.<env>.toml`) や `wrangler.toml.example` の
-    /// `[vars]` テーブルには **書いてはならない** ([`Self::RUNTIME_INJECTED_VARS_KEYS`]
-    /// 経由で test gate)。
-    pub const DEPLOYED_SHA: &'static str = "DEPLOYED_SHA";
-
-    /// 全環境の `[[r2_buckets]]` に必要な binding。任意の基盤は `OPTIONAL_R2_BINDINGS`。
+    /// `wrangler.toml` の `[[r2_buckets]] binding = "..."` で宣言されるべき名前の
+    /// 網羅列挙。新規 R2 binding 定数を追加したら必ず本配列にも追加する。
     pub const ALL_R2_BINDINGS: &'static [&'static str] = &[
         Self::KIFU_BUCKET_BINDING,
         Self::FLOODGATE_HISTORY_BUCKET_BINDING,
     ];
 
-    /// 基盤作成後に個別環境へ追加する任意の R2 binding。
-    pub const OPTIONAL_R2_BINDINGS: &'static [&'static str] = &[Self::KIFU_BACKUP_BUCKET_BINDING];
-
-    /// 終局済棋譜の検索用 D1 database binding。
-    pub const GAMES_SEARCH_DB_BINDING: &'static str = "GAMES_SEARCH_DB";
-
-    /// Wrangler に宣言する D1 binding の網羅列挙。
-    pub const ALL_D1_BINDINGS: &'static [&'static str] = &[Self::GAMES_SEARCH_DB_BINDING];
-
     /// `wrangler.toml` の `[[durable_objects.bindings]] name = "..."` で宣言される
     /// べき名前の網羅列挙。新規 DO binding 定数を追加したら必ず本配列にも追加する。
-    pub const ALL_DO_BINDINGS: &'static [&'static str] = &[
-        Self::GAME_ROOM_BINDING,
-        Self::LOBBY_BINDING,
-        Self::RATE_LIMITER_BINDING,
-    ];
+    pub const ALL_DO_BINDINGS: &'static [&'static str] =
+        &[Self::GAME_ROOM_BINDING, Self::LOBBY_BINDING];
 
     /// **deploy 対象の全環境**（production / staging）の `wrangler.<env>.toml`
     /// `[vars]` テーブルで宣言されるべきキーの網羅列挙。本配列に含まれる定数は
     /// 全 deploy 環境で `[vars]` として平文管理される（公開しても運用上問題ない値）。
     ///
-    /// 本配列に含まれない定数（例: [`Self::ADMIN_API_TOKEN`]）は production / staging
+    /// 本配列に含まれない定数（例: [`Self::ADMIN_HANDLE`]）は production / staging
     /// いずれも `wrangler secret put` 経由で設定し、`wrangler.<env>.toml` には書かない。
     /// ただし [`Self::LOCAL_DEV_ONLY_VARS_KEYS`] に含まれていれば
     /// `wrangler.toml.example` の `[vars]` には placeholder として残し、local dev
@@ -304,27 +123,10 @@ impl ConfigKeys {
         Self::BYOYOMI_MS,
         Self::TOTAL_TIME_MIN,
         Self::BYOYOMI_MIN,
-        Self::CLOCK_PRESETS,
-        Self::ENTERING_KING_RULE,
         Self::RECONNECT_GRACE_SECONDS,
-        Self::AGREE_TIMEOUT_SECONDS,
         Self::ALLOW_FLOODGATE_FEATURES,
         Self::ALLOW_VIEWER_API,
         Self::LOBBY_QUEUE_SIZE_LIMIT,
-        Self::LOBBY_QUEUE_ENTRY_TTL_SEC,
-        Self::CHALLENGE_TTL_SEC,
-        Self::PRIVATE_CHALLENGE_ENABLED,
-        // Rate limit thresholds — 6 keys。各値の根拠は
-        // `docs/csa-server/rate_limit_design.md` §3 Q3 表とこのファイル冒頭の
-        // 各定数 docstring を参照。閾値を deploy なしで上書きしたい場合は
-        // `wrangler secret put <KEY>` ではなく `wrangler.<env>.toml` の `[vars]`
-        // 編集 + redeploy で反映する (この配列に含まれる = 平文管理 OK 値)。
-        Self::LOBBY_LOGIN_RATE_PER_IP_PER_MIN,
-        Self::LOBBY_LOGIN_RATE_PER_HANDLE_PER_MIN,
-        Self::LOBBY_CHALLENGE_RATE_PER_IP_PER_MIN,
-        Self::LOBBY_CHALLENGE_RATE_PER_HANDLE_PER_MIN,
-        Self::ROOM_CREATE_RATE_PER_IP_PER_MIN,
-        Self::WS_ROOM_UPGRADE_RATE_PER_IP_PER_MIN,
     ];
 
     /// **local dev のみ** の `wrangler.toml.example` `[vars]` テーブルに追加で
@@ -334,94 +136,7 @@ impl ConfigKeys {
     /// `wrangler.toml.example` には `SHARED_PUBLIC_VARS_KEYS ∪ LOCAL_DEV_ONLY_VARS_KEYS`
     /// 全件を `[vars]` として記載することで、新規メンバーが `cp wrangler.toml.example
     /// wrangler.toml && wrangler dev` で即動作確認できる friction レス運用を維持する。
-    pub const LOCAL_DEV_ONLY_VARS_KEYS: &'static [&'static str] = &[
-        Self::ADMIN_API_TOKEN,
-        Self::WORKERS_HANDLE_AUTH,
-        Self::PLAYER_ID_SECRET,
-        Self::KIFU_BACKUP_ALERT_URL,
-    ];
-
-    /// **deploy 時に CI から runtime 注入される** `[vars]` キーの網羅列挙
-    /// ([`Self::DEPLOYED_SHA`] 等)。`SHARED_PUBLIC_VARS_KEYS` / `LOCAL_DEV_ONLY_VARS_KEYS`
-    /// とは排他で、env toml (`wrangler.<env>.toml`) と `wrangler.toml.example` の
-    /// **どちらの `[vars]` テーブルにも書いてはならない**。
-    ///
-    /// 値は CI workflow の `wrangler deploy --var KEY:VALUE` 引数で 1 回限り注入され、
-    /// 各 deploy 毎に最新値で上書きされる (Cloudflare の `--keep-vars` を付けない既定
-    /// 挙動に依存)。`tests/integration/wrangler_template_consistency.rs` /
-    /// `tests/integration/wrangler_environment_toml_consistency.rs` が「本配列のキーが
-    /// `[vars]` に含まれていないこと」を gate する。
-    ///
-    /// 新規定数追加時の振り分け基準（[`Self::SHARED_PUBLIC_VARS_KEYS`] の docstring
-    /// に併記している既存 3 分類との比較）:
-    /// - 全 deploy 環境で値が同じで運用者が toml で平文管理する公開値 →
-    ///   `SHARED_PUBLIC_VARS_KEYS`
-    /// - production / staging では secret、local dev は var で動かす値 →
-    ///   `LOCAL_DEV_ONLY_VARS_KEYS`
-    /// - **deploy 毎に CI が値を計算して注入する値** (commit sha / build ID 等) →
-    ///   本配列 `RUNTIME_INJECTED_VARS_KEYS`
-    pub const RUNTIME_INJECTED_VARS_KEYS: &'static [&'static str] = &[Self::DEPLOYED_SHA];
-}
-
-/// `CHALLENGE_TTL_SEC` 既定値 (1 時間)。`parse_challenge_ttl_duration` で
-/// `None` / 空文字 / パース失敗時のフォールバックとして参照する。
-pub(crate) const DEFAULT_CHALLENGE_TTL_SEC: u64 = 3600;
-
-/// `LOBBY_QUEUE_ENTRY_TTL_SEC` 既定値 (5 分)。stale public queue entry の
-/// 上限滞在時間として保守的な値を採る。
-pub(crate) const DEFAULT_LOBBY_QUEUE_ENTRY_TTL_SEC: u64 = 300;
-
-/// `AGREE_TIMEOUT_SECONDS` 既定値 (60 秒)。TCP frontend は 5 分既定だが、Workers
-/// DO は 1 部屋 = 1 instance で memory / room 枠を専有するため、より短めの既定で
-/// stuck DO を素早く解放する設計を採る (https://github.com/SH11235/rshogi/issues/600)。
-pub(crate) const DEFAULT_AGREE_TIMEOUT_SEC: u64 = 60;
-
-/// `CHALLENGE_TTL_SEC` 文字列を `Duration` へ解決する。`None` / 空文字 /
-/// 非数値 / `u64` 範囲外は [`DEFAULT_CHALLENGE_TTL_SEC`] にフォールバック
-/// する (challenge TTL 不正で全 `CHALLENGE_LOBBY` 発行が止まる事態を避ける
-/// 安全側挙動)。`= 0` は purge が即時となり全 token が短命になる選択を
-/// 運用側に与えるため許容する。
-pub fn parse_challenge_ttl_duration(raw: Option<&str>) -> std::time::Duration {
-    let trimmed = raw.unwrap_or("").trim();
-    if trimmed.is_empty() {
-        return std::time::Duration::from_secs(DEFAULT_CHALLENGE_TTL_SEC);
-    }
-    match trimmed.parse::<u64>() {
-        Ok(secs) => std::time::Duration::from_secs(secs),
-        Err(_) => std::time::Duration::from_secs(DEFAULT_CHALLENGE_TTL_SEC),
-    }
-}
-
-/// `LOBBY_QUEUE_ENTRY_TTL_SEC` 文字列を `Duration` へ解決する。
-///
-/// `None` / 空文字 / `0` / 非数値 / `u64` 範囲外は [`DEFAULT_LOBBY_QUEUE_ENTRY_TTL_SEC`]
-/// にフォールバックする (env 不正で TTL 0 = 即時 purge となり全 queue 待機が
-/// 切断される事故を避ける安全側挙動。`AGREE_TIMEOUT_SECONDS` と同じ流儀)。
-pub fn parse_lobby_queue_entry_ttl_duration(raw: Option<&str>) -> std::time::Duration {
-    let trimmed = raw.unwrap_or("").trim();
-    if trimmed.is_empty() {
-        return std::time::Duration::from_secs(DEFAULT_LOBBY_QUEUE_ENTRY_TTL_SEC);
-    }
-    match trimmed.parse::<u64>() {
-        Ok(0) | Err(_) => std::time::Duration::from_secs(DEFAULT_LOBBY_QUEUE_ENTRY_TTL_SEC),
-        Ok(secs) => std::time::Duration::from_secs(secs),
-    }
-}
-
-/// `AGREE_TIMEOUT_SECONDS` 文字列を `Duration` へ解決する。
-///
-/// `None` / 空文字 / `0` / 非数値 / `u64` 範囲外は [`DEFAULT_AGREE_TIMEOUT_SEC`]
-/// にフォールバックする (env 不正で stuck DO が無限残存する事態を避ける安全側挙動)。
-/// `> 0` の正値はそのまま秒として `Duration` にする。
-pub fn parse_agree_timeout_duration(raw: Option<&str>) -> std::time::Duration {
-    let trimmed = raw.unwrap_or("").trim();
-    if trimmed.is_empty() {
-        return std::time::Duration::from_secs(DEFAULT_AGREE_TIMEOUT_SEC);
-    }
-    match trimmed.parse::<u64>() {
-        Ok(0) | Err(_) => std::time::Duration::from_secs(DEFAULT_AGREE_TIMEOUT_SEC),
-        Ok(secs) => std::time::Duration::from_secs(secs),
-    }
+    pub const LOCAL_DEV_ONLY_VARS_KEYS: &'static [&'static str] = &[Self::ADMIN_HANDLE];
 }
 
 /// `RECONNECT_GRACE_SECONDS` 文字列を `Duration` へ解決する。`None` または空文字
@@ -436,65 +151,6 @@ pub fn parse_reconnect_grace_duration(raw: Option<&str>) -> Result<std::time::Du
         .parse()
         .map_err(|e| format!("RECONNECT_GRACE_SECONDS: invalid u64 {trimmed:?}: {e}"))?;
     Ok(std::time::Duration::from_secs(secs))
-}
-
-/// 再接続 grace 設定を解決する pure helper。
-///
-/// `parse_reconnect_grace_duration`（本 crate ローカル）と
-/// `parse_allow_floodgate_features` / `validate_floodgate_feature_gate`
-/// （shared crate `rshogi-csa-server`）を 3 段で組み合わせる。
-///
-/// `worker::Env` 依存を上層 (`game_room.rs::resolve_reconnect_grace`) の薄い
-/// shim に閉じ込めて、本関数は host 単体テストで設定不正パターンを inject
-/// できる pure な API として提供する。
-///
-/// 受理する入出力:
-/// ```text
-/// (None, None)                    : Ok(Duration::ZERO)  (両者未設定 = 保守的既定)
-/// (Some("0"),  Some("false"))     : Ok(Duration::ZERO)  (production の既定構成)
-/// (Some("30"), Some("true"))      : Ok(Duration::from_secs(30))  (再接続有効化)
-/// (Some("abc"), _)                : Err (パースエラー)
-/// (Some("30"), Some("false"))     : Err (gate mismatch: grace>0 だが allow=false)
-/// ```
-///
-/// 通常ビルドでは wasm32 ターゲットの `game_room::resolve_reconnect_grace` 経由で
-/// 消費される。host テストでは本関数を直接呼び出して設定不正パターンを inject
-/// する。
-#[cfg(any(target_arch = "wasm32", test))]
-pub(crate) fn resolve_reconnect_grace_from_strings(
-    grace_raw: Option<&str>,
-    allow_raw: Option<&str>,
-) -> Result<Duration, String> {
-    let grace = parse_reconnect_grace_duration(grace_raw)?;
-    let allow = parse_allow_floodgate_features(allow_raw)?;
-    let intent = FloodgateFeatureIntent {
-        enable_reconnect_protocol: !grace.is_zero(),
-        ..FloodgateFeatureIntent::default()
-    };
-    validate_floodgate_feature_gate(allow, intent)?;
-    Ok(grace)
-}
-
-/// `ENTERING_KING_RULE` env 文字列から `%KACHI` 判定ルールを解決する pure helper。
-///
-/// - `None` / 空文字 → `Ok(default)` (env 未設定は既定運用)
-/// - `EnteringKingRule::from_usi` が受理するトークン → `Ok(その値)`
-/// - 未知トークン → `Err(トークン)` (呼び出し側でログして default にフォールバックする。
-///   1 台の typo で全対局を落とすより、標準ルールで走らせて運用者に気付かせる方が安全)
-///
-/// `default` を引数に取るのは host テストで既定非依存に検証するため。実運用の
-/// フォールバック先は [`DEFAULT_ENTERING_KING_RULE`]。
-#[cfg(any(target_arch = "wasm32", test))]
-pub(crate) fn resolve_entering_king_rule_from_string(
-    raw: Option<&str>,
-    default: rshogi_core::types::EnteringKingRule,
-) -> Result<rshogi_core::types::EnteringKingRule, String> {
-    match raw.map(str::trim) {
-        None | Some("") => Ok(default),
-        Some(token) => {
-            rshogi_core::types::EnteringKingRule::from_usi(token).ok_or_else(|| token.to_owned())
-        }
-    }
 }
 
 /// Workers `[vars]` 文字列群から時計設定を解決する。
@@ -524,138 +180,22 @@ pub fn parse_clock_spec(
         "countdown" => Ok(ClockSpec::Countdown {
             total_time_sec: parse_u32("TOTAL_TIME_SEC", total_time_sec, 600)?,
             byoyomi_sec: parse_u32("BYOYOMI_SEC", byoyomi_sec, 10)?,
-            black_total_time_sec: None,
-            white_total_time_sec: None,
         }),
         "countdown_msec" => Ok(ClockSpec::CountdownMsec {
             total_time_ms: parse_u32("TOTAL_TIME_MS", total_time_ms, 600_000)?,
             byoyomi_ms: parse_u32("BYOYOMI_MS", byoyomi_ms, 10_000)?,
-            black_total_time_ms: None,
-            white_total_time_ms: None,
         }),
         "fischer" => Ok(ClockSpec::Fischer {
             total_time_sec: parse_u32("TOTAL_TIME_SEC", total_time_sec, 600)?,
             increment_sec: parse_u32("BYOYOMI_SEC", byoyomi_sec, 10)?,
-            black_total_time_sec: None,
-            white_total_time_sec: None,
         }),
         "stopwatch" => Ok(ClockSpec::StopWatch {
             total_time_min: parse_u32("TOTAL_TIME_MIN", total_time_min, 10)?,
             byoyomi_min: parse_u32("BYOYOMI_MIN", byoyomi_min, 1)?,
-            black_total_time_min: None,
-            white_total_time_min: None,
         }),
         other => Err(format!(
             "CLOCK_KIND: expected countdown|countdown_msec|fischer|stopwatch, got {other:?}"
         )),
-    }
-}
-
-/// `CLOCK_PRESETS` の 1 entry を解決した結果。時計仕様に加えて、preset 単位の
-/// 対局ルール上書き (現状は `max_moves` のみ) を保持する。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GamePreset {
-    pub clock: ClockSpec,
-    /// 手数上限の上書き。`None` は既定 (`game_room` の `DEFAULT_MAX_MOVES`) を使う。
-    pub max_moves: Option<u32>,
-}
-
-/// `CLOCK_PRESETS` 環境変数 (JSON 配列文字列) から `game_name → GamePreset` の
-/// マップを構築する。
-///
-/// `None` / 空文字 / `[]` は空 HashMap を返す（プリセット未宣言モード）。
-/// 1 件以上を含む場合は呼び出し側 (lobby / game_room) が strict mode に切り替わり、
-/// 未登録 `game_name` の LOGIN を拒否する。
-///
-/// バリデーション:
-/// - JSON パース失敗は `Err`。
-/// - 同一 `game_name` の重複は `Err`。
-/// - `total_time_*` が 0 の preset は `Err`（少なくとも 1 単位以上の本体時間を要求）。
-///   `byoyomi_*` / `increment_sec` の 0 は sudden death として許容。
-/// - `max_moves` は省略可。指定時は 0 を `Err` (0 手上限は即引き分けで無意味)。
-pub fn parse_clock_presets(
-    raw: Option<&str>,
-) -> Result<std::collections::HashMap<String, GamePreset>, String> {
-    use serde::Deserialize;
-    let trimmed = raw.unwrap_or("").trim();
-    if trimmed.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-    #[derive(Deserialize)]
-    struct Entry {
-        game_name: String,
-        #[serde(default)]
-        max_moves: Option<u32>,
-        #[serde(flatten)]
-        spec: ClockSpec,
-    }
-    let entries: Vec<serde_json::Map<String, serde_json::Value>> =
-        serde_json::from_str(trimmed).map_err(|e| format!("CLOCK_PRESETS: invalid JSON: {e}"))?;
-    let mut out: std::collections::HashMap<String, GamePreset> =
-        std::collections::HashMap::with_capacity(entries.len());
-    for fields in entries {
-        let entry: Entry = serde_json::from_value(serde_json::Value::Object(fields.clone()))
-            .map_err(|e| format!("CLOCK_PRESETS: invalid JSON: {e}"))?;
-        entry
-            .spec
-            .validate_color_total_fields(fields.keys().map(String::as_str))
-            .map_err(|field| {
-                format!(
-                    "CLOCK_PRESETS: clock preset {:?}: {field} is not supported by this clock kind",
-                    entry.game_name
-                )
-            })?;
-        entry.spec.validate_total_time_nonzero().map_err(|field| {
-            format!("CLOCK_PRESETS: clock preset {:?}: {field} must be > 0", entry.game_name)
-        })?;
-        if entry.max_moves == Some(0) {
-            return Err(format!(
-                "CLOCK_PRESETS: clock preset {:?}: max_moves must be > 0",
-                entry.game_name
-            ));
-        }
-        if out.contains_key(&entry.game_name) {
-            return Err(format!(
-                "CLOCK_PRESETS: duplicate clock preset entry for game_name {:?}",
-                entry.game_name
-            ));
-        }
-        out.insert(
-            entry.game_name,
-            GamePreset {
-                clock: entry.spec,
-                max_moves: entry.max_moves,
-            },
-        );
-    }
-    Ok(out)
-}
-
-/// `resolve_game_preset_from_presets_map` の戻り値。
-/// `parse_clock_presets` の結果から `game_name` の解決結果を 3 状態で表現する。
-#[derive(Debug, PartialEq, Eq)]
-pub enum PresetResolution {
-    /// presets 空 → 呼び出し側が `load_clock_spec_from_env` 等で fallback 解決する
-    /// （後方互換モード）。
-    Fallback,
-    /// 該当 `game_name` の preset を返す。
-    Hit(GamePreset),
-    /// presets 宣言済みかつ未登録 → strict mode で `Err` 化されるべき。
-    Unknown,
-}
-
-/// `parse_clock_presets` で得たマップと `game_name` から `PresetResolution` を返す
-/// 純粋ロジック部。env-fetch を持たないため、host target テストから直接呼べる。
-pub fn resolve_game_preset_from_presets_map(
-    presets: &std::collections::HashMap<String, GamePreset>,
-    game_name: &str,
-) -> PresetResolution {
-    if presets.is_empty() {
-        return PresetResolution::Fallback;
-    }
-    match presets.get(game_name) {
-        Some(preset) => PresetResolution::Hit(preset.clone()),
-        None => PresetResolution::Unknown,
     }
 }
 
@@ -664,8 +204,7 @@ pub fn resolve_game_preset_from_presets_map(
 ///
 /// 値の解釈は [`rshogi_csa_server::config::parse_truthy_bool_env`] に委ねる。
 /// 設定不正値（`true` / `false` / 数字 / yes/no/on/off 以外）は安全側に倒し
-/// （= viewer API 無効化）、[`structured_log!`](crate::structured_log) で
-/// 警告ログを 1 回だけ出す。
+/// （= viewer API 無効化）、`worker::console_log!` で警告ログを 1 回だけ出す。
 /// production rollout 時の kill-switch を兼ねる: 値を `"0"` に切り替えて
 /// redeploy することで該当 endpoint を即時 404 化できる。
 #[cfg(target_arch = "wasm32")]
@@ -674,28 +213,7 @@ pub fn is_viewer_api_enabled(env: &worker::Env) -> bool {
     match rshogi_csa_server::config::parse_truthy_bool_env(raw.as_deref()) {
         Ok(v) => v,
         Err(e) => {
-            crate::structured_log!(
-                event: "invalid_allow_viewer_api",
-                component: "viewer_api",
-                err: e.to_string(),
-            );
-            false
-        }
-    }
-}
-
-/// 私的対局の feature gate。未指定または設定不正は無効として扱う。
-#[cfg(target_arch = "wasm32")]
-pub fn is_private_challenge_enabled(env: &worker::Env) -> bool {
-    let raw = env.var(ConfigKeys::PRIVATE_CHALLENGE_ENABLED).ok().map(|v| v.to_string());
-    match rshogi_csa_server::config::parse_truthy_bool_env(raw.as_deref()) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::structured_log!(
-                event: "invalid_private_challenge_enabled",
-                component: "lobby",
-                err: e.to_string(),
-            );
+            worker::console_log!("[viewer_api] event=invalid_allow_viewer_api err={e}");
             false
         }
     }
@@ -751,8 +269,6 @@ mod tests {
             ClockSpec::Countdown {
                 total_time_sec: 600,
                 byoyomi_sec: 10,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
             }
         );
     }
@@ -773,8 +289,6 @@ mod tests {
             ClockSpec::CountdownMsec {
                 total_time_ms: 10_000,
                 byoyomi_ms: 100,
-                black_total_time_ms: None,
-                white_total_time_ms: None,
             }
         );
     }
@@ -788,8 +302,6 @@ mod tests {
             ClockSpec::CountdownMsec {
                 total_time_ms: 600_000,
                 byoyomi_ms: 10_000,
-                black_total_time_ms: None,
-                white_total_time_ms: None,
             }
         );
     }
@@ -802,8 +314,6 @@ mod tests {
             ClockSpec::Fischer {
                 total_time_sec: 300,
                 increment_sec: 5,
-                black_total_time_sec: None,
-                white_total_time_sec: None,
             }
         );
     }
@@ -816,8 +326,6 @@ mod tests {
             ClockSpec::StopWatch {
                 total_time_min: 15,
                 byoyomi_min: 2,
-                black_total_time_min: None,
-                white_total_time_min: None,
             }
         );
     }
@@ -828,333 +336,31 @@ mod tests {
         assert!(err.contains("countdown|countdown_msec|fischer|stopwatch"));
     }
 
-    /// production の保守的既定 (`grace=0` + `allow=false`) は `Ok(Duration::ZERO)`
-    /// を返し、新規対局では Reconnect_Token を配布せず再接続経路に立ち入らない。
     #[test]
-    fn resolve_reconnect_grace_from_strings_production_default_returns_zero() {
-        let grace = resolve_reconnect_grace_from_strings(Some("0"), Some("false")).unwrap();
-        assert_eq!(grace, Duration::ZERO);
-    }
-
-    /// `grace=30` + `allow=true` は再接続プロトコル有効化として受け付ける。
-    #[test]
-    fn resolve_reconnect_grace_from_strings_enabled_returns_duration() {
-        let grace = resolve_reconnect_grace_from_strings(Some("30"), Some("true")).unwrap();
-        assert_eq!(grace, Duration::from_secs(30));
-    }
-
-    /// 非数値の grace はパースエラーとして弾く (`parse_reconnect_grace_duration`
-    /// で wrap される `RECONNECT_GRACE_SECONDS:` prefix を維持する)。
-    #[test]
-    fn resolve_reconnect_grace_from_strings_rejects_non_numeric_grace() {
-        let err = resolve_reconnect_grace_from_strings(Some("abc"), Some("true")).unwrap_err();
-        assert!(err.contains("RECONNECT_GRACE_SECONDS"), "err: {err}");
-    }
-
-    /// `grace>0` + `allow=false` は Floodgate features の opt-in 漏れとして
-    /// `validate_floodgate_feature_gate` で弾く。
-    #[test]
-    fn resolve_reconnect_grace_from_strings_rejects_gate_mismatch() {
-        let err = resolve_reconnect_grace_from_strings(Some("30"), Some("false")).unwrap_err();
-        assert!(
-            err.contains("allow_floodgate_features") || err.contains("reconnect_protocol"),
-            "err must mention gate mismatch: {err}"
+    fn parse_reconnect_grace_duration_defaults_to_zero() {
+        assert_eq!(parse_reconnect_grace_duration(None).unwrap(), std::time::Duration::ZERO);
+        assert_eq!(parse_reconnect_grace_duration(Some("")).unwrap(), std::time::Duration::ZERO);
+        assert_eq!(
+            parse_reconnect_grace_duration(Some(" \t ")).unwrap(),
+            std::time::Duration::ZERO,
         );
     }
 
     #[test]
-    fn resolve_entering_king_rule_defaults_when_unset_or_blank() {
-        use rshogi_core::types::EnteringKingRule;
-        let d = EnteringKingRule::Point27;
-        assert_eq!(resolve_entering_king_rule_from_string(None, d), Ok(d));
-        assert_eq!(resolve_entering_king_rule_from_string(Some(""), d), Ok(d));
-        assert_eq!(resolve_entering_king_rule_from_string(Some("  "), d), Ok(d));
-    }
-
-    #[test]
-    fn resolve_entering_king_rule_parses_usi_tokens() {
-        use rshogi_core::types::EnteringKingRule;
-        let d = EnteringKingRule::Point27;
+    fn parse_reconnect_grace_duration_accepts_positive_seconds() {
         assert_eq!(
-            resolve_entering_king_rule_from_string(Some("CSARule24"), d),
-            Ok(EnteringKingRule::Point24)
+            parse_reconnect_grace_duration(Some("60")).unwrap(),
+            std::time::Duration::from_secs(60),
         );
         assert_eq!(
-            resolve_entering_king_rule_from_string(Some("CSARule27"), d),
-            Ok(EnteringKingRule::Point27)
+            parse_reconnect_grace_duration(Some(" 30\n")).unwrap(),
+            std::time::Duration::from_secs(30),
         );
     }
 
     #[test]
-    fn resolve_entering_king_rule_rejects_unknown_token() {
-        use rshogi_core::types::EnteringKingRule;
-        let err = resolve_entering_king_rule_from_string(Some("Bogus"), EnteringKingRule::Point27)
-            .unwrap_err();
-        assert_eq!(err, "Bogus");
-    }
-
-    #[test]
-    fn presets_reject_incompatible_color_fields_only() {
-        for (kind, unit, extra) in [
-            ("countdown", "sec", "byoyomi_sec"),
-            ("fischer", "sec", "increment_sec"),
-            ("countdown_msec", "ms", "byoyomi_ms"),
-            ("stopwatch", "min", "byoyomi_min"),
-            ("stop_watch", "min", "byoyomi_min"),
-        ] {
-            let base = serde_json::json!({"game_name": "test", "kind": kind, format!("total_time_{unit}"): 10, extra: 2, "unknown_option": 42});
-            assert!(
-                parse_clock_presets(Some(&serde_json::json!([base.clone()]).to_string())).is_ok()
-            );
-            for side in ["black", "white"] {
-                for other_unit in ["sec", "ms", "min", "minutes"] {
-                    let field = format!("{side}_total_time_{other_unit}");
-                    for value in [serde_json::json!(3), serde_json::Value::Null] {
-                        let mut input = base.clone();
-                        input[&field] = value;
-                        let result =
-                            parse_clock_presets(Some(&serde_json::json!([input]).to_string()));
-                        if other_unit == unit {
-                            assert!(result.is_ok());
-                        } else {
-                            let error = result.unwrap_err();
-                            assert!(error.contains(&field), "{error}");
-                            assert!(error.contains("test"), "{error}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn parse_clock_presets_empty_inputs_return_empty_map() {
-        assert!(parse_clock_presets(None).unwrap().is_empty());
-        assert!(parse_clock_presets(Some("")).unwrap().is_empty());
-        assert!(parse_clock_presets(Some("   \n  ")).unwrap().is_empty());
-        assert!(parse_clock_presets(Some("[]")).unwrap().is_empty());
-    }
-
-    #[test]
-    fn parse_clock_presets_accepts_three_variants() {
-        let raw = r#"[
-            {"game_name":"byoyomi-600-10","kind":"countdown","total_time_sec":600,"byoyomi_sec":10},
-            {"game_name":"byoyomi-60-5","kind":"countdown","total_time_sec":60,"byoyomi_sec":5},
-            {"game_name":"fischer-300-10F","kind":"fischer","total_time_sec":300,"increment_sec":10}
-        ]"#;
-        let map = parse_clock_presets(Some(raw)).unwrap();
-        assert_eq!(map.len(), 3);
-        assert!(matches!(
-            map.get("byoyomi-600-10"),
-            Some(GamePreset {
-                clock: ClockSpec::Countdown {
-                    total_time_sec: 600,
-                    byoyomi_sec: 10,
-                    black_total_time_sec: None,
-                    white_total_time_sec: None,
-                },
-                max_moves: None
-            })
-        ));
-        assert!(matches!(
-            map.get("fischer-300-10F"),
-            Some(GamePreset {
-                clock: ClockSpec::Fischer {
-                    total_time_sec: 300,
-                    increment_sec: 10,
-                    black_total_time_sec: None,
-                    white_total_time_sec: None,
-                },
-                max_moves: None
-            })
-        ));
-    }
-
-    /// `max_moves` は省略可能な per-preset 上書き。指定した preset のみ値を持ち、
-    /// 0 は拒否する。
-    #[test]
-    fn parse_clock_presets_accepts_optional_max_moves() {
-        let raw = r#"[
-            {"game_name":"floodgate-600-10-moves512","kind":"countdown","total_time_sec":600,"byoyomi_sec":10,"max_moves":512},
-            {"game_name":"floodgate-600-10","kind":"countdown","total_time_sec":600,"byoyomi_sec":10}
-        ]"#;
-        let map = parse_clock_presets(Some(raw)).unwrap();
-        assert_eq!(map.get("floodgate-600-10-moves512").unwrap().max_moves, Some(512));
-        assert_eq!(map.get("floodgate-600-10").unwrap().max_moves, None);
-    }
-
-    #[test]
-    fn parse_clock_presets_rejects_zero_max_moves() {
-        let raw = r#"[
-            {"game_name":"broken","kind":"countdown","total_time_sec":600,"byoyomi_sec":10,"max_moves":0}
-        ]"#;
-        let err = parse_clock_presets(Some(raw)).unwrap_err();
-        assert!(err.contains("max_moves"), "error must mention field: {err}");
-        assert!(err.contains("broken"), "error must mention game_name: {err}");
-    }
-
-    #[test]
-    fn parse_clock_presets_rejects_duplicate_game_name() {
-        let raw = r#"[
-            {"game_name":"x","kind":"countdown","total_time_sec":600,"byoyomi_sec":10},
-            {"game_name":"x","kind":"fischer","total_time_sec":60,"increment_sec":5}
-        ]"#;
-        let err = parse_clock_presets(Some(raw)).unwrap_err();
-        assert!(err.contains("duplicate"), "error must mention duplicate: {err}");
-        assert!(err.contains("\"x\""), "error must mention game_name: {err}");
-    }
-
-    /// `total_time_sec = 0` を loader 経由で弾き、ラッパーが組み立てるメッセージ
-    /// (`CLOCK_PRESETS: clock preset "x": <field> must be > 0`) の prefix と
-    /// phrase が崩れないことを回帰防止する E2E 1 件。`ClockSpec` 全 variant は
-    /// core 側 table テストでカバー。
-    #[test]
-    fn parse_clock_presets_rejects_zero_total_time() {
-        let raw = r#"[
-            {"game_name":"broken","kind":"countdown","total_time_sec":0,"byoyomi_sec":10}
-        ]"#;
-        let err = parse_clock_presets(Some(raw)).unwrap_err();
-        assert!(err.starts_with("CLOCK_PRESETS:"), "error must keep prefix: {err}");
-        assert!(err.contains("total_time_sec"), "error must mention field: {err}");
-        assert!(err.contains("broken"), "error must mention game_name: {err}");
-        assert!(err.contains("must be > 0"), "error must include comparison phrase: {err}");
-    }
-
-    #[test]
-    fn parse_clock_presets_rejects_invalid_json() {
-        let err = parse_clock_presets(Some("not json")).unwrap_err();
-        assert!(err.contains("CLOCK_PRESETS"), "error must mention env name: {err}");
-    }
-
-    #[test]
-    fn parse_clock_presets_allows_zero_byoyomi() {
-        let raw = r#"[
-            {"game_name":"sd","kind":"countdown","total_time_sec":600,"byoyomi_sec":0}
-        ]"#;
-        let map = parse_clock_presets(Some(raw)).unwrap();
-        assert_eq!(map.len(), 1);
-    }
-
-    /// presets が空 (= 未宣言モード) のとき `Fallback` を返し、呼び出し側に
-    /// global clock 解決を委ねる。
-    #[test]
-    fn resolve_returns_fallback_when_presets_empty() {
-        let presets: std::collections::HashMap<String, GamePreset> =
-            std::collections::HashMap::new();
-        assert_eq!(
-            resolve_game_preset_from_presets_map(&presets, "anything"),
-            PresetResolution::Fallback
-        );
-    }
-
-    /// 登録済 `game_name` は該当 spec を `Hit` で返す。
-    #[test]
-    fn resolve_hits_registered_game_name() {
-        let mut presets = std::collections::HashMap::new();
-        presets.insert(
-            "byoyomi-600-10".to_owned(),
-            GamePreset {
-                clock: ClockSpec::Countdown {
-                    total_time_sec: 600,
-                    byoyomi_sec: 10,
-                    black_total_time_sec: None,
-                    white_total_time_sec: None,
-                },
-                max_moves: None,
-            },
-        );
-        assert_eq!(
-            resolve_game_preset_from_presets_map(&presets, "byoyomi-600-10"),
-            PresetResolution::Hit(GamePreset {
-                clock: ClockSpec::Countdown {
-                    total_time_sec: 600,
-                    byoyomi_sec: 10,
-                    black_total_time_sec: None,
-                    white_total_time_sec: None,
-                },
-                max_moves: None
-            })
-        );
-    }
-
-    /// presets 宣言済みかつ未登録 `game_name` は `Unknown` を返し、
-    /// `resolve_clock_spec_for_game` 側で strict mode の Err に変換される。
-    #[test]
-    fn resolve_unknown_game_name_when_presets_declared() {
-        let mut presets = std::collections::HashMap::new();
-        presets.insert(
-            "byoyomi-600-10".to_owned(),
-            GamePreset {
-                clock: ClockSpec::Countdown {
-                    total_time_sec: 600,
-                    byoyomi_sec: 10,
-                    black_total_time_sec: None,
-                    white_total_time_sec: None,
-                },
-                max_moves: None,
-            },
-        );
-        assert_eq!(
-            resolve_game_preset_from_presets_map(&presets, "unregistered"),
-            PresetResolution::Unknown
-        );
-    }
-
-    #[test]
-    fn duration_settings_handle_defaults_and_explicit_values() {
-        for raw in [None, Some(""), Some(" \t "), Some("forever"), Some("-1")] {
-            assert_eq!(
-                parse_agree_timeout_duration(raw),
-                Duration::from_secs(DEFAULT_AGREE_TIMEOUT_SEC)
-            );
-            assert_eq!(
-                parse_challenge_ttl_duration(raw),
-                Duration::from_secs(DEFAULT_CHALLENGE_TTL_SEC)
-            );
-            assert_eq!(
-                parse_lobby_queue_entry_ttl_duration(raw),
-                Duration::from_secs(DEFAULT_LOBBY_QUEUE_ENTRY_TTL_SEC)
-            );
-        }
-        for (raw, seconds) in [("60", 60), (" 120\n", 120)] {
-            let expected = Duration::from_secs(seconds);
-            assert_eq!(parse_agree_timeout_duration(Some(raw)), expected);
-            assert_eq!(parse_challenge_ttl_duration(Some(raw)), expected);
-            assert_eq!(parse_lobby_queue_entry_ttl_duration(Some(raw)), expected);
-            assert_eq!(parse_reconnect_grace_duration(Some(raw)).unwrap(), expected);
-        }
-        assert_eq!(
-            parse_agree_timeout_duration(Some("0")),
-            Duration::from_secs(DEFAULT_AGREE_TIMEOUT_SEC)
-        );
-        assert_eq!(
-            parse_lobby_queue_entry_ttl_duration(Some("0")),
-            Duration::from_secs(DEFAULT_LOBBY_QUEUE_ENTRY_TTL_SEC)
-        );
-        assert_eq!(parse_challenge_ttl_duration(Some("0")), Duration::ZERO);
-        for raw in [None, Some(""), Some(" \t ")] {
-            assert_eq!(parse_reconnect_grace_duration(raw).unwrap(), Duration::ZERO);
-        }
-        assert!(
-            parse_reconnect_grace_duration(Some("forever"))
-                .unwrap_err()
-                .contains("RECONNECT_GRACE_SECONDS")
-        );
-    }
-
-    #[test]
-    fn color_totals_presets() {
-        for (kind, unit, extra) in [
-            ("countdown", "sec", "byoyomi_sec"),
-            ("fischer", "sec", "increment_sec"),
-            ("countdown_msec", "ms", "byoyomi_ms"),
-            ("stopwatch", "min", "byoyomi_min"),
-        ] {
-            let input = serde_json::json!([{"game_name": "unequal", "kind": kind, format!("total_time_{unit}"): 10, format!("black_total_time_{unit}"): 3, format!("white_total_time_{unit}"): 8, extra: 2}]);
-            let presets = parse_clock_presets(Some(&input.to_string())).unwrap();
-            let clock = &presets.values().next().unwrap().clock;
-            assert!(clock.format_time_section().contains("BEGIN Time+\n"));
-            assert!(clock.format_time_section().contains("Total_Time:8\n"));
-        }
+    fn parse_reconnect_grace_duration_rejects_non_numeric() {
+        let err = parse_reconnect_grace_duration(Some("forever")).unwrap_err();
+        assert!(err.contains("RECONNECT_GRACE_SECONDS"));
     }
 }

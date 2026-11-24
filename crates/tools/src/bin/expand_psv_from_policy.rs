@@ -4,6 +4,7 @@
 //! 合法手の選択確率が閾値を超える手について次局面を生成し、新しい PSV ファイルに書き出す。
 //!
 //! AobaZero (`--onnx-model`) と標準 dlshogi (`--dlshogi-onnx-model`) の両方に対応。
+//! cshogi_util の expand_psv_from_policy.py 相当。
 //!
 //! # 使用例
 //!
@@ -16,18 +17,14 @@
 //!
 //! # 標準 dlshogi モデル (DL水匠等)
 //! ORT_DYLIB_PATH=/path/to/libonnxruntime.so \
-//! cargo run --release -p tools --bin expand_psv_from_policy -- \
+//! cargo run --release -p tools --features dlshogi-onnx --bin expand_psv_from_policy -- \
 //!   --input data.psv --output expanded.psv \
 //!   --dlshogi-onnx-model dlshogi_model.onnx
 //! ```
 
 use anyhow::Result;
 use clap::Parser;
-#[cfg(any(test, feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-use std::path::Path;
 use std::path::PathBuf;
-#[cfg(any(test, feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-use tools::packed_sfen::PackedSfenValue;
 
 /// ポリシーネットワークで PSV を展開
 ///
@@ -85,35 +82,13 @@ struct Cli {
     threshold: f32,
 }
 
-#[cfg(any(test, feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn readonly_resources<'a>(
-    cli: &'a Cli,
-    selected_model: &'a Path,
-    ort_library: Option<&'a Path>,
-) -> Vec<&'a Path> {
-    let mut resources = vec![cli.input.as_path(), selected_model];
-    resources.extend(ort_library);
-    resources
-}
-
-#[cfg(any(test, feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn expanded_child(parent: &PackedSfenValue, sfen: [u8; 32]) -> PackedSfenValue {
-    PackedSfenValue {
-        sfen,
-        score: 0,
-        move16: 0,
-        game_ply: parent.game_ply.saturating_add(1),
-        game_result: 0,
-        padding: parent.padding_after_move16_rewrite(),
-    }
-}
-
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn run(cli: &Cli) -> Result<()> {
     use anyhow::Context;
     use indicatif::{ProgressBar, ProgressStyle};
     use ort::ep::ExecutionProvider;
     use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+    use ort::session::Session;
     use ort::value::TensorRef;
     use rayon::prelude::*;
     use std::fs::{self, File};
@@ -123,8 +98,7 @@ fn run(cli: &Cli) -> Result<()> {
     use rshogi_core::movegen::{MoveList, generate_legal};
     use rshogi_core::position::Position;
     use tools::dlshogi_features::{MAX_MOVE_LABEL_NUM, make_move_label};
-    use tools::output_path::{create_safe_output_file, ensure_safe_output_paths};
-    use tools::packed_sfen::{pack_position, unpack_sfen};
+    use tools::packed_sfen::{PackedSfenValue, pack_position, unpack_sfen};
 
     fn ort_err(e: ort::Error) -> anyhow::Error {
         anyhow::anyhow!("{e}")
@@ -170,8 +144,9 @@ fn run(cli: &Cli) -> Result<()> {
     #[cfg(not(feature = "dlshogi-onnx"))]
     if use_dlshogi {
         anyhow::bail!(
-            "--dlshogi-onnx-model requires the 'dlshogi-onnx' feature (on by default; this build disabled it).\n\
-             Rebuild with default features: cargo build --release -p tools --bin expand_psv_from_policy"
+            "--dlshogi-onnx-model requires the 'dlshogi-onnx' feature.\n\
+             Rebuild with: cargo build --release -p tools --features dlshogi-onnx \
+             --bin expand_psv_from_policy"
         );
     }
 
@@ -212,10 +187,23 @@ fn run(cli: &Cli) -> Result<()> {
         unreachable!()
     };
 
-    ensure_safe_output_paths(&[&cli.output], &readonly_resources(cli, onnx_path, None))?;
+    // 入力と出力が同一ファイルでないことを確認
+    {
+        let input_canon = fs::canonicalize(&cli.input)
+            .with_context(|| format!("Cannot resolve {}", cli.input.display()))?;
+        if let Ok(output_canon) = fs::canonicalize(&cli.output)
+            && input_canon == output_canon
+        {
+            anyhow::bail!(
+                "--input and --output point to the same file: {}\n\
+                 Specify a different output path to avoid destroying input data.",
+                input_canon.display()
+            );
+        }
+    }
 
     // ORT_DYLIB_PATH 検証
-    let ort_library = match std::env::var("ORT_DYLIB_PATH") {
+    match std::env::var("ORT_DYLIB_PATH") {
         Ok(path) if !path.is_empty() => {
             if !std::path::Path::new(&path).is_file() {
                 anyhow::bail!(
@@ -224,7 +212,6 @@ fn run(cli: &Cli) -> Result<()> {
                 );
             }
             eprintln!("ORT_DYLIB_PATH: {path}");
-            PathBuf::from(path)
         }
         _ => {
             anyhow::bail!(
@@ -233,14 +220,13 @@ fn run(cli: &Cli) -> Result<()> {
                  Example:\n  ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run ..."
             );
         }
-    };
-    let resources = readonly_resources(cli, onnx_path, Some(&ort_library));
-    ensure_safe_output_paths(&[&cli.output], &resources)?;
+    }
 
     // ONNX セッション初期化
     eprintln!("Loading {model_name} ONNX model: {}", onnx_path.display());
 
-    let mut builder = tools::onnx_env::session_builder()?
+    let mut builder = Session::builder()
+        .map_err(ort_err)?
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::All)
         .map_err(|e| anyhow::anyhow!("ORT builder error: {e}"))?
         .with_intra_threads(1)
@@ -352,7 +338,7 @@ fn run(cli: &Cli) -> Result<()> {
         .with_context(|| format!("Failed to open {}", cli.input.display()))?;
     let mut reader = std::io::BufReader::new(in_file);
 
-    let out_file = create_safe_output_file(&cli.output, &resources)
+    let out_file = File::create(&cli.output)
         .with_context(|| format!("Failed to create {}", cli.output.display()))?;
     let mut writer = BufWriter::new(out_file);
 
@@ -528,7 +514,15 @@ fn run(cli: &Cli) -> Result<()> {
                     let gives_check = pos.gives_check(*mv);
                     pos.do_move(*mv, gives_check);
 
-                    let new_psv = expanded_child(psv, pack_position(&pos));
+                    let packed = pack_position(&pos);
+                    let new_psv = PackedSfenValue {
+                        sfen: packed,
+                        score: 0,
+                        move16: 0,
+                        game_ply: psv.game_ply.saturating_add(1),
+                        game_result: 0,
+                        padding: 0,
+                    };
                     writer.write_all(&new_psv.to_bytes())?;
                     total_expanded += 1;
 
@@ -561,116 +555,12 @@ fn main() -> Result<()> {
     {
         let _ = cli;
         anyhow::bail!(
-            "This binary requires the 'dlshogi-onnx' (on by default) or 'aobazero-onnx' feature; this build has neither (e.g. --no-default-features).\n\
-             Rebuild with default features: cargo build --release -p tools --bin expand_psv_from_policy\n\
-             (add --features aobazero-onnx for AobaZero models)"
+            "This binary requires the 'aobazero-onnx' or 'dlshogi-onnx' feature.\n\
+             Rebuild with: cargo build --release -p tools \
+             --features aobazero-onnx,dlshogi-onnx --bin expand_psv_from_policy"
         );
     }
 
     #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
     run(&cli)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::OsString;
-    use std::fs;
-    use std::io::Write;
-    use tempfile::{TempDir, tempdir};
-    use tools::output_path::create_safe_output_file;
-
-    #[test]
-    fn expanded_child_preserves_only_tree_sample_padding() {
-        let mut parent = PackedSfenValue {
-            sfen: [0; 32],
-            score: 123,
-            move16: 42,
-            game_ply: 1,
-            game_result: 1,
-            padding: 0,
-        };
-        for (padding, expected) in [(0, 0), (1, 0), (2, 2), (3, 2), (0x83, 2)] {
-            parent.padding = padding;
-            let child = expanded_child(&parent, [1; 32]);
-            assert_eq!(child.padding, expected);
-            assert_eq!(child.move16, 0);
-        }
-    }
-
-    fn fixture() -> Result<(TempDir, Cli, PathBuf)> {
-        let dir = tempdir()?;
-        let cli = Cli::parse_from([
-            OsString::from("expand_psv_from_policy"),
-            OsString::from("--input"),
-            dir.path().join("input.psv").into_os_string(),
-            OsString::from("--output"),
-            dir.path().join("expanded.psv").into_os_string(),
-            OsString::from("--dlshogi-onnx-model"),
-            dir.path().join("model.onnx").into_os_string(),
-        ]);
-        let library = dir.path().join("runtime.bin");
-        fs::write(&cli.input, [1u8; 40])?;
-        fs::write(cli.dlshogi_onnx_model.as_ref().unwrap(), b"model fixture")?;
-        fs::write(&library, b"runtime fixture")?;
-        Ok((dir, cli, library))
-    }
-
-    #[test]
-    fn output_creation_rejects_resources_and_their_hardlinks() -> Result<()> {
-        let (dir, cli, library) = fixture()?;
-        let model = cli.dlshogi_onnx_model.as_deref().unwrap();
-        let resources = readonly_resources(&cli, model, Some(&library));
-        for protected in [cli.input.as_path(), model, library.as_path()] {
-            let before = fs::read(protected)?;
-            assert!(create_safe_output_file(protected, &resources).is_err());
-            assert_eq!(fs::read(protected)?, before);
-
-            let alias = dir.path().join("alias.psv");
-            fs::hard_link(protected, &alias)?;
-            assert!(create_safe_output_file(&alias, &resources).is_err());
-            assert_eq!(fs::read(protected)?, before);
-            assert_eq!(fs::read(&alias)?, before);
-            fs::remove_file(alias)?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn output_creation_writes_new_files_and_truncates_distinct_existing_files() -> Result<()> {
-        let (_dir, cli, library) = fixture()?;
-        let model = cli.dlshogi_onnx_model.as_deref().unwrap();
-        let resources = readonly_resources(&cli, model, Some(&library));
-        for bytes in [b"first longer output".as_slice(), b"new".as_slice()] {
-            let mut output = create_safe_output_file(&cli.output, &resources)?;
-            output.write_all(bytes)?;
-            output.flush()?;
-            drop(output);
-            assert_eq!(fs::read(&cli.output)?, bytes);
-            assert_eq!(fs::read(&cli.input)?, [1u8; 40]);
-            assert_eq!(fs::read(model)?, b"model fixture");
-            assert_eq!(fs::read(&library)?, b"runtime fixture");
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn output_creation_rejects_unrelated_and_dangling_symlinks() -> Result<()> {
-        let (dir, cli, library) = fixture()?;
-        let model = cli.dlshogi_onnx_model.as_deref().unwrap();
-        let resources = readonly_resources(&cli, model, Some(&library));
-        let existing = dir.path().join("unrelated.bin");
-        let missing = dir.path().join("missing.bin");
-        fs::write(&existing, b"unrelated fixture")?;
-        for target in [&existing, &missing] {
-            std::os::unix::fs::symlink(target, &cli.output)?;
-            assert!(create_safe_output_file(&cli.output, &resources).is_err());
-            assert_eq!(fs::read(&existing)?, b"unrelated fixture");
-            assert!(!missing.exists());
-            assert!(fs::symlink_metadata(&cli.output)?.file_type().is_symlink());
-            fs::remove_file(&cli.output)?;
-        }
-        Ok(())
-    }
 }

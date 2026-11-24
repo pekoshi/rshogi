@@ -4,215 +4,94 @@ version = "0.1.0"
 edition = "2024"
 authors = ["SH11235"]
 description = "Performance benchmarking and analysis tools for shogi engine"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 repository = "https://github.com/SH11235/rshogi"
 
 [features]
-search-tree-sample = ["rshogi-core/search-tree-sample"]
-# default は解析対象 NNUE アーキテクチャ集合 (nnue-arch)、DL 教師リスコア用 ONNX
-# (dlshogi-onnx)、棋譜プレイヤー TUI (kifu-player) から成る。ort は load-dynamic なので
-# dlshogi-onnx を default にしても build 時に libonnxruntime は不要 (実行時 dlopen)。
-# 分離しておくことで依存を外したビルド (`--no-default-features --features nnue-arch`) を
-# 表現でき、CI もその構成 (ONNX 無効フォールバック経路) を lint できる。
-default = ["nnue-arch", "dlshogi-onnx", "kifu-player"]
-
-# 解析対象 NNUE アーキテクチャ (LayerStack のサイズ 3 種 + FT variant 5 種) の既定集合。
-# gensfen / rescore_psv / teacher_labeler 等は任意の net を `NNUENetwork::load` で読んで評価する
-# ため、header 駆動の汎用経路 (edition-universal) も明示的に含める。静的 LS の内部を解析する
-# 診断ツールは下の size / FT slot の静的実装を使う。
-nnue-arch = [
-    "rshogi-core/edition-universal",
-    "layerstack-arch",
-    "layerstacks-1536x16x32",
-    "layerstacks-1536x16x64",
-    "layerstacks-2304x16x64",
-    "ft-halfkp",
-    "ft-halfka_split",
-    "ft-halfka_merged",
-    "ft-halfka_hm_split",
-    "ft-halfka_hm_merged",
-]
+default = ["layerstacks-1536x16x32"]
+# Policy-Value GPU 推論
+pv-cuda = ["p2-nnue/pv-cuda", "p2-search/pv-cuda"]
 # 診断ログ（EvalHashヒット率など）
 diagnostics = ["rshogi-core/diagnostics"]
-prepacked-nnue = ["nnue-arch", "rshogi-core/prepacked-nnue"]
+# NNUE PSQT / Threat 対応
+nnue-psqt = ["rshogi-core/nnue-psqt"]
+nnue-threat = ["rshogi-core/nnue-threat"]
+# Pin-aware feature / dual PSQT head (step 5/6 で追加)
+nnue-pin-aware = ["rshogi-core/nnue-pin-aware"]
+nnue-dual-psqt = ["rshogi-core/nnue-dual-psqt"]
+nnue-kingring-psqt = ["rshogi-core/nnue-kingring-psqt"]
+# arm 12 (= 2026-05-29): PairShape scalar head
+nnue-pairshape-psqt = ["rshogi-core/nnue-pairshape-psqt"]
+# Activity-Risk Interaction Head (2026-06-06)
+nnue-activity-risk-psqt = ["rshogi-core/nnue-activity-risk-psqt"]
+# King Escape Direction PSQT scalar head (2026-06-09)
+nnue-king-escape-psqt = ["rshogi-core/nnue-king-escape-psqt"]
+# Attack Relay Head (ARH) scalar head (2026-06-09)
+nnue-attack-relay = ["rshogi-core/nnue-attack-relay"]
+# Attack Relay Head v2 (= A5 仕様、 2026-06-10)
+nnue-attack-relay-v2 = ["rshogi-core/nnue-attack-relay-v2"]
+# NNUE progress8kpabs bucket 差分更新最適化
+nnue-progress-diff = ["rshogi-core/nnue-progress-diff"]
+# HalfKAv2_hm 入力（production 1536 net のロードに必須。自玉 feature）
+halfkav2-hm = ["rshogi-core/halfkav2-hm"]
 # Threat exclusion profiles
 threat-profile-same-class = ["rshogi-core/threat-profile-same-class"]
 threat-profile-same-class-major-pawn = ["rshogi-core/threat-profile-same-class-major-pawn"]
-threat-profile-step-attacker = ["rshogi-core/threat-profile-step-attacker"]
-threat-profile-full-symdedup = ["rshogi-core/threat-profile-full-symdedup"]
-threat-profile-cross-side = ["rshogi-core/threat-profile-cross-side"]
-
-# === Edition 軸 atomic feature 群 (本 crate で必要なものだけ forward) ===
-# 命名規則は docs/build.md を参照。
-# tools は静的 LS network の内部を解析するため、nnue-arch から layerstack-arch と
-# size / FT slot を明示的に forward する。汎用評価用の edition-universal も nnue-arch で
-# 明示指定し、rshogi-core の default や他 crate 経由の feature 統合には頼らない。
-# 静的 LS network を直接読む診断ツール (bench_nnue_eval / eval_sfens / nnue_saturation /
-# verify_nnue_accumulator) は tools 側の layerstack-arch で gate する。HalfKX だけの単一構成
-# build では、これを指定しなければ rescore_psv 等の汎用ツールだけが build される。
-layerstack-arch = ["rshogi-core/layerstack-arch"]
-# LS L1 サイズ slot
+# LayerStacks exact architecture / L1 サイズ
 layerstacks-1536x16x32 = ["rshogi-core/layerstacks-1536x16x32"]
 layerstacks-1536x32x32 = ["rshogi-core/layerstacks-1536x32x32"]
-layerstacks-768x16x32  = ["rshogi-core/layerstacks-768x16x32"]
-layerstacks-768x8x32   = ["rshogi-core/layerstacks-768x8x32"]
-layerstacks-512x16x32  = ["rshogi-core/layerstacks-512x16x32"]
-layerstacks-1024x16x32 = ["rshogi-core/layerstacks-1024x16x32"]
-layerstacks-3072x16x32 = ["rshogi-core/layerstacks-3072x16x32"]
-layerstacks-1024x16x64 = ["rshogi-core/layerstacks-1024x16x64"]
-layerstacks-2304x16x64 = ["rshogi-core/layerstacks-2304x16x64"]
-layerstacks-3072x16x64 = ["rshogi-core/layerstacks-3072x16x64"]
-layerstacks-1536x16x64 = ["rshogi-core/layerstacks-1536x16x64"]
-# LS 拡張 slot
-nnue-psqt   = ["rshogi-core/nnue-psqt"]
-nnue-threat = ["rshogi-core/nnue-threat"]
-nnue-effect-bucket = ["rshogi-core/nnue-effect-bucket"]
-effect-bucket-2x2-kingfixed = ["rshogi-core/effect-bucket-2x2-kingfixed"]
-effect-bucket-2x2-kingbucketed = ["rshogi-core/effect-bucket-2x2-kingbucketed"]
-effect-bucket-3x3-kingfixed = ["rshogi-core/effect-bucket-3x3-kingfixed"]
-effect-bucket-3x3-kingbucketed = ["rshogi-core/effect-bucket-3x3-kingbucketed"]
-# FT slot (LS の Feature Transformer 軸、5 variants)
-ft-halfkp           = ["rshogi-core/ft-halfkp"]
-ft-halfka_split     = ["rshogi-core/ft-halfka_split"]
-ft-halfka_merged    = ["rshogi-core/ft-halfka_merged"]
-ft-halfka_hm_split  = ["rshogi-core/ft-halfka_hm_split"]
-ft-halfka_hm_merged = ["rshogi-core/ft-halfka_hm_merged"]
-
+layerstacks-1536x8x96 = ["rshogi-core/layerstacks-1536x8x96"]
+layerstacks-1024x8x64 = ["rshogi-core/layerstacks-1024x8x64"]
+layerstacks-1536x16x96 = ["rshogi-core/layerstacks-1536x16x96"]
+layerstacks-1536x32x96 = ["rshogi-core/layerstacks-1536x32x96"]
+layerstacks-1536x16x48 = ["rshogi-core/layerstacks-1536x16x48"]
+layerstacks-1536x48x96 = ["rshogi-core/layerstacks-1536x48x96"]
+layerstacks-768x32x96 = ["rshogi-core/layerstacks-768x32x96"]
+layerstacks-1536x64x96 = ["rshogi-core/layerstacks-1536x64x96"]
+layerstacks-768x16x32 = ["rshogi-core/layerstacks-768x16x32"]
+layerstacks-768x8x32 = ["rshogi-core/layerstacks-768x8x32"]
+layerstacks-512x16x32 = ["rshogi-core/layerstacks-512x16x32"]
 # AobaZero ONNX直接推論（ONNX Runtime + CUDA が必要）
-aobazero-onnx = ["dep:ort"]
+aobazero-onnx = ["dep:ort", "dep:ndarray"]
 # 標準dlshogi ONNX直接推論（DL水匠等、ONNX Runtime + CUDA が必要）
-dlshogi-onnx = ["dep:ort"]
-
-# 棋譜 replay（CSA/PSV/JSONL の parse・盤面再生・勝敗導出。`replay` モジュールの
-# TUI を除く部分）。教師・評価系ツールが TUI 依存 (ratatui/crossterm) なしで
-# 棋譜 replay を使うための軸。
-csa-replay = []
-
-# 棋譜プレイヤー TUI（PSV / tournament JSONL 共通の対局再生ビューア）。
-# default に含める: 素の `cargo build --release` で kifu_player だけ旧版のまま
-# 取り残されるのを防ぐ (required-features 付き bin は feature 無しだとビルド対象外)。
-# TUI 依存 (ratatui/crossterm) を持ち込みたくない学習パイプライン等は
-# `--no-default-features` でオプトアウトする。
-kifu-player = ["csa-replay", "dep:ratatui", "dep:crossterm"]
-
-[[bin]]
-name = "kifu_player"
-path = "src/bin/kifu_player.rs"
-required-features = ["kifu-player"]
-
-[[bin]]
-name = "prepack_nnue"
-path = "src/bin/prepack_nnue.rs"
-required-features = ["prepacked-nnue"]
-
-# 静的 LayerStacks NNUE を直接読むツールは layerstack-arch に gate する。
-[[bin]]
-name = "eval_sfens"
-path = "src/bin/eval_sfens.rs"
-required-features = ["layerstack-arch"]
-
-[[bin]]
-name = "nnue_saturation"
-path = "src/bin/nnue_saturation.rs"
-required-features = ["layerstack-arch"]
-
-[[bin]]
-name = "bench_nnue_eval"
-path = "src/bin/bench_nnue_eval.rs"
-required-features = ["layerstack-arch"]
-
-[[bin]]
-name = "verify_nnue_accumulator"
-path = "src/bin/verify_nnue_accumulator.rs"
-required-features = ["layerstack-arch"]
-
-# ek_testset は CSA replay に依存する（TUI は不要）ため csa-replay に gate する。
-[[bin]]
-name = "ek_testset"
-path = "src/bin/ek_testset.rs"
-required-features = ["csa-replay"]
-
-# nyugyoku_metrics は CSA replay に依存する（TUI は不要）ため csa-replay に gate する。
-[[bin]]
-name = "nyugyoku_metrics"
-path = "src/bin/nyugyoku_metrics.rs"
-required-features = ["csa-replay"]
+dlshogi-onnx = ["dep:ort", "dep:ndarray"]
 
 [dependencies]
 # Workspace dependencies
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
-serde_json = { workspace = true, features = ["raw_value"] }
-num-bigint = "0.4"
-num-rational = "0.4"
-num-traits = "0.2"
+serde_json.workspace = true
 chrono.workspace = true
 flate2.workspace = true
 env_logger.workspace = true
 log.workspace = true
 
 # Local dependencies
-rshogi-core = { path = "../rshogi-core", default-features = false }
+rshogi-core = { path = "../rshogi-core" }
 rshogi-csa = { path = "../rshogi-csa" }
-# 定跡リーダ(book_from_csa の roundtrip テストで生成 .db を読み戻すのに使う)。
-# edition(NNUE)軸には触れないため default-features=false とし、rshogi-core の feature は
-# 本 crate 側の指定に委ねる(rshogi-usi と同じ方針)。
-rshogi-book = { path = "../rshogi-book", default-features = false }
-# csa_client と同一の TOML (CsaClientConfig) を floodgate_record が読むための依存。
-# 設定型の再利用のみで transport / CLI は使わないため、default-features=false で
-# tungstenite / rustls / clap 系依存を切り落とす。
-rshogi-csa-client = { path = "../rshogi-csa-client", default-features = false }
+
+p2-nnue = { path = "../p2-nnue" }
+p2-search = { path = "../p2-search" }
 
 # Additional dependencies
-# 使うのは Disks (disk) と System のメモリ / プロセス情報 (system) のみ。default の
-# component / network / user (Windows では WMI 等の windows crate feature) は引かない。
-sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "system"] }
-# reqwest の `rustls` feature は aws-lc-rs を引き、Windows MSVC のビルドに NASM を要求する。
-# `rustls-no-provider` にして、csa_client と同じ `ring` provider を
-# `common::floodgate::http_client_builder` で登録する。
-reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls-no-provider", "system-proxy"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sysinfo = "0.37"
+reqwest = { version = "0.12", features = ["blocking"] }
 walkdir = "2.5"
-same-file = "1.0"
 url = "2.5"
 rayon = "1.10"
 crossbeam-channel = "0.5"
 ctrlc = "3.4"
 libc = "0.2"
-rustix = { version = "1.1", features = ["fs"] }
 indicatif = "0.18"
 rand = "0.9.3"
 rand_chacha = "0.9"
-rand_distr = "0.5"
+byteorder = "1.5"
 tempfile = "3.20"
 glob = "0.3"
 regex.workspace = true
 toml.workspace = true
-sha2 = "0.10"
 
 # AobaZero ONNX direct inference (optional, behind "aobazero-onnx" feature)
-# prerelease 間の API 変更を避け、ONNX Runtime API 24 との互換を維持する。
-ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["load-dynamic", "api-24"] }
-
-# 棋譜プレイヤー TUI (optional, behind "kifu-player" feature)
-# default の all-widgets (Calendar widget + time crate) と macros (ratatui-macros) は
-# kifu_player で使わないため外し、残りの default (crossterm / layout-cache / underline-color) は維持する。
-ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
-crossterm = { version = "0.29", optional = true }
-microlp = "0.6.0"
-
-# search_only_ab の Windows 実装 (ETW NT Kernel Logger の PMC counting) と、
-# book_mine tree の台帳のファイル lock (book_tree::file_lock) 用。
-[target.'cfg(windows)'.dependencies]
-known-folders = "1.4.2"
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Console",
-    "Win32_System_Diagnostics_Etw",
-    "Win32_System_IO",
-    "Win32_System_Performance",
-    "Win32_System_Threading",
-    "Win32_System_Time",
-] }
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["load-dynamic", "api-24"] }
+ndarray = { version = "0.16", optional = true }

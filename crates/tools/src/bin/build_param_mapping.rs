@@ -107,9 +107,9 @@ fn main() -> Result<()> {
                 candidates.push((n.clone(), false));
             }
         }
+        // P2-2: rval == 0 のときは -rval == rval なので二重カウントを避ける
         if *rval != 0
-            && let Some(negated) = rval.checked_neg()
-            && let Some(names) = yo_by_value.get(&negated)
+            && let Some(names) = yo_by_value.get(&-*rval)
         {
             for n in names {
                 candidates.push((n.clone(), true));

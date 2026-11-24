@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 
 use rshogi_core::position::Position;
-use rshogi_core::types::{Color as CoreColor, EnteringKingRule, File, PieceType, Rank, Square};
+use rshogi_core::types::{Color as CoreColor, File, PieceType, Rank, Square};
 
 use crate::types::{Color, GameId, PlayerName, ReconnectToken};
 
@@ -20,7 +20,7 @@ pub struct GameSummaryBuilder {
     pub black: PlayerName,
     /// 後手プレイヤ名。
     pub white: PlayerName,
-    /// 持ち時間セクション（`Time` または `Time+` / `Time-`、末尾改行込み）。
+    /// 持ち時間セクション（`BEGIN Time` から `END Time` まで、末尾改行込み）。
     /// 通常は [`crate::game::clock::TimeClock::format_summary`] の戻り値を渡す。
     pub time_section: String,
     /// 初期局面ブロック（`BEGIN Position` … `END Position` 全体、末尾改行込み）。
@@ -30,9 +30,8 @@ pub struct GameSummaryBuilder {
     pub rematch_on_draw: bool,
     /// 開始時の手番。CSA 仕様 `To_Move:` に直接書ける `+`/`-` 文字。
     pub to_move: Color,
-    /// `%KACHI` 判定に使う入玉ルール。CSA 標準の `Declaration:` 行と本リポ拡張の
-    /// `Entering_King_Rule:` 行の両方をここから導出する（値の食い違いを構造的に防ぐ）。
-    pub entering_king_rule: EnteringKingRule,
+    /// 入玉宣言ルール表示（`Declaration:Jishogi 1.1` など）。空ならデフォルト省略。
+    pub declaration: String,
     /// 先手向けの再接続トークン。`Some` の場合、`build_for(Color::Black)` 出力に
     /// 標準項目の後・`END Game_Summary` の直前で `Reconnect_Token:<token>` 拡張行
     /// として埋め込む。`None` なら拡張行を出さず CSA v1.2.1 標準互換の出力に戻る。
@@ -60,8 +59,8 @@ impl GameSummaryBuilder {
         out.push_str("Protocol_Version:1.2\n");
         out.push_str("Protocol_Mode:Server\n");
         out.push_str("Format:Shogi 1.0\n");
-        if let Some(decl) = declaration_of(self.entering_king_rule) {
-            let _ = writeln!(out, "Declaration:{decl}");
+        if !self.declaration.is_empty() {
+            let _ = writeln!(out, "Declaration:{}", self.declaration);
         }
         let _ = writeln!(out, "Game_ID:{}", self.game_id);
         let _ = writeln!(out, "Name+:{}", self.black);
@@ -79,9 +78,7 @@ impl GameSummaryBuilder {
         if !self.position_section.ends_with('\n') {
             out.push('\n');
         }
-        let _ = writeln!(out, "Entering_King_Rule:{}", self.entering_king_rule.to_usi());
-        // 観戦者向け拡張行: 残時間 (ms 粒度)。Workers reconnect 経路の
-        // `Black/White_Time_Remaining_Ms:` 行と同形式。
+        // 観戦者向け拡張行: 残時間 (ms 粒度)。reconnect.rs:148-149 と同形式。
         let _ = writeln!(out, "Black_Time_Remaining_Ms:{black_remaining_ms}");
         let _ = writeln!(out, "White_Time_Remaining_Ms:{white_remaining_ms}");
         out.push_str("END Game_Summary\n");
@@ -97,8 +94,8 @@ impl GameSummaryBuilder {
         out.push_str("Protocol_Version:1.2\n");
         out.push_str("Protocol_Mode:Server\n");
         out.push_str("Format:Shogi 1.0\n");
-        if let Some(decl) = declaration_of(self.entering_king_rule) {
-            let _ = writeln!(out, "Declaration:{decl}");
+        if !self.declaration.is_empty() {
+            let _ = writeln!(out, "Declaration:{}", self.declaration);
         }
         let _ = writeln!(out, "Game_ID:{}", self.game_id);
         let _ = writeln!(out, "Name+:{}", self.black);
@@ -117,11 +114,8 @@ impl GameSummaryBuilder {
         if !self.position_section.ends_with('\n') {
             out.push('\n');
         }
-        // CSA v1.2.1 標準項目の後に続く拡張行。標準互換クライアントは未知キーを
-        // 無視できるため、CSA v1.2.1 とは後方互換。
-        // 入玉ルールの広告: `Declaration:` は CSA 標準に 27 点法のトークンしか無い
-        // ため、24 点法等も含めた正確なルールは USI トークンの拡張行で伝える。
-        let _ = writeln!(out, "Entering_King_Rule:{}", self.entering_king_rule.to_usi());
+        // CSA v1.2.1 標準項目の後に続く拡張行として再接続トークンを末尾追加する。
+        // 標準互換クライアントは未知キーを無視できるため、CSA v1.2.1 とは後方互換。
         let token = match you {
             Color::Black => self.black_reconnect_token.as_ref(),
             Color::White => self.white_reconnect_token.as_ref(),
@@ -138,15 +132,6 @@ fn color_char(c: Color) -> char {
     match c {
         Color::Black => '+',
         Color::White => '-',
-    }
-}
-
-/// CSA 標準 `Declaration:` 行の値。標準仕様にトークンが存在するのは 27 点法
-/// (`Jishogi 1.1`) のみで、他ルールでは行自体を省略する。
-fn declaration_of(rule: EnteringKingRule) -> Option<&'static str> {
-    match rule {
-        EnteringKingRule::Point27 | EnteringKingRule::Point27H => Some("Jishogi 1.1"),
-        _ => None,
     }
 }
 
@@ -311,7 +296,7 @@ mod tests {
             position_section: standard_initial_position_block(),
             rematch_on_draw: false,
             to_move: Color::Black,
-            entering_king_rule: EnteringKingRule::Point27,
+            declaration: "Jishogi 1.1".to_owned(),
             black_reconnect_token: None,
             white_reconnect_token: None,
         }
@@ -349,8 +334,6 @@ mod tests {
         let begin_time = pos("BEGIN Time");
         let begin_pos = pos("BEGIN Position");
         let end_pos = pos("END Position");
-        let ekr = pos("Entering_King_Rule:");
-        let end_summary = pos("END Game_Summary");
         assert!(pv < pm);
         assert!(pm < fmt);
         assert!(fmt < decl);
@@ -363,32 +346,14 @@ mod tests {
         assert!(to_move < begin_time);
         assert!(begin_time < begin_pos);
         assert!(begin_pos < end_pos);
-        assert!(end_pos < ekr);
-        assert!(ekr < end_summary);
     }
 
     #[test]
-    fn declaration_line_only_for_point27() {
+    fn declaration_is_optional() {
         let mut b = skeleton();
-        b.entering_king_rule = EnteringKingRule::Point24;
+        b.declaration = String::new();
         let txt = b.build_for(Color::Black);
         assert!(!txt.contains("Declaration:"));
-        assert!(txt.contains("\nEntering_King_Rule:CSARule24\n"));
-    }
-
-    #[test]
-    fn entering_king_rule_extension_line_for_point27() {
-        let txt = skeleton().build_for(Color::Black);
-        assert!(txt.contains("Declaration:Jishogi 1.1"));
-        assert!(txt.contains("\nEntering_King_Rule:CSARule27\n"));
-    }
-
-    #[test]
-    fn spectator_summary_includes_entering_king_rule() {
-        let mut b = skeleton();
-        b.entering_king_rule = EnteringKingRule::Point24;
-        let txt = b.build_for_spectator(1000, 2000);
-        assert!(txt.contains("\nEntering_King_Rule:CSARule24\n"));
     }
 
     #[test]
@@ -412,7 +377,7 @@ mod tests {
     fn position_section_from_sfen_equals_standard_block_for_hirate() {
         // 平手 SFEN で `position_section_from_sfen` を呼んだ結果は、既存の
         // `standard_initial_position_block()` とほぼ一致するはず (差は無い想定)。
-        // 完全一致は駒並びや手番・持ち駒なしの表現次第だが、ここでは両者とも
+        // 完全一致は駒並びや手番・持ち駒なしの表現次第だが、本実装では両者とも
         // `PI` 行を使わず P1-P9 + 手番のみなので全行一致する。
         let hirate = rshogi_core::position::SFEN_HIRATE;
         let block = position_section_from_sfen(hirate).unwrap();
@@ -432,6 +397,12 @@ mod tests {
         // 手番行も `-` になることを固定する。
         let block = position_section_from_sfen("9/6k2/9/9/9/9/9/6R2/K8 w - 1").unwrap();
         assert!(block.contains("\n-\nEND Position"));
+    }
+
+    #[test]
+    fn build_for_omits_reconnect_token_when_none() {
+        let txt = skeleton().build_for(Color::Black);
+        assert!(!txt.contains("Reconnect_Token:"), "unexpected token line: {txt}");
     }
 
     #[test]
@@ -461,11 +432,7 @@ mod tests {
         let end_game = txt
             .find("END Game_Summary\n")
             .unwrap_or_else(|| panic!("missing END Game_Summary: {txt}"));
-        let ekr_line = txt
-            .find("\nEntering_King_Rule:")
-            .unwrap_or_else(|| panic!("missing Entering_King_Rule line: {txt}"));
-        assert!(end_position < ekr_line, "rule line must follow END Position");
-        assert!(ekr_line < token_line, "token must follow rule line");
+        assert!(end_position < token_line, "token must follow END Position");
         assert!(token_line < end_game, "token must precede END Game_Summary");
     }
 
@@ -541,29 +508,5 @@ mod tests {
         assert!(block.contains("P+00HI00KA"), "block missing P+ hand: {block}");
         // White 手駒は空なので P- 行は出ない。
         assert!(!block.contains("P-"), "block should not have P- line: {block}");
-    }
-
-    #[test]
-    fn color_totals_preserve_full_summary_framing_and_symmetric_bytes() {
-        for (black, white) in [(600, 600), (3, 8)] {
-            let spec = crate::ClockSpec::Countdown {
-                total_time_sec: 600,
-                byoyomi_sec: 10,
-                black_total_time_sec: Some(black),
-                white_total_time_sec: Some(white),
-            };
-            let section = if black == white {
-                skeleton().time_section
-            } else {
-                "BEGIN Time+\nTime_Unit:1sec\nTotal_Time:3\nByoyomi:10\nLeast_Time_Per_Move:0\nEND Time+\nBEGIN Time-\nTime_Unit:1sec\nTotal_Time:8\nByoyomi:10\nLeast_Time_Per_Move:0\nEND Time-\n".to_owned()
-            };
-            for side in [Color::Black, Color::White] {
-                let expected =
-                    skeleton().build_for(side).replace(&skeleton().time_section, &section);
-                let mut builder = skeleton();
-                builder.time_section = spec.format_time_section();
-                assert_eq!(builder.build_for(side), expected);
-            }
-        }
     }
 }

@@ -16,7 +16,7 @@ pub struct Zobrist {
 }
 
 impl Zobrist {
-    /// テーブル初期化（Xorshift64* と固定の生成順序）
+    /// テーブル初期化（YaneuraOu準拠のPRNGと生成順序）
     pub const fn init() -> Self {
         let mut zobrist = Zobrist {
             side: 0,
@@ -25,7 +25,7 @@ impl Zobrist {
             no_pawns: 0,
         };
 
-        // 鍵の値は置換表の添字を通じて探索に影響するため、seed と乱数の呼び出し回数を固定する。
+        // YaneuraOu準拠: seed = 20151225, Xorshift64*, 1キーあたり4回呼び出し
         let mut seed: u64 = 20151225;
 
         // 手番用
@@ -72,7 +72,7 @@ impl Zobrist {
     }
 }
 
-/// Xorshift64* 疑似乱数生成（const fn 対応）
+/// Xorshift64* 疑似乱数生成（YaneuraOu準拠、const fn対応）
 /// shifts: 12, 25, 27 + multiply by 2685821657736338717
 const fn xorshift64_star(mut s: u64) -> (u64, u64) {
     s ^= s >> 12;
@@ -82,7 +82,7 @@ const fn xorshift64_star(mut s: u64) -> (u64, u64) {
     (s, value)
 }
 
-/// 鍵の値を保つため、64bit の鍵でも PRNG を4回進め、最初の値を返す。
+/// 4回PRNGを呼び、r1を返す（YaneuraOu準拠: 64bitモードでも4回呼んでPRNG状態を進める）
 const fn next_key(seed: u64) -> (u64, u64) {
     let (s, r1) = xorshift64_star(seed);
     let (s, _) = xorshift64_star(s);
@@ -195,6 +195,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_zobrist_xor_property() {
+        // XOR性質: A ^ B ^ B = A
+        let sq = Square::new(File::File5, Rank::Rank5);
+        let h1 = zobrist_psq(Piece::B_PAWN, sq);
+        let h2 = zobrist_psq(Piece::B_GOLD, sq);
+
+        let combined = h1 ^ h2;
+        assert_eq!(combined ^ h2, h1);
+        assert_eq!(combined ^ h1, h2);
+    }
+
     // =========================================
     // パス権用Zobristキーのテスト
     // =========================================
@@ -229,5 +241,16 @@ mod tests {
         let key15 = zobrist_pass_rights(15, 15);
         let key20 = zobrist_pass_rights(20, 20);
         assert_eq!(key15, key20);
+    }
+
+    #[test]
+    fn test_zobrist_pass_rights_xor_property() {
+        // XOR性質: A ^ B ^ B = A
+        let key1 = zobrist_pass_rights(2, 2);
+        let key2 = zobrist_pass_rights(3, 3);
+
+        let combined = key1 ^ key2;
+        assert_eq!(combined ^ key2, key1);
+        assert_eq!(combined ^ key1, key2);
     }
 }

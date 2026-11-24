@@ -4,15 +4,17 @@
 
 use std::ptr::NonNull;
 
-use crate::eval::{EvalHash, eval_hash_enabled};
-use crate::nnue::DirtyPiece;
+#[cfg(feature = "use-lazy-evaluate")]
+use crate::nnue::ensure_accumulator_computed;
+#[cfg(feature = "layerstack-only")]
+use crate::nnue::{AccumulatorStackVariant, update_and_evaluate_layer_stacks_cached};
+use crate::nnue::{DirtyPiece, evaluate_dispatch};
 use crate::position::Position;
 use crate::prefetch::TtPrefetch;
 use crate::search::PieceToHistory;
-use crate::types::{Color, Move, Piece, Square, Value};
+use crate::types::{Move, Piece, Square, Value};
 
 use super::alpha_beta::{SearchContext, SearchState};
-use super::history::CorrectionPieceToHistory;
 use super::types::{ContHistKey, STACK_SIZE};
 use super::{LimitsType, TimeManagement};
 
@@ -21,29 +23,8 @@ use super::{LimitsType, TimeManagement};
 // =============================================================================
 
 /// 中断チェック
-/// 実判定は通常 512 回に 1 回、`nodes` 指定時は `min(512, nodes/1024).max(1)` 回に 1 回行う。
-#[inline(always)]
+#[inline]
 pub(super) fn check_abort(
-    st: &mut SearchState,
-    ctx: &SearchContext<'_>,
-    limits: &LimitsType,
-    time_manager: &mut TimeManagement,
-) -> bool {
-    if st.abort {
-        return check_abort_slow(st, ctx, limits, time_manager);
-    }
-    // 頻度制御の減算と判定は、停止済みの場合を除いて毎回行う。
-    st.calls_cnt -= 1;
-    if st.calls_cnt > 0 {
-        return false;
-    }
-    check_abort_slow(st, ctx, limits, time_manager)
-}
-
-/// abort 済みのとき、または間引きカウンタが尽きたときだけ呼ばれる。
-#[cold]
-#[inline(never)]
-fn check_abort_slow(
     st: &mut SearchState,
     ctx: &SearchContext<'_>,
     limits: &LimitsType,
@@ -56,28 +37,30 @@ fn check_abort_slow(
         return true;
     }
 
+    // 頻度制御：512回に1回だけ実際のチェックを行う
+    st.calls_cnt -= 1;
+    if st.calls_cnt > 0 {
+        return false;
+    }
     // カウンターをリセット
-    st.calls_cnt = limits.stop_check_interval();
+    st.calls_cnt = if limits.nodes > 0 {
+        std::cmp::min(512, (limits.nodes / 1024) as i32).max(1)
+    } else {
+        512
+    };
 
-    time_manager.publish_nodes(st.nodes);
     // 外部からの停止要求
     if time_manager.stop_requested() {
-        if ctx.thread_id == 0 {
-            time_manager.trace_external_stop();
-        }
         #[cfg(debug_assertions)]
         eprintln!("check_abort: stop requested");
         st.abort = true;
         return true;
     }
 
-    if time_manager.node_limit_reached(limits, st.nodes) {
+    // ノード数制限チェック
+    if limits.nodes > 0 && st.nodes >= limits.nodes {
         #[cfg(debug_assertions)]
-        eprintln!(
-            "check_abort: node limit reached nodes={} limit={}",
-            time_manager.budget_nodes(st.nodes),
-            limits.nodes
-        );
+        eprintln!("check_abort: node limit reached nodes={} limit={}", st.nodes, limits.nodes);
         st.abort = true;
         return true;
     }
@@ -94,11 +77,7 @@ fn check_abort_slow(
         let elapsed_effective = time_manager.elapsed_from_ponderhit();
 
         // フェーズ1: search_end 設定済み → 即座に停止
-        if !time_manager.is_pondering()
-            && time_manager.search_end() > 0
-            && elapsed >= time_manager.search_end()
-        {
-            time_manager.trace_timing("stop", "deadline", elapsed);
+        if time_manager.search_end() > 0 && elapsed >= time_manager.search_end() {
             #[cfg(debug_assertions)]
             eprintln!(
                 "check_abort: search_end reached elapsed={} search_end={}",
@@ -116,15 +95,6 @@ fn check_abort_slow(
             && limits.use_time_management()
             && (elapsed_effective > time_manager.maximum() || time_manager.stop_on_ponderhit())
         {
-            time_manager.trace_timing(
-                "deadline_request",
-                if time_manager.stop_on_ponderhit() {
-                    "ponderhit"
-                } else {
-                    "maximum"
-                },
-                elapsed,
-            );
             time_manager.set_search_end(elapsed);
             // 注: ここでは停止せず、次のチェックで秒境界で停止
         }
@@ -137,104 +107,67 @@ fn check_abort_slow(
 // NNUE操作
 // =============================================================================
 
-/// 探索開始時に束ねた評価器で評価する。
-#[inline]
-pub(super) fn nnue_evaluate(st: &mut SearchState, pos: &Position) -> Value {
-    st.evaluator.evaluate(pos)
-}
-
-/// EvalHash を介した NNUE 静的評価
+/// NNUE 評価 (= PV node 想定、 dual_cross 完全評価)
 ///
-/// hit 時はアキュムレータを更新しない。後続ノードの `update_accumulator` は
-/// 未計算の祖先を遡って差分適用 / refresh するため、skip しても整合は保たれる。
+/// `layerstack-only` feature 時は `evaluate_dispatch` をバイパスし、
+/// `network_ptr` から直接 LayerStacks 評価を呼ぶ。
+/// これにより `get_network()` の RwLock::read + Arc::clone を完全回避する。
 #[inline]
-pub(super) fn nnue_evaluate_cached(
-    st: &mut SearchState,
-    ctx: &SearchContext<'_>,
-    pos: &Position,
-) -> Value {
-    if !eval_hash_enabled() {
-        let value = nnue_evaluate(st, pos);
-        #[cfg(feature = "search-tree-sample")]
-        sample_tree_position(st, pos);
-        return value;
-    }
-    let key = pos.key();
-    if let Some(raw) = ctx.eval_hash.probe(key) {
-        return Value::new(raw);
-    }
-    let value = nnue_evaluate(st, pos);
-    ctx.eval_hash.store(key, value.raw());
-    #[cfg(feature = "search-tree-sample")]
-    sample_tree_position(st, pos);
-    value
+pub(super) fn nnue_evaluate(st: &mut SearchState, pos: &mut Position) -> Value {
+    nnue_evaluate_with_pv(st, pos, true)
 }
 
-/// 次に静的評価する局面の探索 ply を書き出し側へ伝える。
-#[cfg(feature = "search-tree-sample")]
+/// NNUE 評価 (= PV/非 PV 明示版)
+///
+/// arm 7 Path J (= 2026-05-27): `pv_node = false` のとき thread-local
+/// `NON_PV_DUAL_SKIP` を guard で立て、 `update_dual_cross_accumulator` +
+/// `dual_cross_value` 加算を skip する。 guard が drop されると 前値を復元する
+/// (= 例外安全)。 これにより 非 PV node の dual_cross 更新を ~30% NPS 改善
+/// 見込みで省略する trade-off (= 意図的 eval drift、 stale な prev_acc を許容)。
 #[inline]
-pub(super) fn set_tree_sample_ply(st: &mut SearchState, ply: i32) {
-    if let Some(sampler) = st.tree_sampler.as_deref_mut() {
-        sampler.set_ply(ply);
-    }
-}
-
-/// NNUE を実際に計算した局面だけを書き出しの対象にする。EvalHash hit は同じ局面の重複になるので除く。
-#[cfg(feature = "search-tree-sample")]
-#[inline]
-fn sample_tree_position(st: &mut SearchState, pos: &Position) {
-    if let Some(sampler) = st.tree_sampler.as_deref_mut() {
-        sampler.on_static_eval(pos);
-    }
-}
-
-/// 子局面の TT と EvalHash を局面更新前にプリフェッチする。
-struct SearchPrefetch<'a, P> {
-    tt: &'a P,
-    eval_hash: &'a EvalHash,
-}
-
-impl<P: TtPrefetch> TtPrefetch for SearchPrefetch<'_, P> {
-    #[inline]
-    fn prefetch(&self, key: u64, side_to_move: Color) {
-        self.tt.prefetch(key, side_to_move);
-        if eval_hash_enabled() {
-            self.eval_hash.prefetch(key);
-        }
-    }
-}
-
-/// 合法な通常手の子局面を、枝刈り判定より前にプリフェッチする。
-#[inline]
-pub(super) fn prefetch_child<P: TtPrefetch>(
-    pos: &Position,
-    mv: Move,
-    tt: &P,
-    eval_hash: &EvalHash,
-) {
-    if !mv.is_pass() {
-        SearchPrefetch { tt, eval_hash }.prefetch(pos.key_after(mv), !pos.side_to_move());
-    }
-}
-
-/// 子局面を prefetch 済みの手を実行する。PASS は prefetch_child の対象外なので、局面更新後に EvalHash を prefetch する。
-#[inline]
-pub(super) fn do_move_and_push_prefetched(
+pub(super) fn nnue_evaluate_with_pv(
     st: &mut SearchState,
     pos: &mut Position,
-    mv: Move,
-    gives_check: bool,
-    eval_hash: &EvalHash,
-) {
-    let dirty_piece = pos.do_move(mv, gives_check);
-    if mv.is_pass() && eval_hash_enabled() {
-        eval_hash.prefetch(pos.key());
+    pv_node: bool,
+) -> Value {
+    // PV node の間は flag を false にし、 非 PV node の間は true にする。
+    let _guard = crate::nnue::ablation::NonPvDualSkipGuard::new(!pv_node);
+
+    #[cfg(feature = "layerstack-only")]
+    {
+        let ptr = st.network_ptr;
+        if !ptr.is_null() {
+            // SAFETY: network_ptr は reset() で Arc::as_ptr() から設定。
+            // Arc は NETWORK の RwLock 内に保持され、探索中に drop されない。
+            let network = unsafe { &*ptr };
+            let AccumulatorStackVariant::LayerStacks(ref mut s) = st.nnue_stack else {
+                // SAFETY: `layerstack-only` feature が有効なとき、`from_network()` は
+                // 常に `LayerStacks` 変数体を返し、`nnue_stack` は `reset()` 以降
+                // 変更されない。よって `network_ptr` が非 null であれば `LayerStacks`
+                // 以外のアームに到達することはない。
+                unsafe { std::hint::unreachable_unchecked() }
+            };
+            let net = network.as_layer_stacks();
+            return update_and_evaluate_layer_stacks_cached(net, pos, s, &mut st.acc_cache);
+        }
     }
-    st.nodes += 1;
-    st.evaluator.push(dirty_piece);
+    evaluate_dispatch(pos, &mut st.nnue_stack, &mut st.acc_cache)
+}
+
+/// NNUE アキュムレータを計算済みにする（評価値の計算はしない）
+///
+/// `use-lazy-evaluate` 有効時のみ使用する。
+/// TT eval を再利用する経路で、後続の差分更新の整合を保つために必要。
+#[cfg(feature = "use-lazy-evaluate")]
+#[inline]
+pub(super) fn ensure_nnue_accumulator(st: &mut SearchState, pos: &Position) {
+    ensure_accumulator_computed(pos, &mut st.nnue_stack, &mut st.acc_cache)
 }
 
 /// do_move + nodes++ + nnue_push をまとめたラッパー
+///
+/// YO では Worker::do_move() 内部で nodes++ と nnue push を行う。
+/// rshogi でも同等の一括処理を提供する。
 #[inline]
 pub(super) fn do_move_and_push<P: TtPrefetch>(
     st: &mut SearchState,
@@ -242,31 +175,22 @@ pub(super) fn do_move_and_push<P: TtPrefetch>(
     mv: Move,
     gives_check: bool,
     prefetcher: &P,
-    eval_hash: &EvalHash,
 ) {
-    let search_prefetch = SearchPrefetch {
-        tt: prefetcher,
-        eval_hash,
-    };
-    let dirty_piece = pos.do_move_with_prefetch(mv, gives_check, &search_prefetch);
-    // PASS は do_move_with_prefetch 内のプリフェッチを経由しない。
-    if mv.is_pass() && eval_hash_enabled() {
-        eval_hash.prefetch(pos.key());
-    }
+    let dirty_piece = pos.do_move_with_prefetch(mv, gives_check, prefetcher);
     st.nodes += 1;
-    st.evaluator.push(dirty_piece);
+    st.nnue_stack.push(dirty_piece);
 }
 
 /// NNUE push
 #[inline]
 pub(super) fn nnue_push(st: &mut SearchState, dirty_piece: DirtyPiece) {
-    st.evaluator.push(dirty_piece);
+    st.nnue_stack.push(dirty_piece);
 }
 
 /// NNUE pop
-#[inline(always)]
+#[inline]
 pub(super) fn nnue_pop(st: &mut SearchState) {
-    st.evaluator.pop();
+    st.nnue_stack.pop();
 }
 
 // =============================================================================
@@ -290,23 +214,42 @@ pub(super) fn cont_history_ptr(
     }
 }
 
-/// 1〜6 手前の continuation キー。未設定・探索根より前は sentinel を使う。
+/// ContinuationHistory 参照を取得
 #[inline]
-pub(super) fn cont_history_keys(st: &SearchState, ply: i32) -> [ContHistKey; 6] {
-    std::array::from_fn(|i| {
-        let back = i as i32 + 1;
-        if ply >= back {
-            st.stack[(ply - back) as usize]
-                .cont_hist_key
-                .unwrap_or_else(ContHistKey::null_sentinel)
-        } else {
-            ContHistKey::null_sentinel()
-        }
-    })
+pub(super) fn cont_history_ref<'a>(
+    st: &'a SearchState,
+    ctx: &SearchContext<'_>,
+    ply: i32,
+    back: i32,
+) -> &'a PieceToHistory {
+    let ptr = cont_history_ptr(st, ctx, ply, back);
+    // SAFETY: cont_history_ptrは常に有効なNonNullポインタを返す
+    // - ply >= back の場合: st.stack[(ply-back)].cont_history_ptr から取得
+    //   スタックエントリは SearchState のライフタイム 'a で有効
+    // - ply < back の場合: ctx.cont_history_sentinel（静的に確保されたsentinel）
+    // いずれの場合もポインタは 'a の間有効であり、参照への変換は安全
+    unsafe { ptr.as_ref() }
+}
+
+/// ContinuationHistory テーブル配列を取得
+#[inline]
+pub(super) fn cont_history_tables<'a>(
+    st: &'a SearchState,
+    ctx: &SearchContext<'_>,
+    ply: i32,
+) -> [&'a PieceToHistory; 6] {
+    [
+        cont_history_ref(st, ctx, ply, 1),
+        cont_history_ref(st, ctx, ply, 2),
+        cont_history_ref(st, ctx, ply, 3),
+        cont_history_ref(st, ctx, ply, 4),
+        cont_history_ref(st, ctx, ply, 5),
+        cont_history_ref(st, ctx, ply, 6),
+    ]
 }
 
 /// ContinuationHistory を設定
-#[inline(always)]
+#[inline]
 pub(super) fn set_cont_history_for_move(
     st: &mut SearchState,
     ctx: &SearchContext<'_>,
@@ -320,38 +263,26 @@ pub(super) fn set_cont_history_for_move(
     let in_check_idx = in_check as usize;
     let capture_idx = capture as usize;
     // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない
-    let (table, correction_table) = {
+    let table = {
         let h = unsafe { ctx.history.as_ref_unchecked() };
-        (
-            NonNull::from(h.continuation_history[in_check_idx][capture_idx].get_table(piece, to)),
-            NonNull::<CorrectionPieceToHistory>::from(
-                h.correction_history.continuation_table(piece, to),
-            ),
-        )
+        NonNull::from(h.continuation_history[in_check_idx][capture_idx].get_table(piece, to))
     };
     // SAFETY: ply < MAX_PLY < STACK_SIZE は上の debug_assert で検証済み。
     let ss = unsafe { st.stack.get_unchecked_mut(ply as usize) };
     ss.cont_history_ptr = table;
-    ss.cont_correction_ptr = correction_table;
-    ss.cont_hist_key = Some(ContHistKey::new(in_check, capture, piece, to));
+    ss.cont_hist_key = ContHistKey::new(in_check, capture, piece, to);
 }
 
 /// ContinuationHistory をクリア（null move用）
 /// sentinelテーブル(NO_PIECE, SQ_ZERO)を参照するようにする。
 /// cont_hist_keyをNoneにするとcorrection historyのcontinuation更新がスキップされてしまうため、
-/// sentinel keyを設定してsentinelテーブルへの読み書きを継続する。
+/// sentinel keyを設定してYOと同じsentinelテーブルへの読み書きが行われるようにする。
 #[inline]
 pub(super) fn clear_cont_history_for_null(st: &mut SearchState, ctx: &SearchContext<'_>, ply: i32) {
-    let correction_sentinel = {
-        // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない。
-        let h = unsafe { ctx.history.as_ref_unchecked() };
-        NonNull::from(h.correction_history.continuation_table(Piece::NONE, Square::SQ_11))
-    };
     // SAFETY: ply < MAX_PLY < STACK_SIZE。
     let ss = unsafe { st.stack.get_unchecked_mut(ply as usize) };
     ss.cont_history_ptr = ctx.cont_history_sentinel;
-    ss.cont_correction_ptr = correction_sentinel;
-    ss.cont_hist_key = Some(ContHistKey::null_sentinel());
+    ss.cont_hist_key = ContHistKey::null_sentinel();
 }
 
 // =============================================================================

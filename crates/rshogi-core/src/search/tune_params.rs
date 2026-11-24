@@ -2,13 +2,6 @@
 //!
 //! USI `setoption` で更新できる探索係数を集約する。
 
-use crate::types::MAX_PLY;
-
-/// depth-liveness の非減少 edge 連続数は ply が `MAX_PLY` で打ち切られるため
-/// `MAX_PLY - 1` を超えられない。これより大きい閾値を許すと「0のみ無効」の
-/// 契約に反して guard が黙って無効化されるので、上限をここで縛る。
-const DEPTH_LIVENESS_RUN_MAX: i32 = MAX_PLY - 1;
-
 /// 1つのチューニング項目のUSI定義。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchTuneOptionSpec {
@@ -90,16 +83,16 @@ pub struct SearchTuneParams {
     pub lmr_step16_cutoff_count_add: i32,
     /// LMR Step16: cutoff_cnt>2 かつ all_node 時の追加加算
     pub lmr_step16_cutoff_count_all_node_add: i32,
+    /// LMR Step16: allNode 比例削減係数。 YaneuraOu v9.40 の
+    /// `r += r * 273 / (256 * depth + 260)` に対応（all_node のみ適用）。
+    /// 既定値 0 = 無効（現状動作を維持）。
+    pub lmr_allnode_reduction_coeff: i32,
     /// LMR Step16: tt_move 一致時の減算
     pub lmr_step16_tt_move_penalty: i32,
     /// LMR Step16: capture stat の駒価値スケール分子（/128）
     pub lmr_step16_capture_stat_scale_num: i32,
     /// LMR Step16: stat_score 補正の分子（/8192）
     pub lmr_step16_stat_score_scale_num: i32,
-    /// allNode では合成済みの reduction を深さに応じて増幅する。
-    pub lmr_all_node_scale_num: i32,
-    /// allNode reduction 増幅率の深さ依存を調整する。
-    pub lmr_all_node_scale_offset: i32,
     /// LMR再探索: deeper判定のベース値（43 + 2*depth の43）
     pub lmr_research_deeper_base: i32,
     /// LMR再探索: deeper判定の depth 係数（43 + 2*depth の2）
@@ -149,11 +142,26 @@ pub struct SearchTuneParams {
     pub singular_negative_extension_tt_fail_high: i32,
     /// Singular Extension: cut node 時の負延長量
     pub singular_negative_extension_cut_node: i32,
+    /// Singular Extension: capture move での double/triple extension を抑止するか
+    /// （0 = 抑止しない＝既存挙動 / 1 = 抑止する。capture では singular の +1 は維持）。
+    /// YaneuraOu 最新の "skip double/triple extensions for capture moves" 相当。
+    pub singular_skip_capture_double_triple: i32,
 
     /// Futility: 基本マージン係数
     pub futility_margin_base: i32,
     /// Futility: TT非ヒット時の減算係数
     pub futility_margin_tt_bonus: i32,
+    // PATCH-2026-05-31-RANK5-START
+    /// Futility: shallow depth (= 1) で適用される係数（base への補間下限）。
+    /// SF 7bd32a5 に対応。 depth が `futility_margin_ramp_depth` 以上で
+    /// base に達する線形補間。 既定値 50 (= base 91 の約 55%)。
+    pub futility_margin_low: i32,
+    /// Futility: low → base に達する depth。 SF と同様 10 を既定値とする。
+    pub futility_margin_ramp_depth: i32,
+    // PATCH-2026-05-31-RANK5-END
+    /// Reverse Futility Pruning: 適用する最大 depth（`depth < x` の x）。
+    /// YaneuraOu v9.40 は 15。 既定値 14 = 現状動作を維持。
+    pub reverse_futility_max_depth: i32,
     /// Futility: improving 補正係数（/1024）
     pub futility_improving_scale: i32,
     /// Futility: opponent worsening 補正係数（/4096）
@@ -203,8 +211,6 @@ pub struct SearchTuneParams {
     pub stat_bonus_max: i32,
     /// stat bonus: TT手一致時の加算（375）
     pub stat_bonus_tt_bonus: i32,
-    /// stat bonus に親ノードの statScore を還流する分子（/8192、0 で無効）。
-    pub stat_bonus_parent_stat_num: i32,
     /// stat malus: depth 係数（825）
     pub stat_malus_depth_mult: i32,
     /// stat malus: オフセット（-196）
@@ -213,6 +219,8 @@ pub struct SearchTuneParams {
     pub stat_malus_max: i32,
     /// stat malus: move_count 係数（16）
     pub stat_malus_move_count_mult: i32,
+    /// stat bonus: 前ノード statScore 加算の除数（0=無効=現状維持、有効時 bonus += (ss-1).stat_score / div）
+    pub stat_bonus_prev_statscore_div: i32,
     /// lowPlyHistory ボーナス倍率（/1024）
     pub low_ply_history_multiplier: i32,
     /// lowPlyHistory ボーナスオフセット
@@ -257,10 +265,6 @@ pub struct SearchTuneParams {
     pub update_all_stats_quiet_bonus_scale_num: i32,
     /// update_all_stats: quiet malus更新のスケール分子（/1024）
     pub update_all_stats_quiet_malus_scale_num: i32,
-    /// quiet malus を適用手ごとに減衰させる分子（/1024）。
-    pub update_all_stats_quiet_malus_decay_num: i32,
-    /// 非PVノードで探索済み手数を bonus に反映する分子（/(256*1024)、0 で無効）。
-    pub update_all_stats_searched_count_num: i32,
     /// update_all_stats: capture best更新のスケール分子（/1024）
     pub update_all_stats_capture_bonus_scale_num: i32,
     /// update_all_stats: capture malus更新のスケール分子（/1024）
@@ -315,12 +319,8 @@ pub struct SearchTuneParams {
     pub correction_value_micv_weight: i32,
     /// correction_value: non-pawn correction weight
     pub correction_value_nonpawn_weight: i32,
-    /// correction_value: continuation correction (ss-2, ss-4) weight
+    /// correction_value: continuation correction weight
     pub correction_value_cnt_weight: i32,
-    /// correction_value: continuation correction (ss-6) weight
-    pub correction_value_cnt_ss6_weight: i32,
-    /// correction_value: 前の手が無いときに continuation 項全体の代わりに足す定数
-    pub correction_value_cnt_no_move: i32,
     /// correction_history: non-pawn update weight (/128)
     pub correction_history_non_pawn_weight: i32,
     /// correction_history: minor piece update multiplier (/128)
@@ -329,8 +329,6 @@ pub struct SearchTuneParams {
     pub correction_history_cont_ss2_weight: i32,
     /// correction_history: continuation (ss-4) update weight (/128)
     pub correction_history_cont_ss4_weight: i32,
-    /// correction_history: continuation (ss-6) update weight (/128)
-    pub correction_history_cont_ss6_weight: i32,
 
     // =========================================================================
     // Group B: History 初期値
@@ -353,10 +351,6 @@ pub struct SearchTuneParams {
     pub aspiration_delta_base: i32,
     /// aspiration window: mean squared score 除算値
     pub aspiration_mean_sq_div: i32,
-    /// 1回のroot searchでこのnode数を超えたらdepth livenessを監視（0=無効）
-    pub depth_liveness_node_threshold: i32,
-    /// remaining depthが減らない連続edge数の発火閾値（0=無効）
-    pub depth_liveness_run_threshold: i32,
 
     // =========================================================================
     // Group D: Reductions テーブル
@@ -450,1053 +444,1029 @@ pub struct SearchTuneParams {
 const SPSA_OPTION_SPECS: &[SearchTuneOptionSpec] = &[
     SearchTuneOptionSpec {
         usi_name: "SPSA_IIR_SHALLOW",
-        default: SearchTuneParams::DEFAULT.iir_prior_reduction_threshold_shallow,
+        default: 1,
         min: 0,
         max: 8,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_IIR_DEEP",
-        default: SearchTuneParams::DEFAULT.iir_prior_reduction_threshold_deep,
+        default: 3,
         min: 0,
         max: 16,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_IIR_DEPTH_BOUNDARY",
-        default: SearchTuneParams::DEFAULT.iir_depth_boundary,
+        default: 10,
         min: 1,
         max: 64,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_IIR_EVAL_SUM",
-        default: SearchTuneParams::DEFAULT.iir_eval_sum_threshold,
+        default: 177,
         min: 0,
         max: 5000,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_DRAW_JITTER_MASK",
-        default: SearchTuneParams::DEFAULT.draw_jitter_mask,
+        default: 2,
         min: 0,
         max: 31,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_DRAW_JITTER_OFFSET",
-        default: SearchTuneParams::DEFAULT.draw_jitter_offset,
+        default: -1,
         min: -16,
         max: 16,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_DELTA_SCALE",
-        default: SearchTuneParams::DEFAULT.lmr_reduction_delta_scale,
+        default: 757,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_NON_IMPROVING_MULT",
-        default: SearchTuneParams::DEFAULT.lmr_reduction_non_improving_mult,
+        default: 218,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_NON_IMPROVING_DIV",
-        default: SearchTuneParams::DEFAULT.lmr_reduction_non_improving_div,
+        default: 512,
         min: 1,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_BASE_OFFSET",
-        default: SearchTuneParams::DEFAULT.lmr_reduction_base_offset,
+        default: 1200,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_TTPV_ADD",
-        default: SearchTuneParams::DEFAULT.lmr_ttpv_add,
+        default: 946,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_TTPV_SUB_BASE",
-        default: SearchTuneParams::DEFAULT.lmr_step16_ttpv_sub_base,
+        default: 2618,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_TTPV_SUB_PV_NODE",
-        default: SearchTuneParams::DEFAULT.lmr_step16_ttpv_sub_pv_node,
+        default: 991,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_TTPV_SUB_TT_VALUE",
-        default: SearchTuneParams::DEFAULT.lmr_step16_ttpv_sub_tt_value,
+        default: 903,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_TTPV_SUB_TT_DEPTH",
-        default: SearchTuneParams::DEFAULT.lmr_step16_ttpv_sub_tt_depth,
+        default: 978,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_TTPV_SUB_CUT_NODE",
-        default: SearchTuneParams::DEFAULT.lmr_step16_ttpv_sub_cut_node,
+        default: 1051,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_BASE_ADD",
-        default: SearchTuneParams::DEFAULT.lmr_step16_base_add,
+        default: 843,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_MOVE_COUNT_MUL",
-        default: SearchTuneParams::DEFAULT.lmr_step16_move_count_mul,
+        default: 66,
         min: -1024,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_CORRECTION_DIV",
-        default: SearchTuneParams::DEFAULT.lmr_step16_correction_div,
+        default: 30_450,
         min: 1,
         max: 1_000_000,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_CUT_NODE_ADD",
-        default: SearchTuneParams::DEFAULT.lmr_step16_cut_node_add,
+        default: 3094,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_CUT_NODE_NO_TT_ADD",
-        default: SearchTuneParams::DEFAULT.lmr_step16_cut_node_no_tt_add,
+        default: 1056,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_TT_CAPTURE_ADD",
-        default: SearchTuneParams::DEFAULT.lmr_step16_tt_capture_add,
+        default: 1415,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_CUTOFF_COUNT_ADD",
-        default: SearchTuneParams::DEFAULT.lmr_step16_cutoff_count_add,
+        default: 1051,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_CUTOFF_COUNT_ALL_NODE_ADD",
-        default: SearchTuneParams::DEFAULT.lmr_step16_cutoff_count_all_node_add,
+        default: 814,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_TT_MOVE_PENALTY",
-        default: SearchTuneParams::DEFAULT.lmr_step16_tt_move_penalty,
+        default: 2018,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
+        usi_name: "SPSA_LMR_ALLNODE_COEFF",
+        default: 0,
+        min: 0,
+        max: 1024,
+    },
+    SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_CAPTURE_STAT_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.lmr_step16_capture_stat_scale_num,
+        default: 803,
         min: 0,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_STEP16_STAT_SCORE_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.lmr_step16_stat_score_scale_num,
+        default: 794,
         min: 0,
-        max: 8192,
-    },
-    SearchTuneOptionSpec {
-        usi_name: "SPSA_LMR_ALL_NODE_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.lmr_all_node_scale_num,
-        min: 0,
-        max: 4096,
-    },
-    SearchTuneOptionSpec {
-        usi_name: "SPSA_LMR_ALL_NODE_SCALE_OFFSET",
-        default: SearchTuneParams::DEFAULT.lmr_all_node_scale_offset,
-        min: 1,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_RESEARCH_DEEPER_BASE",
-        default: SearchTuneParams::DEFAULT.lmr_research_deeper_base,
+        default: 43,
         min: -1024,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_RESEARCH_DEEPER_DEPTH_MUL",
-        default: SearchTuneParams::DEFAULT.lmr_research_deeper_depth_mul,
+        default: 2,
         min: -64,
         max: 64,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_RESEARCH_SHALLOWER_THRESHOLD",
-        default: SearchTuneParams::DEFAULT.lmr_research_shallower_threshold,
+        default: 9,
         min: -1024,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_MIN_DEPTH_BASE",
-        default: SearchTuneParams::DEFAULT.singular_min_depth_base,
+        default: 6,
         min: 0,
         max: 64,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_MIN_DEPTH_TT_PV_ADD",
-        default: SearchTuneParams::DEFAULT.singular_min_depth_tt_pv_add,
+        default: 1,
         min: 0,
         max: 8,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_TT_DEPTH_MARGIN",
-        default: SearchTuneParams::DEFAULT.singular_tt_depth_margin,
+        default: 3,
         min: 0,
         max: 16,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_BETA_MARGIN_BASE",
-        default: SearchTuneParams::DEFAULT.singular_beta_margin_base,
+        default: 56,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_BETA_MARGIN_TT_PV_NON_PV_ADD",
-        default: SearchTuneParams::DEFAULT.singular_beta_margin_tt_pv_non_pv_add,
+        default: 81,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_BETA_MARGIN_DIV",
-        default: SearchTuneParams::DEFAULT.singular_beta_margin_div,
+        default: 60,
         min: 1,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_DEPTH_DIV",
-        default: SearchTuneParams::DEFAULT.singular_depth_div,
+        default: 2,
         min: 1,
         max: 16,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_DOUBLE_MARGIN_BASE",
-        default: SearchTuneParams::DEFAULT.singular_double_margin_base,
+        default: -4,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_DOUBLE_MARGIN_PV_NODE",
-        default: SearchTuneParams::DEFAULT.singular_double_margin_pv_node,
+        default: 198,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_DOUBLE_MARGIN_NON_TT_CAPTURE",
-        default: SearchTuneParams::DEFAULT.singular_double_margin_non_tt_capture,
+        default: -212,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_CORR_VAL_ADJ_DIV",
-        default: SearchTuneParams::DEFAULT.singular_corr_val_adj_div,
+        default: 229_958,
         min: 1,
         max: 1_000_000,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_DOUBLE_MARGIN_TT_MOVE_HIST_MULT",
-        default: SearchTuneParams::DEFAULT.singular_double_margin_tt_move_hist_mult,
+        default: -921,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_DOUBLE_MARGIN_TT_MOVE_HIST_DIV",
-        default: SearchTuneParams::DEFAULT.singular_double_margin_tt_move_hist_div,
+        default: 127_649,
         min: 1,
         max: 1_000_000,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_DOUBLE_MARGIN_LATE_PLY_PENALTY",
-        default: SearchTuneParams::DEFAULT.singular_double_margin_late_ply_penalty,
+        default: 45,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_TRIPLE_MARGIN_BASE",
-        default: SearchTuneParams::DEFAULT.singular_triple_margin_base,
+        default: 76,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_TRIPLE_MARGIN_PV_NODE",
-        default: SearchTuneParams::DEFAULT.singular_triple_margin_pv_node,
+        default: 308,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_TRIPLE_MARGIN_NON_TT_CAPTURE",
-        default: SearchTuneParams::DEFAULT.singular_triple_margin_non_tt_capture,
+        default: -250,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_TRIPLE_MARGIN_TT_PV",
-        default: SearchTuneParams::DEFAULT.singular_triple_margin_tt_pv,
+        default: 92,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_TRIPLE_MARGIN_LATE_PLY_PENALTY",
-        default: SearchTuneParams::DEFAULT.singular_triple_margin_late_ply_penalty,
+        default: 52,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_NEGATIVE_EXTENSION_TT_FAIL_HIGH",
-        default: SearchTuneParams::DEFAULT.singular_negative_extension_tt_fail_high,
+        default: -3,
         min: -8,
         max: 0,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_SINGULAR_NEGATIVE_EXTENSION_CUT_NODE",
-        default: SearchTuneParams::DEFAULT.singular_negative_extension_cut_node,
+        default: -2,
         min: -8,
         max: 0,
     },
     SearchTuneOptionSpec {
+        usi_name: "SPSA_SKIP_CAPTURE_DOUBLE_TRIPLE_SE",
+        default: 0,
+        min: 0,
+        max: 1,
+    },
+    SearchTuneOptionSpec {
         usi_name: "SPSA_FUTILITY_MARGIN_BASE",
-        default: SearchTuneParams::DEFAULT.futility_margin_base,
+        default: 91,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FUTILITY_MARGIN_TT_BONUS",
-        default: SearchTuneParams::DEFAULT.futility_margin_tt_bonus,
+        default: 21,
         min: 0,
         max: 512,
     },
+    // PATCH-2026-05-31-RANK5-START
+    SearchTuneOptionSpec {
+        usi_name: "SPSA_FUTILITY_MARGIN_LOW",
+        default: 50,
+        min: 0,
+        max: 1024,
+    },
+    SearchTuneOptionSpec {
+        usi_name: "SPSA_FUTILITY_MARGIN_RAMP_DEPTH",
+        default: 10,
+        min: 1,
+        max: 32,
+    },
+    // PATCH-2026-05-31-RANK5-END
+    SearchTuneOptionSpec {
+        usi_name: "SPSA_RFP_MAX_DEPTH",
+        default: 14,
+        min: 1,
+        max: 32,
+    },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FUTILITY_IMPROVING_SCALE",
-        default: SearchTuneParams::DEFAULT.futility_improving_scale,
+        default: 2094,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FUTILITY_OPP_WORSENING_SCALE",
-        default: SearchTuneParams::DEFAULT.futility_opponent_worsening_scale,
+        default: 1324,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FUTILITY_CORRECTION_DIV",
-        default: SearchTuneParams::DEFAULT.futility_correction_div,
+        default: 158_105,
         min: 1,
         max: 1_000_000,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_RAZORING_BASE",
-        default: SearchTuneParams::DEFAULT.razoring_margin_base,
+        default: 514,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_RAZORING_DEPTH2",
-        default: SearchTuneParams::DEFAULT.razoring_margin_depth2_coeff,
+        default: 294,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_NMP_MARGIN_DEPTH_MULT",
-        default: SearchTuneParams::DEFAULT.nmp_margin_depth_mult,
+        default: 18,
         min: 0,
         max: 256,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_NMP_MARGIN_OFFSET",
-        default: SearchTuneParams::DEFAULT.nmp_margin_offset,
+        default: -390,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_NMP_MARGIN_IMPROVING_BONUS",
-        default: SearchTuneParams::DEFAULT.nmp_margin_improving_bonus,
+        default: 50,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_NMP_REDUCTION_BASE",
-        default: SearchTuneParams::DEFAULT.nmp_reduction_base,
+        default: 7,
         min: 1,
         max: 32,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_NMP_REDUCTION_DEPTH_DIV",
-        default: SearchTuneParams::DEFAULT.nmp_reduction_depth_div,
+        default: 3,
         min: 1,
         max: 32,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_NMP_VERIFICATION_DEPTH",
-        default: SearchTuneParams::DEFAULT.nmp_verification_depth_threshold,
+        default: 16,
         min: 1,
         max: 128,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_NMP_MIN_PLY_NUM",
-        default: SearchTuneParams::DEFAULT.nmp_min_ply_update_num,
+        default: 3,
         min: 1,
         max: 32,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_NMP_MIN_PLY_DEN",
-        default: SearchTuneParams::DEFAULT.nmp_min_ply_update_den,
+        default: 4,
         min: 1,
         max: 32,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PROBCUT_BETA_MARGIN",
-        default: SearchTuneParams::DEFAULT.probcut_beta_margin_base,
+        default: 224,
         min: 0,
         max: 2048,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PROBCUT_IMPROVING_SUB",
-        default: SearchTuneParams::DEFAULT.probcut_beta_improving_sub,
+        default: 64,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PROBCUT_DYNAMIC_DIV",
-        default: SearchTuneParams::DEFAULT.probcut_dynamic_reduction_div,
+        default: 306,
         min: 1,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PROBCUT_DEPTH_BASE",
-        default: SearchTuneParams::DEFAULT.probcut_depth_base,
+        default: 5,
         min: 1,
         max: 32,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_QS_FUTILITY_BASE",
-        default: SearchTuneParams::DEFAULT.qsearch_futility_base,
+        default: 352,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_STAT_BONUS_DEPTH_MULT",
-        default: SearchTuneParams::DEFAULT.stat_bonus_depth_mult,
+        default: 121,
         min: 0,
         max: 2048,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_STAT_BONUS_OFFSET",
-        default: SearchTuneParams::DEFAULT.stat_bonus_offset,
+        default: -77,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_STAT_BONUS_MAX",
-        default: SearchTuneParams::DEFAULT.stat_bonus_max,
+        default: 1633,
         min: 1,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_STAT_BONUS_TT_BONUS",
-        default: SearchTuneParams::DEFAULT.stat_bonus_tt_bonus,
+        default: 375,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
-        usi_name: "SPSA_STAT_BONUS_PARENT_STAT_NUM",
-        default: SearchTuneParams::DEFAULT.stat_bonus_parent_stat_num,
-        min: 0,
-        max: 8192,
-    },
-    SearchTuneOptionSpec {
         usi_name: "SPSA_STAT_MALUS_DEPTH_MULT",
-        default: SearchTuneParams::DEFAULT.stat_malus_depth_mult,
+        default: 825,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_STAT_MALUS_OFFSET",
-        default: SearchTuneParams::DEFAULT.stat_malus_offset,
+        default: -196,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_STAT_MALUS_MAX",
-        default: SearchTuneParams::DEFAULT.stat_malus_max,
+        default: 2159,
         min: 1,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_STAT_MALUS_MOVE_COUNT_MULT",
-        default: SearchTuneParams::DEFAULT.stat_malus_move_count_mult,
+        default: 16,
         min: 0,
         max: 512,
     },
     SearchTuneOptionSpec {
+        usi_name: "SPSA_STATBONUS_PREV_DIV",
+        default: 0,
+        min: 0,
+        max: 256,
+    },
+    SearchTuneOptionSpec {
         usi_name: "SPSA_LOW_PLY_HISTORY_MULTIPLIER",
-        default: SearchTuneParams::DEFAULT.low_ply_history_multiplier,
+        default: 761,
         min: 0,
         max: 2048,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LOW_PLY_HISTORY_OFFSET",
-        default: SearchTuneParams::DEFAULT.low_ply_history_offset,
+        default: 0,
         min: -2048,
         max: 2048,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CONT_HISTORY_MULTIPLIER",
-        default: SearchTuneParams::DEFAULT.continuation_history_multiplier,
+        default: 955,
         min: 0,
         max: 2048,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CONT_HISTORY_NEAR_PLY_OFFSET",
-        default: SearchTuneParams::DEFAULT.continuation_history_near_ply_offset,
+        default: 88,
         min: -1024,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CONT_HISTORY_WEIGHT_1",
-        default: SearchTuneParams::DEFAULT.continuation_history_weight_1,
+        default: 1157,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CONT_HISTORY_WEIGHT_2",
-        default: SearchTuneParams::DEFAULT.continuation_history_weight_2,
+        default: 648,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CONT_HISTORY_WEIGHT_3",
-        default: SearchTuneParams::DEFAULT.continuation_history_weight_3,
+        default: 288,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CONT_HISTORY_WEIGHT_4",
-        default: SearchTuneParams::DEFAULT.continuation_history_weight_4,
+        default: 576,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CONT_HISTORY_WEIGHT_5",
-        default: SearchTuneParams::DEFAULT.continuation_history_weight_5,
+        default: 140,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CONT_HISTORY_WEIGHT_6",
-        default: SearchTuneParams::DEFAULT.continuation_history_weight_6,
+        default: 441,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FAIL_HIGH_CONT_BASE_NUM",
-        default: SearchTuneParams::DEFAULT.fail_high_continuation_base_num,
+        default: 1412,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FAIL_HIGH_CONT_NEAR_PLY_OFFSET",
-        default: SearchTuneParams::DEFAULT.fail_high_continuation_near_ply_offset,
+        default: 80,
         min: -1024,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FAIL_HIGH_CONT_WEIGHT_1",
-        default: SearchTuneParams::DEFAULT.fail_high_continuation_weight_1,
+        default: 1108,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FAIL_HIGH_CONT_WEIGHT_2",
-        default: SearchTuneParams::DEFAULT.fail_high_continuation_weight_2,
+        default: 652,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FAIL_HIGH_CONT_WEIGHT_3",
-        default: SearchTuneParams::DEFAULT.fail_high_continuation_weight_3,
+        default: 273,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FAIL_HIGH_CONT_WEIGHT_4",
-        default: SearchTuneParams::DEFAULT.fail_high_continuation_weight_4,
+        default: 572,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FAIL_HIGH_CONT_WEIGHT_5",
-        default: SearchTuneParams::DEFAULT.fail_high_continuation_weight_5,
+        default: 126,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_FAIL_HIGH_CONT_WEIGHT_6",
-        default: SearchTuneParams::DEFAULT.fail_high_continuation_weight_6,
+        default: 449,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PAWN_HISTORY_POS_MULTIPLIER",
-        default: SearchTuneParams::DEFAULT.pawn_history_pos_multiplier,
+        default: 850,
         min: 0,
         max: 2048,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PAWN_HISTORY_NEG_MULTIPLIER",
-        default: SearchTuneParams::DEFAULT.pawn_history_neg_multiplier,
+        default: 550,
         min: 0,
         max: 2048,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_UPDATE_ALL_QUIET_BONUS_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.update_all_stats_quiet_bonus_scale_num,
+        default: 881,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_UPDATE_ALL_QUIET_MALUS_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.update_all_stats_quiet_malus_scale_num,
+        default: 1083,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
-        usi_name: "SPSA_UPDATE_ALL_QUIET_MALUS_DECAY_NUM",
-        default: SearchTuneParams::DEFAULT.update_all_stats_quiet_malus_decay_num,
-        min: 0,
-        max: 1024,
-    },
-    SearchTuneOptionSpec {
-        usi_name: "SPSA_UPDATE_ALL_SEARCHED_COUNT_NUM",
-        default: SearchTuneParams::DEFAULT.update_all_stats_searched_count_num,
-        min: 0,
-        max: 16_384,
-    },
-    SearchTuneOptionSpec {
         usi_name: "SPSA_UPDATE_ALL_CAPTURE_BONUS_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.update_all_stats_capture_bonus_scale_num,
+        default: 1482,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_UPDATE_ALL_CAPTURE_MALUS_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.update_all_stats_capture_malus_scale_num,
+        default: 1397,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_UPDATE_ALL_EARLY_REFUTE_PENALTY_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.update_all_stats_early_refutation_penalty_scale_num,
+        default: 614,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_BONUS_SCALE_BASE",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_bonus_scale_base,
+        default: -228,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_PARENT_STAT_DIV",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_parent_stat_div,
+        default: 104,
         min: 1,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_DEPTH_MUL",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_depth_mul,
+        default: 63,
         min: -1024,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_DEPTH_CAP",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_depth_cap,
+        default: 508,
         min: 0,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_MOVE_COUNT_BONUS",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_move_count_bonus,
+        default: 184,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_EVAL_BONUS",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_eval_bonus,
+        default: 143,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_EVAL_MARGIN",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_eval_margin,
+        default: 92,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_PARENT_EVAL_BONUS",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_parent_eval_bonus,
+        default: 149,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_PARENT_EVAL_MARGIN",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_parent_eval_margin,
+        default: 70,
         min: 0,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_SCALED_DEPTH_MUL",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_scaled_depth_mul,
+        default: 144,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_SCALED_OFFSET",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_scaled_offset,
+        default: -92,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_SCALED_CAP",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_scaled_cap,
+        default: 1365,
         min: 0,
         max: 32768,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_CONT_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_cont_scale_num,
+        default: 400,
         min: -32768,
         max: 32768,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_MAIN_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_main_scale_num,
+        default: 220,
         min: -32768,
         max: 32768,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_QUIET_CM_PAWN_SCALE_NUM",
-        default: SearchTuneParams::DEFAULT.prior_quiet_countermove_pawn_scale_num,
+        default: 1164,
         min: -32768,
         max: 32768,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_TT_MOVE_BONUS",
-        default: SearchTuneParams::DEFAULT.tt_move_history_bonus,
+        default: 811,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_TT_MOVE_MALUS",
-        default: SearchTuneParams::DEFAULT.tt_move_history_malus,
+        default: -848,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PRIOR_CAPTURE_CM_BONUS",
-        default: SearchTuneParams::DEFAULT.prior_capture_countermove_bonus,
+        default: 964,
         min: -8192,
         max: 8192,
     },
     // Group A: correction_value / correction_history
     SearchTuneOptionSpec {
         usi_name: "SPSA_CORR_PCV_WEIGHT",
-        default: SearchTuneParams::DEFAULT.correction_value_pcv_weight,
+        default: 9536,
         min: 0,
         max: 32768,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CORR_MICV_WEIGHT",
-        default: SearchTuneParams::DEFAULT.correction_value_micv_weight,
+        default: 8494,
         min: 0,
         max: 32768,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CORR_NONPAWN_WEIGHT",
-        default: SearchTuneParams::DEFAULT.correction_value_nonpawn_weight,
+        default: 10132,
         min: 0,
         max: 32768,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CORR_CNT_WEIGHT",
-        default: SearchTuneParams::DEFAULT.correction_value_cnt_weight,
+        default: 7156,
         min: 0,
         max: 32768,
-    },
-    SearchTuneOptionSpec {
-        usi_name: "SPSA_CORR_CNT_SS6_WEIGHT",
-        default: SearchTuneParams::DEFAULT.correction_value_cnt_ss6_weight,
-        min: 0,
-        max: 32768,
-    },
-    // (ss-6) を使わない式の、前の手が無いときの `8 * SPSA_CORR_CNT_WEIGHT` を CNT_WEIGHT の
-    // 全範囲で表せるよう、上限は CNT_WEIGHT の上限の 8 倍にする。
-    SearchTuneOptionSpec {
-        usi_name: "SPSA_CORR_CNT_NO_MOVE",
-        default: SearchTuneParams::DEFAULT.correction_value_cnt_no_move,
-        min: 0,
-        max: 262144,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CORR_HIST_NONPAWN",
-        default: SearchTuneParams::DEFAULT.correction_history_non_pawn_weight,
+        default: 165,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CORR_HIST_MINOR",
-        default: SearchTuneParams::DEFAULT.correction_history_minor_piece_mult,
+        default: 156,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CORR_HIST_CONT_SS2",
-        default: SearchTuneParams::DEFAULT.correction_history_cont_ss2_weight,
+        default: 137,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CORR_HIST_CONT_SS4",
-        default: SearchTuneParams::DEFAULT.correction_history_cont_ss4_weight,
-        min: 0,
-        max: 1024,
-    },
-    SearchTuneOptionSpec {
-        usi_name: "SPSA_CORR_HIST_CONT_SS6",
-        default: SearchTuneParams::DEFAULT.correction_history_cont_ss6_weight,
+        default: 64,
         min: 0,
         max: 1024,
     },
     // Group B: History 初期値
     SearchTuneOptionSpec {
         usi_name: "SPSA_MAIN_HIST_INIT",
-        default: SearchTuneParams::DEFAULT.main_history_init,
+        default: 68,
         min: -2048,
         max: 2048,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CAPTURE_HIST_INIT",
-        default: SearchTuneParams::DEFAULT.capture_history_init,
+        default: -689,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_CONT_HIST_INIT",
-        default: SearchTuneParams::DEFAULT.continuation_history_init,
+        default: -529,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_PAWN_HIST_INIT",
-        default: SearchTuneParams::DEFAULT.pawn_history_init,
+        default: -1238,
         min: -4096,
         max: 4096,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_LOW_PLY_HIST_INIT",
-        default: SearchTuneParams::DEFAULT.low_ply_history_init,
+        default: 97,
         min: -2048,
         max: 2048,
     },
     // Group C: Aspiration Window
     SearchTuneOptionSpec {
         usi_name: "SPSA_ASP_DELTA_BASE",
-        default: SearchTuneParams::DEFAULT.aspiration_delta_base,
+        default: 5,
         min: 1,
         max: 64,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_ASP_MEAN_SQ_DIV",
-        default: SearchTuneParams::DEFAULT.aspiration_mean_sq_div,
+        default: 9000,
         min: 1,
         max: 100000,
-    },
-    SearchTuneOptionSpec {
-        usi_name: "SPSA_DEPTH_LIVENESS_NODES",
-        default: SearchTuneParams::DEFAULT.depth_liveness_node_threshold,
-        min: 0,
-        max: 100000000,
-    },
-    SearchTuneOptionSpec {
-        usi_name: "SPSA_DEPTH_LIVENESS_RUN",
-        default: SearchTuneParams::DEFAULT.depth_liveness_run_threshold,
-        min: 0,
-        max: DEPTH_LIVENESS_RUN_MAX,
     },
     // Group D: Reductions テーブル
     SearchTuneOptionSpec {
         usi_name: "SPSA_LMR_TABLE_COEFF",
-        default: SearchTuneParams::DEFAULT.lmr_table_coeff,
+        default: 2809,
         min: 1024,
         max: 8192,
     },
     // Group E: TT cutoff
     SearchTuneOptionSpec {
         usi_name: "SPSA_TT_CUTOFF_CONT_PENALTY",
-        default: SearchTuneParams::DEFAULT.tt_cutoff_cont_hist_penalty,
+        default: -2142,
         min: -8192,
         max: 0,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_TT_CUTOFF_QUIET_BONUS_DEPTH_MULT",
-        default: SearchTuneParams::DEFAULT.tt_cutoff_quiet_bonus_depth_mult,
+        default: 130,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_TT_CUTOFF_QUIET_BONUS_OFFSET",
-        default: SearchTuneParams::DEFAULT.tt_cutoff_quiet_bonus_offset,
+        default: -71,
         min: -512,
         max: 512,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_TT_CUTOFF_QUIET_BONUS_MAX",
-        default: SearchTuneParams::DEFAULT.tt_cutoff_quiet_bonus_max,
+        default: 1043,
         min: 0,
         max: 8192,
     },
     // Group E2: Small ProbCut
     SearchTuneOptionSpec {
         usi_name: "SPSA_SMALL_PROBCUT_BETA_MARGIN",
-        default: SearchTuneParams::DEFAULT.small_probcut_beta_margin,
+        default: 418,
         min: 0,
         max: 2048,
     },
     // Group F: Step 6 static eval
     SearchTuneOptionSpec {
         usi_name: "SPSA_EVAL_DIFF_CLAMP_MIN",
-        default: SearchTuneParams::DEFAULT.eval_diff_clamp_min,
+        default: -200,
         min: -1024,
         max: 0,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_EVAL_DIFF_CLAMP_MAX",
-        default: SearchTuneParams::DEFAULT.eval_diff_clamp_max,
+        default: 156,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_EVAL_DIFF_OFFSET",
-        default: SearchTuneParams::DEFAULT.eval_diff_offset,
+        default: 58,
         min: -512,
         max: 512,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_EVAL_DIFF_MAIN_HIST",
-        default: SearchTuneParams::DEFAULT.eval_diff_main_hist_mult,
+        default: 9,
         min: 0,
         max: 64,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_EVAL_DIFF_PAWN_HIST",
-        default: SearchTuneParams::DEFAULT.eval_diff_pawn_hist_mult,
+        default: 13,
         min: 0,
         max: 64,
     },
     // Group G: Step 14 futility capture
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_FUT_BASE",
-        default: SearchTuneParams::DEFAULT.step14_futility_base,
+        default: 231,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_FUT_LMR_MULT",
-        default: SearchTuneParams::DEFAULT.step14_futility_lmr_depth_mult,
+        default: 211,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_FUT_CAPT_HIST",
-        default: SearchTuneParams::DEFAULT.step14_futility_capt_hist_scale,
+        default: 130,
         min: 0,
         max: 1024,
     },
     // Group H: Step 14 history pruning
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_CONT_HIST_THRESH",
-        default: SearchTuneParams::DEFAULT.cont_history_pruning_threshold,
+        default: -4312,
         min: -16384,
         max: 0,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_MAIN_HIST_NUM",
-        default: SearchTuneParams::DEFAULT.main_hist_pruning_add_num,
+        default: 76,
         min: 0,
         max: 512,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_MAIN_HIST_DEN",
-        default: SearchTuneParams::DEFAULT.main_hist_pruning_add_den,
+        default: 32,
         min: 1,
         max: 512,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_LMR_HIST_DIV",
-        default: SearchTuneParams::DEFAULT.lmr_depth_history_div,
+        default: 3220,
         min: 1,
         max: 16384,
     },
     // Group I: Step 14 quiet futility
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_QFUT_BASE",
-        default: SearchTuneParams::DEFAULT.quiet_futility_base,
+        default: 47,
         min: -512,
         max: 512,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_QFUT_NO_BEST",
-        default: SearchTuneParams::DEFAULT.quiet_futility_no_best_move,
+        default: 171,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_QFUT_LMR_MULT",
-        default: SearchTuneParams::DEFAULT.quiet_futility_lmr_depth_mult,
+        default: 134,
         min: 0,
         max: 1024,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_QFUT_EVAL_ALPHA",
-        default: SearchTuneParams::DEFAULT.quiet_futility_eval_gt_alpha,
+        default: 90,
         min: 0,
         max: 512,
     },
     // Group J: Step 14 SEE
     SearchTuneOptionSpec {
         usi_name: "SPSA_S14_SEE_MULT",
-        default: SearchTuneParams::DEFAULT.see_pruning_threshold_mult,
+        default: -27,
         min: -256,
         max: 0,
     },
     // Group K: Step 18 full depth
     SearchTuneOptionSpec {
         usi_name: "SPSA_S18_NO_TT_ADD",
-        default: SearchTuneParams::DEFAULT.full_depth_no_tt_add,
+        default: 1118,
         min: -8192,
         max: 8192,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S18_R_THRESH1",
-        default: SearchTuneParams::DEFAULT.full_depth_r_threshold1,
+        default: 3212,
         min: 0,
         max: 16384,
     },
     SearchTuneOptionSpec {
         usi_name: "SPSA_S18_R_THRESH2",
-        default: SearchTuneParams::DEFAULT.full_depth_r_threshold2,
+        default: 4784,
         min: 0,
         max: 16384,
     },
@@ -1504,200 +1474,194 @@ const SPSA_OPTION_SPECS: &[SearchTuneOptionSpec] = &[
 
 impl Default for SearchTuneParams {
     fn default() -> Self {
-        Self::DEFAULT
+        Self {
+            iir_prior_reduction_threshold_shallow: 3,
+            iir_prior_reduction_threshold_deep: 3,
+            iir_depth_boundary: 10,
+            iir_eval_sum_threshold: 173,
+            draw_jitter_mask: 2,
+            draw_jitter_offset: -1,
+            lmr_reduction_delta_scale: 757,
+            lmr_reduction_non_improving_mult: 218,
+            lmr_reduction_non_improving_div: 512,
+            lmr_reduction_base_offset: 1200,
+            lmr_ttpv_add: 946,
+            lmr_step16_ttpv_sub_base: 2618,
+            lmr_step16_ttpv_sub_pv_node: 991,
+            lmr_step16_ttpv_sub_tt_value: 903,
+            lmr_step16_ttpv_sub_tt_depth: 978,
+            lmr_step16_ttpv_sub_cut_node: 1051,
+            lmr_step16_base_add: 843,
+            lmr_step16_move_count_mul: 66,
+            lmr_step16_correction_div: 30_450,
+            lmr_step16_cut_node_add: 3094,
+            lmr_step16_cut_node_no_tt_add: 1056,
+            lmr_step16_tt_capture_add: 1415,
+            lmr_step16_cutoff_count_add: 1051,
+            lmr_step16_cutoff_count_all_node_add: 814,
+            lmr_allnode_reduction_coeff: 0,
+            lmr_step16_tt_move_penalty: 2018,
+            lmr_step16_capture_stat_scale_num: 803,
+            lmr_step16_stat_score_scale_num: 794,
+            lmr_research_deeper_base: 43,
+            lmr_research_deeper_depth_mul: 2,
+            lmr_research_shallower_threshold: 9,
+            singular_min_depth_base: 6,
+            singular_min_depth_tt_pv_add: 1,
+            singular_tt_depth_margin: 3,
+            singular_beta_margin_base: 56,
+            singular_beta_margin_tt_pv_non_pv_add: 81,
+            singular_beta_margin_div: 60,
+            singular_depth_div: 2,
+            singular_double_margin_base: -4,
+            singular_double_margin_pv_node: 198,
+            singular_double_margin_non_tt_capture: -212,
+            singular_corr_val_adj_div: 229_958,
+            singular_double_margin_tt_move_hist_mult: -921,
+            singular_double_margin_tt_move_hist_div: 127_649,
+            singular_double_margin_late_ply_penalty: 45,
+            singular_triple_margin_base: 76,
+            singular_triple_margin_pv_node: 308,
+            singular_triple_margin_non_tt_capture: -250,
+            singular_triple_margin_tt_pv: 92,
+            singular_triple_margin_late_ply_penalty: 52,
+            singular_negative_extension_tt_fail_high: -3,
+            singular_negative_extension_cut_node: -2,
+            singular_skip_capture_double_triple: 0,
+            futility_margin_base: 91,
+            futility_margin_tt_bonus: 21,
+            // PATCH-2026-05-31-RANK5: depth 1 では低係数、depth>=ramp で base
+            futility_margin_low: 50,
+            futility_margin_ramp_depth: 10,
+            reverse_futility_max_depth: 14,
+            futility_improving_scale: 2094,
+            futility_opponent_worsening_scale: 1324,
+            futility_correction_div: 158_105,
+            razoring_margin_base: 514,
+            razoring_margin_depth2_coeff: 294,
+            nmp_margin_depth_mult: 18,
+            nmp_margin_offset: -390,
+            nmp_margin_improving_bonus: 50,
+            nmp_reduction_base: 7,
+            nmp_reduction_depth_div: 3,
+            nmp_verification_depth_threshold: 16,
+            nmp_min_ply_update_num: 3,
+            nmp_min_ply_update_den: 4,
+            probcut_beta_margin_base: 224,
+            probcut_beta_improving_sub: 64,
+            probcut_dynamic_reduction_div: 306,
+            probcut_depth_base: 5,
+            qsearch_futility_base: 352,
+            stat_bonus_depth_mult: 121,
+            stat_bonus_offset: -77,
+            stat_bonus_max: 1633,
+            stat_bonus_tt_bonus: 375,
+            stat_malus_depth_mult: 825,
+            stat_malus_offset: -196,
+            stat_malus_max: 2159,
+            stat_malus_move_count_mult: 16,
+            stat_bonus_prev_statscore_div: 0,
+            low_ply_history_multiplier: 761,
+            low_ply_history_offset: 0,
+            continuation_history_multiplier: 955,
+            continuation_history_near_ply_offset: 88,
+            continuation_history_weight_1: 1157,
+            continuation_history_weight_2: 648,
+            continuation_history_weight_3: 288,
+            continuation_history_weight_4: 576,
+            continuation_history_weight_5: 140,
+            continuation_history_weight_6: 441,
+            fail_high_continuation_base_num: 1365,
+            fail_high_continuation_near_ply_offset: 88,
+            fail_high_continuation_weight_1: 1157,
+            fail_high_continuation_weight_2: 648,
+            fail_high_continuation_weight_3: 288,
+            fail_high_continuation_weight_4: 576,
+            fail_high_continuation_weight_5: 140,
+            fail_high_continuation_weight_6: 441,
+            pawn_history_pos_multiplier: 850,
+            pawn_history_neg_multiplier: 550,
+            update_all_stats_quiet_bonus_scale_num: 881,
+            update_all_stats_quiet_malus_scale_num: 1083,
+            update_all_stats_capture_bonus_scale_num: 1482,
+            update_all_stats_capture_malus_scale_num: 1397,
+            update_all_stats_early_refutation_penalty_scale_num: 614,
+            prior_quiet_countermove_bonus_scale_base: -228,
+            prior_quiet_countermove_parent_stat_div: 104,
+            prior_quiet_countermove_depth_mul: 63,
+            prior_quiet_countermove_depth_cap: 508,
+            prior_quiet_countermove_move_count_bonus: 184,
+            prior_quiet_countermove_eval_bonus: 143,
+            prior_quiet_countermove_eval_margin: 92,
+            prior_quiet_countermove_parent_eval_bonus: 149,
+            prior_quiet_countermove_parent_eval_margin: 70,
+            prior_quiet_countermove_scaled_depth_mul: 144,
+            prior_quiet_countermove_scaled_offset: -92,
+            prior_quiet_countermove_scaled_cap: 1365,
+            prior_quiet_countermove_cont_scale_num: 400,
+            prior_quiet_countermove_main_scale_num: 220,
+            prior_quiet_countermove_pawn_scale_num: 1160,
+            tt_move_history_bonus: 809,
+            tt_move_history_malus: -865,
+            prior_capture_countermove_bonus: 964,
+            // Group A
+            correction_value_pcv_weight: 9536,
+            correction_value_micv_weight: 8494,
+            correction_value_nonpawn_weight: 10132,
+            correction_value_cnt_weight: 7156,
+            correction_history_non_pawn_weight: 165,
+            correction_history_minor_piece_mult: 156,
+            correction_history_cont_ss2_weight: 137,
+            correction_history_cont_ss4_weight: 64,
+            // Group B
+            main_history_init: 68,
+            capture_history_init: -689,
+            continuation_history_init: -529,
+            pawn_history_init: -1238,
+            low_ply_history_init: 97,
+            // Group C
+            aspiration_delta_base: 5,
+            aspiration_mean_sq_div: 9000,
+            // Group D
+            lmr_table_coeff: 2809,
+            // Group E
+            tt_cutoff_cont_hist_penalty: -2142,
+            tt_cutoff_quiet_bonus_depth_mult: 130,
+            tt_cutoff_quiet_bonus_offset: -71,
+            tt_cutoff_quiet_bonus_max: 1043,
+            // Group E2
+            small_probcut_beta_margin: 418,
+            // Group F
+            eval_diff_clamp_min: -200,
+            eval_diff_clamp_max: 156,
+            eval_diff_offset: 58,
+            eval_diff_main_hist_mult: 9,
+            eval_diff_pawn_hist_mult: 13,
+            // Group G
+            step14_futility_base: 231,
+            step14_futility_lmr_depth_mult: 211,
+            step14_futility_capt_hist_scale: 130,
+            // Group H
+            cont_history_pruning_threshold: -4312,
+            main_hist_pruning_add_num: 76,
+            main_hist_pruning_add_den: 32,
+            lmr_depth_history_div: 3220,
+            // Group I
+            quiet_futility_base: 47,
+            quiet_futility_no_best_move: 171,
+            quiet_futility_lmr_depth_mult: 134,
+            quiet_futility_eval_gt_alpha: 90,
+            // Group J
+            see_pruning_threshold_mult: -27,
+            // Group K
+            full_depth_no_tt_add: 1118,
+            full_depth_r_threshold1: 3212,
+            full_depth_r_threshold2: 4784,
+        }
     }
 }
 
 impl SearchTuneParams {
-    /// 探索・USI 宣言・SPSA 生成で共有する既定値の正本。
-    pub(super) const DEFAULT: Self = Self {
-        iir_prior_reduction_threshold_shallow: 3,
-        iir_prior_reduction_threshold_deep: 3,
-        iir_depth_boundary: 10,
-        iir_eval_sum_threshold: 173,
-        draw_jitter_mask: 2,
-        draw_jitter_offset: -1,
-        lmr_reduction_delta_scale: 757,
-        lmr_reduction_non_improving_mult: 218,
-        lmr_reduction_non_improving_div: 512,
-        lmr_reduction_base_offset: 1200,
-        lmr_ttpv_add: 946,
-        lmr_step16_ttpv_sub_base: 2618,
-        lmr_step16_ttpv_sub_pv_node: 991,
-        lmr_step16_ttpv_sub_tt_value: 903,
-        lmr_step16_ttpv_sub_tt_depth: 978,
-        lmr_step16_ttpv_sub_cut_node: 1051,
-        lmr_step16_base_add: 843,
-        lmr_step16_move_count_mul: 66,
-        lmr_step16_correction_div: 30_450,
-        lmr_step16_cut_node_add: 3094,
-        lmr_step16_cut_node_no_tt_add: 1056,
-        lmr_step16_tt_capture_add: 1415,
-        lmr_step16_cutoff_count_add: 1051,
-        lmr_step16_cutoff_count_all_node_add: 814,
-        lmr_step16_tt_move_penalty: 2018,
-        lmr_step16_capture_stat_scale_num: 803,
-        lmr_step16_stat_score_scale_num: 794,
-        lmr_all_node_scale_num: 272,
-        lmr_all_node_scale_offset: 285,
-        lmr_research_deeper_base: 43,
-        lmr_research_deeper_depth_mul: 2,
-        lmr_research_shallower_threshold: 9,
-        singular_min_depth_base: 6,
-        singular_min_depth_tt_pv_add: 1,
-        singular_tt_depth_margin: 3,
-        singular_beta_margin_base: 56,
-        singular_beta_margin_tt_pv_non_pv_add: 81,
-        singular_beta_margin_div: 60,
-        singular_depth_div: 2,
-        singular_double_margin_base: -4,
-        singular_double_margin_pv_node: 198,
-        singular_double_margin_non_tt_capture: -212,
-        singular_corr_val_adj_div: 229_958,
-        singular_double_margin_tt_move_hist_mult: -921,
-        singular_double_margin_tt_move_hist_div: 127_649,
-        singular_double_margin_late_ply_penalty: 45,
-        singular_triple_margin_base: 76,
-        singular_triple_margin_pv_node: 308,
-        singular_triple_margin_non_tt_capture: -250,
-        singular_triple_margin_tt_pv: 92,
-        singular_triple_margin_late_ply_penalty: 52,
-        singular_negative_extension_tt_fail_high: -3,
-        singular_negative_extension_cut_node: -2,
-        futility_margin_base: 91,
-        futility_margin_tt_bonus: 21,
-        futility_improving_scale: 2094,
-        futility_opponent_worsening_scale: 1324,
-        futility_correction_div: 158_105,
-        razoring_margin_base: 514,
-        razoring_margin_depth2_coeff: 294,
-        nmp_margin_depth_mult: 18,
-        nmp_margin_offset: -390,
-        nmp_margin_improving_bonus: 50,
-        nmp_reduction_base: 7,
-        nmp_reduction_depth_div: 3,
-        nmp_verification_depth_threshold: 16,
-        nmp_min_ply_update_num: 3,
-        nmp_min_ply_update_den: 4,
-        probcut_beta_margin_base: 224,
-        probcut_beta_improving_sub: 64,
-        probcut_dynamic_reduction_div: 306,
-        probcut_depth_base: 5,
-        qsearch_futility_base: 352,
-        stat_bonus_depth_mult: 121,
-        stat_bonus_offset: -77,
-        stat_bonus_max: 1633,
-        stat_bonus_tt_bonus: 375,
-        stat_bonus_parent_stat_num: 273,
-        stat_malus_depth_mult: 825,
-        stat_malus_offset: -196,
-        stat_malus_max: 2159,
-        stat_malus_move_count_mult: 16,
-        low_ply_history_multiplier: 761,
-        low_ply_history_offset: 0,
-        continuation_history_multiplier: 955,
-        continuation_history_near_ply_offset: 88,
-        continuation_history_weight_1: 1157,
-        continuation_history_weight_2: 648,
-        continuation_history_weight_3: 288,
-        continuation_history_weight_4: 576,
-        continuation_history_weight_5: 140,
-        continuation_history_weight_6: 441,
-        fail_high_continuation_base_num: 1365,
-        fail_high_continuation_near_ply_offset: 88,
-        fail_high_continuation_weight_1: 1157,
-        fail_high_continuation_weight_2: 648,
-        fail_high_continuation_weight_3: 288,
-        fail_high_continuation_weight_4: 576,
-        fail_high_continuation_weight_5: 140,
-        fail_high_continuation_weight_6: 441,
-        pawn_history_pos_multiplier: 850,
-        pawn_history_neg_multiplier: 550,
-        update_all_stats_quiet_bonus_scale_num: 881,
-        update_all_stats_quiet_malus_scale_num: 1083,
-        update_all_stats_quiet_malus_decay_num: 956,
-        update_all_stats_searched_count_num: 1024,
-        update_all_stats_capture_bonus_scale_num: 1482,
-        update_all_stats_capture_malus_scale_num: 1397,
-        update_all_stats_early_refutation_penalty_scale_num: 614,
-        prior_quiet_countermove_bonus_scale_base: -228,
-        prior_quiet_countermove_parent_stat_div: 104,
-        prior_quiet_countermove_depth_mul: 63,
-        prior_quiet_countermove_depth_cap: 508,
-        prior_quiet_countermove_move_count_bonus: 184,
-        prior_quiet_countermove_eval_bonus: 143,
-        prior_quiet_countermove_eval_margin: 92,
-        prior_quiet_countermove_parent_eval_bonus: 149,
-        prior_quiet_countermove_parent_eval_margin: 70,
-        prior_quiet_countermove_scaled_depth_mul: 144,
-        prior_quiet_countermove_scaled_offset: -92,
-        prior_quiet_countermove_scaled_cap: 1365,
-        prior_quiet_countermove_cont_scale_num: 400,
-        prior_quiet_countermove_main_scale_num: 220,
-        prior_quiet_countermove_pawn_scale_num: 1160,
-        tt_move_history_bonus: 809,
-        tt_move_history_malus: -865,
-        prior_capture_countermove_bonus: 964,
-        // Group A
-        correction_value_pcv_weight: 13806,
-        correction_value_micv_weight: 9512,
-        correction_value_nonpawn_weight: 11615,
-        correction_value_cnt_weight: 7885,
-        correction_value_cnt_ss6_weight: 6307,
-        correction_value_cnt_no_move: 80695,
-        correction_history_non_pawn_weight: 186,
-        correction_history_minor_piece_mult: 150,
-        correction_history_cont_ss2_weight: 130,
-        correction_history_cont_ss4_weight: 70,
-        correction_history_cont_ss6_weight: 35,
-        // Group B
-        main_history_init: 68,
-        capture_history_init: -689,
-        continuation_history_init: -529,
-        pawn_history_init: -1238,
-        low_ply_history_init: 97,
-        // Group C
-        aspiration_delta_base: 5,
-        aspiration_mean_sq_div: 9000,
-        depth_liveness_node_threshold: 500_000,
-        depth_liveness_run_threshold: 8,
-        // Group D
-        lmr_table_coeff: 2809,
-        // Group E
-        tt_cutoff_cont_hist_penalty: -2142,
-        tt_cutoff_quiet_bonus_depth_mult: 130,
-        tt_cutoff_quiet_bonus_offset: -71,
-        tt_cutoff_quiet_bonus_max: 1043,
-        // Group E2
-        small_probcut_beta_margin: 418,
-        // Group F
-        eval_diff_clamp_min: -200,
-        eval_diff_clamp_max: 156,
-        eval_diff_offset: 58,
-        eval_diff_main_hist_mult: 9,
-        eval_diff_pawn_hist_mult: 13,
-        // Group G
-        step14_futility_base: 231,
-        step14_futility_lmr_depth_mult: 211,
-        step14_futility_capt_hist_scale: 130,
-        // Group H
-        cont_history_pruning_threshold: -4312,
-        main_hist_pruning_add_num: 76,
-        main_hist_pruning_add_den: 32,
-        lmr_depth_history_div: 3220,
-        // Group I
-        quiet_futility_base: 47,
-        quiet_futility_no_best_move: 171,
-        quiet_futility_lmr_depth_mult: 134,
-        quiet_futility_eval_gt_alpha: 90,
-        // Group J
-        see_pruning_threshold_mult: -27,
-        // Group K
-        full_depth_no_tt_add: 1118,
-        full_depth_r_threshold1: 3212,
-        full_depth_r_threshold2: 4784,
-    };
-
     /// SPSA向けに公開する USI option 定義を返す。
     pub fn option_specs() -> &'static [SearchTuneOptionSpec] {
         SPSA_OPTION_SPECS
@@ -1761,6 +1725,7 @@ impl SearchTuneParams {
             8192
         );
         try_apply!("SPSA_LMR_STEP16_TT_MOVE_PENALTY", lmr_step16_tt_move_penalty, -8192, 8192);
+        try_apply!("SPSA_LMR_ALLNODE_COEFF", lmr_allnode_reduction_coeff, 0, 1024);
         try_apply!(
             "SPSA_LMR_STEP16_CAPTURE_STAT_SCALE_NUM",
             lmr_step16_capture_stat_scale_num,
@@ -1773,8 +1738,6 @@ impl SearchTuneParams {
             0,
             8192
         );
-        try_apply!("SPSA_LMR_ALL_NODE_SCALE_NUM", lmr_all_node_scale_num, 0, 4096);
-        try_apply!("SPSA_LMR_ALL_NODE_SCALE_OFFSET", lmr_all_node_scale_offset, 1, 8192);
         try_apply!("SPSA_LMR_RESEARCH_DEEPER_BASE", lmr_research_deeper_base, -1024, 1024);
         try_apply!("SPSA_LMR_RESEARCH_DEEPER_DEPTH_MUL", lmr_research_deeper_depth_mul, -64, 64);
         try_apply!(
@@ -1859,8 +1822,13 @@ impl SearchTuneParams {
             -8,
             0
         );
+        try_apply!("SPSA_SKIP_CAPTURE_DOUBLE_TRIPLE_SE", singular_skip_capture_double_triple, 0, 1);
         try_apply!("SPSA_FUTILITY_MARGIN_BASE", futility_margin_base, 0, 1024);
         try_apply!("SPSA_FUTILITY_MARGIN_TT_BONUS", futility_margin_tt_bonus, 0, 512);
+        // PATCH-2026-05-31-RANK5
+        try_apply!("SPSA_FUTILITY_MARGIN_LOW", futility_margin_low, 0, 1024);
+        try_apply!("SPSA_FUTILITY_MARGIN_RAMP_DEPTH", futility_margin_ramp_depth, 1, 32);
+        try_apply!("SPSA_RFP_MAX_DEPTH", reverse_futility_max_depth, 1, 32);
         try_apply!("SPSA_FUTILITY_IMPROVING_SCALE", futility_improving_scale, 0, 4096);
         try_apply!("SPSA_FUTILITY_OPP_WORSENING_SCALE", futility_opponent_worsening_scale, 0, 4096);
         try_apply!("SPSA_FUTILITY_CORRECTION_DIV", futility_correction_div, 1, 1_000_000);
@@ -1883,11 +1851,11 @@ impl SearchTuneParams {
         try_apply!("SPSA_STAT_BONUS_OFFSET", stat_bonus_offset, -4096, 4096);
         try_apply!("SPSA_STAT_BONUS_MAX", stat_bonus_max, 1, 8192);
         try_apply!("SPSA_STAT_BONUS_TT_BONUS", stat_bonus_tt_bonus, -4096, 4096);
-        try_apply!("SPSA_STAT_BONUS_PARENT_STAT_NUM", stat_bonus_parent_stat_num, 0, 8192);
         try_apply!("SPSA_STAT_MALUS_DEPTH_MULT", stat_malus_depth_mult, 0, 4096);
         try_apply!("SPSA_STAT_MALUS_OFFSET", stat_malus_offset, -4096, 4096);
         try_apply!("SPSA_STAT_MALUS_MAX", stat_malus_max, 1, 8192);
         try_apply!("SPSA_STAT_MALUS_MOVE_COUNT_MULT", stat_malus_move_count_mult, 0, 512);
+        try_apply!("SPSA_STATBONUS_PREV_DIV", stat_bonus_prev_statscore_div, 0, 256);
         try_apply!("SPSA_LOW_PLY_HISTORY_MULTIPLIER", low_ply_history_multiplier, 0, 2048);
         try_apply!("SPSA_LOW_PLY_HISTORY_OFFSET", low_ply_history_offset, -2048, 2048);
         try_apply!("SPSA_CONT_HISTORY_MULTIPLIER", continuation_history_multiplier, 0, 2048);
@@ -1929,18 +1897,6 @@ impl SearchTuneParams {
             update_all_stats_quiet_malus_scale_num,
             0,
             4096
-        );
-        try_apply!(
-            "SPSA_UPDATE_ALL_QUIET_MALUS_DECAY_NUM",
-            update_all_stats_quiet_malus_decay_num,
-            0,
-            1024
-        );
-        try_apply!(
-            "SPSA_UPDATE_ALL_SEARCHED_COUNT_NUM",
-            update_all_stats_searched_count_num,
-            0,
-            16_384
         );
         try_apply!(
             "SPSA_UPDATE_ALL_CAPTURE_BONUS_SCALE_NUM",
@@ -2038,13 +1994,10 @@ impl SearchTuneParams {
         try_apply!("SPSA_CORR_MICV_WEIGHT", correction_value_micv_weight, 0, 32768);
         try_apply!("SPSA_CORR_NONPAWN_WEIGHT", correction_value_nonpawn_weight, 0, 32768);
         try_apply!("SPSA_CORR_CNT_WEIGHT", correction_value_cnt_weight, 0, 32768);
-        try_apply!("SPSA_CORR_CNT_SS6_WEIGHT", correction_value_cnt_ss6_weight, 0, 32768);
-        try_apply!("SPSA_CORR_CNT_NO_MOVE", correction_value_cnt_no_move, 0, 262144);
         try_apply!("SPSA_CORR_HIST_NONPAWN", correction_history_non_pawn_weight, 0, 1024);
         try_apply!("SPSA_CORR_HIST_MINOR", correction_history_minor_piece_mult, 0, 1024);
         try_apply!("SPSA_CORR_HIST_CONT_SS2", correction_history_cont_ss2_weight, 0, 1024);
         try_apply!("SPSA_CORR_HIST_CONT_SS4", correction_history_cont_ss4_weight, 0, 1024);
-        try_apply!("SPSA_CORR_HIST_CONT_SS6", correction_history_cont_ss6_weight, 0, 1024);
         // Group B
         try_apply!("SPSA_MAIN_HIST_INIT", main_history_init, -2048, 2048);
         try_apply!("SPSA_CAPTURE_HIST_INIT", capture_history_init, -4096, 4096);
@@ -2054,13 +2007,6 @@ impl SearchTuneParams {
         // Group C
         try_apply!("SPSA_ASP_DELTA_BASE", aspiration_delta_base, 1, 64);
         try_apply!("SPSA_ASP_MEAN_SQ_DIV", aspiration_mean_sq_div, 1, 100000);
-        try_apply!("SPSA_DEPTH_LIVENESS_NODES", depth_liveness_node_threshold, 0, 100000000);
-        try_apply!(
-            "SPSA_DEPTH_LIVENESS_RUN",
-            depth_liveness_run_threshold,
-            0,
-            DEPTH_LIVENESS_RUN_MAX
-        );
         // Group D
         try_apply!("SPSA_LMR_TABLE_COEFF", lmr_table_coeff, 1024, 8192);
         // Group E
@@ -2119,7 +2065,6 @@ mod tests {
                 .set_from_usi_name(spec.usi_name, spec.default)
                 .expect("spec must be mappable");
             assert_eq!(res.applied, spec.default);
-            assert_eq!(params, defaults, "{} changed actual defaults", spec.usi_name);
         }
     }
 
@@ -2133,32 +2078,27 @@ mod tests {
     }
 
     #[test]
-    fn sf_gap_params_round_trip() {
+    fn skip_capture_double_triple_se_default_off_and_parses() {
+        // 既定値は OFF（0 = 既存挙動）であること。
+        let params = SearchTuneParams::default();
+        assert_eq!(params.singular_skip_capture_double_triple, 0);
+
+        // ON へ切り替えられること。
         let mut params = SearchTuneParams::default();
+        let res = params
+            .set_from_usi_name("SPSA_SKIP_CAPTURE_DOUBLE_TRIPLE_SE", 1)
+            .expect("known name");
+        assert!(!res.clamped);
+        assert_eq!(res.applied, 1);
+        assert_eq!(params.singular_skip_capture_double_triple, 1);
 
-        params.set_from_usi_name("SPSA_STAT_BONUS_PARENT_STAT_NUM", 274).unwrap();
-        params.set_from_usi_name("SPSA_UPDATE_ALL_SEARCHED_COUNT_NUM", 1025).unwrap();
-        params.set_from_usi_name("SPSA_UPDATE_ALL_QUIET_MALUS_DECAY_NUM", 955).unwrap();
-        params.set_from_usi_name("SPSA_LMR_ALL_NODE_SCALE_NUM", 273).unwrap();
-        params.set_from_usi_name("SPSA_LMR_ALL_NODE_SCALE_OFFSET", 286).unwrap();
-
-        assert_eq!(params.stat_bonus_parent_stat_num, 274);
-        assert_eq!(params.update_all_stats_searched_count_num, 1025);
-        assert_eq!(params.update_all_stats_quiet_malus_decay_num, 955);
-        assert_eq!(params.lmr_all_node_scale_num, 273);
-        assert_eq!(params.lmr_all_node_scale_offset, 286);
-    }
-
-    #[test]
-    fn depth_liveness_params_default_and_disable_round_trip() {
+        // 範囲外（2）は 1 へ clamp されること。
         let mut params = SearchTuneParams::default();
-        assert_eq!(params.depth_liveness_node_threshold, 500_000);
-        assert_eq!(params.depth_liveness_run_threshold, 8);
-
-        params.set_from_usi_name("SPSA_DEPTH_LIVENESS_NODES", 0).unwrap();
-        params.set_from_usi_name("SPSA_DEPTH_LIVENESS_RUN", 0).unwrap();
-        assert_eq!(params.depth_liveness_node_threshold, 0);
-        assert_eq!(params.depth_liveness_run_threshold, 0);
+        let res = params
+            .set_from_usi_name("SPSA_SKIP_CAPTURE_DOUBLE_TRIPLE_SE", 2)
+            .expect("known name");
+        assert!(res.clamped);
+        assert_eq!(res.applied, 1);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 //! Skill Level (強さ制限・手加減) 機能
+//!
+//! Stockfish/YaneuraOu の Skill を移植したもの。
 
 use rand::Rng;
 
@@ -37,7 +39,7 @@ pub struct Skill {
 impl Skill {
     /// オプションから Skill を生成
     pub fn from_options(opts: &SkillOptions) -> Self {
-        // Elo からスキル値への近似多項式
+        // Stockfish の近似多項式をそのまま移植
         const LOWEST_ELO: i32 = 1320;
         const HIGHEST_ELO: i32 = 3190;
 
@@ -59,7 +61,7 @@ impl Skill {
         self.level < 20.0
     }
 
-    /// depth が SkillLevel 相当の深さに到達したか
+    /// depth が SkillLevel 相当の深さに到達したか（Stockfish 準拠）
     pub fn time_to_pick(&self, depth: Depth) -> bool {
         depth == 1 + self.level as Depth
     }
@@ -80,7 +82,7 @@ impl Skill {
         let top_score = root_moves[0].score.raw();
         let last_score = root_moves[capped_multi_pv - 1].score.raw();
 
-        // delta は 100cp（PawnValue）まで
+        // Stockfish 相当: delta は 100cp（PawnValue）まで
         let delta = (top_score - last_score).min(100);
         let weakness = 120.0 - 2.0 * self.level;
         let weakness_int = weakness.max(1.0) as u32;
@@ -121,7 +123,7 @@ impl Skill {
         let top_score = top_moves[0].1.raw();
         let last_score = top_moves[capped_len - 1].1.raw();
 
-        // delta は 100cp（PawnValue）まで
+        // Stockfish equivalent: delta capped at 100cp (PawnValue)
         let delta = (top_score - last_score).min(100);
         let weakness = 120.0 - 2.0 * self.level;
         let weakness_int = weakness.max(1.0) as u32;

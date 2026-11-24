@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["SH11235"]
 description = "Cloudflare Workers frontend for the CSA shogi game server."
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 repository = "https://github.com/SH11235/rshogi"
 
 [lib]
@@ -19,39 +19,20 @@ crate-type = ["cdylib", "rlib"]
 # `[target.'cfg(target_arch = "wasm32")'.dependencies]` に分離して
 # ホスト側 `cargo check --workspace` を壊さない。
 rshogi-csa-server = { path = "../rshogi-csa-server", default-features = false, features = ["workers"] }
-# rshogi-core は types (EnteringKingRule) のみ利用し、NNUE / 探索には触れない。
-# NNUE の edition 軸をコンパイルしない (ビルド時間削減・他 crate への feature 漏れ防止) よう
-# default-features=false とする。未参照コードはリンク時に除去されるため bundle サイズへの効果は小さい。
-rshogi-core = { path = "../rshogi-core", default-features = false }
-# 外部棋譜取り込み (`kifu_import`) で CSA 本文の parse に使う。
-rshogi-csa = { path = "../rshogi-csa" }
+rshogi-core = { path = "../rshogi-core" }
 serde.workspace = true
 serde_json.workspace = true
-base64 = "0.22.1"
 # chrono はホスト／wasm32 で挙動を揃えるため `clock` 既定を切り、
 # serde 以外の機能は取り込まない。
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
-# Reconnect_Token のタイミング攻撃耐性比較に使う。`default-features = false`
-# で std を切っておくと wasm32-unknown-unknown でも問題なく動く (no_std 経路)。
-subtle = { version = "2", default-features = false }
-# イベントメタ (`event_meta`) の URL 検証に使う。`worker` も同じ crate に依存している。
-url = "2.5"
-# `WORKERS_HANDLE_AUTH` whitelist (issue #664) の password SHA256 比較に使う。
-# pure-Rust 実装で wasm32-unknown-unknown でも問題なく動く。LOGIN は人手駆動で
-# 頻度が低いため `default-features = false` (asm 無効化) で十分。
-sha2 = { version = "0.10", default-features = false }
-# LOGIN credential から公開用 player ID を導出する HMAC-SHA256。
-hmac = { version = "0.12", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # wasm32-unknown-unknown 以外では参照しない。worker-build / wrangler dev から
-# ビルドされる経路のみで有効化される。`worker` 0.8 は `wasm-bindgen` /
+# ビルドされる経路のみで有効化される。`worker` 0.8 が `wasm-bindgen` /
 # `wasm-bindgen-futures` / `js-sys` / `async-trait` / `futures-util` を内部で
-# 引き込むが、`futures_util::future::join_all` (viewer_api の R2 get 並列化) を
-# 本 crate から直接使うため `futures-util` は明示的な直接依存にしている。
-worker = { version = "0.8", features = ["d1", "http"] }
+# 引き込むので、本 crate からは worker のみを直接参照すればよい。
+worker = { version = "0.8", features = ["http"] }
 worker-macros = { version = "0.8", features = ["http"] }
-futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 
 [features]
 default = []
@@ -67,6 +48,6 @@ tokio-transport = []
 tokio = { workspace = true, features = ["rt", "macros"] }
 # `wrangler.toml.example` / `wrangler.staging.toml` / `wrangler.production.toml`
 # を解析して `ConfigKeys` 定数群が正しく宣言されていることを検証する
-# integration test (`tests/integration/wrangler_template_consistency.rs` /
-# `tests/integration/wrangler_environment_toml_consistency.rs`) でのみ使用。
+# integration test (`tests/wrangler_template_consistency.rs` /
+# `tests/wrangler_environment_toml_consistency.rs`) でのみ使用。
 toml = { workspace = true }

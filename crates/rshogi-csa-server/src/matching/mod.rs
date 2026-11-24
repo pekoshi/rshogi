@@ -4,7 +4,6 @@
 //! [`pairing::DirectMatchStrategy`] のみを提供する。Floodgate スケジューラや
 //! LeastDiff ペアリングは `pairing` モジュールへ追加する形で拡張する。
 
-pub mod challenge;
 pub mod league;
 pub mod pairing;
 pub mod registry;

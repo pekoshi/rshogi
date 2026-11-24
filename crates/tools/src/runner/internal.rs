@@ -1,8 +1,5 @@
 //! 内部API直接呼び出しモードでのベンチマーク実行
 
-use crate::nnue_routing::{
-    NativeRouting, ProgressCoefficients, parse_native_layer_stack_bucket_mode,
-};
 use std::sync::mpsc;
 use std::thread;
 
@@ -11,7 +8,7 @@ use anyhow::{Context, Result};
 use rshogi_core::eval::{MaterialLevel, set_eval_hash_enabled, set_material_level};
 #[cfg(feature = "diagnostics")]
 use rshogi_core::eval::{eval_hash_stats, reset_eval_hash_stats};
-use rshogi_core::nnue::{get_network, init_nnue};
+use rshogi_core::nnue::init_nnue;
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search, SearchInfo};
 
@@ -73,37 +70,6 @@ fn setup_eval(config: &BenchmarkConfig) -> Result<()> {
                     nnue_path.display()
                 ));
             }
-        }
-        let option_value = |name: &str| {
-            config.eval_config.usi_options.iter().find_map(|option| {
-                let (key, value) = option.split_once('=')?;
-                key.eq_ignore_ascii_case(name).then_some(value)
-            })
-        };
-        let mode = option_value("LS_BUCKET_MODE")
-            .map(|value| {
-                parse_native_layer_stack_bucket_mode(value)
-                    .with_context(|| format!("invalid LS_BUCKET_MODE={value}"))
-            })
-            .transpose()?;
-        let progress_buckets = option_value("LS_PROGRESS_BUCKETS")
-            .map(|value| {
-                value
-                    .parse::<usize>()
-                    .with_context(|| format!("invalid LS_PROGRESS_BUCKETS={value}"))
-            })
-            .transpose()?;
-        let coeff = option_value("LS_PROGRESS_COEFF");
-        let network = get_network().context("NNUE was not initialized")?;
-        if let Some(plan) = NativeRouting::prepare(
-            network.layer_stack_num_buckets(),
-            mode,
-            progress_buckets,
-            coeff.is_some(),
-        )
-        .context("internal routing: LS_BUCKET_MODE / LS_PROGRESS_BUCKETS / LS_PROGRESS_COEFF")?
-        {
-            plan.apply(|| coeff.map(|path| ProgressCoefficients::load(path.as_ref())).transpose())?;
         }
     }
     Ok(())
@@ -437,8 +403,7 @@ mod tests {
 
     #[test]
     fn test_benchmark_with_default_positions() {
-        let mut config = test_config(LimitType::Depth, 3);
-        config.iterations = 2;
+        let config = test_config(LimitType::Depth, 5);
         let result = run_internal_benchmark(&config);
         assert!(result.is_ok(), "Benchmark failed: {:?}", result.err());
 
@@ -446,11 +411,7 @@ mod tests {
 
         assert_eq!(report.results.len(), 1);
         assert_eq!(report.results[0].threads, 1);
-        assert_eq!(
-            report.results[0].results.len(),
-            8,
-            "two iterations of the four default positions"
-        );
+        assert_eq!(report.results[0].results.len(), 4, "Should have 4 default positions");
 
         for (i, bench_result) in report.results[0].results.iter().enumerate() {
             assert!(!bench_result.sfen.is_empty(), "Position {i}: SFEN should not be empty");
@@ -458,6 +419,19 @@ mod tests {
             assert!(bench_result.nodes > 0, "Position {i}: Nodes should be positive");
             assert_ne!(bench_result.bestmove, "none", "Position {i}: Bestmove should be valid");
         }
+    }
+
+    #[test]
+    fn test_benchmark_multiple_iterations() {
+        let mut config = test_config(LimitType::Depth, 3);
+        config.iterations = 2;
+
+        let result = run_internal_benchmark(&config);
+        assert!(result.is_ok());
+
+        let report = result.unwrap();
+        // 2 iterations × 4 positions = 8 results
+        assert_eq!(report.results[0].results.len(), 8);
     }
 
     #[test]

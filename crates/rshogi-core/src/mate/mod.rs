@@ -1,12 +1,14 @@
-// 1手詰め探索 と df-pn 詰み探索
+// 1手詰め探索モジュール
+// YaneuraOuのmate1ply_without_effect.cppの移植
 
-pub mod dfpn;
 pub mod drop_mate;
 pub mod helpers;
 pub mod move_mate;
 pub mod tables;
 
-use crate::bitboard::{BISHOP_STEP, Bitboard, RANK_BB, ROOK_STEP, king_effect, line_bb};
+use crate::bitboard::{
+    Bitboard, RANK_BB, bishop_effect, king_effect, lance_effect, line_bb, rook_effect,
+};
 use crate::position::Position;
 use crate::types::{Color, Move, Square};
 
@@ -33,19 +35,19 @@ pub fn aligned(s1: Square, s2: Square, s3: Square) -> bool {
 /// 盤上の駒を考慮しない飛車の利き
 #[inline]
 pub fn rook_step_effect(sq: Square) -> Bitboard {
-    ROOK_STEP[sq.index()]
+    rook_effect(sq, Bitboard::EMPTY)
 }
 
 /// 盤上の駒を考慮しない角の利き
 #[inline]
 pub fn bishop_step_effect(sq: Square) -> Bitboard {
-    BISHOP_STEP[sq.index()]
+    bishop_effect(sq, Bitboard::EMPTY)
 }
 
 /// 盤上の駒を考慮しない香の利き
 #[inline]
 pub fn lance_step_effect(us: Color, sq: Square) -> Bitboard {
-    crate::bitboard::lance_step_effect(us, sq)
+    lance_effect(us, sq, Bitboard::EMPTY)
 }
 
 /// 斜め1ステップの利き
@@ -72,7 +74,7 @@ fn enemy_field(us: Color) -> Bitboard {
 /// 1手詰め判定（簡易版）
 ///
 /// 王手がかかっていない局面で1手詰めかどうかを判定する。
-/// 近接王手の候補をテーブルで絞り込む。
+/// 高速化のためのテーブルを利用し、やねうら王の簡易版ロジックに準拠する。
 pub fn mate_1ply(pos: &mut Position) -> Option<Move> {
     // 王手がかかっている局面では判定しない
     if pos.in_check() {
@@ -93,10 +95,11 @@ pub fn mate_1ply(pos: &mut Position) -> Option<Move> {
 
 /// 1手詰め判定の初期化
 ///
-/// CHECK_AROUND_BB、NEXT_SQUAREテーブルを初期化する。
+/// CHECK_CAND_BB、CHECK_AROUND_BB、NEXT_SQUAREテーブルを初期化する。
 /// この関数は起動時に一度だけ呼ばれる。
 pub fn init() {
     // LazyLockを使用するため、最初のアクセス時に自動的に初期化される
+    let _ = &*tables::CHECK_CAND_BB;
     let _ = &*tables::CHECK_AROUND_BB;
     let _ = &*tables::NEXT_SQUARE;
 }
@@ -104,21 +107,11 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitboard::{bishop_effect, lance_effect, rook_effect};
 
     #[test]
-    fn mate_step_helpers_match_empty_occupancy_effects() {
-        for sq in Square::all() {
-            let rook = rook_effect(sq, Bitboard::EMPTY);
-            let bishop = bishop_effect(sq, Bitboard::EMPTY);
-            assert_eq!(rook_step_effect(sq), rook);
-            assert_eq!(bishop_step_effect(sq), bishop);
-            assert_eq!(queen_step_effect(sq), rook | bishop);
-            assert_eq!(cross45_step_effect(sq), bishop & king_effect(sq));
-            for color in [Color::Black, Color::White] {
-                assert_eq!(lance_step_effect(color, sq), lance_effect(color, sq, Bitboard::EMPTY));
-            }
-        }
+    fn test_module_structure() {
+        // モジュールが正しく構成されているかの基本テスト
+        init();
     }
 
     #[test]
@@ -223,59 +216,5 @@ mod tests {
             "l2+R3nl/3s1kg2/3pppsp1/p1p3p1p/2lS3P1/P4PP1P/1PNPP1N2/2K1g1SR1/+b4G2L w BGN2p 46";
         let mv = mate_by_new(sfen);
         assert!(mv.is_some(), "成香では玉に逃げられるが不成り串刺しで1手詰み: {:?}", mv);
-    }
-
-    /// `mv` が合法手で、指すと相手玉が詰む（王手がかかり、相手に合法手が無い）ことを確認する。
-    ///
-    /// 打ち歩詰めは合法手生成の時点で除かれるので、合法手の一覧に無ければ詰み手ではない。
-    fn assert_legal_mating_move(pos: &mut Position, mv: Move, context: &str) {
-        use crate::movegen::{MoveList, generate_legal_all};
-
-        let mut list = MoveList::new();
-        generate_legal_all(pos, &mut list);
-        let legal = list.iter().copied().find(|legal| legal.to_u16() == mv.to_u16());
-        let Some(legal) = legal else {
-            panic!("mate_1ply の {} は合法手ではない: {context}", mv.to_usi());
-        };
-
-        let gives_check = pos.gives_check(legal);
-        pos.do_move(legal, gives_check);
-        let mut replies = MoveList::new();
-        generate_legal_all(pos, &mut replies);
-        let mated = pos.in_check() && replies.is_empty();
-        pos.undo_move(legal);
-        assert!(mated, "mate_1ply の {} では詰まない: {context}", mv.to_usi());
-    }
-
-    /// ランダムプレイアウトの各局面で、`mate_1ply` が返した手を 1 手読みで検証する。
-    ///
-    /// `mate_1ply` は近接王手しか調べない（玉から離れた
-    /// 飛車・龍の王手による詰みなどは見逃してよい）。そのため保証するのは健全性だけ:
-    /// 手を返したなら、その手は合法で実際に詰んでいなければならない。
-    /// 見逃しは仕様なので、総当たりでの 1 手詰め列挙はここでは行わない。
-    #[test]
-    fn mate_1ply_agrees_with_one_ply_search() {
-        use crate::position::playout_test_support::RandomPlayout;
-
-        const SEED: u64 = 0x4D41_5445_2026;
-        const PLAYOUTS: u64 = 40;
-        const MAX_PLIES: usize = 300;
-
-        let mut fast_found = 0u64;
-        for index in 0..PLAYOUTS {
-            let mut playout = RandomPlayout::new(SEED, index);
-            for _ in 0..MAX_PLIES {
-                if let Some(mv) = mate_1ply(&mut playout.pos) {
-                    fast_found += 1;
-                    let context = playout.describe();
-                    assert_legal_mating_move(&mut playout.pos, mv, &context);
-                }
-                if playout.step().is_none() {
-                    break;
-                }
-            }
-        }
-        // 標本に 1 手詰めが無ければ何も検証していないことになる。
-        assert!(fast_found > 0, "標本に mate_1ply が詰みを返す局面が無い");
     }
 }

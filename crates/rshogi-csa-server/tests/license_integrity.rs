@@ -1,22 +1,22 @@
-//! csa-server 系クレート群の `license` メタデータが GPL-3.0-or-later に揃っている
+//! csa-server 系クレート群の `license` メタデータが GPL-3.0-only に揃っている
 //! ことを CI で機械的に検証する。
 //!
-//! 本サーバ群は GPL-3.0-or-later を採用するクリーンルーム実装で、生成物
+//! 本サーバ群は GPL-3.0-only を採用するクリーンルーム実装で、生成物
 //! （`crates/rshogi-csa-server*` の rlib / cdylib / バイナリ）にも同ライセンス
 //! を引き継がせる必要がある。各 `Cargo.toml` の `license` フィールドが手作業で
 //! 書き換わって不揃いになる事故を、ビルド時 / cargo test 時に確実に止める。
 //!
-//! workspace ルートの `Cargo.toml` の `members` を動的に走査するため、将来
-//! `crates/rshogi-csa-server-*` という名前で新クレートが追加された場合も
-//! 自動で検査対象になる（追加時に license を忘れるとここで落ちる）。
+//! 本テストは workspace ルートの `Cargo.toml` の `members` を動的に走査するため、
+//! 将来 `crates/rshogi-csa-server-*` という名前で新クレートが追加された場合も
+//! 自動で検査対象になる（追加 PR が license を忘れるとここで落ちる）。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// csa-server 系クレートのライセンスとして許可される唯一の値。
-const REQUIRED_LICENSE: &str = "GPL-3.0-or-later";
+const REQUIRED_LICENSE: &str = "GPL-3.0-only";
 
-/// workspace 内クレートのうち、整合性を要求する名前接頭辞。
+/// workspace 内クレートのうち、本テストが整合性を要求する名前接頭辞。
 const SCOPED_PREFIX: &str = "rshogi-csa-server";
 
 /// `CARGO_MANIFEST_DIR` から workspace ルート（= `Cargo.toml` に
@@ -57,12 +57,12 @@ fn read_package_metadata(cargo_toml: &Path) -> (String, Option<String>) {
 }
 
 /// `crates/rshogi-csa-server*` 系メンバーの Cargo.toml を全て検査し、`license`
-/// が `GPL-3.0-or-later` で一貫していることを保証する。
+/// が `GPL-3.0-only` で一貫していることを保証する。
 ///
 /// 失敗時は具体的な crate 名と検出したライセンス値をエラーメッセージに含めるため、
 /// CI ログだけで「どの crate の Cargo.toml を直せばよいか」が分かる。
 #[test]
-fn csa_server_crates_declare_gpl_3_or_later_license() {
+fn csa_server_crates_declare_gpl_3_only_license() {
     let root = workspace_root();
     let workspace_toml_text =
         fs::read_to_string(root.join("Cargo.toml")).expect("read workspace Cargo.toml");

@@ -1,30 +1,19 @@
 //! Floodgate棋譜サーバーからのダウンロードユーティリティ
 
 use anyhow::{Context, Result};
-use reqwest::blocking::{Client, ClientBuilder};
+use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT_ENCODING, HeaderValue};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use url::Url;
 
-/// Floodgate root。サイトは http アクセスを 301 で https へ誘導するため、
-/// リダイレクトを避けて https を直接指す。
-pub const DEFAULT_ROOT: &str = "https://wdoor.c.u-tokyo.ac.jp/shogi/x/";
+/// Floodgate root (HTTP only)
+pub const DEFAULT_ROOT: &str = "http://wdoor.c.u-tokyo.ac.jp/shogi/x/";
 
-/// レーティングページの相対パス接頭辞。実体は日次生成の日付スタンプ付き
-/// `rating/players-floodgate-YYYYMMDD.html`。
-const RATING_PAGE_REL_PREFIX: &str = "rating/players-floodgate-";
-
-/// HTTPS 用の `ClientBuilder` を返す。
-///
-/// reqwest を `rustls-no-provider` で使っているため、process-level の `CryptoProvider` が
-/// 未登録のまま `build()` すると panic する。登録漏れを作らないよう、`Client` は必ず
-/// この関数経由で作る。登録済みなら `install_default` は `Err` を返すだけなので無視する。
-pub fn http_client_builder() -> ClientBuilder {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    Client::builder()
-}
+/// Floodgate レーティングページ URL
+pub const RATING_PAGE_URL: &str =
+    "http://wdoor.c.u-tokyo.ac.jp/shogi/LATEST/players-floodgate.html";
 
 /// Download text from a URL (HTTP).
 pub fn http_get_text(client: &Client, url: &str) -> Result<String> {
@@ -54,25 +43,14 @@ pub fn http_get_to_file_noclobber(client: &Client, url: &str, out_path: &Path) -
         .with_context(|| format!("GET {url}"))?;
     let status = res.status();
     anyhow::ensure!(status.is_success(), "HTTP {status} for {url}");
-    let parent = out_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut staged = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary download in {}", parent.display()))?;
+    let mut f = File::create(out_path).with_context(|| format!("open {}", out_path.display()))?;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = res.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        staged.write_all(&buf[..n])?;
-    }
-    staged.flush()?;
-    match staged.persist_noclobber(out_path) {
-        Ok(_) => {}
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error).with_context(|| format!("save {}", out_path.display())),
+        f.write_all(&buf[..n])?;
     }
     Ok(out_path.to_path_buf())
 }
@@ -102,14 +80,21 @@ fn extract_csa_rel_path(line: &str) -> Option<String> {
         }
         if let Some(idx) = tok.find(".csa") {
             let path = &tok[..idx + 4];
-            // 絶対パスは末尾の "/x/" 以降を相対パスとして返す。floodgate サーバの
-            // www root は変わりうる (例: /home/shogi-server/www/x/ →
-            // /home/shogi/work/x/) ため prefix をハードコードせず "/x/" を anchor に
-            // して吸収する。rfind で末尾側の "/x/" を採るので、先行パスに偶発的な
-            // "/x/" があっても影響されない。"/x/" が無ければ既に相対形式とみなす。
-            if let Some(pos) = path.rfind("/x/") {
-                return Some(path[pos + "/x/".len()..].to_string());
+            // 正規化: /home/shogi-server/www/x/ 以降を相対パスとして返却
+            const ABS_PREFIX: &str = "/home/shogi-server/www/x/";
+            if let Some(rest) = path.strip_prefix(ABS_PREFIX) {
+                return Some(rest.to_string());
             }
+            // /shogi/x/ を含む場合はその直後を相対とみなす
+            if let Some(pos) = path.find("/shogi/x/") {
+                let rel = &path[pos + "/shogi/x/".len()..];
+                return Some(rel.to_string());
+            }
+            // 既に YYYY/MM/DD/... 形式
+            if path.starts_with('2') && path.contains('/') {
+                return Some(path.to_string());
+            }
+            // それ以外はパスのまま返す（join_url で失敗する可能性あり）
             return Some(path.to_string());
         }
     }
@@ -128,87 +113,37 @@ pub fn local_path_for(root_dir: &Path, rel: &str) -> PathBuf {
     root_dir.join(rel)
 }
 
-/// 指定日 (YYYYMMDD) の Floodgate レーティングページ URL を root から構築する。
-pub fn rating_page_url(root: &str, date_yyyymmdd: &str) -> Result<String> {
-    join_url(root, &format!("{RATING_PAGE_REL_PREFIX}{date_yyyymmdd}.html"))
-}
-
-/// floodgate サーバ基準 (JST/+0900) の「今日」。ページ名・日次ディレクトリ名は JST 日付
-/// なので、ホスト TZ に依存せず JST で求める。UTC など JST より遅れた TZ のホストでは
-/// 現地 today が当日分を取りこぼしうるため。
-pub fn jst_today() -> chrono::NaiveDate {
-    let jst = chrono::FixedOffset::east_opt(9 * 3600).expect("JST は有効なオフセット");
-    chrono::Utc::now().with_timezone(&jst).date_naive()
-}
-
-/// 指定日の棋譜ディレクトリ URL (`<root>YYYY/MM/DD/`) を組む。Apache autoindex を返し、
-/// 当日ぶんは対局開始直後のファイル(進行中・逐次追記)も列挙される。
-pub fn day_dir_url(root: &str, date: chrono::NaiveDate) -> Result<String> {
-    join_url(root, &date.format("%Y/%m/%d/").to_string())
-}
-
-/// Apache autoindex HTML から `*.csa` のファイル名(`href` 値)を抽出する。
-/// 相対 href のみ対象(親ディレクトリ等へのリンクは `.csa` で終わらないため落ちる)。
-pub fn parse_autoindex_csa_names(html: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for chunk in html.split("href=\"").skip(1) {
-        let Some(end) = chunk.find('"') else { continue };
-        let href = &chunk[..end];
-        if href.ends_with(".csa") && !href.contains('/') && !names.iter().any(|n| n == href) {
-            names.push(href.to_string());
-        }
-    }
-    names
-}
-
-/// CSA テキストが終局済みか。shogi-server は終局時に `'$END_TIME:` コメントを書くため、
-/// その有無で判定する(進行中の逐次追記ファイルには無い)。
-pub fn csa_is_finished(text: &str) -> bool {
-    text.lines().any(|l| l.starts_with("'$END_TIME:"))
-}
-
-/// 直近のレーティングページを取得し (URL, ページ日付 `YYYYMMDD`, HTML) を返す。
-///
-/// ページは日次生成の日付スタンプ付きで当日分が未生成のこともあるため、
-/// 今日から数日遡って最初に取得できたページを採用する。
-pub fn fetch_latest_rating_page(client: &Client) -> Result<(String, String, String)> {
-    const LOOKBACK_DAYS: i64 = 7;
-    let today = jst_today();
-    let mut last_err: Option<anyhow::Error> = None;
-    for back in 0..=LOOKBACK_DAYS {
-        let date = (today - chrono::Duration::days(back)).format("%Y%m%d").to_string();
-        let url = rating_page_url(DEFAULT_ROOT, &date)?;
-        match http_get_text(client, &url) {
-            Ok(html) => return Ok((url, date, html)),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    // ここに到達するのは全試行が Err だった時のみで、その場合 last_err は必ず Some。
-    Err(last_err.expect("全失敗時のみ到達するため last_err は Some").context(format!(
-        "直近 {LOOKBACK_DAYS} 日分の Floodgate レーティングページを取得できませんでした"
-    )))
-}
-
 /// Floodgate レーティングページ HTML から (プレイヤー名, レーティング) のリストを抽出。
 ///
-/// ページはプレイヤー 1 人につき以下のテーブル行を持つ:
+/// HTML のパターン:
 /// ```html
-/// <td class="name"><a href="...">PlayerName</a></td>
-/// <td class="rate">4550</td>
+/// <a id="popup1" href="...">PlayerName</a>
+/// ...
+/// <span id="popup2"> 4550</span>
 /// ```
-/// 表示名 (`<td class="name">` 内アンカーのテキスト) と直後に現れる
-/// `<td class="rate">` の数値をペアにする。
+/// 名前 (popup奇数) とレーティング (popup偶数) が交互に出現する。
 pub fn parse_rating_page(html: &str) -> Vec<(String, f64)> {
     let mut results = Vec::new();
     let mut pending_name: Option<String> = None;
     for line in html.lines() {
         let s = line.trim();
-        if let Some(rest) = s.strip_prefix("<td class=\"name\">") {
-            pending_name = anchor_text(rest);
-        } else if let Some(rest) = s.strip_prefix("<td class=\"rate\">") {
-            // セル先頭から最初の '<' (</td>) 直前までを数値とみなす。負レートも取りこぼさない。
-            let val = rest.split('<').next().unwrap_or("").trim();
-            if let Ok(rating) = val.parse::<f64>()
+        // <a id="popupN" href="...">NAME</a>
+        if s.starts_with("<a id=\"popup")
+            && s.ends_with("</a>")
+            && let Some(gt_pos) = s.rfind("\">")
+        {
+            let name = &s[gt_pos + 2..s.len() - 4];
+            if !name.is_empty() {
+                pending_name = Some(name.to_string());
+            }
+        }
+        // <span id="popupN"> RATING</span>
+        if s.starts_with("<span id=\"popup")
+            && s.ends_with("</span>")
+            && let Some(gt_pos) = s.find("\">")
+        {
+            let val_str = &s[gt_pos + 2..s.len() - 7];
+            if let Ok(rating) = val_str.trim().parse::<f64>()
                 && let Some(name) = pending_name.take()
             {
                 results.push((name, rating));
@@ -216,14 +151,6 @@ pub fn parse_rating_page(html: &str) -> Vec<(String, f64)> {
         }
     }
     results
-}
-
-/// `<a href="...">TEXT</a>...` から TEXT を抽出する。
-fn anchor_text(s: &str) -> Option<String> {
-    let open_end = s.find('>')? + 1;
-    let close = s[open_end..].find("</a>")? + open_end;
-    let text = s[open_end..close].trim();
-    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// CSA ファイルの相対パスからプレイヤー名を抽出。
@@ -239,21 +166,6 @@ pub fn players_from_path(rel: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
-}
-
-/// レート表 TSV(`name<TAB>rate`)を読み込む。壊れた行・非有限値は捨てる。
-/// `floodgate_record --ratings-cache` の書き出しと同形式。名前は raw のまま返す
-/// (正規化キーへの変換は用途側で行う)。
-pub fn read_ratings_tsv(path: &Path) -> Result<Vec<(String, f64)>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(text
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .filter_map(|(n, r)| {
-            let v = r.trim().parse::<f64>().ok().filter(|v| v.is_finite())?;
-            Some((n.trim().to_owned(), v))
-        })
-        .collect())
 }
 
 /// プレイヤーファイルを読み込みパターンリストとして返す。
@@ -279,101 +191,36 @@ pub fn player_matches(name: &str, patterns: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn http_client_builder_builds_a_client() {
-        http_client_builder().build().unwrap();
-    }
-
     #[test]
     fn test_parse_index_lines() {
-        let sample = b"2010/01/01\t...\t/home/shogi-server/www/x/2010/01/01/wdoor+floodgate-900-0+Bonanza+gps_l+20100101000000.csa\t115\n2026/04/13\t...\t/home/shogi/work/x/2026/04/13/wdoor+floodgate-300-10F+910+foo_human+20260413203001.csa\t70\n# comment\nfoo.txt\n2025/01/floodgate-3600-20250101-0001.csa\n";
+        let sample = b"2010/01/01\t...\t/home/shogi-server/www/x/2010/01/01/wdoor+floodgate-900-0+Bonanza+gps_l+20100101000000.csa\t115\n# comment\nfoo.txt\n2025/01/floodgate-3600-20250101-0001.csa\n";
         let v = parse_index_lines(&sample[..]).unwrap();
-        assert_eq!(v.len(), 3);
+        assert_eq!(v.len(), 2);
         assert!(v[0].starts_with("2010/01/01/") && v[0].ends_with(".csa"));
-        // www root が変わった新形式 (/home/shogi/work/x/) も "/x/" anchor で吸収
-        assert!(v[1].starts_with("2026/04/13/") && v[1].ends_with(".csa"));
-        assert!(v[2].contains("2025/01/"));
+        assert!(v[1].contains("2025/01/"));
     }
     #[test]
     fn test_join_url() {
         let u = join_url(DEFAULT_ROOT, "2025/01/a.csa").unwrap();
-        assert!(u.starts_with("https://"));
+        assert!(u.starts_with("http://"));
         assert!(u.contains("/shogi/x/2025/01/a.csa"));
     }
     #[test]
-    fn test_rating_page_url() {
-        let u = rating_page_url(DEFAULT_ROOT, "20260620").unwrap();
-        assert_eq!(
-            u,
-            "https://wdoor.c.u-tokyo.ac.jp/shogi/x/rating/players-floodgate-20260620.html"
-        );
-    }
-    #[test]
-    fn test_day_dir_url() {
-        let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 7).unwrap();
-        assert_eq!(
-            day_dir_url(DEFAULT_ROOT, d).unwrap(),
-            "https://wdoor.c.u-tokyo.ac.jp/shogi/x/2026/07/07/"
-        );
-    }
-
-    #[test]
-    fn test_parse_autoindex_csa_names() {
-        let html = r#"
-        <tr><td><a href="?C=N;O=D">Name</a></td></tr>
-        <tr><td><a href="/shogi/x/2026/07/">Parent Directory</a></td></tr>
-        <tr><td><a href="wdoor+floodgate-300-10F+A+B+20260707000001.csa">wdoor+...csa</a></td></tr>
-        <tr><td><a href="wdoor+floodgate-300-10F+C+D+20260707000002.csa">wdoor+...csa</a></td></tr>
-        <tr><td><a href="wdoor+floodgate-300-10F+A+B+20260707000001.csa">dup</a></td></tr>
-        <tr><td><a href="00INDEX.html">index</a></td></tr>
-        "#;
-        let names = parse_autoindex_csa_names(html);
-        assert_eq!(
-            names,
-            vec![
-                "wdoor+floodgate-300-10F+A+B+20260707000001.csa",
-                "wdoor+floodgate-300-10F+C+D+20260707000002.csa"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_csa_is_finished() {
-        assert!(csa_is_finished(
-            "+7776FU\n%TORYO\n'summary:toryo\n'$END_TIME:2026/07/07 01:52:29\n"
-        ));
-        assert!(!csa_is_finished("'$START_TIME:2026/07/07 01:30:00\n+7776FU\n-3334FU\n"));
-    }
-
-    #[test]
     fn test_parse_rating_page() {
         let html = r#"
-        <tr>
-          <td class="name"><a href="/shogi/x/2026/player/Frieren+abc1234.html">Frieren</a></td>
-          <td class="rate">4550</td>
-          <td class="last_modified">2026-06-19 03:00:00</td>
-        </tr>
-        <tr>
-          <td class="name"><a href="/shogi/x/2026/player/Reze+def5678.html">Reze</a></td>
-          <td class="rate">4474</td>
-          <td class="last_modified">2026-06-18 03:00:00</td>
-        </tr>
-        <tr>
-          <td class="name"><a href="/shogi/x/2026/player/BCT+aaa9999.html">BCT</a></td>
-          <td class="rate">-1769</td>
-          <td class="last_modified">2026-06-17 03:00:00</td>
-        </tr>
+        <a id="popup1" href="/shogi/view/show-player.cgi?user=Frieren%2Bhash">Frieren</a>
+        <script>...</script>
+        <span id="popup2"> 4550</span>
+        <a id="popup3" href="/shogi/view/show-player.cgi?user=Reze%2Bhash">Reze</a>
+        <script>...</script>
+        <span id="popup4"> 4474</span>
         "#;
         let result = parse_rating_page(html);
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, "Frieren");
         assert!((result[0].1 - 4550.0).abs() < 0.01);
         assert_eq!(result[1].0, "Reze");
         assert!((result[1].1 - 4474.0).abs() < 0.01);
-        // 負レートも取りこぼさない
-        assert_eq!(result[2].0, "BCT");
-        assert!((result[2].1 + 1769.0).abs() < 0.01);
     }
     #[test]
     fn test_players_from_path() {
@@ -387,43 +234,5 @@ mod tests {
         let (a2, b2) = players_from_path(p2).unwrap();
         assert_eq!(a2, "gps_normal");
         assert_eq!(b2, "gps500");
-    }
-    #[test]
-    fn interrupted_download_is_not_published_and_can_be_retried() -> Result<()> {
-        use std::net::TcpListener;
-        use std::time::Duration;
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let address = listener.local_addr()?;
-        let server = std::thread::spawn(move || -> std::io::Result<()> {
-            for truncated in [true, false] {
-                let (mut stream, _) = listener.accept()?;
-                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                let mut request = BufReader::new(stream.try_clone()?);
-                loop {
-                    let mut line = String::new();
-                    if request.read_line(&mut line)? == 0 || line == "\r\n" {
-                        break;
-                    }
-                }
-                stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n",
-                )?;
-                stream.write_all(if truncated { b"part" } else { b"complete" })?;
-            }
-            Ok(())
-        });
-        let dir = tempfile::tempdir()?;
-        let output = dir.path().join("download.csa");
-        let client = http_client_builder().no_proxy().timeout(Duration::from_secs(5)).build()?;
-        let url = format!("http://{address}/game.csa");
-        assert!(http_get_to_file_noclobber(&client, &url, &output).is_err());
-        assert!(!output.exists());
-        assert_eq!(fs::read_dir(dir.path())?.count(), 0);
-        http_get_to_file_noclobber(&client, &url, &output)?;
-        assert_eq!(fs::read(&output)?, b"complete");
-        http_get_to_file_noclobber(&client, "invalid url", &output)?;
-        assert_eq!(fs::read(&output)?, b"complete");
-        server.join().expect("HTTP fixture thread")?;
-        Ok(())
     }
 }

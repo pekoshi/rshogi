@@ -7,11 +7,7 @@ use crate::position::Position;
 use crate::types::Value;
 
 // 型エイリアスを aliases 経由でインポート
-use crate::nnue::aliases::{
-    HalfKP512_8_64CReLU, HalfKP512_8_64Pairwise, HalfKP512_8_64SCReLU, HalfKP512_32_32CReLU,
-    HalfKP512_32_32Pairwise, HalfKP512_32_32SCReLU, HalfKP512CReLU, HalfKP512Pairwise,
-    HalfKP512SCReLU,
-};
+use crate::nnue::aliases::{HalfKP512_8_64CReLU, HalfKP512_32_32CReLU, HalfKP512CReLU};
 
 crate::define_l1_variants!(
     enum HalfKPL512,
@@ -22,16 +18,72 @@ crate::define_l1_variants!(
 
     variants {
         // L2=8, L3=64 バリアント
-        (8,  64, CReLU)         => CReLU8x64     : HalfKP512_8_64CReLU,
-        (8,  64, SCReLU)        => SCReLU8x64    : HalfKP512_8_64SCReLU,
-        (8,  64, PairwiseCReLU) => Pairwise8x64  : HalfKP512_8_64Pairwise,
+        (8,  64, CReLU,         "CReLU")    => CReLU8x64     : HalfKP512_8_64CReLU,
         // L2=8, L3=96 バリアント
-        (8,  96, CReLU)         => CReLU8x96     : HalfKP512CReLU,
-        (8,  96, SCReLU)        => SCReLU8x96    : HalfKP512SCReLU,
-        (8,  96, PairwiseCReLU) => Pairwise8x96  : HalfKP512Pairwise,
+        (8,  96, CReLU,         "CReLU")    => CReLU8x96     : HalfKP512CReLU,
         // L2=32, L3=32 バリアント
-        (32, 32, CReLU)         => CReLU32x32    : HalfKP512_32_32CReLU,
-        (32, 32, SCReLU)        => SCReLU32x32   : HalfKP512_32_32SCReLU,
-        (32, 32, PairwiseCReLU) => Pairwise32x32 : HalfKP512_32_32Pairwise,
+        (32, 32, CReLU,         "CReLU")    => CReLU32x32    : HalfKP512_32_32CReLU,
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_supported_specs() {
+        assert_eq!(HalfKPL512::SUPPORTED_SPECS.len(), 3);
+
+        // 8-64 CReLU
+        let spec = &HalfKPL512::SUPPORTED_SPECS[0];
+        assert_eq!(spec.feature_set, FeatureSet::HalfKP);
+        assert_eq!(spec.l1, 512);
+        assert_eq!(spec.l2, 8);
+        assert_eq!(spec.l3, 64);
+        assert_eq!(spec.activation, Activation::CReLU);
+
+        // 8-96 CReLU
+        let spec = &HalfKPL512::SUPPORTED_SPECS[1];
+        assert_eq!(spec.l2, 8);
+        assert_eq!(spec.l3, 96);
+    }
+
+    #[test]
+    fn test_l1_size() {
+        for spec in HalfKPL512::SUPPORTED_SPECS {
+            assert_eq!(spec.l1, 512);
+        }
+    }
+
+    /// マクロ生成: architecture_name() の命名規則テスト
+    #[test]
+    fn test_architecture_name_format() {
+        for spec in HalfKPL512::SUPPORTED_SPECS {
+            let name = spec.name();
+            assert!(
+                name.starts_with("HalfKP-512-"),
+                "Architecture name should start with 'HalfKP-512-', got: {name}"
+            );
+        }
+    }
+
+    /// マクロ生成: 活性化関数の output_dim_divisor テスト
+    #[test]
+    fn test_activation_output_dim_divisor() {
+        for spec in HalfKPL512::SUPPORTED_SPECS {
+            assert_eq!(spec.activation, Activation::CReLU);
+            assert_eq!(spec.activation.output_dim_divisor(), 1);
+        }
+    }
+
+    /// マクロ生成: L2/L3 の組み合わせが複数あることを確認
+    #[test]
+    fn test_multiple_l2_l3_combinations() {
+        let combinations: Vec<_> =
+            HalfKPL512::SUPPORTED_SPECS.iter().map(|s| (s.l2, s.l3)).collect();
+
+        assert!(combinations.contains(&(8, 64)), "Should support L2=8, L3=64");
+        assert!(combinations.contains(&(8, 96)), "Should support L2=8, L3=96");
+        assert!(combinations.contains(&(32, 32)), "Should support L2=32, L3=32");
+    }
+}

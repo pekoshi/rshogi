@@ -1,0 +1,62 @@
+[package]
+name = "nnue-convert"
+version = "0.1.0"
+edition = "2024"
+authors = ["SH11235"]
+description = "NNUE arch 変換ツール (1536-8-96 → 1536-16-96 等の L1 拡張)"
+license = "GPL-3.0-only"
+repository = "https://github.com/SH11235/rshogi"
+
+[features]
+# 入出力 arch を独立に build feature で指定。
+# convert は src 側 (1536x8x96) と dst 側 (1536x16x96) 両方が必要。
+default = ["layerstacks-1536x8x96", "layerstacks-1536x16x96"]
+layerstacks-1536x8x96 = ["rshogi-core/layerstacks-1536x8x96"]
+layerstacks-1536x16x96 = ["rshogi-core/layerstacks-1536x16x96"]
+layerstacks-1536x32x96 = ["rshogi-core/layerstacks-1536x32x96"]
+layerstacks-1536x16x48 = ["rshogi-core/layerstacks-1536x16x48"]
+layerstacks-1536x48x96 = ["rshogi-core/layerstacks-1536x48x96"]
+layerstacks-768x32x96 = ["rshogi-core/layerstacks-768x32x96"]
+layerstacks-1536x64x96 = ["rshogi-core/layerstacks-1536x64x96"]
+nnue-psqt = ["rshogi-core/nnue-psqt"]
+halfkav2-hm = ["rshogi-core/halfkav2-hm"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+rand.workspace = true
+rand_xoshiro.workspace = true
+rshogi-core = { path = "../rshogi-core" }
+
+[[bin]]
+name = "convert_layerstack_l1_8_to_16"
+path = "src/bin/convert_layerstack_l1_8_to_16.rs"
+
+[[bin]]
+name = "expand_ckpt_l1_8_to_16"
+path = "src/bin/expand_ckpt_l1_8_to_16.rs"
+
+[[bin]]
+name = "convert_layerstack_l1_16_to_32"
+path = "src/bin/convert_layerstack_l1_16_to_32.rs"
+
+[[bin]]
+name = "convert_layerstack_l1_32_to_48"
+path = "src/bin/convert_layerstack_l1_32_to_48.rs"
+required-features = ["layerstacks-1536x32x96", "layerstacks-1536x48x96"]
+
+[[bin]]
+name = "expand_ckpt_l1_16_to_32"
+path = "src/bin/expand_ckpt_l1_16_to_32.rs"
+
+[[bin]]
+name = "shrink_layerstack_1536_32_96_to_1536_16_48"
+path = "src/bin/shrink_layerstack_1536_32_96_to_1536_16_48.rs"
+required-features = ["layerstacks-1536x32x96", "layerstacks-1536x16x48"]
+
+[[bin]]
+name = "convert_halfka_to_halfkav2"
+path = "src/bin/convert_halfka_to_halfkav2.rs"
+required-features = ["layerstacks-1536x48x96", "halfkav2-hm"]

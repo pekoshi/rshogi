@@ -29,14 +29,12 @@ pub fn get_pass_right_value() -> i32 {
 
 /// パス権評価値を設定（序盤・終盤両方を同じ値に設定）
 pub fn set_pass_right_value(value: i32) {
-    crate::eval::changed();
     PASS_RIGHT_VALUE_EARLY.store(value, Ordering::Relaxed);
     PASS_RIGHT_VALUE_LATE.store(value, Ordering::Relaxed);
 }
 
 /// パス権評価値を設定（序盤・終盤を個別に設定）
 pub fn set_pass_right_value_phased(early: i32, late: i32) {
-    crate::eval::changed();
     PASS_RIGHT_VALUE_EARLY.store(early, Ordering::Relaxed);
     PASS_RIGHT_VALUE_LATE.store(late, Ordering::Relaxed);
 }
@@ -101,9 +99,7 @@ pub fn evaluate_pass_rights(pos: &Position, ply: u16) -> Value {
 ///
 /// 正の値を設定するとパス手が選ばれやすくなる。
 /// USI オプション PassMoveBonus で調整可能。
-/// root・内部探索・MultiPV で、手数によるスケーリングなしに適用する。
-/// 詰みスコアと中断値には適用せず、通常スコアは詰み領域の手前で飽和する。
-/// 非ゼロ設定の PASS は子を full PV window で探索するため、探索ノード数が増える場合がある。
+/// 手数によるスケーリングは行わず、常に設定値の100%が適用される。
 const DEFAULT_PASS_MOVE_BONUS: i32 = 0;
 
 /// ランタイムで切り替え可能なパス手ボーナス
@@ -117,7 +113,6 @@ pub fn get_pass_move_bonus() -> i32 {
 
 /// パス手ボーナスを設定
 pub fn set_pass_move_bonus(value: i32) {
-    crate::eval::changed();
     PASS_MOVE_BONUS.store(value, Ordering::Relaxed);
 }
 
@@ -131,7 +126,7 @@ pub fn get_scaled_pass_move_bonus(_ply: i32) -> i32 {
     PASS_MOVE_BONUS.load(Ordering::Relaxed)
 }
 
-/// Material評価の適用レベル
+/// Material評価の適用レベル（YaneuraOu MaterialLv に対応）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterialLevel {
     Lv1,
@@ -146,7 +141,7 @@ pub enum MaterialLevel {
 impl MaterialLevel {
     /// レベル値から MaterialLevel を取得
     ///
-    /// レベル番号は USI option の値に合わせているため、未実装の5, 6は欠番とする。
+    /// 注意: レベル5, 6は未実装（YaneuraOu互換性のため欠番）
     pub fn from_value(v: u8) -> Option<Self> {
         match v {
             1 => Some(MaterialLevel::Lv1),
@@ -174,7 +169,7 @@ impl MaterialLevel {
     }
 }
 
-/// デフォルトのMaterial評価レベル
+/// デフォルトのMaterial評価レベル（YaneuraOu MaterialLv9 相当）
 pub const DEFAULT_MATERIAL_LEVEL: MaterialLevel = MaterialLevel::Lv9;
 
 /// ランタイムで切り替え可能なMaterial評価レベル
@@ -206,14 +201,12 @@ pub fn get_material_level() -> MaterialLevel {
 
 /// Material評価レベルを設定し、Material評価を有効化する
 pub fn set_material_level(level: MaterialLevel) {
-    crate::eval::changed();
     MATERIAL_LEVEL.store(level.value(), Ordering::Relaxed);
     MATERIAL_ENABLED.store(true, Ordering::Relaxed);
 }
 
 /// Material評価を無効化する
 pub fn disable_material() {
-    crate::eval::changed();
     MATERIAL_ENABLED.store(false, Ordering::Relaxed);
 }
 
@@ -229,7 +222,7 @@ pub fn material_needs_board_effects() -> bool {
     )
 }
 
-/// Material 評価用の駒価値
+/// Apery(WCSC26)準拠の駒価値
 pub(crate) fn base_piece_value(pt: PieceType) -> i32 {
     match pt {
         PieceType::Pawn => 90,
@@ -310,7 +303,7 @@ const LV7_THEIR_EFFECT_VALUE: [i32; 9] = make_effect_values(92);
 /// 利きの多重度に応じた評価値テーブル（LazyLockによる遅延初期化）
 static MULTI_EFFECT_VALUE: LazyLock<[i32; 11]> = LazyLock::new(|| {
     let mut arr = [0i32; 11];
-    // 利きの多重度から評価値を求める近似式
+    // YaneuraOu の optimizer が出力した近似式
     // 6365 - pow(0.8525, m-1) * 5341 (m=1..10)
     // 利きが増えるほど逓減しつつ上限に漸近する特性を再現するための定数
     for (m, value) in arr.iter_mut().enumerate().skip(1) {
@@ -349,13 +342,14 @@ static LV7_TABLES: LazyLock<Lv7Tables> = LazyLock::new(|| {
 });
 
 // 自駒への味方/敵の利きが 0/1/2 のときの補正係数（MaterialLv7-9）
-// 4096 で割って駒価値に掛ける係数。
+// 値は YaneuraOu から移植。後で 4096 で割って駒価値に掛ける。
 const OUR_EFFECT_TO_OUR_PIECE: [i32; 3] = [0, 33, 43];
 const THEIR_EFFECT_TO_OUR_PIECE: [i32; 3] = [0, 113, 122];
 
 // 玉の位置ボーナス（先手視点の81升テーブル）
 // インデックス: (8 - file) + rank * 9 （先手1段1筋が先頭、左から9筋→1筋の順）
 // 高い値ほど玉にとって安全とみなす。後手は Inv(sq) でミラーし、符号を反転して用いる。
+// 値は YaneuraOu MaterialLv8/9 から移植。
 const KING_POS_BONUS: [i32; 81] = [
     875, 655, 830, 680, 770, 815, 720, 945, 755, 605, 455, 610, 595, 730, 610, 600, 590, 615, 565,
     640, 555, 525, 635, 565, 440, 600, 575, 520, 515, 580, 420, 640, 535, 565, 500, 510, 220, 355,
@@ -389,7 +383,7 @@ fn direction_of(king: Square, sq: Square) -> usize {
         df = -df;
     }
 
-    // 返り値の意味
+    // 返り値の意味（YaneuraOuのバケット順）
     // 0: 真上, 1: 右上上, 2: 右上, 3: 右右上, 4: 右
     // 5: 右右下, 6: 右下, 7: 右下下, 8: 真下, 9: 同じ升
     if df == 0 && dr == 0 {
@@ -615,11 +609,7 @@ fn eval_lv7_like(
 /// - Level 3-4: 利きの計算を含む（中速）
 /// - Level 7-9: より複雑な評価（低速だがNNUEより高速）
 pub fn evaluate_material(pos: &Position) -> Value {
-    evaluate_material_at_level(pos, get_material_level())
-}
-
-/// 指定したレベルの駒得評価を返す。
-pub(crate) fn evaluate_material_at_level(pos: &Position, level: MaterialLevel) -> Value {
+    let level = get_material_level();
     let raw = match level {
         MaterialLevel::Lv1 => eval_lv1(pos),
         MaterialLevel::Lv2 => eval_lv2(pos),
@@ -654,49 +644,6 @@ pub(crate) fn evaluate_material_at_level(pos: &Position, level: MaterialLevel) -
     }
 }
 
-/// テスト専用: eval グローバル状態 (MATERIAL_LEVEL / MATERIAL_ENABLED /
-/// PASS_RIGHT_VALUE_EARLY / PASS_RIGHT_VALUE_LATE) を触るテストの直列化と状態復元
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-    use std::sync::{Mutex, MutexGuard};
-
-    /// eval グローバルを変更するテストを直列化するロック
-    static EVAL_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
-
-    /// ロック取得時点の material グローバル状態を Drop で復元する guard
-    pub(crate) struct MaterialGuard {
-        _lock: MutexGuard<'static, ()>,
-        level: u8,
-        enabled: bool,
-        pass_right_early: i32,
-        pass_right_late: i32,
-    }
-
-    /// ロックを取得し、現在の material グローバル状態を snapshot する
-    ///
-    /// panic したテストが持っていた poison は無視してよい (Drop で状態復元済みのため)。
-    pub(crate) fn lock_material() -> MaterialGuard {
-        let lock = EVAL_GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        MaterialGuard {
-            _lock: lock,
-            level: MATERIAL_LEVEL.load(Ordering::Relaxed),
-            enabled: MATERIAL_ENABLED.load(Ordering::Relaxed),
-            pass_right_early: PASS_RIGHT_VALUE_EARLY.load(Ordering::Relaxed),
-            pass_right_late: PASS_RIGHT_VALUE_LATE.load(Ordering::Relaxed),
-        }
-    }
-
-    impl Drop for MaterialGuard {
-        fn drop(&mut self) {
-            MATERIAL_LEVEL.store(self.level, Ordering::Relaxed);
-            MATERIAL_ENABLED.store(self.enabled, Ordering::Relaxed);
-            PASS_RIGHT_VALUE_EARLY.store(self.pass_right_early, Ordering::Relaxed);
-            PASS_RIGHT_VALUE_LATE.store(self.pass_right_late, Ordering::Relaxed);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,8 +651,6 @@ mod tests {
 
     #[test]
     fn test_material_eval_hirate() {
-        let guard = test_support::lock_material();
-
         let mut pos = Position::new();
         pos.set_sfen(SFEN_HIRATE).unwrap();
 
@@ -713,8 +658,6 @@ mod tests {
 
         // 初期局面はほぼ互角（MaterialLvにより0から僅かにずれる場合がある）
         assert!(value.raw().abs() < 200);
-
-        drop(guard);
     }
 
     #[test]
@@ -747,7 +690,8 @@ mod tests {
 
     #[test]
     fn test_get_set_material_level() {
-        let guard = test_support::lock_material();
+        let original = get_material_level();
+        let original_enabled = is_material_enabled();
 
         set_material_level(MaterialLevel::Lv1);
         assert_eq!(get_material_level(), MaterialLevel::Lv1);
@@ -760,7 +704,9 @@ mod tests {
         disable_material();
         assert!(!is_material_enabled());
 
-        drop(guard);
+        if original_enabled {
+            set_material_level(original);
+        }
     }
 
     // =========================================================================
@@ -822,7 +768,10 @@ mod tests {
     fn test_pass_right_value_global_and_evaluation() {
         use crate::types::Color;
 
-        let guard = test_support::lock_material();
+        // 設定を保存
+        let orig_early = PASS_RIGHT_VALUE_EARLY.load(std::sync::atomic::Ordering::Relaxed);
+        let orig_late = PASS_RIGHT_VALUE_LATE.load(std::sync::atomic::Ordering::Relaxed);
+        let orig_level = get_material_level();
 
         // --- Part 1: set_pass_right_value_phased のテスト ---
         set_pass_right_value_phased(50, 200);
@@ -876,6 +825,8 @@ mod tests {
             "Negamax combined score should be negative: got {negamax_combined}"
         );
 
-        drop(guard);
+        // 設定を復元
+        set_pass_right_value_phased(orig_early, orig_late);
+        set_material_level(orig_level);
     }
 }

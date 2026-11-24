@@ -3,7 +3,7 @@
 // Each helper thread runs in its own OS thread with a dedicated SearchWorker.
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread::JoinHandle;
 
@@ -13,11 +13,7 @@ mod imp {
     use crate::types::Depth;
 
     use crate::search::engine::{SearchProgress, search_helper};
-    #[cfg(target_os = "linux")]
-    use crate::search::numa::{NumaNetwork, NumaPlan, pin_current_thread};
-    use crate::search::{
-        LimitsType, SearchTuneParams, SearchWorker, SharedHistories, TimeManagement, TimeOptions,
-    };
+    use crate::search::{LimitsType, SearchTuneParams, SearchWorker, TimeManagement, TimeOptions};
     use crate::types::EnteringKingRule;
 
     const SEARCH_STACK_SIZE: usize = 64 * 1024 * 1024;
@@ -27,25 +23,15 @@ mod imp {
         stop: Arc<AtomicBool>,
         ponderhit: Arc<AtomicBool>,
         increase_depth_shared: Arc<AtomicBool>,
+        eval_hash: Arc<EvalHash>,
         search_tune_params: SearchTuneParams,
-        /// `NumaPolicy=auto` で有効なときのスレッドと node の対応。`None` ならスレッドを固定しない。
-        #[cfg(target_os = "linux")]
-        numa_plan: Option<Arc<NumaPlan>>,
     }
 
     impl ThreadPool {
-        pub(crate) fn completed_depths(&self) -> Vec<Depth> {
-            self.threads
-                .iter()
-                .map(|thread| thread.with_worker(|worker| worker.state.completed_depth))
-                .collect()
-        }
-
         pub fn new(
             num_threads: usize,
             tt: Arc<TranspositionTable>,
             eval_hash: Arc<EvalHash>,
-            shared_histories: Arc<SharedHistories>,
             stop: Arc<AtomicBool>,
             ponderhit: Arc<AtomicBool>,
             increase_depth_shared: Arc<AtomicBool>,
@@ -57,18 +43,10 @@ mod imp {
                 stop,
                 ponderhit,
                 increase_depth_shared,
+                eval_hash: Arc::clone(&eval_hash),
                 search_tune_params,
-                #[cfg(target_os = "linux")]
-                numa_plan: None,
             };
-            pool.set_num_threads(
-                num_threads,
-                tt,
-                eval_hash,
-                shared_histories,
-                max_moves_to_draw,
-                search_tune_params,
-            );
+            pool.set_num_threads(num_threads, tt, eval_hash, max_moves_to_draw, search_tune_params);
             pool
         }
 
@@ -77,87 +55,32 @@ mod imp {
             num_threads: usize,
             tt: Arc<TranspositionTable>,
             eval_hash: Arc<EvalHash>,
-            shared_histories: Arc<SharedHistories>,
             max_moves_to_draw: i32,
             search_tune_params: SearchTuneParams,
         ) {
             let helper_count = num_threads.saturating_sub(1);
             if helper_count == self.threads.len() {
+                self.eval_hash = eval_hash;
                 self.search_tune_params = search_tune_params;
                 return;
             }
 
             self.wait_for_search_finished();
             self.threads.clear();
+            self.eval_hash = Arc::clone(&eval_hash);
             self.search_tune_params = search_tune_params;
 
             for id in 1..=helper_count {
-                let worker = WorkerArgs {
+                self.threads.push(Thread::new(
                     id,
-                    tt: Arc::clone(&tt),
-                    eval_hash: Arc::clone(&eval_hash),
-                    shared_histories: Arc::clone(&shared_histories),
+                    Arc::clone(&tt),
+                    Arc::clone(&eval_hash),
+                    Arc::clone(&self.stop),
+                    Arc::clone(&self.ponderhit),
+                    Arc::clone(&self.increase_depth_shared),
                     max_moves_to_draw,
                     search_tune_params,
-                };
-                let signals = Signals {
-                    stop: Arc::clone(&self.stop),
-                    ponderhit: Arc::clone(&self.ponderhit),
-                    increase_depth_shared: Arc::clone(&self.increase_depth_shared),
-                };
-                #[cfg(target_os = "linux")]
-                let thread = match &self.numa_plan {
-                    Some(plan) => {
-                        Thread::new_pinned(worker, signals, plan.cpus_of_thread(id).to_vec())
-                    }
-                    None => Thread::new(worker, signals),
-                };
-                #[cfg(not(target_os = "linux"))]
-                let thread = Thread::new(worker, signals);
-                self.threads.push(thread);
-            }
-        }
-
-        /// スレッドと node の対応を差し替える。helper は作り直すまで前の固定のままなので、
-        /// ここで全て破棄し、続く `set_num_threads` で新しい対応のもとに作り直させる。
-        #[cfg(target_os = "linux")]
-        pub(crate) fn set_numa_plan(&mut self, plan: Option<Arc<NumaPlan>>) {
-            self.wait_for_search_finished();
-            self.threads.clear();
-            self.numa_plan = plan;
-        }
-
-        /// 割り当てを外し、helper を作り直さずに `cpus` (プロセスが使える CPU 全体) へ固定し直す。
-        ///
-        /// 作り直すと新しいスレッドは呼び出し元の固定を継ぐので、固定された探索スレッドから
-        /// 呼ばれても helper が 1 node に閉じ込められないよう、各 helper 自身に固定し直させる。
-        #[cfg(target_os = "linux")]
-        pub(crate) fn release_numa_plan(&mut self, cpus: &[usize]) {
-            self.wait_for_search_finished();
-            self.numa_plan = None;
-            for thread in &self.threads {
-                thread.pin_to(cpus.to_vec());
-            }
-        }
-
-        /// helper の CPU 固定に失敗した最初の理由。
-        #[cfg(target_os = "linux")]
-        pub(crate) fn numa_pin_error(&self) -> Option<String> {
-            self.threads
-                .iter()
-                .find_map(|thread| thread.inner.pin_error.lock().unwrap().clone())
-        }
-
-        /// 各 helper が読む重みの写しを差し替える。`network_for` は helper の id を受け取る。
-        #[cfg(target_os = "linux")]
-        pub(crate) fn set_numa_networks(
-            &self,
-            mut network_for: impl FnMut(usize) -> Option<NumaNetwork>,
-        ) {
-            self.wait_for_search_finished();
-            for thread in &self.threads {
-                let network = network_for(thread.id);
-                thread.with_worker(|worker| worker.set_numa_network(network));
+                ));
             }
         }
 
@@ -177,8 +100,7 @@ mod imp {
                 return;
             }
 
-            let count = self.threads.len().saturating_sub(limits.reserved_game_mate_threads);
-            for thread in self.threads.iter().take(count) {
+            for thread in &self.threads {
                 thread.start_searching(SearchTask {
                     pos: pos.clone(),
                     limits: limits.clone(),
@@ -231,7 +153,7 @@ mod imp {
             self.search_tune_params = search_tune_params;
             for thread in &self.threads {
                 thread.with_worker(|worker| {
-                    worker.update_search_tune_params(search_tune_params);
+                    worker.search_tune_params = search_tune_params;
                 });
             }
         }
@@ -240,19 +162,10 @@ mod imp {
             &self.threads
         }
 
-        /// helper が終了してから、次の探索用に進捗をリセットする。
+        /// Clear helper thread results.
+        /// Native builds don't use helper_results, so this is a no-op.
         pub fn clear_helper_results(&self) {
-            self.wait_for_search_finished();
-            for thread in &self.threads {
-                thread.inner.progress.reset();
-            }
-        }
-    }
-
-    impl Drop for ThreadPool {
-        fn drop(&mut self) {
-            // helper は探索中に exit を確認しないため、join の前に探索を止める。
-            self.stop.store(true, Ordering::SeqCst);
+            // No-op: Native builds access workers directly via helper_threads()
         }
     }
 
@@ -264,8 +177,6 @@ mod imp {
         ponderhit: Arc<AtomicBool>,
         increase_depth_shared: Arc<AtomicBool>,
         progress: Arc<SearchProgress>,
-        #[cfg(target_os = "linux")]
-        pin_error: Mutex<Option<String>>,
     }
 
     struct ThreadState {
@@ -277,9 +188,6 @@ mod imp {
     enum ThreadTask {
         Search(Box<SearchTask>),
         ClearHistories,
-        /// このスレッドを与えた CPU 集合に固定する。
-        #[cfg(target_os = "linux")]
-        Pin(Vec<usize>),
     }
 
     struct SearchTask {
@@ -301,40 +209,21 @@ mod imp {
         handle: Option<JoinHandle<()>>,
     }
 
-    /// helper の SearchWorker を作るための引数。
-    struct WorkerArgs {
-        id: usize,
-        tt: Arc<TranspositionTable>,
-        eval_hash: Arc<EvalHash>,
-        shared_histories: Arc<SharedHistories>,
-        max_moves_to_draw: i32,
-        search_tune_params: SearchTuneParams,
-    }
-
-    impl WorkerArgs {
-        fn build(self) -> Box<SearchWorker> {
-            SearchWorker::new_with_shared(
-                self.tt,
-                self.eval_hash,
-                self.shared_histories,
-                self.max_moves_to_draw,
-                self.id,
-                self.search_tune_params,
-            )
-        }
-    }
-
-    /// main と共有する停止・ponderhit・深さ延長のフラグ。
-    struct Signals {
-        stop: Arc<AtomicBool>,
-        ponderhit: Arc<AtomicBool>,
-        increase_depth_shared: Arc<AtomicBool>,
-    }
-
-    impl ThreadInner {
-        fn new(worker: Box<SearchWorker>, signals: Signals) -> Arc<Self> {
+    impl Thread {
+        fn new(
+            id: usize,
+            tt: Arc<TranspositionTable>,
+            eval_hash: Arc<EvalHash>,
+            stop: Arc<AtomicBool>,
+            ponderhit: Arc<AtomicBool>,
+            increase_depth_shared: Arc<AtomicBool>,
+            max_moves_to_draw: i32,
+            search_tune_params: SearchTuneParams,
+        ) -> Self {
+            let worker =
+                SearchWorker::new(tt, eval_hash, max_moves_to_draw, id, search_tune_params);
             let progress = Arc::new(SearchProgress::new());
-            Arc::new(Self {
+            let inner = Arc::new(ThreadInner {
                 worker: Mutex::new(worker),
                 state: Mutex::new(ThreadState {
                     searching: true,
@@ -342,20 +231,11 @@ mod imp {
                     task: None,
                 }),
                 condvar: Condvar::new(),
-                stop: signals.stop,
-                ponderhit: signals.ponderhit,
-                increase_depth_shared: signals.increase_depth_shared,
+                stop,
+                ponderhit,
+                increase_depth_shared,
                 progress,
-                #[cfg(target_os = "linux")]
-                pin_error: Mutex::new(None),
-            })
-        }
-    }
-
-    impl Thread {
-        fn new(worker: WorkerArgs, signals: Signals) -> Self {
-            let id = worker.id;
-            let inner = ThreadInner::new(worker.build(), signals);
+            });
             let inner_clone = Arc::clone(&inner);
             let handle = std::thread::Builder::new()
                 .stack_size(SEARCH_STACK_SIZE)
@@ -371,62 +251,16 @@ mod imp {
             thread
         }
 
-        /// `cpus` に固定してから、そのスレッドの上で SearchWorker を確保・初期化する。
-        /// 履歴などスレッドごとの表は first-touch で固定先の node のメモリに載る。
-        #[cfg(target_os = "linux")]
-        fn new_pinned(worker: WorkerArgs, signals: Signals, cpus: Vec<usize>) -> Self {
-            let id = worker.id;
-            let (worker_tx, worker_rx) = std::sync::mpsc::channel();
-            let (inner_tx, inner_rx) = std::sync::mpsc::channel::<Arc<ThreadInner>>();
-            let handle = std::thread::Builder::new()
-                .stack_size(SEARCH_STACK_SIZE)
-                .spawn(move || {
-                    let pin_error = pin_current_thread(&cpus).err();
-                    if worker_tx.send((worker.build(), pin_error)).is_err() {
-                        return;
-                    }
-                    if let Ok(inner) = inner_rx.recv() {
-                        idle_loop(inner);
-                    }
-                })
-                .expect("failed to spawn search helper thread");
-            let (worker, pin_error) = worker_rx
-                .recv()
-                .expect("search helper thread exited before creating its worker");
-            let inner = ThreadInner::new(worker, signals);
-            *inner.pin_error.lock().unwrap() = pin_error;
-            inner_tx
-                .send(Arc::clone(&inner))
-                .expect("search helper thread exited before starting its idle loop");
-
-            let thread = Self {
-                id,
-                inner,
-                handle: Some(handle),
-            };
-            thread.wait_for_search_finished();
-            thread
-        }
-
         pub fn id(&self) -> usize {
             self.id
         }
 
         fn start_searching(&self, task: SearchTask) {
-            self.wait_for_search_finished();
-            self.inner.progress.reset();
             self.schedule_task(ThreadTask::Search(Box::new(task)));
         }
 
         fn clear_worker(&self) {
             self.schedule_task(ThreadTask::ClearHistories);
-        }
-
-        /// 固定し直しはそのスレッド自身が行う必要があるので task として渡し、終わるまで待つ。
-        #[cfg(target_os = "linux")]
-        fn pin_to(&self, cpus: Vec<usize>) {
-            self.schedule_task(ThreadTask::Pin(cpus));
-            self.wait_for_search_finished();
         }
 
         fn schedule_task(&self, task: ThreadTask) {
@@ -458,19 +292,8 @@ mod imp {
             self.inner.progress.nodes()
         }
 
-        /// 探索開始からの最善手変更回数の累計を取得する。
         pub fn best_move_changes(&self) -> f64 {
             self.inner.progress.best_move_changes()
-        }
-
-        /// main が前回の回収以降の変更回数を取得する。
-        pub(crate) fn take_best_move_changes(&self) -> f64 {
-            self.inner.progress.take_best_move_changes()
-        }
-
-        #[cfg(test)]
-        pub(crate) fn progress_for_test(&self) -> Arc<SearchProgress> {
-            Arc::clone(&self.inner.progress)
         }
     }
 
@@ -509,13 +332,14 @@ mod imp {
             match task {
                 Some(ThreadTask::Search(task)) => {
                     let task = *task;
+                    inner.progress.reset();
                     let mut worker = inner.worker.lock().unwrap();
                     worker.max_moves_to_draw = task.max_moves_to_draw;
                     worker.search_tune_params = task.search_tune_params;
                     worker.draw_value_black = task.draw_value_black;
                     worker.draw_value_white = task.draw_value_white;
                     worker.entering_king_rule = task.entering_king_rule;
-                    worker.prepare_search(&task.limits);
+                    worker.prepare_search();
 
                     let mut pos = task.pos;
                     let mut time_manager =
@@ -544,10 +368,6 @@ mod imp {
                     let mut worker = inner.worker.lock().unwrap();
                     worker.clear();
                 }
-                #[cfg(target_os = "linux")]
-                Some(ThreadTask::Pin(cpus)) => {
-                    *inner.pin_error.lock().unwrap() = pin_current_thread(&cpus).err();
-                }
                 None => {}
             }
         }
@@ -574,7 +394,7 @@ mod imp {
     use crate::tt::TranspositionTable;
     use crate::types::Depth;
 
-    use crate::search::{LimitsType, SearchTuneParams, SharedHistories, TimeOptions};
+    use crate::search::{LimitsType, SearchTuneParams, TimeOptions};
 
     /// Stub ThreadPool for single-threaded Wasm builds.
     /// All methods are no-ops since there are no helper threads.
@@ -584,15 +404,10 @@ mod imp {
     }
 
     impl ThreadPool {
-        pub(crate) fn completed_depths(&self) -> Vec<Depth> {
-            Vec::new()
-        }
-
         pub fn new(
             _num_threads: usize,
             _tt: Arc<TranspositionTable>,
             _eval_hash: Arc<EvalHash>,
-            _shared_histories: Arc<SharedHistories>,
             stop: Arc<AtomicBool>,
             ponderhit: Arc<AtomicBool>,
             _increase_depth_shared: Arc<AtomicBool>,
@@ -611,7 +426,6 @@ mod imp {
             _num_threads: usize,
             _tt: Arc<TranspositionTable>,
             _eval_hash: Arc<EvalHash>,
-            _shared_histories: Arc<SharedHistories>,
             _max_moves_to_draw: i32,
             _search_tune_params: SearchTuneParams,
         ) {
@@ -744,18 +558,25 @@ mod imp {
 // - Acquire on load: Ensures all writes from helpers are visible after loop exits
 #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
 mod imp {
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    use rayon::prelude::*;
 
     use crate::eval::EvalHash;
     use crate::position::Position;
     use crate::tt::TranspositionTable;
-    use crate::types::{Bound, Depth, Move, Value};
+    use crate::types::{Depth, Move, Value};
 
     use crate::search::engine::search_helper;
-    use crate::search::{
-        LimitsType, SearchTuneParams, SearchWorker, SharedHistories, TimeManagement, TimeOptions,
-    };
+    use crate::search::{LimitsType, SearchTuneParams, SearchWorker, TimeManagement, TimeOptions};
+
+    // Thread-local storage for SearchWorker instances.
+    // Each Rayon worker thread gets its own SearchWorker on first use.
+    thread_local! {
+        static THREAD_WORKER: RefCell<Option<Box<SearchWorker>>> = const { RefCell::new(None) };
+    }
 
     /// Helper thread の探索結果を格納する構造体。
     /// 各 helper が探索完了時にこの情報を shared vector に push する。
@@ -773,8 +594,6 @@ mod imp {
         pub best_move: Move,
         /// 最善手のスコア
         pub best_score: Value,
-        /// `best_score` の種類。中断した反復の結果は下界・上界になることがある
-        pub best_bound: Bound,
         /// Top N moves for skill-based move selection.
         /// Contains (move, score) pairs from root_moves, used by skill.pick_best().
         /// Typically contains up to 4 moves (multi_pv when skill is enabled).
@@ -785,53 +604,41 @@ mod imp {
     /// 各イテレーション完了時に更新され、info出力や時間管理で参照される。
     pub struct HelperProgress {
         nodes: AtomicU64,
-        best_move_changes: crate::search::progress::BestMoveChanges,
-    }
-
-    impl Default for HelperProgress {
-        fn default() -> Self {
-            Self::new()
-        }
+        best_move_changes_bits: AtomicU64,
     }
 
     impl HelperProgress {
         pub fn new() -> Self {
             Self {
                 nodes: AtomicU64::new(0),
-                best_move_changes: crate::search::progress::BestMoveChanges::new(),
+                best_move_changes_bits: AtomicU64::new(0.0f64.to_bits()),
             }
         }
 
         pub fn reset(&self) {
             self.nodes.store(0, Ordering::Relaxed);
-            self.best_move_changes.reset();
+            self.best_move_changes_bits.store(0.0f64.to_bits(), Ordering::Relaxed);
         }
 
         pub fn update(&self, nodes: u64, best_move_changes: f64) {
             self.nodes.store(nodes, Ordering::Relaxed);
-            self.best_move_changes.publish(best_move_changes);
+            self.best_move_changes_bits
+                .store(best_move_changes.to_bits(), Ordering::Relaxed);
         }
 
         pub fn nodes(&self) -> u64 {
             self.nodes.load(Ordering::Relaxed)
         }
 
-        /// 探索開始からの最善手変更回数の累計を取得する。
         pub fn best_move_changes(&self) -> f64 {
-            self.best_move_changes.cumulative()
-        }
-
-        fn take_best_move_changes(&self) -> f64 {
-            self.best_move_changes.take_delta()
+            f64::from_bits(self.best_move_changes_bits.load(Ordering::Relaxed))
         }
     }
 
     pub struct ThreadPool {
-        workers: Vec<Arc<Mutex<Option<Box<SearchWorker>>>>>,
         num_threads: usize,
         tt: Arc<TranspositionTable>,
         eval_hash: Arc<EvalHash>,
-        shared_histories: Arc<SharedHistories>,
         stop: Arc<AtomicBool>,
         ponderhit: Arc<AtomicBool>,
         increase_depth_shared: Arc<AtomicBool>,
@@ -849,23 +656,10 @@ mod imp {
     }
 
     impl ThreadPool {
-        pub(crate) fn completed_depths(&self) -> Vec<Depth> {
-            self.workers
-                .iter()
-                .map(|slot| {
-                    slot.lock()
-                        .expect("worker slot poisoned")
-                        .as_ref()
-                        .map_or(0, |worker| worker.state.completed_depth)
-                })
-                .collect()
-        }
-
         pub fn new(
             num_threads: usize,
             tt: Arc<TranspositionTable>,
             eval_hash: Arc<EvalHash>,
-            shared_histories: Arc<SharedHistories>,
             stop: Arc<AtomicBool>,
             ponderhit: Arc<AtomicBool>,
             increase_depth_shared: Arc<AtomicBool>,
@@ -877,11 +671,9 @@ mod imp {
             let helper_progress =
                 (0..helper_count).map(|_| Arc::new(HelperProgress::new())).collect();
             Self {
-                workers: (0..helper_count).map(|_| Arc::new(Mutex::new(None))).collect(),
                 num_threads,
                 tt,
                 eval_hash,
-                shared_histories,
                 stop,
                 ponderhit,
                 increase_depth_shared,
@@ -898,15 +690,11 @@ mod imp {
             num_threads: usize,
             tt: Arc<TranspositionTable>,
             eval_hash: Arc<EvalHash>,
-            shared_histories: Arc<SharedHistories>,
             max_moves_to_draw: i32,
             search_tune_params: SearchTuneParams,
         ) {
-            self.wait_for_search_finished();
             let num_threads = num_threads.max(1);
             let helper_count = num_threads.saturating_sub(1);
-            self.workers.resize_with(helper_count, || Arc::new(Mutex::new(None)));
-            self.workers.truncate(helper_count);
             // Resize helper_progress to match new thread count
             self.helper_progress
                 .resize_with(helper_count, || Arc::new(HelperProgress::new()));
@@ -914,13 +702,6 @@ mod imp {
             self.num_threads = num_threads;
             self.tt = tt;
             self.eval_hash = eval_hash;
-            // 残っている worker の参照も差し替え、古い表を次の go を待たずに解放する。
-            for slot in &self.workers {
-                if let Some(worker) = slot.lock().expect("worker slot poisoned").as_mut() {
-                    worker.shared_histories = Arc::clone(&shared_histories);
-                }
-            }
-            self.shared_histories = shared_histories;
             self.max_moves_to_draw = max_moves_to_draw;
             self.search_tune_params = search_tune_params;
         }
@@ -988,7 +769,6 @@ mod imp {
                 let increase_depth = Arc::clone(&self.increase_depth_shared);
                 let tt = Arc::clone(&self.tt);
                 let eval_hash = Arc::clone(&self.eval_hash);
-                let shared_histories = Arc::clone(&self.shared_histories);
                 let pending = Arc::clone(&self.pending_tasks);
                 let helper_results = Arc::clone(&self.helper_results);
                 // thread_id is 1-indexed, so subtract 1 to get the progress index
@@ -996,92 +776,94 @@ mod imp {
                 let pos_clone = pos.clone();
                 let limits_clone = limits.clone();
 
-                let slot = Arc::clone(&self.workers[thread_id - 1]);
-                // ロックは所有権の受け渡し時のみ。探索中はタスクが Box を排他的に所有する。
-                let mut worker =
-                    slot.lock().expect("worker slot poisoned").take().unwrap_or_else(|| {
-                        SearchWorker::new_with_shared(
-                            Arc::clone(&tt),
-                            Arc::clone(&eval_hash),
-                            Arc::clone(&shared_histories),
-                            max_moves_to_draw,
-                            thread_id,
-                            search_tune_params,
-                        )
-                    });
                 rayon::spawn_fifo(move || {
-                    // 論理 ID の slot から受け取った worker に実行設定を適用する。
-                    worker.thread_id = thread_id;
-                    worker.tt = Arc::clone(&tt);
-                    worker.eval_hash = Arc::clone(&eval_hash);
-                    worker.shared_histories = shared_histories;
-                    worker.max_moves_to_draw = max_moves_to_draw;
-                    worker.draw_value_black = draw_value_black;
-                    worker.draw_value_white = draw_value_white;
-                    worker.entering_king_rule = entering_king_rule;
-                    worker.update_search_tune_params(search_tune_params);
-                    worker.prepare_search(&limits_clone);
+                    THREAD_WORKER.with(|cell| {
+                        let mut worker_opt = cell.borrow_mut();
 
-                    let mut search_pos = pos_clone;
-                    let mut time_manager =
-                        TimeManagement::new(Arc::clone(&stop), Arc::clone(&ponderhit));
-                    time_manager.set_options(&time_options);
-                    time_manager.init(
-                        &limits_clone,
-                        search_pos.side_to_move(),
-                        search_pos.game_ply(),
-                        max_moves_to_draw,
-                    );
-
-                    search_helper(
-                        &mut worker,
-                        &mut search_pos,
-                        &limits_clone,
-                        &mut time_manager,
-                        max_depth,
-                        skill_enabled,
-                        Some(&*progress),
-                        &increase_depth,
-                    );
-
-                    // Collect result after search completes
-                    // Extract top N moves for skill-based selection (typically 4 when skill enabled)
-                    let top_moves: Vec<(Move, Value)> = worker
-                        .state
-                        .root_moves
-                        .iter()
-                        .take(4) // multi_pv is at least 4 when skill is enabled
-                        .map(|rm| (rm.mv(), rm.score))
-                        .collect();
-                    let result = HelperResult {
-                        thread_id,
-                        nodes: worker.state.nodes,
-                        best_move_changes: worker.state.best_move_changes,
-                        completed_depth: worker.state.completed_depth,
-                        best_move: worker.state.best_move,
-                        best_score: worker
-                            .state
-                            .root_moves
-                            .get(0)
-                            .map(|rm| rm.score)
-                            .unwrap_or(Value::ZERO),
-                        best_bound: worker
-                            .state
-                            .root_moves
-                            .get(0)
-                            .map_or(Bound::Exact, |rm| rm.score_bound()),
-                        top_moves,
-                    };
-                    match helper_results.lock() {
-                        Ok(mut results) => results.push(result),
-                        Err(e) => {
-                            // Mutex poisoned - indicates a panic occurred in another thread.
-                            // This is a serious bug that should be investigated.
-                            #[cfg(debug_assertions)]
-                            eprintln!("Warning: Failed to lock helper_results for pushing: {e}");
+                        // Initialize SearchWorker on first use
+                        if worker_opt.is_none() {
+                            *worker_opt = Some(SearchWorker::new(
+                                Arc::clone(&tt),
+                                Arc::clone(&eval_hash),
+                                max_moves_to_draw,
+                                thread_id,
+                                search_tune_params,
+                            ));
                         }
-                    }
-                    *slot.lock().expect("worker slot poisoned") = Some(worker);
+
+                        let worker = worker_opt.as_mut().unwrap();
+
+                        // Update worker state for this search.
+                        // thread_id must be updated because Rayon may assign
+                        // this task to a different pool thread than last time,
+                        // and the thread_local worker retains the old thread_id.
+                        worker.thread_id = thread_id;
+                        worker.tt = Arc::clone(&tt);
+                        worker.eval_hash = Arc::clone(&eval_hash);
+                        worker.max_moves_to_draw = max_moves_to_draw;
+                        worker.draw_value_black = draw_value_black;
+                        worker.draw_value_white = draw_value_white;
+                        worker.entering_king_rule = entering_king_rule;
+                        worker.search_tune_params = search_tune_params;
+                        worker.prepare_search();
+
+                        let mut search_pos = pos_clone;
+                        let mut time_manager =
+                            TimeManagement::new(Arc::clone(&stop), Arc::clone(&ponderhit));
+                        time_manager.set_options(&time_options);
+                        time_manager.init(
+                            &limits_clone,
+                            search_pos.side_to_move(),
+                            search_pos.game_ply(),
+                            max_moves_to_draw,
+                        );
+
+                        search_helper(
+                            worker,
+                            &mut search_pos,
+                            &limits_clone,
+                            &mut time_manager,
+                            max_depth,
+                            skill_enabled,
+                            Some(&*progress),
+                            &increase_depth,
+                        );
+
+                        // Collect result after search completes
+                        // Extract top N moves for skill-based selection (typically 4 when skill enabled)
+                        let top_moves: Vec<(Move, Value)> = worker
+                            .state
+                            .root_moves
+                            .iter()
+                            .take(4) // multi_pv is at least 4 when skill is enabled
+                            .map(|rm| (rm.mv(), rm.score))
+                            .collect();
+                        let result = HelperResult {
+                            thread_id,
+                            nodes: worker.state.nodes,
+                            best_move_changes: worker.state.best_move_changes,
+                            completed_depth: worker.state.completed_depth,
+                            best_move: worker.state.best_move,
+                            best_score: worker
+                                .state
+                                .root_moves
+                                .get(0)
+                                .map(|rm| rm.score)
+                                .unwrap_or(Value::ZERO),
+                            top_moves,
+                        };
+                        match helper_results.lock() {
+                            Ok(mut results) => results.push(result),
+                            Err(e) => {
+                                // Mutex poisoned - indicates a panic occurred in another thread.
+                                // This is a serious bug that should be investigated.
+                                #[cfg(debug_assertions)]
+                                eprintln!(
+                                    "Warning: Failed to lock helper_results for pushing: {e}"
+                                );
+                            }
+                        }
+                    });
 
                     // Release ordering ensures that all writes made by this helper thread
                     // (TT updates, helper_results.push(), etc.) are visible to the main
@@ -1123,13 +905,20 @@ mod imp {
         }
 
         pub fn clear_histories(&self) {
-            self.wait_for_search_finished();
-            for slot in &self.workers {
-                if let Some(worker) = slot.lock().expect("worker slot poisoned").as_mut() {
-                    worker.search_tune_params = self.search_tune_params;
-                    worker.clear();
-                }
+            let helper_count = self.num_threads.saturating_sub(1);
+            if helper_count == 0 {
+                return;
             }
+
+            // clear_histories can use synchronous parallel iteration
+            // since it's called outside of search
+            (1..=helper_count).into_par_iter().for_each(|_| {
+                THREAD_WORKER.with(|cell| {
+                    if let Some(worker) = cell.borrow_mut().as_mut() {
+                        worker.clear();
+                    }
+                });
+            });
         }
 
         pub fn update_tt(&mut self, tt: Arc<TranspositionTable>) {
@@ -1146,7 +935,6 @@ mod imp {
             self.eval_hash = eval_hash;
         }
 
-        /// 次の helper 探索に使うパラメータを設定する。
         pub fn update_search_tune_params(&mut self, search_tune_params: SearchTuneParams) {
             self.search_tune_params = search_tune_params;
         }
@@ -1168,10 +956,6 @@ mod imp {
         /// This should be called at the start of each search to prevent stale results
         /// from being used when switching from multi-threaded to single-threaded mode.
         pub fn clear_helper_results(&self) {
-            self.wait_for_search_finished();
-            for progress in &self.helper_progress {
-                progress.reset();
-            }
             match self.helper_results.lock() {
                 Ok(mut results) => results.clear(),
                 Err(e) => {
@@ -1187,14 +971,10 @@ mod imp {
             self.helper_progress.iter().fold(0u64, |acc, p| acc.saturating_add(p.nodes()))
         }
 
-        /// 各 helper の探索開始からの最善手変更回数の累計を取得する。
+        /// Get best_move_changes values from all helper threads (realtime).
+        /// Returns a vector of (nodes, best_move_changes) for each helper.
         pub fn helper_best_move_changes(&self) -> Vec<f64> {
             self.helper_progress.iter().map(|p| p.best_move_changes()).collect()
-        }
-
-        /// main が各 helper の前回の回収以降の変更回数を取得する。
-        pub(crate) fn take_helper_best_move_changes(&self) -> Vec<f64> {
-            self.helper_progress.iter().map(|p| p.take_best_move_changes()).collect()
         }
     }
 

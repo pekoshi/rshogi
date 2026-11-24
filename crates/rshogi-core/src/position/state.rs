@@ -67,6 +67,8 @@ pub(crate) fn check_sq_index(pt: PieceType) -> Option<usize> {
 #[derive(Clone)]
 pub struct StateInfo {
     // === do_move時にコピーされる部分 ===
+    /// 駒割ハッシュ
+    pub material_key: u64,
     /// 歩のハッシュ（打ち歩詰め判定用）
     pub pawn_key: u64,
     /// 小駒（香・桂・銀・金・その成り駒）のハッシュ
@@ -77,6 +79,8 @@ pub struct StateInfo {
     pub plies_from_null: i32,
     /// 連続王手カウンタ [Color]
     pub continuous_check: [i32; Color::NUM],
+    /// ゲーム開始からの総手数（320手ルール用）
+    pub game_ply: u16,
     /// パス権残数（パック形式）
     /// 上位4bit: 先手のパス権 (0-15)
     /// 下位4bit: 後手のパス権 (0-15)
@@ -88,8 +92,8 @@ pub struct StateInfo {
     pub board_key: u64,
     /// 手駒ハッシュ
     pub hand_key: u64,
-    /// この局面の手番側の手駒スナップショット（千日手判定用）
-    pub hand_snapshot: Hand,
+    /// 手駒スナップショット（千日手判定用）
+    pub hand_snapshot: [Hand; Color::NUM],
     /// 前の局面のインデックス（StateInfoプール内）
     pub previous: usize,
     /// 王手している駒
@@ -125,15 +129,17 @@ impl StateInfo {
     /// 空の状態を生成
     pub fn new() -> Self {
         StateInfo {
+            material_key: 0,
             pawn_key: zobrist_no_pawns(),
             minor_piece_key: 0,
             non_pawn_key: [0; Color::NUM],
             plies_from_null: 0,
             continuous_check: [0; Color::NUM],
+            game_ply: 0,
             pass_rights: 0, // パス権なし＝通常将棋
             board_key: 0,
             hand_key: 0,
-            hand_snapshot: Hand::EMPTY,
+            hand_snapshot: [Hand::EMPTY; Color::NUM],
             previous: Self::NO_PREVIOUS,
             checkers: Bitboard::EMPTY,
             blockers_for_king: [Bitboard::EMPTY; Color::NUM],
@@ -199,11 +205,13 @@ impl StateInfo {
     /// ここでは初期化しない。do_moveの主なコストはBitboard/ハッシュ更新のみになる。
     pub fn partial_clone(&self) -> Self {
         StateInfo {
+            material_key: self.material_key,
             pawn_key: self.pawn_key,
             minor_piece_key: self.minor_piece_key,
             non_pawn_key: self.non_pawn_key,
             plies_from_null: self.plies_from_null,
             continuous_check: self.continuous_check,
+            game_ply: self.game_ply,
             pass_rights: self.pass_rights, // パス権をコピー
             // 以下は再計算される
             board_key: self.board_key,
@@ -258,12 +266,14 @@ mod tests {
     #[test]
     fn test_state_info_partial_clone() {
         let mut state = StateInfo::new();
+        state.material_key = 100;
         state.plies_from_null = 5;
         state.continuous_check = [3, 2];
         state.minor_piece_key = 42;
         state.non_pawn_key = [7, 11];
 
         let cloned = state.partial_clone();
+        assert_eq!(cloned.material_key, 100);
         assert_eq!(cloned.plies_from_null, 5);
         assert_eq!(cloned.continuous_check, [3, 2]);
         assert_eq!(cloned.minor_piece_key, 42);

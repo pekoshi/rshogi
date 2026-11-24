@@ -9,8 +9,7 @@
 //! ([`crate::matching::league::League::confirm_match`]) が担う。
 
 use crate::matching::league::{MatchedPair, PairingCandidate};
-use crate::types::{Color, PlayerName};
-use rand::Rng;
+use crate::types::Color;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -169,74 +168,6 @@ impl LeastDiffPairingStrategy {
     }
 }
 
-/// 1 ペア分の配色決定ロジック。private match dispatch 等の **shuffling を伴わない
-/// 経路** から呼ぶ用途で公開する。
-///
-/// 双方が `Some` で相補的 → そのまま割当。片方のみ `Some` → そちらの希望を尊重して
-/// もう片方は反対色。双方 `None` → `rng.random::<bool>()` で乱択。
-/// 双方が同色 (`(Black, Black)` / `(White, White)`) → `None` (色不適合、上位層が
-/// CHALLENGE 受理時に弾く想定だが防御的に Option を返す)。
-///
-/// # `try_pair_with_cost` と統合しない理由
-///
-/// 既存 [`try_pair_with_cost`] は同形の `match (a_color, b_color)` 表を持つが、
-/// `(None, None)` ケースの挙動が異なる:
-///
-/// - `try_pair_with_cost`: 入力順 `(a, b)` を **deterministic** に Black/White に
-///   割当てる。ランダム性は `LeastDiffPairingStrategy::try_pair` が外側で行う
-///   `indices.shuffle(&mut rng)` (shuffle ベース) で担保される。
-/// - `resolve_color_for_pair`: 入力順がそのままなら配色も固定になるので、本関数
-///   内部で `rng.random::<bool>()` を引いて乱択する。private match dispatch は
-///   shuffle 経路を持たないため。
-///
-/// 以上の挙動差を共通 helper に吸収しようとすると引数で動作モードを切り替える
-/// 設計になりコストが先に立つため、`(None, None)` の扱いだけが違う 2 関数として
-/// 並置する。
-pub fn resolve_color_for_pair<R: Rng>(
-    a_name: PlayerName,
-    a_color: Option<Color>,
-    b_name: PlayerName,
-    b_color: Option<Color>,
-    rng: &mut R,
-) -> Option<MatchedPair> {
-    match (a_color, b_color) {
-        (Some(Color::Black), Some(Color::White)) | (Some(Color::Black), None) => {
-            Some(MatchedPair {
-                black: a_name,
-                white: b_name,
-            })
-        }
-        (Some(Color::White), Some(Color::Black)) | (Some(Color::White), None) => {
-            Some(MatchedPair {
-                black: b_name,
-                white: a_name,
-            })
-        }
-        (None, Some(Color::Black)) => Some(MatchedPair {
-            black: b_name,
-            white: a_name,
-        }),
-        (None, Some(Color::White)) => Some(MatchedPair {
-            black: a_name,
-            white: b_name,
-        }),
-        (None, None) => {
-            if rng.random::<bool>() {
-                Some(MatchedPair {
-                    black: a_name,
-                    white: b_name,
-                })
-            } else {
-                Some(MatchedPair {
-                    black: b_name,
-                    white: a_name,
-                })
-            }
-        }
-        (Some(Color::Black), Some(Color::Black)) | (Some(Color::White), Some(Color::White)) => None,
-    }
-}
-
 /// 候補ペア (a, b) のコストを計算する。`None` を返した場合は color 不適合で、
 /// このペアは本 trial では成立せずスキップ（trial 全体は破棄しない）。
 /// `Some(...)` の中身は `(black, white, cost)`。
@@ -391,6 +322,23 @@ mod tests {
         assert!(pairs.is_empty());
     }
 
+    #[test]
+    fn strategy_name_is_stable() {
+        assert_eq!(DirectMatchStrategy::new().name(), "direct");
+    }
+
+    /// 戦略は trait オブジェクトとしても扱える（差し替え可能性の確認）。
+    #[test]
+    fn strategy_is_usable_via_trait_object() {
+        let s: Box<dyn PairingLogic> = Box::new(DirectMatchStrategy::new());
+        assert_eq!(s.name(), "direct");
+        let pairs = s.try_pair(&[
+            cand("alice", Some(Color::Black)),
+            cand("bob", Some(Color::White)),
+        ]);
+        assert_eq!(pairs.len(), 1);
+    }
+
     fn rated_cand(
         name: &str,
         color: Option<Color>,
@@ -503,28 +451,16 @@ mod tests {
     /// LeastDiff: rate 未指定（`None`）は既定 1500 として扱う。
     #[test]
     fn least_diff_treats_missing_rate_as_default_1500() {
-        let mut missing = rated_cand("a", None, 1500, vec![]);
-        missing.rate = None;
-        let candidates = [
-            missing,
-            rated_cand("b", None, 1501, vec![]),
-            rated_cand("c", None, 1000, vec![]),
-            rated_cand("d", None, 1001, vec![]),
-        ];
-        let pairs = LeastDiffPairingStrategy::new()
-            .with_seed(7)
-            .with_max_trials(300)
-            .try_pair(&candidates);
-        let mut actual: Vec<_> = pairs
-            .iter()
-            .map(|pair| {
-                let mut names = [pair.black.as_str(), pair.white.as_str()];
-                names.sort_unstable();
-                names
-            })
-            .collect();
-        actual.sort_unstable();
-        assert_eq!(actual, [["a", "b"], ["c", "d"]]);
+        // alice rate=None (defaults to 1500), bob rate=Some(2000) →
+        // diff² = 500² = 250000
+        let candidates = vec![rated_cand("alice", None, 1500, vec![]), {
+            let mut c = rated_cand("bob", None, 2000, vec![]);
+            c.rate = Some(2000);
+            c
+        }];
+        let s = LeastDiffPairingStrategy::new().with_seed(0).with_max_trials(10);
+        let pairs = s.try_pair(&candidates);
+        assert_eq!(pairs.len(), 1);
     }
 
     /// LeastDiff: 色希望が同一の 2 名しかいない場合（trial discard 累積）→
@@ -557,6 +493,13 @@ mod tests {
         assert_eq!(pairs.len(), 1, "color 偏りでも成立可能な 1 ペアは返る");
         assert_eq!(pairs[0].black.as_str(), "alice");
         assert_eq!(pairs[0].white.as_str(), "dave");
+    }
+
+    /// LeastDiff: 戦略名が `"least_diff"` で安定している契約を固定。
+    /// `build_strategy` 経由の dispatch が依存する。
+    #[test]
+    fn least_diff_strategy_name_is_stable() {
+        assert_eq!(LeastDiffPairingStrategy::new().name(), "least_diff");
     }
 
     /// League → waiting_candidates → PairingLogic → confirm_match の一連の経路。
@@ -592,63 +535,5 @@ mod tests {
                 Some(PlayerStatus::AgreeWaiting { .. })
             ));
         }
-    }
-
-    /// `resolve_color_for_pair`: 双方が `Some` で相補的なら指定通り、片方 `None` なら
-    /// 反対色、双方 `None` なら rng による乱択、双方同色は `None` を返す契約を
-    /// 1 関数で網羅する。
-    #[test]
-    fn resolve_color_for_pair_covers_all_cases() {
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0);
-        let alice = PlayerName::new("alice");
-        let bob = PlayerName::new("bob");
-
-        // 相補的指定
-        let r = resolve_color_for_pair(
-            alice.clone(),
-            Some(Color::Black),
-            bob.clone(),
-            Some(Color::White),
-            &mut rng,
-        )
-        .unwrap();
-        assert_eq!(r.black.as_str(), "alice");
-        assert_eq!(r.white.as_str(), "bob");
-
-        // 片方 None
-        let r =
-            resolve_color_for_pair(alice.clone(), Some(Color::White), bob.clone(), None, &mut rng)
-                .unwrap();
-        assert_eq!(r.black.as_str(), "bob");
-        assert_eq!(r.white.as_str(), "alice");
-
-        let r =
-            resolve_color_for_pair(alice.clone(), None, bob.clone(), Some(Color::Black), &mut rng)
-                .unwrap();
-        assert_eq!(r.black.as_str(), "bob");
-        assert_eq!(r.white.as_str(), "alice");
-
-        // 双方 None: rng による乱択 (シードを固定して経路網羅を検証)。
-        let r = resolve_color_for_pair(alice.clone(), None, bob.clone(), None, &mut rng).unwrap();
-        assert!(
-            (r.black.as_str() == "alice" && r.white.as_str() == "bob")
-                || (r.black.as_str() == "bob" && r.white.as_str() == "alice"),
-        );
-
-        // 同色希望は None
-        assert!(
-            resolve_color_for_pair(
-                alice.clone(),
-                Some(Color::Black),
-                bob.clone(),
-                Some(Color::Black),
-                &mut rng,
-            )
-            .is_none(),
-        );
-        assert!(
-            resolve_color_for_pair(alice, Some(Color::White), bob, Some(Color::White), &mut rng,)
-                .is_none(),
-        );
     }
 }

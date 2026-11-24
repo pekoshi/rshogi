@@ -3,21 +3,13 @@
 use crate::eval::material::compute_material_value;
 use crate::nnue::piece_list::piece_number_base;
 use crate::nnue::{ExtBonaPiece, PieceNumber};
-use crate::types::{Color, File, Hand, Piece, PieceType, Rank, Square};
+use crate::types::{Color, File, Piece, PieceType, Rank, Square};
 
 use super::pos::{Position, is_minor_piece};
-use super::state::StateInfo;
 use super::zobrist::{zobrist_hand, zobrist_no_pawns, zobrist_psq, zobrist_side};
 
 /// 平手初期局面のSFEN
 pub const SFEN_HIRATE: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
-
-/// SFEN・局面 JSON から受け付ける手数の上限 (下限は 0)。
-///
-/// 手数は指し手を実行するたびに 1 増える。上限を `i32` の半分に置くことで、読み込んだ後に
-/// 指し手を積んでも `i32` を越えない (越えるには約 10 億手分の状態スタックが要る)。
-/// 上限の近くから指し進めた局面の `to_sfen()` はこの値を越えることがあり、その出力は読み込めない。
-pub const MAX_GAME_PLY: i32 = i32::MAX / 2;
 
 /// SFENパースエラー
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +20,7 @@ pub enum SfenError {
     SideToMove(String),
     /// 手駒の形式が不正
     Hand(String),
-    /// 手数の形式が不正、または 0..=[`MAX_GAME_PLY`] の外
+    /// 手数の形式が不正
     Ply(String),
 }
 
@@ -38,94 +30,12 @@ impl std::fmt::Display for SfenError {
             SfenError::Board(s) => write!(f, "Invalid board: {s}"),
             SfenError::SideToMove(s) => write!(f, "Invalid side to move: {s}"),
             SfenError::Hand(s) => write!(f, "Invalid hand: {s}"),
-            SfenError::Ply(s) => write!(f, "Invalid ply: {s} (expected 0..={MAX_GAME_PLY})"),
+            SfenError::Ply(s) => write!(f, "Invalid ply: {s}"),
         }
     }
 }
 
 impl std::error::Error for SfenError {}
-
-/// 盤面・手駒・手番・手数とハッシュだけを初期化した、読み取り専用の局面。
-/// 利きの全升集計・NNUE の駒表・駒割は作らない。指し手の実行や評価には
-/// [`Self::into_position`] で完全な [`Position`] に変換してから使う。
-///
-/// ```compile_fail
-/// use rshogi_core::position::{StaticPosition, SFEN_HIRATE};
-/// use rshogi_core::types::Move;
-/// let mut position = StaticPosition::from_sfen(SFEN_HIRATE).unwrap();
-/// position.do_move(Move::NONE, false);
-/// ```
-pub struct StaticPosition {
-    position: Position,
-}
-
-impl StaticPosition {
-    /// SFEN を解析し、通常の局面と同じ駒在庫の検査を行う。手数は 0..=[`MAX_GAME_PLY`] だけを受け付ける。
-    pub fn from_sfen(sfen: &str) -> Result<Self, SfenError> {
-        let mut position = Position::new();
-        position.populate_sfen(sfen)?;
-        Self::from_populated(position)
-    }
-
-    /// 盤面・手駒・手番から作る。手数は 1 とし、駒在庫を検査する。
-    pub fn from_parts(
-        board: &[Piece; Square::NUM],
-        hand: &[Hand; Color::NUM],
-        side_to_move: Color,
-    ) -> Result<Self, SfenError> {
-        let mut position = Position::new();
-        position.populate_parts(board, hand, side_to_move);
-        Self::from_populated(position)
-    }
-
-    fn from_populated(mut position: Position) -> Result<Self, SfenError> {
-        position.validate_piece_inventory()?;
-        position.compute_hash();
-        Ok(Self { position })
-    }
-
-    /// 指定した升の駒。
-    pub fn piece_on(&self, square: Square) -> Piece {
-        self.position.piece_on(square)
-    }
-
-    /// 指定した側の手駒。
-    pub fn hand(&self, color: Color) -> Hand {
-        self.position.hand(color)
-    }
-
-    /// 手番。
-    pub fn side_to_move(&self) -> Color {
-        self.position.side_to_move()
-    }
-
-    /// 玉の位置。玉の無い側では通常の局面と同じ既定の升を返す。
-    pub fn king_square(&self, color: Color) -> Square {
-        self.position.king_square(color)
-    }
-
-    /// 盤面・手駒・手番のハッシュ値。
-    pub fn key(&self) -> u64 {
-        self.position.key()
-    }
-
-    /// 手番の側が王手を受けているか。
-    pub fn in_check(&self) -> bool {
-        let side = self.side_to_move();
-        !self.position.attackers_to_c(self.king_square(side), !side).is_empty()
-    }
-
-    /// 手数を含む正規の SFEN。
-    pub fn to_sfen(&self) -> String {
-        self.position.to_sfen()
-    }
-
-    /// 利き・NNUE の駒表・駒割などを初期化し、指し手の実行や評価に使える局面へ変換する。
-    pub fn into_position(mut self) -> Result<Position, SfenError> {
-        self.position.finalize_after_population()?;
-        Ok(self.position)
-    }
-}
 
 impl Position {
     /// 平手初期局面を設定
@@ -133,13 +43,8 @@ impl Position {
         self.set_sfen(SFEN_HIRATE).unwrap();
     }
 
-    /// SFEN文字列から局面を設定。手数は 0..=[`MAX_GAME_PLY`] だけを受け付ける。
+    /// SFEN文字列から局面を設定
     pub fn set_sfen(&mut self, sfen: &str) -> Result<(), SfenError> {
-        self.populate_sfen(sfen)?;
-        self.finalize_after_population()
-    }
-
-    fn populate_sfen(&mut self, sfen: &str) -> Result<(), SfenError> {
         // 局面をクリア
         *self = Position::new();
 
@@ -168,71 +73,11 @@ impl Position {
 
         // 4. 手数（オプション）
         if parts.len() >= 4 {
-            let ply: i32 = parts[3].parse().map_err(|_| SfenError::Ply(parts[3].to_string()))?;
-            if !(0..=MAX_GAME_PLY).contains(&ply) {
-                return Err(SfenError::Ply(parts[3].to_string()));
-            }
-            self.game_ply = ply;
+            self.game_ply = parts[3].parse().map_err(|_| SfenError::Ply(parts[3].to_string()))?;
         } else {
             self.game_ply = 1;
         }
 
-        Ok(())
-    }
-
-    /// SFEN 文字列を経ずに、盤面・手駒・手番から局面を構築する。
-    ///
-    /// `set_sfen` の文字列パース（`generate_sfen` 由来の `String` 生成や `split` の `Vec` 確保）
-    /// を避けたいホットパス（PSV → 局面の大量変換など）向け。`board` はマス index（0..81、
-    /// `Square` の index と同順）で空マスは `Piece::NONE`、`hand` は `[先手, 後手]`。手数は 1
-    /// に設定する（PSV 変換用途では手数は評価に影響しない）。`set_sfen` と同じ後処理
-    /// （PieceList / ハッシュ / 利き / pin / 王手 / material の再計算と在庫検証）を通すため、
-    /// 得られる局面は同一盤面を `set_sfen` で構築したものと一致する。
-    pub fn set_from_parts(
-        &mut self,
-        board: &[Piece; Square::NUM],
-        hand: &[Hand; Color::NUM],
-        side_to_move: Color,
-    ) -> Result<(), SfenError> {
-        self.populate_parts(board, hand, side_to_move);
-        self.finalize_after_population()
-    }
-
-    fn populate_parts(
-        &mut self,
-        board: &[Piece; Square::NUM],
-        hand: &[Hand; Color::NUM],
-        side_to_move: Color,
-    ) {
-        // 局面を大量に組み直す用途で、状態スタックの領域を確保し直さない
-        let mut state_stack = std::mem::take(&mut self.state_stack);
-        state_stack.clear();
-        state_stack.push(StateInfo::new());
-        *self = Position::with_state_stack(state_stack);
-
-        for (sq_idx, &pc) in board.iter().enumerate() {
-            if pc.is_none() {
-                continue;
-            }
-            // sq_idx は board.iter() の添字で 0..Square::NUM(81) の範囲内。範囲外になるのは
-            // 入力エラーではなく内部不変条件の破壊（ロジックバグ）なので panic させる。
-            let sq = Square::from_u8(sq_idx as u8)
-                .expect("sq_idx は 0..Square::NUM の範囲内であり from_u8 は必ず Some");
-            self.put_piece(pc, sq);
-            if pc.piece_type() == PieceType::King {
-                // put_piece は king_square を更新しないため、parse_board と同様に明示的にセットする。
-                self.king_square[pc.color().index()] = sq;
-            }
-        }
-
-        self.hand = *hand;
-        self.side_to_move = side_to_move;
-        self.game_ply = 1;
-    }
-
-    /// 盤面・手駒・手番を投入済みの状態から、PieceList・ハッシュ・利き・pin・王手・material・
-    /// 千日手判定用の手駒スナップショットを再計算し、駒在庫を検証して局面を確定する（SFEN / parts / JSON 共通の後処理）。
-    pub(super) fn finalize_after_population(&mut self) -> Result<(), SfenError> {
         self.validate_piece_inventory()?;
 
         // PieceList の初期化
@@ -242,7 +87,8 @@ impl Position {
         self.compute_hash();
 
         // pin情報と王手マスの更新
-        self.set_check_info::<false>();
+        self.update_blockers_and_pinners();
+        self.update_check_squares();
 
         // 盤面の利き数を再計算
         self.recompute_board_effects();
@@ -254,10 +100,6 @@ impl Position {
 
         // material_value を再計算
         self.state_mut().material_value = compute_material_value(self);
-
-        // 千日手判定に使う手駒スナップショットを保存（開始局面へ戻る千日手でも手駒を比較できるようにする）
-        let hand_snapshot = self.hand[self.side_to_move.index()];
-        self.state_mut().hand_snapshot = hand_snapshot;
 
         Ok(())
     }
@@ -334,17 +176,11 @@ impl Position {
 
             for c in rank_str.chars() {
                 if c == '+' {
-                    if promoted {
-                        return Err(SfenError::Board("Repeated promotion marker".to_string()));
-                    }
                     promoted = true;
                     continue;
                 }
 
                 if let Some(digit) = c.to_digit(10) {
-                    if promoted || digit == 0 {
-                        return Err(SfenError::Board(format!("Invalid empty-square count: {c}")));
-                    }
                     file_idx -= digit as i32;
                     if file_idx < -1 {
                         return Err(SfenError::Board(format!(
@@ -374,9 +210,6 @@ impl Position {
                 }
             }
 
-            if promoted {
-                return Err(SfenError::Board("Promotion marker without a piece".to_string()));
-            }
             if file_idx != -1 {
                 return Err(SfenError::Board(format!(
                     "Rank {rank_idx} has wrong number of squares"
@@ -396,9 +229,6 @@ impl Position {
         let mut count = 0u32;
         for c in hand_str.chars() {
             if let Some(digit) = c.to_digit(10) {
-                if count == 0 && digit == 0 {
-                    return Err(SfenError::Hand("Hand count must be positive".to_string()));
-                }
                 count =
                     count.checked_mul(10).and_then(|v| v.checked_add(digit)).ok_or_else(|| {
                         SfenError::Hand("Hand count overflow while parsing digits".to_string())
@@ -876,29 +706,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sfen_rejects_misplaced_promotion_markers() {
-        for rank in ["9+", "++P8", "+1P7", "+9", "0P8"] {
-            let sfen = format!("{rank}/9/9/9/9/9/9/9/9 b - 1");
-            assert!(matches!(Position::new().set_sfen(&sfen), Err(SfenError::Board(_))));
-            assert!(matches!(StaticPosition::from_sfen(&sfen), Err(SfenError::Board(_))));
-        }
-    }
-
-    #[test]
-    fn test_sfen_rejects_zero_hand_counts() {
-        for hand in ["0", "0P", "00P", "01P", "P0", "P0p"] {
-            let sfen = format!("9/9/9/9/9/9/9/9/9 b {hand} 1");
-            assert!(matches!(Position::new().set_sfen(&sfen), Err(SfenError::Hand(_))));
-            assert!(matches!(StaticPosition::from_sfen(&sfen), Err(SfenError::Hand(_))));
-        }
-        let sfen = "9/9/9/9/9/9/9/9/9 b 10P 1";
-        let mut position = Position::new();
-        position.set_sfen(sfen).unwrap();
-        assert_eq!(position.to_sfen(), sfen);
-        assert_eq!(StaticPosition::from_sfen(sfen).unwrap().to_sfen(), sfen);
-    }
-
-    #[test]
     fn test_sfen_promoted_pieces() {
         let sfen = "4k4/9/9/9/4+P4/9/9/9/4K4 b - 1";
         let mut pos = Position::new();
@@ -925,195 +732,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sfen_ply_range() {
-        let board = SFEN_HIRATE.rsplit_once(' ').unwrap().0;
-        for ply in [0, 1, MAX_GAME_PLY] {
-            let sfen = format!("{board} {ply}");
-            let mut pos = Position::new();
-            pos.set_sfen(&sfen).unwrap();
-            assert_eq!(pos.game_ply(), ply);
-            assert_eq!(StaticPosition::from_sfen(&sfen).unwrap().to_sfen(), sfen);
-        }
-        let above_max = (MAX_GAME_PLY + 1).to_string();
-        for ply in [
-            "-1",
-            above_max.as_str(),
-            "2147483647",
-            "-2147483648",
-            "2147483648",
-        ] {
-            let sfen = format!("{board} {ply}");
-            assert_eq!(Position::new().set_sfen(&sfen), Err(SfenError::Ply(ply.to_string())));
-            assert!(matches!(StaticPosition::from_sfen(&sfen), Err(SfenError::Ply(_))));
-        }
-    }
-
-    #[test]
-    fn test_moves_from_max_game_ply_stay_in_range() {
-        use crate::types::Move;
-        let board = SFEN_HIRATE.rsplit_once(' ').unwrap().0;
-        let mut pos = Position::new();
-        pos.set_sfen(&format!("{board} {MAX_GAME_PLY}")).unwrap();
-        let mv = Move::from_usi_strict("7g7f").unwrap();
-        let gives_check = pos.gives_check(mv);
-        pos.do_move(mv, gives_check);
-        assert_eq!(pos.game_ply(), MAX_GAME_PLY + 1);
-        pos.do_null_move();
-        assert_eq!(pos.game_ply(), MAX_GAME_PLY + 1);
-        pos.undo_null_move();
-        pos.undo_move(mv);
-        assert_eq!(pos.game_ply(), MAX_GAME_PLY);
-    }
-
-    #[test]
     fn test_piece_to_sfen() {
         assert_eq!(piece_to_sfen(Piece::B_PAWN), "P");
         assert_eq!(piece_to_sfen(Piece::W_PAWN), "p");
         assert_eq!(piece_to_sfen(Piece::B_PRO_PAWN), "+P");
         assert_eq!(piece_to_sfen(Piece::W_HORSE), "+b");
-    }
-
-    fn assert_materialized_matches(actual: &Position, expected: &Position, effects: bool) {
-        assert_eq!(actual.to_sfen(), expected.to_sfen());
-        assert_eq!(actual.key(), expected.key());
-        assert_eq!(actual.state().material_value, expected.state().material_value);
-        assert_eq!(actual.state().checkers, expected.state().checkers);
-        assert_eq!(actual.state().blockers_for_king, expected.state().blockers_for_king);
-        assert_eq!(actual.state().pinners, expected.state().pinners);
-        assert_eq!(actual.state().check_squares, expected.state().check_squares);
-        assert_eq!(actual.piece_list().piece_list_fb(), expected.piece_list().piece_list_fb());
-        assert_eq!(actual.piece_list().piece_list_fw(), expected.piece_list().piece_list_fw());
-        if effects {
-            for sq in Square::all() {
-                for c in [Color::Black, Color::White] {
-                    assert_eq!(actual.board_effect(c, sq), expected.board_effect(c, sq));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn static_position_matches_full_position_and_materializes_for_moves() {
-        use crate::movegen::{MoveList, generate_legal_all};
-        let mut played = Position::new();
-        played.set_hirate();
-        for ply in 0..64 {
-            let sfen = played.to_sfen();
-            let light = StaticPosition::from_sfen(&sfen).unwrap();
-            let mut expected = Position::new();
-            expected.set_sfen(&sfen).unwrap();
-            assert_eq!(light.to_sfen(), expected.to_sfen());
-            assert_eq!(light.key(), expected.key());
-            assert_eq!(light.in_check(), expected.in_check());
-            assert_eq!(light.side_to_move(), expected.side_to_move());
-            let board = std::array::from_fn(|i| {
-                let sq = Square::from_u8(i as u8).unwrap();
-                assert_eq!(light.piece_on(sq), expected.piece_on(sq));
-                light.piece_on(sq)
-            });
-            let hands = [light.hand(Color::Black), light.hand(Color::White)];
-            let parts = StaticPosition::from_parts(&board, &hands, light.side_to_move()).unwrap();
-            assert_eq!(parts.key(), light.key());
-            assert_eq!(parts.in_check(), light.in_check());
-            let mut full_parts = Position::new();
-            full_parts.set_from_parts(&board, &hands, light.side_to_move()).unwrap();
-            assert_materialized_matches(&parts.into_position().unwrap(), &full_parts, true);
-            let mut actual = light.into_position().unwrap();
-            assert_materialized_matches(&actual, &expected, true);
-            let mut moves = MoveList::new();
-            generate_legal_all(&expected, &mut moves);
-            if moves.is_empty() {
-                break;
-            }
-            let mv = moves.as_slice()[(ply * 37 + 11) % moves.len()];
-            actual.do_move(mv, actual.gives_check(mv));
-            expected.do_move(mv, expected.gives_check(mv));
-            assert_materialized_matches(&actual, &expected, false);
-            actual.undo_move(mv);
-            expected.undo_move(mv);
-            assert_materialized_matches(&actual, &expected, false);
-            played.do_move(mv, played.gives_check(mv));
-        }
-    }
-
-    #[test]
-    fn static_position_preserves_missing_kings_checks_and_input_errors() {
-        for sfen in [
-            "7k1/9/9/9/9/9/9/9/9 w - 3",
-            "9/9/9/9/9/9/9/9/7K1 b - 1",
-            "9/9/9/9/9/9/9/9/9 b P 1",
-            "4k4/9/9/9/4+R4/9/9/9/4K4 w P 7",
-            "4k4/9/9/9/9/9/9/9/4K4 b 2R2B4G4S4N4L18P 37",
-        ] {
-            let light = StaticPosition::from_sfen(sfen).unwrap();
-            let mut full = Position::new();
-            full.set_sfen(sfen).unwrap();
-            assert_eq!(light.to_sfen(), full.to_sfen());
-            assert_eq!(light.key(), full.key());
-            assert_eq!(light.in_check(), full.in_check());
-            assert_materialized_matches(&light.into_position().unwrap(), &full, true);
-        }
-        for sfen in [
-            "invalid",
-            "9/9/9/9/9/9/9/9/9 x - 1",
-            "9/9/9/9/9/9/9/9/9 b X 1",
-            "9/9/9/9/9/9/9/9/9 b - x",
-            "4k4/9/9/9/9/9/9/9/4K4 b 3R 1",
-        ] {
-            let mut full = Position::new();
-            assert_eq!(StaticPosition::from_sfen(sfen).err(), full.set_sfen(sfen).err());
-        }
-        let mut full = Position::new();
-        full.set_hirate();
-        let mut board = std::array::from_fn(|i| full.piece_on(Square::from_u8(i as u8).unwrap()));
-        board[Square::SQ_55.index()] = Piece::B_PAWN;
-        let hands = [Hand::EMPTY; Color::NUM];
-        assert_eq!(
-            StaticPosition::from_parts(&board, &hands, Color::Black).err(),
-            full.set_from_parts(&board, &hands, Color::Black).err()
-        );
-    }
-
-    #[test]
-    fn test_set_from_parts_matches_set_sfen() {
-        // set_from_parts（String を経由しない構築）が、同一盤面を set_sfen で構築した
-        // 局面と一致することを保証する。手駒・成り駒・駒落ち・後手番を網羅。
-        // 手数は set_from_parts が 1 固定のため、SFEN 側も手数 1 で揃える。
-        let sfens = [
-            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
-            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPP1P/1B5R1/LNSGKGSNL b P 1",
-            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1+B5R1/LNSGKGSNL w - 1",
-            "lnsgkgsn1/1r5b1/ppppppppp/9/9/9/1PPPPPPPP/1B5R1/LNSGKGSN1 b - 1",
-            "9/9/9/9/4k4/9/9/9/4K4 w 2G2g 1",
-            // 手番側（先手）が王手を受けている局面。先手玉 5e を後手飛車 5a が同一筋で王手。
-            // finalize_after_population の王手計算が set_from_parts でも働くことを確認する。
-            "4r4/9/9/9/4K4/9/9/9/4k4 b - 1",
-        ];
-        let mut any_in_check = false;
-        for sfen in sfens {
-            let mut from_sfen = Position::new();
-            from_sfen.set_sfen(sfen).expect("set_sfen should succeed");
-
-            // 構築済み局面から素の要素を取り出す
-            let mut board = [Piece::NONE; Square::NUM];
-            for (i, cell) in board.iter_mut().enumerate() {
-                let sq = Square::from_u8(i as u8).expect("valid square index");
-                *cell = from_sfen.piece_on(sq);
-            }
-            let hand = [from_sfen.hand(Color::Black), from_sfen.hand(Color::White)];
-
-            let mut from_parts = Position::new();
-            from_parts
-                .set_from_parts(&board, &hand, from_sfen.side_to_move())
-                .expect("set_from_parts should succeed");
-
-            assert_eq!(from_parts.to_sfen(), from_sfen.to_sfen(), "sfen mismatch for {sfen}");
-            assert_eq!(from_parts.key(), from_sfen.key(), "key mismatch for {sfen}");
-            assert_eq!(from_parts.in_check(), from_sfen.in_check(), "in_check mismatch for {sfen}");
-
-            any_in_check |= from_sfen.in_check();
-        }
-        // 王手計算の parity を実際に検証するため、in_check() == true の局面を最低 1 件通す。
-        assert!(any_in_check, "王手局面を最低 1 件含むこと");
     }
 }

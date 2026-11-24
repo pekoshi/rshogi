@@ -2,19 +2,18 @@
 //!
 //! 王手や駒取りなど、局面が安定するまで探索を続ける。
 
-#[cfg(feature = "search-pass-rules")]
+#[cfg(not(feature = "search-no-pass-rules"))]
 use crate::eval::evaluate_pass_rights;
+use crate::nnue::get_bucket_index_for_pos;
 use crate::position::Position;
 use crate::types::{Bound, DEPTH_QS, DEPTH_UNSEARCHED, MAX_PLY, Move, Value};
 
 use super::alpha_beta::{SearchContext, SearchState, draw_jitter, to_corrected_static_eval};
 use super::eval_helpers::correction_value;
-#[cfg(feature = "search-stats")]
-use super::movepicker::Stage;
 use super::movepicker::piece_value;
 use super::search_helpers::{
-    check_abort, clear_cont_history_for_null, cont_history_keys, do_move_and_push, nnue_evaluate,
-    nnue_evaluate_cached, nnue_pop, set_cont_history_for_move,
+    check_abort, clear_cont_history_for_null, cont_history_tables, do_move_and_push,
+    nnue_evaluate_with_pv, nnue_pop, set_cont_history_for_move,
 };
 use super::stats::{inc_stat, inc_stat_by_depth};
 #[cfg(feature = "tt-trace")]
@@ -54,15 +53,21 @@ pub(super) fn qsearch<const NT: u8>(
         return if in_check {
             Value::ZERO
         } else {
-            nnue_evaluate(st, pos)
+            // arm 7 Path J: qsearch tail eval も pv_node 状態で gating する。
+            let mut v = nnue_evaluate_with_pv(st, pos, pv_node);
+            // bucket eval scale 適用: mate 域は除外
+            if v != Value::NONE && ctx.bucket_eval_scale != [100i32; 8] {
+                let bucket = get_bucket_index_for_pos(pos);
+                let scale = ctx.bucket_eval_scale[bucket];
+                if scale != 100 {
+                    let raw = v.raw();
+                    if raw.abs() < 30000 {
+                        v = Value::new(raw * scale / 100);
+                    }
+                }
+            }
+            v
         };
-    }
-
-    // 親の PvTable::update はこの ply の行をそのままコピーするため、早期 return でも
-    // 兄弟ノードが残した行を渡さないよう、PV ノードでは最初に空にしてから自前で維持する。
-    if pv_node {
-        st.pv_table.clear(ply as usize);
-        st.pv_table.clear((ply + 1) as usize);
     }
 
     if pv_node && st.sel_depth < ply + 1 {
@@ -94,14 +99,6 @@ pub(super) fn qsearch<const NT: u8>(
             ctx.draw_value_table[pos.side_to_move() as usize].raw()
                 + draw_jitter(st.nodes, ctx.tune_params),
         );
-    }
-
-    // 宣言勝ち判定（通常探索の probe_transposition と同じ扱い）。縮小で深さが尽きて
-    // 静止探索に入った局面でも宣言を見落とさないよう、置換表を引く前に判定する。
-    if pos.declaration_possible(ctx.entering_king_rule)
-        && pos.declaration_win(ctx.entering_king_rule).is_some()
-    {
-        return Value::mate_in(ply + 1);
     }
 
     let key = pos.key();
@@ -208,8 +205,6 @@ pub(super) fn qsearch<const NT: u8>(
     let mut best_move = Move::NONE;
 
     let corr_value = correction_value(st, ctx, pos, ply);
-    #[cfg(feature = "search-tree-sample")]
-    super::search_helpers::set_tree_sample_ply(st, ply);
     let mut unadjusted_static_eval = Value::NONE;
     let mut static_eval = if in_check {
         Value::NONE
@@ -222,25 +217,12 @@ pub(super) fn qsearch<const NT: u8>(
             let mate_move = pos.mate_1ply();
             if mate_move.is_some() {
                 let mate_value = Value::mate_in(ply + 1);
-                let stored_value = value_to_tt(mate_value, ply);
                 #[cfg(feature = "tt-trace")]
                 let allow_write = ctx.allow_tt_write
                     && helper_tt_write_enabled_for_depth(ctx.thread_id, Bound::Exact, DEPTH_QS);
                 #[cfg(not(feature = "tt-trace"))]
                 let allow_write = ctx.allow_tt_write;
-                if allow_write
-                    && tt_result.write(
-                        key,
-                        stored_value,
-                        // SAFETY: ply < MAX_PLY < STACK_SIZEを満たす探索局面のttPvを使う。
-                        unsafe { st.stack.get_unchecked(ply as usize) }.tt_pv,
-                        Bound::Exact,
-                        DEPTH_QS,
-                        mate_move,
-                        unadjusted_static_eval,
-                        ctx.tt.generation(),
-                    )
-                {
+                if allow_write {
                     #[cfg(feature = "tt-trace")]
                     maybe_trace_tt_write(TtWriteTrace {
                         stage: "qsearch_mate1_store",
@@ -253,7 +235,7 @@ pub(super) fn qsearch<const NT: u8>(
                         // SAFETY: ply < MAX_PLY < STACK_SIZE。
                         is_pv: unsafe { st.stack.get_unchecked(ply as usize) }.tt_pv,
                         tt_move: mate_move,
-                        stored_value,
+                        stored_value: mate_value,
                         eval: unadjusted_static_eval,
                         root_move: if ply >= 1 {
                             st.stack[0].current_move
@@ -261,19 +243,48 @@ pub(super) fn qsearch<const NT: u8>(
                             Move::NONE
                         },
                     });
+                    // mate1ではss->ttPvを使用
+                    tt_result.write(
+                        key,
+                        mate_value,
+                        unsafe { st.stack.get_unchecked(ply as usize) }.tt_pv,
+                        Bound::Exact,
+                        DEPTH_QS,
+                        mate_move,
+                        unadjusted_static_eval,
+                        ctx.tt.generation(),
+                    );
                     inc_stat_by_depth!(st, tt_write_by_depth, 0);
                 }
                 return mate_value;
             }
         }
-        unadjusted_static_eval = nnue_evaluate_cached(st, ctx, pos);
+        // Lazy NNUE eval は 2026-05-12 に試行したが、 material_eval の視点不一致
+        // (sente 絶対視点 vs stm 視点期待) + NNUE skip 時の探索効率劣化で
+        // NPS -23% / 評価値異常を観測したため rollback。
+        // 真の lazy eval は NNUE 内部の FT 出力後の中間値で判定する必要 (= SF 流)、
+        // 単純 material 閾値では不可。 別 session で SF 風 internal lazyEval を再検討。
+        // arm 7 Path J: pv_node 状態で dual_cross gating。
+        unadjusted_static_eval = nnue_evaluate_with_pv(st, pos, pv_node);
         unadjusted_static_eval
     };
+
+    // bucket eval scale 適用: mate 域 (|eval| >= 30000) は除外
+    if !in_check && unadjusted_static_eval != Value::NONE && ctx.bucket_eval_scale != [100i32; 8] {
+        let bucket = get_bucket_index_for_pos(pos);
+        let scale = ctx.bucket_eval_scale[bucket];
+        if scale != 100 {
+            let raw = unadjusted_static_eval.raw();
+            if raw.abs() < 30000 {
+                unadjusted_static_eval = Value::new(raw * scale / 100);
+            }
+        }
+    }
 
     if !in_check && unadjusted_static_eval != Value::NONE {
         static_eval = to_corrected_static_eval(unadjusted_static_eval, corr_value);
         // パス権評価を動的に追加（TTには保存されないので手数依存でもOK）
-        #[cfg(feature = "search-pass-rules")]
+        #[cfg(not(feature = "search-no-pass-rules"))]
         {
             static_eval += evaluate_pass_rights(pos, pos.game_ply() as u16);
         }
@@ -316,18 +327,7 @@ pub(super) fn qsearch<const NT: u8>(
                 && helper_tt_write_enabled_for_depth(ctx.thread_id, Bound::Lower, DEPTH_UNSEARCHED);
             #[cfg(not(feature = "tt-trace"))]
             let allow_write = ctx.allow_tt_write;
-            if allow_write
-                && tt_result.write(
-                    key,
-                    value_to_tt(v, ply),
-                    false,
-                    Bound::Lower,
-                    DEPTH_UNSEARCHED,
-                    Move::NONE,
-                    unadjusted_static_eval,
-                    ctx.tt.generation(),
-                )
-            {
+            if allow_write {
                 #[cfg(feature = "tt-trace")]
                 maybe_trace_tt_write(TtWriteTrace {
                     stage: "qsearch_stand_pat_store",
@@ -346,6 +346,16 @@ pub(super) fn qsearch<const NT: u8>(
                         Move::NONE
                     },
                 });
+                tt_result.write(
+                    key,
+                    value_to_tt(v, ply),
+                    false,
+                    Bound::Lower,
+                    DEPTH_UNSEARCHED,
+                    Move::NONE,
+                    unadjusted_static_eval,
+                    ctx.tt.generation(),
+                );
                 inc_stat_by_depth!(st, tt_write_by_depth, 0);
             }
         }
@@ -372,8 +382,10 @@ pub(super) fn qsearch<const NT: u8>(
         Move::NONE
     };
 
-    let cont_tables = cont_history_keys(st, ply);
-    // 王手されていない静止探索では quiet checks を生成しない。
+    // qsearchではquiet checksを生成しない (YO movepick.cpp line 69:
+    // QSEARCH_TT → QCAPTURE_INIT → QCAPTURE のみ)。
+    // alpha_beta と同じ逐次 next_move パターンで OrderedMovesBuffer collect を排除。
+    let cont_tables = cont_history_tables(st, ctx, ply);
     let mut mp = if in_check {
         MovePicker::new_evasions(pos, tt_move, ply, cont_tables, ctx.generate_all_legal_moves)
     } else {
@@ -382,24 +394,21 @@ pub(super) fn qsearch<const NT: u8>(
 
     let mut move_count = 0;
 
-    // 逐次 next_move 方式（バッファへの事前 collect はしない）。
-    // qsearch の子ノードも qsearch なので、この部分木では MovePicker が読む history
-    // （capture/main/continuation）は一切更新されない。よって手順は事前 collect と同一で、
-    // beta カット時に残りステージの生成・スコアリング・ソートを丸ごと省ける。
-    // qsearch の部分木へ history の更新を足す場合は、手順が変わるのでこの前提を見直すこと。
     loop {
-        // SAFETY: history は worker 単位で、単一スレッドからしか触らない。共有参照 h は
-        // next_move の呼び出しを囲むブロックの終わりで破棄され、下の再帰呼び出しの間は生存しない。
+        // SAFETY: 単一スレッド内で使用、可変参照と同時保持しない
         let mv = {
             let h = unsafe { ctx.history.as_ref_unchecked() };
-            mp.next_move(pos, h, ctx.shared)
+            mp.next_move(pos, h)
         };
         if mv == Move::NONE {
             break;
         }
 
-        // MovePicker が返した手の数を記録
-        inc_stat!(st, qs_moves_picked);
+        // 生成された手をカウント (旧 ordered_moves.len() 相当)
+        #[cfg(feature = "search-stats")]
+        {
+            st.stats.qs_moves_generated += 1;
+        }
 
         // 静止探索では PASS は対象外（TT手として来る可能性があるため明示的にスキップ）
         if mv.is_pass() {
@@ -462,7 +471,7 @@ pub(super) fn qsearch<const NT: u8>(
         // 実際に探索された手をカウント
         inc_stat!(st, qs_moves_searched);
 
-        do_move_and_push(st, pos, mv, gives_check, ctx.tt, ctx.eval_hash);
+        do_move_and_push(st, pos, mv, gives_check, ctx.tt);
 
         // PASS は to()/moved_piece_after() が未定義のため、null move と同様に扱う
         if mv.is_pass() {
@@ -488,9 +497,6 @@ pub(super) fn qsearch<const NT: u8>(
             if value > alpha {
                 // value > alpha のときのみ bestMove を更新
                 best_move = mv;
-                if pv_node {
-                    st.pv_table.update(ply as usize, mv);
-                }
 
                 if value >= beta {
                     break;
@@ -498,15 +504,6 @@ pub(super) fn qsearch<const NT: u8>(
                 // fail-high しなかった場合のみ alpha を更新する。
                 alpha = value;
             }
-        }
-    }
-
-    // 打ち切りにより capture/evasion の生成ステージへ到達しなかったノードを数える。
-    // 逐次化で省けた指し手生成・スコアリング・ソートの発生率を示す。
-    #[cfg(feature = "search-stats")]
-    {
-        if matches!(mp.stage(), Stage::QCaptureInit | Stage::EvasionInit) {
-            st.stats.qs_movegen_skipped += 1;
         }
     }
 
@@ -531,18 +528,7 @@ pub(super) fn qsearch<const NT: u8>(
         ctx.allow_tt_write && helper_tt_write_enabled_for_depth(ctx.thread_id, bound, DEPTH_QS);
     #[cfg(not(feature = "tt-trace"))]
     let allow_write = ctx.allow_tt_write;
-    if allow_write
-        && tt_result.write(
-            key,
-            value_to_tt(best_value, ply),
-            pv_hit,
-            bound,
-            DEPTH_QS,
-            best_move,
-            unadjusted_static_eval,
-            ctx.tt.generation(),
-        )
-    {
+    if allow_write {
         #[cfg(feature = "tt-trace")]
         maybe_trace_tt_write(TtWriteTrace {
             stage: "qsearch_store",
@@ -561,6 +547,16 @@ pub(super) fn qsearch<const NT: u8>(
                 Move::NONE
             },
         });
+        tt_result.write(
+            key,
+            value_to_tt(best_value, ply),
+            pv_hit,
+            bound,
+            DEPTH_QS,
+            best_move,
+            unadjusted_static_eval,
+            ctx.tt.generation(),
+        );
         inc_stat_by_depth!(st, tt_write_by_depth, 0);
     }
 

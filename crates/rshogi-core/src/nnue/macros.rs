@@ -20,16 +20,16 @@
 ///
 /// ```ignore
 /// define_l1_variants!(
-///     enum HalfKaHmMergedL512,
-///     feature_set HalfKaHmMerged,
+///     enum HalfKA_hm_L512,
+///     feature_set HalfKA_hm,
 ///     l1 512,
-///     acc AccumulatorHalfKaHmMerged<512>,
-///     stack AccumulatorStackHalfKaHmMerged<512>,
+///     acc AccumulatorHalfKA_hm<512>,
+///     stack AccumulatorStackHalfKA_hm<512>,
 ///
 ///     variants {
-///         (8,  96, CReLU,        "CReLU")    => CReLU_8_96     : HalfKaHmMerged512CReLU,
-///         (8,  96, SCReLU,       "SCReLU")   => SCReLU_8_96    : HalfKaHmMerged512SCReLU,
-///         (8,  96, PairwiseCReLU,"Pairwise") => Pairwise_8_96  : HalfKaHmMerged512Pairwise,
+///         (8,  96, CReLU,        "CReLU")    => CReLU_8_96     : HalfKA_hm512CReLU,
+///         (8,  96, SCReLU,       "SCReLU")   => SCReLU_8_96    : HalfKA_hm512SCReLU,
+///         (8,  96, PairwiseCReLU,"Pairwise") => Pairwise_8_96  : HalfKA_hm512Pairwise,
 ///     }
 /// );
 /// ```
@@ -44,7 +44,7 @@ macro_rules! define_l1_variants {
 
         variants {
             $(
-                ($l2:literal, $l3:literal, $act:ident)
+                ($l2:literal, $l3:literal, $act:ident, $act_name:literal)
                     => $Var:ident : $Ty:ty
             ),+ $(,)?
         }
@@ -53,7 +53,6 @@ macro_rules! define_l1_variants {
         ///
         /// L2/L3/活性化の組み合わせごとにバリアントを持つ。
         /// 新しい組み合わせ追加は、このマクロ定義に1行追加するだけ。
-        #[derive(Clone)]
         pub enum $Enum {
             $(
                 $Var(Box<$Ty>),
@@ -166,12 +165,18 @@ macro_rules! define_l1_variants {
             }
 
             /// アーキテクチャ名を取得
-            ///
-            /// `architecture_spec().name()` に委譲する。feature set 名は
-            /// `FeatureSet::as_str()`、活性化名は `Activation::as_str()` を
-            /// 単一の真実源とし、判定と display 名の決定ロジックを共通化する。
-            pub fn architecture_name(&self) -> String {
-                self.architecture_spec().name()
+            pub fn architecture_name(&self) -> &'static str {
+                match self {
+                    $(
+                        Self::$Var(_) => concat!(
+                            stringify!($FeatureSet), "-",
+                            stringify!($L1), "-",
+                            stringify!($l2), "-",
+                            stringify!($l3), "-",
+                            $act_name
+                        ),
+                    )+
+                }
             }
 
             /// アーキテクチャ仕様を取得
@@ -216,5 +221,5 @@ pub use define_l1_variants;
 
 #[cfg(test)]
 mod tests {
-    // マクロのコンパイルテストは halfka_split/l*.rs で実施
+    // マクロのコンパイルテストは halfka/l*.rs で実施
 }

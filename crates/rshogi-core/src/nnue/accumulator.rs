@@ -8,17 +8,11 @@
 //! AccumulatorStack は探索時の Accumulator と DirtyPiece を管理するスタック。
 //! StateInfo から Accumulator を分離し、do_move での初期化コストを削減する。
 
-use super::bona_piece::{BonaPiece, ExtBonaPiece};
+use super::bona_piece::ExtBonaPiece;
 use super::constants::{NUM_REFRESH_TRIGGERS, TRANSFORMED_FEATURE_DIMENSIONS};
-use super::finny::{apply_weight_changes_to_two, collect_piece_list_diff};
-use super::ls_feature_spec::LsFeatureSpec;
 use super::piece_list::PieceNumber;
-use crate::position::Position;
 use crate::types::{Color, MAX_PLY, Square, Value};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::alloc::alloc;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 
@@ -28,7 +22,7 @@ use std::ops::{Deref, DerefMut};
 
 /// 差分更新での最大変化特徴量数
 /// HalfKP: 駒3 + 手駒2 = 5
-/// HalfKaHmMerged^（coalesced）: 各変化=最大5
+/// HalfKA_hm^（coalesced）: 各変化=最大5
 /// 余裕を持たせて16
 pub const MAX_CHANGED_FEATURES: usize = 16;
 
@@ -36,7 +30,7 @@ pub const MAX_CHANGED_FEATURES: usize = 16;
 ///
 /// アーキテクチャごとの理論上限:
 /// - HalfKP: 盤上38 + 手駒14 = 52
-/// - HalfKaHmMerged^（coalesced）: 盤上38 + 自玉1 + 敵玉1 + 手駒14 = 54
+/// - HalfKA_hm^（coalesced）: 盤上38 + 自玉1 + 敵玉1 + 手駒14 = 54
 ///
 /// この値は`Feature::MAX_ACTIVE`（合法局面での最大値）より大きく設定し、
 /// テスト用の非合法局面にも安全に対応できるマージンを持たせている。
@@ -86,22 +80,6 @@ impl<const N: usize> IndexList<N> {
         }
     }
 
-    /// 一括生成用の未初期化領域を返す。書込み後に `set_len` で公開する。
-    #[inline]
-    pub(super) fn as_mut_ptr(&mut self) -> *mut u32 {
-        self.indices.as_mut_ptr().cast()
-    }
-
-    /// 一括生成した先頭要素を公開する。
-    ///
-    /// # Safety
-    /// `len <= N` かつ先頭 `len` 要素が初期化済みでなければならない。
-    #[inline]
-    pub(super) unsafe fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= N);
-        self.len = len as u8;
-    }
-
     /// 要素を追加
     ///
     /// 容量（N）を超える場合は追加を無視する（安全のため）。
@@ -115,7 +93,7 @@ impl<const N: usize> IndexList<N> {
             return false;
         }
         // SAFETY: pos < N なので範囲内。MaybeUninit への書き込みは常に安全。
-        // feature index は最大でも 138,509 (HalfKaSplit) で u32 の範囲内。
+        // feature index は最大でも 138,509 (HalfKA) で u32 の範囲内。
         debug_assert!(
             index <= u32::MAX as usize,
             "IndexList::push: index {index} exceeds u32::MAX"
@@ -123,77 +101,6 @@ impl<const N: usize> IndexList<N> {
         self.indices[pos].write(index as u32);
         self.len += 1;
         true
-    }
-
-    /// インデックス列を順序を保って追記する。
-    ///
-    /// 長さは配列と独立したローカル変数で数え、末尾で一度だけ反映する。
-    /// 容量超過は `push` と同じく debug 時にパニックし、release 時には無視する。
-    #[inline]
-    pub(crate) fn extend(&mut self, indices: impl IntoIterator<Item = usize>) {
-        let mut len = self.len as usize;
-        // filter/map の内部反復で、抽出と追記を同じ走査にまとめる。
-        indices.into_iter().for_each(|index| {
-            if len >= N {
-                #[cfg(debug_assertions)]
-                {
-                    self.len = len as u8;
-                    debug_assert!(false, "IndexList overflow: capacity={N}, len={len}");
-                }
-                return;
-            }
-            #[cfg(debug_assertions)]
-            if index > u32::MAX as usize {
-                self.len = len as u8;
-                debug_assert!(false, "IndexList::push: index {index} exceeds u32::MAX");
-            }
-            self.indices[len].write(index as u32);
-            len += 1;
-        });
-        self.len = len as u8;
-    }
-
-    /// 各組の第1要素、第2要素の順で、それぞれのリストへ追記する。
-    ///
-    /// 長さは二つのローカル変数で数え、末尾で一度ずつ反映する。
-    /// debug 時の不正な追記では、パニック前に両リストの有効な要素数を反映する。
-    #[inline]
-    pub(crate) fn extend_pairs(
-        &mut self,
-        other: &mut Self,
-        indices: impl IntoIterator<Item = (Option<usize>, Option<usize>)>,
-    ) {
-        let mut len = self.len as usize;
-        let mut other_len = other.len as usize;
-        indices.into_iter().for_each(|(first, second)| {
-            if let Some(index) = first {
-                #[cfg(debug_assertions)]
-                if len >= N || index > u32::MAX as usize {
-                    self.len = len as u8;
-                    other.len = other_len as u8;
-                    // push と同じ検査順序・メッセージでパニックする。
-                    let _ = self.push(index);
-                }
-                if len < N {
-                    self.indices[len].write(index as u32);
-                    len += 1;
-                }
-            }
-            if let Some(index) = second {
-                #[cfg(debug_assertions)]
-                if other_len >= N || index > u32::MAX as usize {
-                    self.len = len as u8;
-                    other.len = other_len as u8;
-                    let _ = other.push(index);
-                }
-                if other_len < N {
-                    other.indices[other_len].write(index as u32);
-                    other_len += 1;
-                }
-            }
-        });
-        self.len = len as u8;
-        other.len = other_len as u8;
     }
 
     /// イテレータを返す（usize に変換して返す）
@@ -217,20 +124,6 @@ impl<const N: usize> IndexList<N> {
         self.len as usize
     }
 
-    /// i 番目の要素を取得
-    ///
-    /// `i >= len()` の場合はパニックする。`assume_init()` を含む safe public API
-    /// なので、release ビルドでも境界を検査して未初期化領域へのアクセス（UB）を
-    /// 防ぐ。fast path 判定で長さを確認済みの呼び出し（`get(0)`/`get(1)` を
-    /// `len()` が 1/2 と確定した文脈で呼ぶ）では、コンパイラがこの検査を除去する。
-    #[inline]
-    pub fn get(&self, i: usize) -> usize {
-        assert!(i < self.len as usize, "IndexList::get: i={i} out of bounds (len={})", self.len);
-        // SAFETY: 直前の assert! で i < len を保証。0..len の範囲は push 済みで
-        // 初期化されているため assume_init は健全。
-        unsafe { self.indices[i].assume_init() as usize }
-    }
-
     /// 要素を逆順に並べ替え
     #[inline]
     pub fn reverse(&mut self) {
@@ -252,13 +145,21 @@ impl<const N: usize> Default for IndexList<N> {
 pub struct Aligned<T: Copy>(pub T);
 
 impl<T: Copy> Aligned<T> {
-    /// 値をまだ持たない、64バイトアラインされたストレージを作成する。
+    /// 未初期化のAlignedを作成（ゼロ初期化をスキップ）
     ///
-    /// 戻り値は `MaybeUninit<Self>`。`write(Aligned(value))` で有効な値を
-    /// 書き込んでから利用する。旧来の型付き未初期化値は返さない。
+    /// # Safety
+    ///
+    /// 呼び出し側が使用前に全要素を初期化する責任を持つ。
+    /// evaluate関数内で使用され、直後にtransform/propagateで全要素が上書きされる。
+    ///
+    /// この関数はパフォーマンス最適化のため、整数配列の初期化をスキップする。
+    /// Clippy警告(uninit_assumed_init)を許可しているが、これは呼び出し直後に
+    /// 全要素が上書きされることが保証されているため安全である。
     #[inline]
-    pub fn new_uninit() -> std::mem::MaybeUninit<Self> {
-        std::mem::MaybeUninit::uninit()
+    #[allow(clippy::uninit_assumed_init)]
+    pub unsafe fn new_uninit() -> Self {
+        // SAFETY: 呼び出し直後に全要素が上書きされることを呼び出し側が保証する
+        unsafe { std::mem::MaybeUninit::uninit().assume_init() }
     }
 }
 
@@ -289,61 +190,16 @@ impl<const N: usize> Default for AlignedI16<N> {
 /// キャッシュラインサイズ（64バイト）
 pub const CACHE_LINE_SIZE: usize = 64;
 
-/// Transparent Huge Page のサイズ（x86_64 / aarch64 Linux の 2MiB）
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const HUGEPAGE_SIZE: usize = 2 * 1024 * 1024;
-
-/// `AlignedBox` のメモリ backing 種別
-enum AlignedBoxBacking {
-    /// `new_zeroed` がグローバルアロケータで確保した通常ヒープ。Drop で `dealloc`。
-    Heap(Layout),
-    /// 確保に失敗した複製の代わりに置く長さ 0 の箱。何も確保しておらず Drop でも何もしない。
-    /// メモリ不足のときにさらに確保して abort しないために使う。
-    Empty,
-    /// file の読み取り専用 mapping を共有所有。Drop では `owner` の解放のみ。
-    /// read-only 専用で、可変参照は `WeightBox` 経由の複製後にしか得られない。
-    #[cfg(all(windows, feature = "prepacked-nnue"))]
-    Mapped {
-        owner: std::sync::Arc<super::mapped_weights::ReadOnlyMapping>,
-    },
-    /// プロセス間共有メモリ（`mmap`）のマッピングを借用。Drop で `munmap`。
-    /// ロード後は read-only として扱う（`DerefMut` は panic する）。
-    #[cfg(target_os = "linux")]
-    Shared {
-        /// `mmap` が返したマッピング先頭（ページアライン）
-        map_base: *mut libc::c_void,
-        /// マッピング全長（ヘッダ + blob）
-        map_len: usize,
-    },
-}
-
-/// 64バイトアラインメントで確保されたスライス
+/// 64バイトアラインメントでヒープに確保されたスライス
 ///
 /// FeatureTransformerのweightsなど、大きな配列をアラインして確保するために使用。
 /// aligned load/store命令を使うためにはデータが64バイト境界に配置されている必要がある。
 ///
-/// backing の種別:
-/// - `Heap`: `new_zeroed` による通常ヒープ確保（`T: Zeroable`）。
-/// - `Shared`: `from_shared` によるプロセス間共有メモリの借用（read-only、`DerefMut` 不可）。
-/// - `Mapped`: fileの読み取り専用mappingを共有所有（read-only、`DerefMut` 不可）。
-///
-/// LayerStacks の重み配列は `WeightBox` で包んで保持する。`WeightBox` は `DerefMut` を
-/// 持たず、書き換えは `make_mut`（read-only backing なら私有ヒープへ複製）だけ。
-///
-/// 2 つの read-only backing で保証の強さが違うことに注意:
-/// - `Mapped` を作れるのは `WeightBox::from_mapped` だけなので、`Mapped` が `DerefMut` へ
-///   届く経路は型として存在しない（構造的に到達不能）。
-/// - `Shared` は `from_shared` が `pub(crate)` で、HalfKx の FeatureTransformer
-///   (`feature_transformer.rs` / `network_halfk*.rs`) は素の `AlignedBox` のまま
-///   `shared_weights::try_share` を呼ぶ。こちらは「共有化はロード完了後・以後書き込まない」
-///   という規約で守られており、型では保証されない。
-///
 /// # 安全性契約
 ///
-/// - `new_zeroed` は閉じた `Zeroable` 型だけを受け付け、ゼロビット列が有効値になる。
-///   `Copy` により要素の `Drop` は不要で、領域の解放だけでよい。
-/// - `Shared` backing は複数プロセスから参照される read-only 領域。`DerefMut` は panic し、
-///   可変参照を一切発行しないことで Rust の排他参照不変条件を守る。
+/// - `T: Copy + Default` を要求することで、`T` が `Drop` を実装できないことを保証
+/// - `Copy` トレイトは `Drop` と排他的（コンパイラが禁止）
+/// - これにより `drop` 時に `drop_in_place` を呼ぶ必要がなく、`dealloc` のみで安全
 ///
 /// # 使用例
 ///
@@ -354,33 +210,10 @@ enum AlignedBoxBacking {
 pub struct AlignedBox<T> {
     ptr: *mut T,
     len: usize,
-    backing: AlignedBoxBacking,
+    layout: Layout,
 }
 
-enum AlignedAllocationError {
-    SizeOverflow,
-    InvalidLayout,
-    OutOfMemory(Layout),
-}
-
-mod zeroable {
-    pub trait Sealed {}
-
-    impl Sealed for i8 {}
-    impl Sealed for i16 {}
-    impl Sealed for i32 {}
-    impl Sealed for u8 {}
-}
-
-/// ゼロビット列が有効値になる、重み・作業領域用の閉じた型集合。
-pub trait Zeroable: zeroable::Sealed + Copy + Default {}
-
-impl Zeroable for i8 {}
-impl Zeroable for i16 {}
-impl Zeroable for i32 {}
-impl Zeroable for u8 {}
-
-impl<T: Zeroable> AlignedBox<T> {
+impl<T: Copy + Default> AlignedBox<T> {
     /// 指定された長さの配列をゼロ初期化して確保
     ///
     /// # Panics
@@ -388,155 +221,21 @@ impl<T: Zeroable> AlignedBox<T> {
     /// - レイアウトが無効な場合
     /// - メモリ確保に失敗した場合
     pub fn new_zeroed(len: usize) -> Self {
-        match Self::allocate_zeroed(len) {
-            Ok(value) => value,
-            Err(AlignedAllocationError::SizeOverflow) => {
-                panic!("AlignedBox::new_zeroed: size overflow")
-            }
-            Err(AlignedAllocationError::InvalidLayout) => panic!("Invalid layout"),
-            Err(AlignedAllocationError::OutOfMemory(layout)) => {
-                std::alloc::handle_alloc_error(layout)
-            }
-        }
-    }
-
-    pub(crate) fn try_new_zeroed(len: usize) -> std::io::Result<Self> {
-        Self::allocate_zeroed(len).map_err(|error| {
-            match error {
-                AlignedAllocationError::SizeOverflow | AlignedAllocationError::InvalidLayout => {
-                    std::io::ErrorKind::InvalidInput
-                }
-                AlignedAllocationError::OutOfMemory(_) => std::io::ErrorKind::OutOfMemory,
-            }
-            .into()
-        })
-    }
-
-    fn allocate_zeroed(len: usize) -> Result<Self, AlignedAllocationError> {
         let size = std::mem::size_of::<T>()
             .checked_mul(len)
-            .ok_or(AlignedAllocationError::SizeOverflow)?;
+            .expect("AlignedBox::new_zeroed: size overflow");
         let align = CACHE_LINE_SIZE.max(std::mem::align_of::<T>());
-        // FT 重み級の大きな配列は THP 境界に置き madvise する。THP enabled=madvise の
-        // 環境では madvise 無しだと 4KiB ページのままになる。
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let use_hugepage = size >= HUGEPAGE_SIZE;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let align = if use_hugepage {
-            align.max(HUGEPAGE_SIZE)
-        } else {
-            align
-        };
 
-        // 空配列でも allocator の非ゼロ size 契約を守り、整列済みポインタを保持する。
-        let layout = Layout::from_size_align(size.max(1), align)
-            .map_err(|_| AlignedAllocationError::InvalidLayout)?
-            .pad_to_align();
+        // SAFETY: align は 2 のべき乗で、size は align の倍数に切り上げられる
+        let layout = Layout::from_size_align(size, align).expect("Invalid layout").pad_to_align();
 
-        // hugepage 経路では alloc → madvise → 手動ゼロ埋めの順にする。alloc_zeroed は
-        // 非既定 align では内部 memset で先に fault するため、ゼロ埋めより前にヒントを置く。
-        // SAFETY: layout は有効で size は非ゼロ。alloc / alloc_zeroed は
-        // 失敗時に null を返す。write_bytes は alloc が返した layout.size() バイトの
-        // 確保範囲内への書込で、alloc_zeroed と同じ初期状態にする。
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let ptr = if use_hugepage {
-            unsafe {
-                let raw = alloc(layout);
-                if !raw.is_null() {
-                    libc::madvise(raw as *mut libc::c_void, layout.size(), libc::MADV_HUGEPAGE);
-                    std::ptr::write_bytes(raw, 0, layout.size());
-                }
-                raw as *mut T
-            }
-        } else {
-            unsafe { alloc_zeroed(layout) as *mut T }
-        };
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        // SAFETY: layout は有効、alloc_zeroed は失敗時に null を返す
         let ptr = unsafe { alloc_zeroed(layout) as *mut T };
         if ptr.is_null() {
-            return Err(AlignedAllocationError::OutOfMemory(layout));
+            std::alloc::handle_alloc_error(layout);
         }
 
-        Ok(Self {
-            ptr,
-            len,
-            backing: AlignedBoxBacking::Heap(layout),
-        })
-    }
-}
-
-impl<T> AlignedBox<T> {
-    /// プロセス間共有メモリ上の領域を借用する `AlignedBox` を構築する。
-    ///
-    /// backing は `Shared` となり、Drop で `munmap` する。read-only 専用で
-    /// `DerefMut` は panic する。
-    ///
-    /// # Safety
-    /// 呼び出し元は以下を保証しなければならない:
-    /// - `data_ptr` は `len` 個の `T` を読める有効ポインタで、`T` のアライン要件
-    ///   （`align_of::<T>()`）を満たす。
-    /// - `data_ptr` は `[map_base, map_base + map_len)` の範囲内を指す。
-    /// - `map_base` / `map_len` は `mmap` で得たマッピングそのもの（Drop で `munmap` する）。
-    /// - この `AlignedBox` がそのマッピングの唯一の所有者（1 box : 1 mapping）。
-    /// - マッピングはロード完了後 read-only（書き込まれない）であること。
-    #[cfg(target_os = "linux")]
-    pub(crate) unsafe fn from_shared(
-        data_ptr: *mut T,
-        len: usize,
-        map_base: *mut libc::c_void,
-        map_len: usize,
-    ) -> Self {
-        Self {
-            ptr: data_ptr,
-            len,
-            backing: AlignedBoxBacking::Shared { map_base, map_len },
-        }
-    }
-}
-
-// 任意の T を許さず、全 bit pattern が有効な重みの整数型だけを受け付ける。
-#[cfg(all(windows, feature = "prepacked-nnue"))]
-mod mapped_element {
-    pub trait Element: Copy {}
-    impl Element for i8 {}
-    impl Element for i16 {}
-    impl Element for i32 {}
-}
-
-#[cfg(all(windows, feature = "prepacked-nnue"))]
-impl<T: mapped_element::Element> AlignedBox<T> {
-    /// mapping 上の span を借用する。可変参照が漏れないよう、呼び出しは同一モジュール内の
-    /// `WeightBox::from_mapped` だけに限定する（`Mapped` backing の唯一の生成口）。
-    fn from_mapped(
-        owner: std::sync::Arc<super::mapped_weights::ReadOnlyMapping>,
-        offset: usize,
-        len: usize,
-    ) -> std::io::Result<Self> {
-        let invalid =
-            || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid weight span");
-        let end = len
-            .checked_mul(std::mem::size_of::<T>())
-            .and_then(|bytes| offset.checked_add(bytes))
-            .ok_or_else(invalid)?;
-        if !cfg!(target_endian = "little")
-            || len == 0
-            || end > owner.bytes().len()
-            || !offset.is_multiple_of(CACHE_LINE_SIZE)
-        {
-            return Err(invalid());
-        }
-        // SAFETY: offset/endはmapping内。Windowsのmapping先頭とoffsetは64B整列。
-        // private traitの実装型(i8/i16/i32)は全bit patternが有効で、LE target限定。
-        // 各型の整列要求は64B以下。ownerがmapping全寿命を保持する。
-        let ptr = unsafe { owner.bytes().as_ptr().add(offset).cast::<T>().cast_mut() };
-        if !(ptr as usize).is_multiple_of(CACHE_LINE_SIZE) {
-            return Err(invalid());
-        }
-        Ok(Self {
-            ptr,
-            len,
-            backing: AlignedBoxBacking::Mapped { owner },
-        })
+        Self { ptr, len, layout }
     }
 }
 
@@ -544,134 +243,37 @@ impl<T> Deref for AlignedBox<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: ptr は有効で、len 要素分のメモリが確保されている。`Empty` の ptr は
-        // T に整列した dangling で len は 0 なので、長さ 0 のスライスとして有効。
+        // SAFETY: ptr は有効で、len 要素分のメモリが確保されている
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
 impl<T> DerefMut for AlignedBox<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        match &self.backing {
-            #[cfg(all(windows, feature = "prepacked-nnue"))]
-            AlignedBoxBacking::Mapped { .. } => {
-                // file の read-only mapping。可変参照を発行しないことで Rust の排他参照
-                // 不変条件を守る。`Mapped` を作れるのは `WeightBox::from_mapped` だけで、
-                // `WeightBox` は `DerefMut` を持たず `make_mut` が先に私有ヒープへ
-                // 複製するため、ここには到達しない。
-                panic!("AlignedBox: mapped backing は read-only。可変参照は取得できない");
-            }
-            AlignedBoxBacking::Heap(_) => {
-                // SAFETY: backing が Heap であることを確認済み。ptr は new_zeroed が
-                // 確保した有効ポインタで、len 要素分を排他的に所有する。
-                unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-            }
-            AlignedBoxBacking::Empty => &mut [],
-            #[cfg(target_os = "linux")]
-            AlignedBoxBacking::Shared { .. } => {
-                // 共有メモリは複数プロセスから参照される read-only 領域。可変参照を
-                // 発行しないことで Rust の排他参照不変条件を守る。重みロード後の
-                // mutation は共有採用前（Heap）に完了しているためここには到達しない。
-                panic!("AlignedBox: 共有メモリ backing は read-only。可変参照は取得できない");
-            }
-        }
+        // SAFETY: ptr は有効で、len 要素分のメモリが確保されている
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }
 
 impl<T> Drop for AlignedBox<T> {
     fn drop(&mut self) {
-        match &self.backing {
-            #[cfg(all(windows, feature = "prepacked-nnue"))]
-            AlignedBoxBacking::Mapped { owner } => {
-                // fieldのArcはこのDrop後に解放する。sliceがmapping内である不変条件を点検。
-                let start = owner.bytes().as_ptr() as usize;
-                debug_assert!(self.ptr as usize >= start);
-                debug_assert!(
-                    self.ptr as usize + self.len * std::mem::size_of::<T>()
-                        <= start + owner.bytes().len()
-                );
-            }
-            AlignedBoxBacking::Heap(layout) => {
-                // SAFETY:
-                // - ptr は new_zeroed が確保したポインタ、layout は確保時と同じもの
-                // - AlignedBox::new_zeroed は T: Zeroable (Copy) を要求する
-                // - Copy トレイトは Drop と排他的なので、T は Drop を実装できない
-                // - したがって drop_in_place は不要で、dealloc のみで安全
-                unsafe {
-                    dealloc(self.ptr as *mut u8, *layout);
-                }
-            }
-            AlignedBoxBacking::Empty => {}
-            #[cfg(target_os = "linux")]
-            AlignedBoxBacking::Shared { map_base, map_len } => {
-                // SAFETY: map_base / map_len は from_shared が受け取った mmap 領域
-                // そのもの。1 box : 1 mapping のため他に参照はなく、Drop 後に
-                // この領域へアクセスする箇所はない。munmap 失敗は無視（プロセス
-                // 終了時に OS が回収するため実害なし）。
-                unsafe {
-                    libc::munmap(*map_base, *map_len);
-                }
-            }
+        // SAFETY:
+        // - ptr は alloc_zeroed で確保したポインタ、layout は同じもの
+        // - AlignedBox::new_zeroed は T: Copy + Default を要求する
+        // - Copy トレイトは Drop と排他的なので、T は Drop を実装できない
+        // - したがって drop_in_place は不要で、dealloc のみで安全
+        unsafe {
+            dealloc(self.ptr as *mut u8, self.layout);
         }
     }
 }
 
-impl<T> AlignedBox<T> {
-    /// 何も確保しない長さ 0 の箱。
-    fn empty_unallocated() -> Self {
-        Self {
-            ptr: std::ptr::NonNull::dangling().as_ptr(),
-            len: 0,
-            backing: AlignedBoxBacking::Empty,
-        }
-    }
-}
-
-impl<T: Zeroable> Clone for AlignedBox<T> {
+impl<T: Copy + Default> Clone for AlignedBox<T> {
     fn clone(&self) -> Self {
-        let mut new_box = match FALLIBLE_CLONE.with(Cell::get) {
-            None => Self::new_zeroed(self.len),
-            Some(true) => return Self::empty_unallocated(),
-            Some(false) => match Self::try_new_zeroed(self.len) {
-                Ok(new_box) => new_box,
-                Err(_) => {
-                    FALLIBLE_CLONE.with(|state| state.set(Some(true)));
-                    return Self::empty_unallocated();
-                }
-            },
-        };
+        let mut new_box = Self::new_zeroed(self.len);
         new_box.copy_from_slice(self);
         new_box
     }
-}
-
-thread_local! {
-    /// [`try_clone_weights`] の実行中だけ `Some`。`Some(true)` は確保に失敗したことを表す。
-    static FALLIBLE_CLONE: Cell<Option<bool>> = const { Cell::new(None) };
-}
-
-/// `clone` の中で行う `AlignedBox` の確保を、失敗しても abort しないようにして実行する。
-///
-/// 重みの複製は派生した `Clone` を通るので、確保の失敗を戻り値で伝えられない。そこで実行中の
-/// 確保失敗を thread-local に記録し、失敗した箱とそれ以降の箱は確保しない空の箱にしておき、
-/// 終わってから結果ごと捨てる。
-/// 空の箱を含む途中の値は外へ出さない。重み以外の小さな確保 (`Vec` や `Box`) の失敗は従来どおり。
-pub(crate) fn try_clone_weights<R>(clone: impl FnOnce() -> R) -> std::io::Result<R> {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            FALLIBLE_CLONE.with(|state| state.set(None));
-        }
-    }
-    FALLIBLE_CLONE.with(|state| state.set(Some(false)));
-    let reset = Reset;
-    let value = clone();
-    let failed = FALLIBLE_CLONE.with(Cell::get) == Some(true);
-    drop(reset);
-    if failed {
-        return Err(std::io::ErrorKind::OutOfMemory.into());
-    }
-    Ok(value)
 }
 
 // SAFETY: T が Send なら AlignedBox<T> も Send
@@ -679,102 +281,17 @@ unsafe impl<T: Send> Send for AlignedBox<T> {}
 // SAFETY: T が Sync なら AlignedBox<T> も Sync
 unsafe impl<T: Sync> Sync for AlignedBox<T> {}
 
-/// ロード後は書き換えない NNUE 重み配列の格納先
-///
-/// backing は通常ヒープ・プロセス間共有メモリ・file の読み取り専用 mapping のいずれか。
-/// 後ろ 2 つへ可変参照を配ると Rust の排他参照不変条件を破るため、この型は `DerefMut` を
-/// **実装しない**。書き換えたい場合は `make_mut` を使い、read-only backing なら私有ヒープ
-/// への複製（copy-on-write）を経てから可変スライスを得る。
-///
-/// これにより、この型が保持する重みについては「read-only backing を誤って書き換えて
-/// 実行時 panic する」経路が型として無くなる。`Mapped` backing を作れるのは
-/// `WeightBox::from_mapped` だけなので、LayerStacks の prepacked 重みはこれで構造的に
-/// 保護される。一方 HalfKx の FeatureTransformer は素の `AlignedBox` のまま
-/// `shared_weights::try_share` を使っており、そちらの `Shared` backing は従来どおり
-/// 「共有化後は書き込まない」という規約で守られている（型では保証されない）。
-///
-/// 推論経路は `Deref` による共有読み取りだけで足りる。
-///
-/// `#[repr(transparent)]` はネットワーク構造体のレイアウトを導入前と同一に保つためで、
-/// この型を別の型へキャストする箇所は無い。
-#[repr(transparent)]
-pub struct WeightBox<T>(AlignedBox<T>);
-
-impl<T> From<AlignedBox<T>> for WeightBox<T> {
-    #[inline]
-    fn from(inner: AlignedBox<T>) -> Self {
-        Self(inner)
-    }
-}
-
-#[cfg(all(windows, feature = "prepacked-nnue"))]
-impl<T: mapped_element::Element> WeightBox<T> {
-    /// 事前展開コンテナの読み取り専用 mapping 上にある重み span を借用する。
-    pub(super) fn from_mapped(
-        owner: std::sync::Arc<super::mapped_weights::ReadOnlyMapping>,
-        offset: usize,
-        len: usize,
-    ) -> std::io::Result<Self> {
-        AlignedBox::from_mapped(owner, offset, len).map(Self)
-    }
-}
-
-/// 複製は backing によらず私有ヒープへの深い写しになる。
-impl<T: Zeroable> Clone for WeightBox<T> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<T> Deref for WeightBox<T> {
-    type Target = [T];
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T: Zeroable> WeightBox<T> {
-    /// 書き換え用の可変スライスを返す。
-    ///
-    /// backing が read-only（共有メモリ / file mapping）のときは、先に私有ヒープへ
-    /// 複製する（copy-on-write）。複製後は元の共有領域・mapping を参照しないため、
-    /// 他プロセスや mapping 元 file のバイト列は変化しない。
-    ///
-    /// コスト: read-only backing に対する最初の 1 回だけ tensor 全体を確保してコピーする
-    /// （FT 重みなら数百 MB になり得る）。2 回目以降は既に Heap なのでコピーしない。
-    ///
-    /// 重みを書き換えるのは net delta (`SPSA_NET_*`) だけなので、それを持つ構成に
-    /// 限ってコンパイルする。
-    #[cfg(any(test, feature = "layerstack-arch", feature = "nnue-runtime-dimensions"))]
-    pub(crate) fn make_mut(&mut self) -> &mut [T] {
-        if !matches!(self.0.backing, AlignedBoxBacking::Heap(_)) {
-            self.0 = self.0.clone();
-        }
-        &mut self.0
-    }
-
-    /// 重み配列をプロセス間共有メモリへ移行する（Linux のみ実効、失敗時は現状維持）。
-    ///
-    /// `Mapped` backing は Windows 限定、`Shared` backing は Linux 限定で互いに排他のため、
-    /// mapping 済みの box がここで共有メモリへ差し替わることはない。
-    pub(crate) fn share(&mut self, label: &str) {
-        super::shared_weights::try_share(&mut self.0, label);
-    }
-}
-
 /// Accumulatorの構造
 /// 入力特徴量をアフィン変換した結果を保持
 ///
-/// トリガーごとに accumulation を分離。
+/// YaneuraOu の classic NNUE と同様に、トリガーごとに accumulation を分離。
 /// `accumulation[perspective][trigger][dimension]` の構造で、
 /// transform 時にトリガーごとの値を合算する。
 /// 現在は NUM_REFRESH_TRIGGERS=1 なので従来と同等の動作。
 #[repr(C, align(64))]
 #[derive(Clone)]
 pub struct Accumulator {
-    /// 累積値 `[perspective][trigger][dimension]`
+    /// 累積値 [perspective][trigger][dimension]
     /// - perspective: BLACK=0, WHITE=1
     /// - trigger: 0..NUM_REFRESH_TRIGGERS
     pub accumulation: [[Aligned<[i16; TRANSFORMED_FEATURE_DIMENSIONS]>; NUM_REFRESH_TRIGGERS]; 2],
@@ -840,7 +357,7 @@ impl Accumulator {
 // DirtyPiece - 差分更新用の駒移動情報（PieceNumber + ExtBonaPiece ベース）
 // =============================================================================
 
-/// 差分更新用の駒移動情報
+/// 差分更新用の駒移動情報（YaneuraOu 準拠の新形式）
 ///
 /// PieceNumber で変化した駒を識別し、old/new の ExtBonaPiece ペアで
 /// 盤上駒・手駒の区別なく統一的に変化を表現する。
@@ -916,6 +433,12 @@ pub struct StackEntry {
     pub dirty_piece: DirtyPiece,
     /// 前のエントリへのインデックス（祖先探索用）
     pub previous: Option<usize>,
+    /// 2026-06-06 追加: Activity-Risk feature accumulator (= 中盤楽観バイアス補正用)。
+    ///
+    /// dirty フラグ true で次回 evaluate 時に full refresh、 false なら cached features 使用。
+    /// push 時に dirty=true でリセット (= ply 進めば常に refresh 必要、 incremental update は別 step で対応)。
+    #[cfg(feature = "nnue-activity-risk-psqt")]
+    pub activity_risk_accum: super::activity_risk::ActivityRiskAccumulator,
 }
 
 /// AccumulatorStack - 探索時のAccumulatorを管理するスタック
@@ -950,6 +473,10 @@ impl AccumulatorStack {
         self.entries[0].accumulator.reset();
         self.entries[0].dirty_piece.clear();
         self.entries[0].previous = None;
+        #[cfg(feature = "nnue-activity-risk-psqt")]
+        {
+            self.entries[0].activity_risk_accum.dirty = true;
+        }
     }
 
     /// 現在のエントリを取得
@@ -986,6 +513,7 @@ impl AccumulatorStack {
     ///
     /// DirtyPieceは呼び出し側で設定する。
     /// Accumulatorは計算済みフラグをリセットするだけで、配列の初期化は行わない。
+    /// 2026-06-06: activity_risk accumulator も dirty=true でマーク (= 次回 evaluate 時に lazy refresh)。
     #[inline]
     pub fn push(&mut self, dirty_piece: DirtyPiece) {
         let prev_idx = self.current_idx;
@@ -996,6 +524,10 @@ impl AccumulatorStack {
         entry.previous = Some(prev_idx);
         entry.accumulator.reset(); // フラグのみリセット、配列初期化なし
         entry.dirty_piece = dirty_piece;
+        #[cfg(feature = "nnue-activity-risk-psqt")]
+        {
+            entry.activity_risk_accum.dirty = true;
+        }
     }
 
     /// undo_move時に呼び出す: エントリをpop
@@ -1122,7 +654,7 @@ impl Default for AccumulatorStack {
 /// 玉位置×視点ごとのアキュムレータキャッシュ（Finny Tables、汎用版）
 ///
 /// 81マス × 2視点 = 162 エントリ。
-/// 非LayerStacks の HalfKX 5 系統で使用する。
+/// 非LayerStacks（HalfKP/HalfKA/HalfKA_hm）で使用する。
 /// L1サイズは実行時に決定される。
 ///
 /// アキュムレータ値は1つの連続した AlignedBox に格納し、
@@ -1130,8 +662,10 @@ impl Default for AccumulatorStack {
 pub struct AccumulatorCacheGeneric {
     /// 全エントリのアキュムレータ値を連続格納 [NUM_ENTRIES * l1]
     accumulations: AlignedBox<i16>,
-    /// 各 PieceNumber に対応する視点固有の BonaPiece。
-    piece_lists: Box<[[BonaPiece; PieceNumber::NB]]>,
+    /// 各エントリのアクティブ特徴インデックス（ソート済み）
+    active_indices: Box<[[u32; MAX_ACTIVE_FEATURES]]>,
+    /// 各エントリの有効特徴数
+    num_active: Box<[u16]>,
     /// 各エントリの有効フラグ
     valid: Box<[bool]>,
     /// L1 サイズ
@@ -1146,8 +680,8 @@ impl AccumulatorCacheGeneric {
     pub fn new(l1: usize) -> Self {
         Self {
             accumulations: AlignedBox::new_zeroed(NUM_CACHE_ENTRIES * l1),
-            piece_lists: vec![[BonaPiece::ZERO; PieceNumber::NB]; NUM_CACHE_ENTRIES]
-                .into_boxed_slice(),
+            active_indices: vec![[0u32; MAX_ACTIVE_FEATURES]; NUM_CACHE_ENTRIES].into_boxed_slice(),
+            num_active: vec![0u16; NUM_CACHE_ENTRIES].into_boxed_slice(),
             valid: vec![false; NUM_CACHE_ENTRIES].into_boxed_slice(),
             l1,
         }
@@ -1160,109 +694,107 @@ impl AccumulatorCacheGeneric {
         }
     }
 
-    /// テスト用に有効な cache entry の accumulator を参照する。
-    #[cfg(all(
-        test,
-        feature = "halfkx-arch",
-        not(feature = "nnue-runtime-dimensions")
-    ))]
-    pub(crate) fn cached_accumulation(
-        &self,
+    /// エントリのアキュムレータスライスを取得
+    #[inline]
+    fn acc_slice(&self, entry_idx: usize) -> &[i16] {
+        let start = entry_idx * self.l1;
+        &self.accumulations[start..start + self.l1]
+    }
+
+    /// エントリのアキュムレータスライスを取得（可変）
+    #[inline]
+    fn acc_slice_mut(&mut self, entry_idx: usize) -> &mut [i16] {
+        let start = entry_idx * self.l1;
+        &mut self.accumulations[start..start + self.l1]
+    }
+
+    /// キャッシュからの差分で refresh を実行
+    ///
+    /// キャッシュが有効な場合、現在のアクティブ特徴量との差分を計算し、
+    /// add/sub のみでアキュムレータを更新する。
+    /// キャッシュが無効な場合は通常の full refresh を行い、キャッシュを更新する。
+    pub(crate) fn refresh_or_cache<FA, FS>(
+        &mut self,
         king_sq: Square,
         perspective: Color,
-    ) -> Option<&[i16]> {
+        active: &[u32],
+        biases: &[i16],
+        accumulation: &mut [i16],
+        add_fn: FA,
+        sub_fn: FS,
+    ) where
+        FA: Fn(&mut [i16], usize),
+        FS: Fn(&mut [i16], usize),
+    {
         let entry_idx = king_sq.raw() as usize * 2 + perspective as usize;
-        let start = entry_idx * self.l1;
-        self.valid[entry_idx].then(|| &self.accumulations[start..start + self.l1])
-    }
 
-    /// 視点側の玉升を key に、駒スロット差分だけを更新する。
-    ///
-    /// 全 FT で index の玉側の依存は king_sq と perspective で決まる。
-    /// HM の mirror / bucket も同じ key から決まる。相手玉は key に含めず、
-    /// HalfKA の駒リスト内の BonaPiece として比較する。
-    pub(crate) fn refresh_or_cache<const L1: usize, FT: LsFeatureSpec>(
-        &mut self,
-        pos: &Position,
-        perspective: Color,
-        biases: &[i16],
-        accumulation: &mut [i16],
-        weights: &[i16],
-    ) {
-        let king_sq = pos.king_square(perspective);
-        let raw = if perspective == Color::Black {
-            pos.piece_list().piece_list_fb()
-        } else {
-            pos.piece_list().piece_list_fw()
-        };
-        let owned;
-        let pieces = if FT::INCLUDE_KING_IN_PIECE_LIST {
-            raw
-        } else {
-            owned = {
-                let mut pieces = *raw;
-                pieces[PieceNumber::KING as usize] = BonaPiece::ZERO;
-                pieces[PieceNumber::KING as usize + 1] = BonaPiece::ZERO;
-                pieces
-            };
-            &owned
-        };
-        self.refresh_piece_list::<L1, _>(
-            (king_sq, perspective),
-            pieces,
-            biases,
-            accumulation,
-            weights,
-            |bp| FT::feature_index(bp, perspective, king_sq),
-        );
-    }
+        if self.valid[entry_idx] {
+            // キャッシュが有効 → 差分更新
+            accumulation.copy_from_slice(self.acc_slice(entry_idx));
 
-    /// 各スロットから最大 1 件ずつ差分を集め、cache と出力を同時に更新する。
-    pub(super) fn refresh_piece_list<const L1: usize, FI: Fn(BonaPiece) -> usize>(
-        &mut self,
-        key: (Square, Color),
-        pieces: &[BonaPiece; PieceNumber::NB],
-        biases: &[i16],
-        accumulation: &mut [i16],
-        weights: &[i16],
-        idx_fn: FI,
-    ) {
-        assert_eq!(L1, self.l1);
-        assert_eq!(accumulation.len(), L1);
-        assert_eq!(biases.len(), L1);
-        let entry = key.0.raw() as usize * 2 + key.1 as usize;
-        let was_valid = self.valid[entry];
-        // 重みの境界検証などで unwind しても半更新の entry を再利用しない。
-        self.valid[entry] = false;
-        let mut removed = IndexList::new();
-        let mut added = IndexList::new();
-        if was_valid {
-            collect_piece_list_diff(
-                &self.piece_lists[entry],
-                pieces,
-                idx_fn,
-                &mut removed,
-                &mut added,
-            );
+            // ソート済み配列のマージベース差分（O(n)）
+            let cached = &self.active_indices[entry_idx][..self.num_active[entry_idx] as usize];
+            Self::apply_diff(cached, active, accumulation, &add_fn, &sub_fn);
         } else {
-            for &bp in pieces {
-                if bp != BonaPiece::ZERO {
-                    let pushed = added.push(idx_fn(bp));
-                    debug_assert!(pushed);
-                }
+            // キャッシュ無効 → バイアスから full refresh
+            accumulation.copy_from_slice(biases);
+            for &idx in active {
+                add_fn(accumulation, idx as usize);
             }
         }
-        let start = entry * L1;
-        apply_weight_changes_to_two::<L1>(
-            &mut self.accumulations[start..start + L1],
-            (!was_valid).then_some(biases),
-            accumulation,
-            weights,
-            &removed,
-            &added,
+
+        // キャッシュを更新
+        self.acc_slice_mut(entry_idx).copy_from_slice(accumulation);
+        debug_assert!(
+            active.len() <= MAX_ACTIVE_FEATURES,
+            "active features overflow: {}",
+            active.len()
         );
-        self.piece_lists[entry] = *pieces;
-        self.valid[entry] = true;
+        let n = active.len().min(MAX_ACTIVE_FEATURES);
+        self.active_indices[entry_idx][..n].copy_from_slice(&active[..n]);
+        self.num_active[entry_idx] = n as u16;
+        self.valid[entry_idx] = true;
+    }
+
+    /// ソート済み配列のマージベース差分を適用
+    #[inline]
+    fn apply_diff<FA, FS>(
+        cached: &[u32],
+        current: &[u32],
+        accumulation: &mut [i16],
+        add_fn: &FA,
+        sub_fn: &FS,
+    ) where
+        FA: Fn(&mut [i16], usize),
+        FS: Fn(&mut [i16], usize),
+    {
+        let mut ci = 0;
+        let mut ni = 0;
+
+        while ci < cached.len() && ni < current.len() {
+            let c = cached[ci];
+            let n = current[ni];
+            if c < n {
+                sub_fn(accumulation, c as usize);
+                ci += 1;
+            } else if c > n {
+                add_fn(accumulation, n as usize);
+                ni += 1;
+            } else {
+                ci += 1;
+                ni += 1;
+            }
+        }
+
+        while ci < cached.len() {
+            sub_fn(accumulation, cached[ci] as usize);
+            ci += 1;
+        }
+
+        while ni < current.len() {
+            add_fn(accumulation, current[ni] as usize);
+            ni += 1;
+        }
     }
 }
 
@@ -1271,206 +803,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn try_clone_weights_copies_or_reports_allocation_failure() {
-        let mut source = AlignedBox::<i16>::new_zeroed(1000);
-        source[7] = 3;
-        let copy = try_clone_weights(|| source.clone()).unwrap();
-        assert_eq!(&copy[..], &source[..]);
-
-        // 確保に失敗した状態を作り、途中の値を捨てて Err になることを確かめる。
-        let result = try_clone_weights(|| {
-            FALLIBLE_CLONE.with(|state| state.set(Some(true)));
-            let failed = source.clone();
-            assert!(failed.is_empty() && matches!(failed.backing, AlignedBoxBacking::Empty));
-            failed
-        });
-        assert!(result.is_err());
-        assert_eq!(FALLIBLE_CLONE.with(Cell::get), None);
-        assert_eq!(&source.clone()[..], &source[..]);
-    }
-
-    #[test]
-    fn aligned_box_fallible_allocation_preserves_zeroes_and_alignment() {
-        #[derive(Clone, Copy, Default)]
-        #[repr(align(128))]
-        struct Wide(u8);
-
-        impl zeroable::Sealed for Wide {}
-        impl Zeroable for Wide {}
-
-        for len in [0, 1, 63, 64, 65] {
-            let mut values = AlignedBox::<i16>::try_new_zeroed(len).unwrap();
-            assert_eq!(values.len(), len);
-            assert!(values.iter().all(|&value| value == 0));
-            assert_eq!(values.as_ptr() as usize % CACHE_LINE_SIZE, 0);
-            values.fill(7);
-            assert!(values.iter().all(|&value| value == 7));
-        }
-        let values = AlignedBox::<Wide>::try_new_zeroed(1).unwrap();
-        assert_eq!(values[0].0, 0);
-        assert_eq!(values.as_ptr() as usize % align_of::<Wide>(), 0);
-        assert!(AlignedBox::<i16>::new_zeroed(0).is_empty());
-    }
-
-    #[test]
-    fn aligned_box_fallible_allocation_rejects_invalid_layout_without_allocating() {
-        let overflow = AlignedBox::<i16>::try_new_zeroed(usize::MAX).err().unwrap();
-        assert_eq!(overflow.kind(), std::io::ErrorKind::InvalidInput);
-        let padding_overflow = AlignedBox::<u8>::try_new_zeroed(isize::MAX as usize).err().unwrap();
-        assert_eq!(padding_overflow.kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    fn check_index_list_extend<const N: usize>() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        for prefix in [0, N / 2, N] {
-            for count in [0, N.saturating_sub(prefix), N + 2] {
-                let mut expected = IndexList::<N>::new();
-                for i in 0..prefix {
-                    assert!(expected.push(100 + i));
-                }
-                let mut actual = expected;
-                let expected_result = catch_unwind(AssertUnwindSafe(|| {
-                    for i in 0..count {
-                        let _ = expected.push(i);
-                    }
-                }));
-                let actual_result = catch_unwind(AssertUnwindSafe(|| actual.extend(0..count)));
-                assert_eq!(actual_result.is_err(), expected_result.is_err());
-                assert_eq!(actual.iter().collect::<Vec<_>>(), expected.iter().collect::<Vec<_>>());
-            }
-        }
-    }
-
-    #[test]
-    fn index_list_extend_matches_push_at_capacity_boundaries() {
-        check_index_list_extend::<0>();
-        check_index_list_extend::<4>();
-        check_index_list_extend::<255>();
-    }
-
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn index_list_extend_pairs_matches_push_for_large_index() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        for invalid_first in [false, true] {
-            let invalid = Some(u32::MAX as usize + 1);
-            let pair = if invalid_first {
-                (invalid, Some(23))
-            } else {
-                (Some(23), invalid)
-            };
-            let pairs = [(Some(12), Some(34)), pair];
-            let mut expected = (IndexList::<4>::new(), IndexList::<4>::new());
-            let mut actual = expected;
-            let expected_result = catch_unwind(AssertUnwindSafe(|| {
-                for (first, second) in pairs {
-                    if let Some(index) = first {
-                        let _ = expected.0.push(index);
-                    }
-                    if let Some(index) = second {
-                        let _ = expected.1.push(index);
-                    }
-                }
-            }));
-            let actual_result =
-                catch_unwind(AssertUnwindSafe(|| actual.0.extend_pairs(&mut actual.1, pairs)));
-            assert_eq!(actual_result.is_err(), expected_result.is_err());
-            assert_eq!(actual.0.iter().collect::<Vec<_>>(), expected.0.iter().collect::<Vec<_>>());
-            assert_eq!(actual.1.iter().collect::<Vec<_>>(), expected.1.iter().collect::<Vec<_>>());
-        }
-    }
-
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn index_list_extend_matches_push_for_large_index() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-
-        let mut expected = IndexList::<4>::new();
-        let mut actual = expected;
-        let indices = [12, u32::MAX as usize, u32::MAX as usize + 1];
-        let expected_result = catch_unwind(AssertUnwindSafe(|| {
-            for index in indices {
-                let _ = expected.push(index);
-            }
-        }));
-        let actual_result = catch_unwind(AssertUnwindSafe(|| actual.extend(indices)));
-        assert_eq!(actual_result.is_err(), expected_result.is_err());
-        assert_eq!(actual.iter().collect::<Vec<_>>(), expected.iter().collect::<Vec<_>>());
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion `left == right` failed")]
-    fn finny_generic_checks_dimensions_before_simd_callback() {
-        let mut cache = AccumulatorCacheGeneric::new(32);
-        cache.refresh_piece_list::<64, _>(
-            (Square::SQ_55, Color::Black),
-            &[BonaPiece::ZERO; PieceNumber::NB],
-            &[0; 64],
-            &mut [0; 64],
-            &[],
-            |_| panic!("寸法不一致の index 計算"),
-        );
-    }
-
-    #[test]
-    fn finny_generic_updates_only_changed_features_and_invalidates() {
-        use std::cell::RefCell;
-        let mut cache = AccumulatorCacheGeneric::new(32);
-        let mut actual = [0; 32];
-        let changes = RefCell::new(Vec::new());
-        let weights: Vec<_> = (0..4).flat_map(|i| [(i as i16).wrapping_mul(12000); 32]).collect();
-        for (values, expected_changes) in [
-            ([1, 3, 3], vec![1, 3, 3]),
-            ([1, 3, 3], vec![]),
-            ([2, 3, 0], vec![1, 2, 3]),
-            ([3, 2, 0], vec![2, 3, 3, 2]),
-            ([0, 0, 0], vec![3, 2]),
-        ] {
-            let mut pieces = [BonaPiece::ZERO; PieceNumber::NB];
-            for (slot, value) in values.into_iter().enumerate() {
-                pieces[slot] = BonaPiece::new(value);
-            }
-            changes.borrow_mut().clear();
-            cache.refresh_piece_list::<32, _>(
-                (Square::SQ_55, Color::Black),
-                &pieces,
-                &[123; 32],
-                &mut actual,
-                &weights,
-                |bp| {
-                    changes.borrow_mut().push(bp.value());
-                    bp.value() as usize
-                },
-            );
-            let expected = values
-                .iter()
-                .fold(123i16, |sum, &i| sum.wrapping_add((i as i16).wrapping_mul(12000)));
-            assert_eq!(actual, [expected; 32]);
-            assert_eq!(*changes.borrow(), expected_changes);
-        }
-        cache.invalidate();
-        cache.refresh_piece_list::<32, _>(
-            (Square::SQ_55, Color::Black),
-            &[BonaPiece::ZERO; PieceNumber::NB],
-            &[-456; 32],
-            &mut actual,
-            &weights,
-            |bp| bp.value() as usize,
-        );
-        assert_eq!(actual, [-456; 32]);
-    }
-
-    #[test]
-    fn valid_init_aligned_storage_supports_nonzero_values() {
-        use std::num::NonZeroU32;
-        let mut storage = Aligned::<NonZeroU32>::new_uninit();
-        assert_eq!(storage.as_ptr() as usize % 64, 0);
-        let initialized = storage.write(Aligned(NonZeroU32::new(17).unwrap()));
-        assert_eq!(initialized.0.get(), 17);
-        // SAFETY: write が構造体全体を有効な値で初期化した。
-        assert_eq!(unsafe { storage.assume_init() }.0.get(), 17);
+    fn test_accumulator_new() {
+        let acc = Accumulator::new();
+        assert!(!acc.computed_accumulation);
+        assert!(!acc.computed_score);
+        assert_eq!(acc.score, Value::ZERO);
     }
 
     #[test]
@@ -1505,12 +842,17 @@ mod tests {
     }
 
     #[test]
+    fn test_dirty_piece_new() {
+        let dp = DirtyPiece::new();
+        assert_eq!(dp.dirty_num, 0);
+        assert!(!dp.king_moved[0]);
+        assert!(!dp.king_moved[1]);
+    }
+
+    #[test]
     fn test_accumulator_stack_push_pop() {
         let mut stack = AccumulatorStack::new();
         assert_eq!(stack.current_index(), 0);
-        assert!(!stack.current().accumulator.computed_accumulation);
-        assert!(!stack.current().accumulator.computed_score);
-        assert_eq!(stack.current().accumulator.score, Value::ZERO);
 
         stack.push(DirtyPiece::new());
         assert_eq!(stack.current_index(), 1);

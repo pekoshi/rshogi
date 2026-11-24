@@ -1,35 +1,30 @@
 //! 置換表モジュール
 //!
-//! 探索結果をキャッシュする置換表（Transposition Table）。
+//! 探索結果をキャッシュする置換表 (= Transposition Table)。
 //!
-//! - `TTEntry`: エントリ（10バイト、16bitキー）
-//! - `Cluster`: エントリのグループ（32バイト）
+//! - `TTEntry`: エントリ (= 16 byte、 AtomicU64×2、 XOR torn detection)
+//! - `Cluster`: エントリのグループ (= 48 byte、 64 byte align)
 //! - `TranspositionTable`: テーブル本体
 //! - 世代管理
 //! - prefetch
 //!
-//! # 3 エントリのクラスター
+//! # XOR + AtomicU64 設計 (= Stockfish/YaneuraOu 準拠)
 //!
-//! クラスターインデックスは64bitキーの上位ビットで決定し、
-//! クラスター内マッチングに下位16bitを使用する。
-//! payload の AtomicU64 × 3 + 短縮キーの AtomicU16 × 3 + 2バイトパディング
-//! = 32バイト/クラスター。排他は取らず、payload 内のフィールド対応だけを不可分に保つ。
-//! 短縮キーと payload は別ワードなので、異なる書込みの組が観測されうる。
+//! クラスターインデックスは 64bit キーの上位ビットで決定し、
+//! クラスター内マッチングに下位 16bit を使用する。
+//! key_xor_data = (key16 as u64) ^ data として格納、 read 時に復元し torn 検出。
+//! multi-thread search で同一 cluster へ並行 write しても false positive なし
+//! (= XOR mismatch なら invalid 扱い = cache miss)。
 
-pub(crate) mod alloc;
+mod alloc;
 mod entry;
 mod table;
-#[cfg(feature = "tt-write-stats")]
-mod write_stats;
-#[cfg(feature = "tt-write-stats")]
-pub use write_stats::TTWriteStats;
 
 pub use entry::{TTData, TTEntry};
-pub(crate) use table::TTWriter;
 pub use table::{ProbeResult, TranspositionTable};
 
 /// クラスターサイズ（エントリ数）
-/// payload 8bytes × 3 + 短縮キー 2bytes × 3 + padding 2bytes = 32bytes
+/// YaneuraOu準拠: 10bytes × 3 + 2padding = 32bytes
 pub const CLUSTER_SIZE: usize = 3;
 
 /// Generation関連の定数

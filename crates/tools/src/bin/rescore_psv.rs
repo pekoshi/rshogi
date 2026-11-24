@@ -47,44 +47,25 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use glob::glob;
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use tools::common::dedup::canonicalize_maybe_new;
-use tools::nnue_routing::{
-    NativeRouting, ProgressCoefficients, parse_native_layer_stack_bucket_mode,
-};
-// Arc/Instant は ONNX 直推論パイプライン専用（フェーズ計時など）。ONNX 無効ビルドでの
-// unused import を避けるため cfg で囲う。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-use std::time::Instant;
 
-use rshogi_core::nnue::{LayerStackBucketMode, get_network, init_nnue};
+use rshogi_core::nnue::init_nnue;
 use rshogi_core::position::Position;
 use rshogi_core::search::{LimitsType, Search};
-use tools::packed_sfen::{
-    PackedSfenValue, move_to_psv_move16, pack_position, unpack_sfen, unpack_sfen_to_parts,
-};
-use tools::progress::{FileProgress, MultiFileProgress};
-// UnpackedSfen は ONNX 経路専用。ONNX 無効ビルドの unused import を避けるため cfg で囲う。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-use tools::packed_sfen::UnpackedSfen;
-use tools::qsearch_pv::{NnueStacks, apply_pv, qsearch_with_pv_nnue};
+use tools::packed_sfen::{PackedSfenValue, pack_position, unpack_sfen};
+use tools::qsearch_pv::{NnueStacks, qsearch_with_pv_nnue};
 
 /// 探索用スタックサイズ（64MB）
 const SEARCH_STACK_SIZE: usize = 64 * 1024 * 1024;
-const SCORE_RECORD_SIZE: u64 = std::mem::size_of::<i16>() as u64;
 
 /// PSVファイルの評価値を再評価
 #[derive(Parser)]
@@ -104,31 +85,9 @@ struct Cli {
     #[arg(short, long)]
     output_dir: PathBuf,
 
-    /// フル PSV の代わりに little-endian i16 の score sidecar を出力
-    #[arg(long)]
-    out_scores: bool,
-
     /// NNUEモデルファイル（--engine未使用時に必須）
     #[arg(long)]
     nnue: Option<PathBuf>,
-
-    /// LayerStacks bucket mode。LayerStacks NNUE では必須。
-    #[arg(long)]
-    ls_bucket_mode: Option<String>,
-
-    /// 進行度方式が推論に使う bucket 数。
-    #[arg(long)]
-    ls_progress_buckets: Option<usize>,
-
-    /// 進行度方式 (progresskpabs / progresskpabsq16) 用の進行度係数ファイル。
-    #[arg(long)]
-    ls_progress_coeff: Option<PathBuf>,
-
-    /// --ls-progress-buckets が NNUE ファイルの格納 bucket 数と異なる指定を警告付きで
-    /// 許可する。格納 9 bucket を floor(p*8) routing で学習した旧世代 net の再評価
-    /// 専用。通常の net は格納数 = routing 数なので、不一致は指定ミスとして拒否される。
-    #[arg(long)]
-    allow_routing_buckets_mismatch: bool,
 
     /// qsearch評価を使用（デフォルトは静的評価）
     #[arg(long)]
@@ -138,10 +97,6 @@ struct Cli {
     /// 指定した深さでalpha-beta探索を実行し、その結果をスコアとして使用
     #[arg(long)]
     search_depth: Option<i32>,
-
-    /// 深さ指定探索の最善手を実 YaneuraOu PSV 形式 (A) で move16 に出力
-    #[arg(long)]
-    emit_bestmove: bool,
 
     /// 置換表サイズ（MB）、--search-depth使用時のみ有効
     #[arg(long, default_value_t = 64)]
@@ -160,22 +115,6 @@ struct Cli {
     /// qsearch leaf置換も同時に適用
     #[arg(long)]
     apply_qsearch_leaf: bool,
-
-    /// root 局面を保持したまま、ラベルだけを qsearch 葉の評価にする（局面は置換しない）。
-    /// `--nnue`（葉探索用）＋ `--dlshogi-onnx-model`/`--onnx-model`（葉ラベル用）と併用する。
-    /// DL 系の静的評価でラベル付けする教師生成で、葉の評価を root 局面に付与する用途。
-    /// `--apply-qsearch-leaf`（局面置換）とは併用不可。
-    #[arg(long)]
-    qsearch_leaf_label: bool,
-
-    /// `--qsearch-leaf-label` と併用し、同一 1 パスで葉局面に置換したレコードを
-    /// 別ディレクトリにも書き出す（leaf-REPLACEMENT arm）。
-    /// `--output-dir` 側は root 局面 + 葉ラベル（leaf-LABEL arm）のまま。
-    /// このディレクトリには葉局面 + 葉評価（符号反転なし）を書き出す。
-    /// `--apply-qsearch-leaf` → DL rescore の 2 工程と bit 一致する。
-    /// `--output-dir` とは別ディレクトリ必須。
-    #[arg(long)]
-    qsearch_leaf_replacement_output: Option<PathBuf>,
 
     /// qsearchの最大深さ
     #[arg(long, default_value_t = 16)]
@@ -228,6 +167,11 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     engine_nodes: u64,
 
+    /// エンジンの探索深さ（--engine使用時、0=指定なし）。
+    /// engine_nodes と併用すると `go depth D nodes N` を送り、エンジンが早い方で停止する。
+    #[arg(long, default_value_t = 0)]
+    engine_depth: u32,
+
     /// USIオプション（"Name=Value"形式、複数指定可）
     /// 例: --usi-option "DNN_Model=model.onnx" --usi-option "UCT_Threads=1"
     #[arg(long = "usi-option")]
@@ -256,30 +200,13 @@ struct Cli {
     #[arg(long)]
     dlshogi_onnx_model: Option<PathBuf>,
 
-    /// ONNX推論バッチサイズ（--onnx-model/--dlshogi-onnx-model使用時）。
-    /// GPU 推論の実測（dlshogi 系 + TensorRT）では 512〜2048 がほぼフラットで
-    /// 256 以下は GPU 利用率が下がり遅い。CPU 推論・省メモリ環境では小さい値も検討。
-    #[arg(long, default_value_t = 1024)]
+    /// ONNX推論バッチサイズ（--onnx-model/--dlshogi-onnx-model使用時）
+    #[arg(long, default_value_t = 256)]
     onnx_batch_size: usize,
 
-    /// ONNX推論の GPU ID（-1=CPU）。`0,1` のようにカンマ区切りで複数の GPU を指定すると、
-    /// GPU ごとに `--onnx-sessions` 本のセッションを作り、空いたセッションが次のバッチを取る。
-    #[arg(
-        long,
-        default_value = "0",
-        value_parser = parse_onnx_gpu_ids,
-        allow_negative_numbers = true
-    )]
-    onnx_gpu_id: OnnxGpuIds,
-
-    /// GPU 1 つあたりの ONNX推論セッション数（GPU 推論時のみ有効、CPU 推論では常に 1）。
-    /// 2 以上で複数セッションが空いた順にバッチを取り、H2D/D2H 転送と compute をオーバーラップ
-    /// させる（in-flight 多重化）。出力はバッチ順に再整列される。同一 TensorRT
-    /// エンジンキャッシュならセッション数に依存せず出力が一致することを
-    /// dlshogi 系 + TensorRT の実測で確認済み（全モデル / EP の一般保証ではない）。
-    /// VRAM 使用量はセッション数に応じて増える。
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=4))]
-    onnx_sessions: u64,
+    /// ONNX推論の GPU ID（-1=CPU）
+    #[arg(long, default_value_t = 0)]
+    onnx_gpu_id: i32,
 
     /// TensorRT ExecutionProvider を使用（FP16推論、初回はエンジンコンパイルに時間がかかる）
     #[arg(long)]
@@ -337,340 +264,101 @@ enum OnnxMarkerDecision {
     Skip,
     /// rescore + expand 出力を truncate して最初から処理
     TruncateAndProcess,
-    /// score sidecar の in-progress marker が一致。件数ベースで追記再開
-    ResumeSidecar,
-    ResumeFullPsv,
+    /// marker 不存在 + expand 無効 → 既存の record-count resume にフォールバック
+    LegacyResume,
 }
 
-use tools::output_path::{
-    ensure_distinct_output_paths, ensure_safe_output_file, ensure_safe_output_path,
-    ensure_safe_output_paths,
-};
-
-/// `--onnx-gpu-id` の値。GPU 番号の列 (重複可) か、CPU 推論を表す `[-1]`。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OnnxGpuIds(Vec<i32>);
-
-impl OnnxGpuIds {
-    fn is_cpu(&self) -> bool {
-        self.0 == [-1]
+/// 2 つのパスが同じファイル実体を指すかを判定する。
+/// パス文字列一致、canonicalize 一致、Unix の `dev + ino` 一致のいずれかで true を返す。
+/// I/O エラーや非 Unix プラットフォームで dev/ino が取れないケースでは false
+/// に倒れる（= 「同一と判定できなかった」。呼び出し側の文脈で追加の安全策が
+/// 必要な場面ではパス一致検証と併用する）。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn is_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
     }
-
-    #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-    fn ids(&self) -> &[i32] {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for OnnxGpuIds {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let ids: Vec<String> = self.0.iter().map(i32::to_string).collect();
-        f.write_str(&ids.join(","))
-    }
-}
-
-fn parse_onnx_gpu_ids(value: &str) -> std::result::Result<OnnxGpuIds, String> {
-    let ids = value
-        .split(',')
-        .map(|part| {
-            let part = part.trim();
-            part.parse::<i32>().map_err(|_| format!("invalid GPU id '{part}' in '{value}'"))
-        })
-        .collect::<std::result::Result<Vec<i32>, String>>()?;
-    if ids.len() > 1 && ids.contains(&-1) {
-        return Err(format!("-1 (CPU) cannot be combined with GPU ids: '{value}'"));
-    }
-    if let Some(id) = ids.iter().find(|&&id| id < -1) {
-        return Err(format!("GPU id must be -1 (CPU) or >= 0, got {id}"));
-    }
-    Ok(OnnxGpuIds(ids))
-}
-
-struct OutputProtection {
-    inputs: Vec<PathBuf>,
-    outputs: Vec<PathBuf>,
-}
-
-impl OutputProtection {
-    fn new(inputs: Vec<PathBuf>, outputs: Vec<PathBuf>) -> Result<Self> {
-        let protection = Self { inputs, outputs };
-        protection.check_all()?;
-        Ok(protection)
-    }
-
-    fn check_all(&self) -> Result<()> {
-        #[cfg(windows)]
-        {
-            let mut planned = std::collections::BTreeSet::new();
-            for output in &self.outputs {
-                let canonical = canonicalize_maybe_new(output)?;
-                let spelling =
-                    canonical.to_str().context("Output path cannot be compared as Unicode")?;
-                let folded = spelling.to_lowercase().to_uppercase();
-                anyhow::ensure!(
-                    planned.insert(folded),
-                    "Output paths resolve to the same file or differ only in case: {}",
-                    output.display()
-                );
-            }
-        }
-        let inputs: Vec<_> = self.inputs.iter().map(PathBuf::as_path).collect();
-        let outputs: Vec<_> = self.outputs.iter().map(PathBuf::as_path).collect();
-        ensure_safe_output_paths(&outputs, &inputs)?;
-        Ok(())
-    }
-
-    fn check_path(&self, path: &std::path::Path) -> Result<()> {
-        let inputs: Vec<_> = self.inputs.iter().map(PathBuf::as_path).collect();
-        ensure_safe_output_paths(&[path], &inputs)?;
-        for other in &self.outputs {
-            if other.as_path() != path {
-                ensure_distinct_output_paths(path, other)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn forget_deleted_input(&mut self, path: &std::path::Path) {
-        self.inputs.retain(|input| input != path);
-    }
-
-    fn check_file(&self, path: &std::path::Path, file: &File) -> Result<()> {
-        let inputs: Vec<_> = self.inputs.iter().map(PathBuf::as_path).collect();
-        let others: Vec<_> = self
-            .outputs
-            .iter()
-            .filter(|other| other.as_path() != path)
-            .map(PathBuf::as_path)
-            .collect();
-        ensure_safe_output_file(file, path, &inputs, &others)
-    }
-
-    fn check_existing(&self, path: &std::path::Path) -> Result<()> {
-        match File::open(path) {
-            Ok(file) => self.check_file(path, &file),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => {
-                Err(error).with_context(|| format!("Failed to inspect {}", path.display()))
-            }
-        }
-    }
-
-    fn open(&self, path: &std::path::Path, append: bool) -> Result<File> {
-        self.check_path(path)?;
-        let file = File::options()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .append(append)
-            .open(path)?;
-        self.check_file(path, &file)?;
-        Ok(file)
-    }
-
-    fn truncate(&self, path: &std::path::Path, size: u64) -> Result<()> {
-        self.check_path(path)?;
-        let file = File::options().write(true).open(path)?;
-        self.check_file(path, &file)?;
-        file.set_len(size)?;
-        Ok(())
-    }
-
-    fn remove(&self, path: &std::path::Path) -> Result<()> {
-        self.check_path(path)?;
-        self.check_existing(path)?;
-        fs::remove_file(path)?;
-        Ok(())
-    }
-}
-
-fn paths_match(a: &std::path::Path, b: &std::path::Path) -> Result<bool> {
-    if a == b || canonicalize_maybe_new(a)? == canonicalize_maybe_new(b)? {
-        return Ok(true);
-    }
-    match same_file::is_same_file(a, b) {
-        Ok(same) => Ok(same),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn parsed_usi_option(option: &str) -> Option<(&str, &str)> {
-    option.split_once('=').map(|(name, value)| (name.trim(), value.trim()))
-}
-
-fn is_usi_resource_option(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name == "dnn_model"
-        || ["file", "dir", "path", "coeff"].iter().any(|suffix| name.ends_with(suffix))
-}
-
-fn output_protection(cli: &Cli, input_files: &[PathBuf]) -> Result<OutputProtection> {
-    let mut inputs = input_files.to_vec();
-    for resource in [
-        &cli.nnue,
-        &cli.ls_progress_coeff,
-        &cli.engine,
-        &cli.onnx_model,
-        &cli.dlshogi_onnx_model,
-    ]
-    .into_iter()
-    .flatten()
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize())
+        && ca == cb
     {
-        inputs.push(resource.clone());
+        return true;
     }
-    if let Some(engine) = &cli.engine {
-        tools::book_fingerprint::ensure_no_engine_options(engine)?;
-        let cwd = engine.parent().unwrap_or(std::path::Path::new("."));
-        for (name, value) in cli.usi_options.iter().filter_map(|option| parsed_usi_option(option)) {
-            anyhow::ensure!(
-                !name.split_whitespace().chain(value.split_whitespace()).any(|token| {
-                    token.eq_ignore_ascii_case("name") || token.eq_ignore_ascii_case("value")
-                }),
-                "Reserved USI token in option name or value: {name}"
-            );
-            if is_usi_resource_option(name) {
-                anyhow::ensure!(
-                    name.split_whitespace().collect::<Vec<_>>().join(" ") == name
-                        && value.split_whitespace().collect::<Vec<_>>().join(" ") == value,
-                    "Ambiguous whitespace in USI resource option: {name}"
-                );
-            }
-        }
-        let options: std::collections::BTreeMap<_, _> = cli
-            .usi_options
-            .iter()
-            .filter_map(|option| parsed_usi_option(option))
-            .map(|(name, value)| (name.to_owned(), value))
-            .collect();
-        let explicit_spsa = options
-            .get("SPSAParamsFile")
-            .is_some_and(|value| !matches!(*value, "" | "<auto>" | "<empty>"));
-        let implicit_spsa = !explicit_spsa
-            || options.iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case("SPSAParamsFile")
-                    && matches!(*value, "" | "<auto>" | "<empty>")
-            });
-        let mut book_dirs: std::collections::BTreeSet<_> = options
-            .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case("BookDir"))
-            .map(|(_, value)| if value.is_empty() { "book" } else { *value })
-            .collect();
-        if options.get("BookDir").is_none_or(|value| value.is_empty()) {
-            book_dirs.insert("book");
-        }
-        for (raw_name, value) in &options {
-            let name = raw_name.to_ascii_lowercase();
-            if value.is_empty()
-                || matches!(*value, "<empty>" | "<auto>")
-                || name == "bookdir"
-                || (name == "bookfile" && *value == "no_book")
-            {
-                continue;
-            }
-            if is_usi_resource_option(raw_name) {
-                let resources: Vec<_> = if name == "bookfile" {
-                    book_dirs
-                        .iter()
-                        .map(|directory| PathBuf::from(*directory).join(*value))
-                        .collect()
-                } else {
-                    vec![PathBuf::from(*value)]
-                };
-                for resource in resources {
-                    let path = if resource.is_absolute() {
-                        resource
-                    } else {
-                        cwd.join(resource)
-                    };
-                    if !path.try_exists()? {
-                        continue;
-                    }
-                    if path.is_dir() {
-                        for entry in walkdir::WalkDir::new(&path).follow_links(true) {
-                            let entry = entry?;
-                            if entry.file_type().is_file() {
-                                inputs.push(entry.into_path());
-                            }
-                        }
-                    } else {
-                        inputs.push(path);
-                    }
-                }
-            }
-        }
-        if implicit_spsa {
-            let automatic = engine
-                .canonicalize()?
-                .parent()
-                .context("Engine has no parent")?
-                .join("spsa.params");
-            if automatic.try_exists()? {
-                inputs.push(automatic);
-            }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if a.exists()
+            && b.exists()
+            && let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b))
+            && ma.dev() == mb.dev()
+            && ma.ino() == mb.ino()
+        {
+            return true;
         }
     }
-    let expand_dir = cli.expand_output_dir.as_ref().map(|dir| dir.canonicalize()).transpose()?;
-    let replacement_dir = cli
-        .qsearch_leaf_replacement_output
-        .as_ref()
-        .map(|dir| dir.canonicalize())
-        .transpose()?;
-    let mut outputs = Vec::new();
-    let mut old_artifacts = Vec::new();
-    for input in input_files {
-        let name = input.file_name().context("Input has no file name")?;
-        let mut output_name = name.to_os_string();
-        if cli.out_scores {
-            output_name.push(".scores.i16");
-        }
-        let output = cli.output_dir.join(output_name);
-        let expand = expand_dir.as_ref().map(|dir| dir.join(name));
-        let replacement = replacement_dir.as_ref().map(|dir| dir.join(name));
-        outputs.push(output.clone());
-        outputs.extend(expand.iter().chain(replacement.iter()).cloned());
-        if cli.out_scores || cli.onnx_model.is_some() || cli.dlshogi_onnx_model.is_some() {
-            let done = marker_path_for(&output);
-            for marker in [done.clone(), in_progress_marker_path_for(&output)] {
-                let mut tmp = marker.as_os_str().to_os_string();
-                tmp.push(".tmp");
-                outputs.extend([marker, PathBuf::from(tmp)]);
-            }
-            if done.try_exists()? {
-                let marker = parse_marker(&done)?;
-                for (old, current) in [
-                    (marker.fingerprint.expand_output_path, expand),
-                    (marker.fingerprint.replacement_output_path, replacement),
-                ] {
-                    if let Some(old) = old {
-                        let retained = current
-                            .as_ref()
-                            .map(|current| paths_match(&old, current))
-                            .transpose()?
-                            .unwrap_or(false);
-                        if !retained {
-                            old_artifacts.push(old);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    outputs.extend(old_artifacts);
-    OutputProtection::new(inputs, outputs)
+    false
 }
 
+/// 既存出力パスが symlink でないこと、未作成・既存どちらでも入力パスと衝突
+/// しないことを検証する。既存ファイルが入力の hardlink である場合も検出する
+/// （Unix のみ、`MetadataExt::dev/ino` で同一 inode を判定）。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn ensure_safe_output_path(
+    predicted: &std::path::Path,
+    canonical_input: &std::path::Path,
+) -> Result<()> {
+    // 既存ファイルなら symlink を拒否（truncate/append が symlink を辿ると
+    // 入力破壊につながる）
+    if let Ok(meta) = fs::symlink_metadata(predicted)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "Output path is a symlink (refusing to truncate a symlink): {}. \
+             Remove the symlink or choose a different directory.",
+            predicted.display()
+        );
+    }
+    // 出力ファイル未作成でも parent を canonicalize して予定 canonical パスを構築
+    // し、入力パスと一致したらエラー
+    let predicted_canonical = canonicalize_predicted_path(predicted)?;
+    if predicted_canonical == canonical_input {
+        anyhow::bail!(
+            "Output path resolves to input file: {} -> {}",
+            predicted.display(),
+            canonical_input.display()
+        );
+    }
+    // 既存出力ファイルが入力と同じ inode を指す（hardlink）ケースを検出。
+    // `canonicalize` はパス解決のみで hardlink を検出できないため、Unix では
+    // `MetadataExt::{dev, ino}` で同一 inode 判定する。
+    #[cfg(unix)]
+    if predicted.exists() {
+        use std::os::unix::fs::MetadataExt;
+        let pred_meta = fs::metadata(predicted)
+            .with_context(|| format!("Failed to stat predicted output {}", predicted.display()))?;
+        let in_meta = fs::metadata(canonical_input)
+            .with_context(|| format!("Failed to stat input {}", canonical_input.display()))?;
+        if pred_meta.dev() == in_meta.dev() && pred_meta.ino() == in_meta.ino() {
+            anyhow::bail!(
+                "Output path is a hardlink to the input file ({} ↔ {}). \
+                 Refusing to truncate; choose a different directory.",
+                predicted.display(),
+                canonical_input.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// ONNX モードの marker チェック + 必要な truncate を行い、判定結果を返す
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 #[allow(clippy::too_many_arguments)]
 fn onnx_marker_decide(
-    protection: &OutputProtection,
     cli: &Cli,
     model_kind: &str,
     onnx_path: &std::path::Path,
     input_path: &std::path::Path,
     rescore_output_path: &std::path::Path,
     expand_output_path: Option<&std::path::Path>,
-    replacement_output: Option<&std::path::Path>,
     process_count: u64,
 ) -> Result<OnnxMarkerDecision> {
     // 現在 run の OnnxPipelineConfig を組み立てて fingerprint を作る
@@ -695,11 +383,9 @@ fn onnx_marker_decide(
         onnx_path,
         input_path,
         output_path: rescore_output_path,
-        out_scores: cli.out_scores,
         process_count,
         batch_size: cli.onnx_batch_size,
-        gpu_ids: cli.onnx_gpu_id.ids(),
-        sessions: cli.onnx_sessions as usize,
+        gpu_id: cli.onnx_gpu_id,
         use_tensorrt: cli.onnx_tensorrt,
         tensorrt_cache: cli.onnx_tensorrt_cache.as_deref(),
         score_clip: cli.score_clip,
@@ -712,13 +398,6 @@ fn onnx_marker_decide(
         input2_channels: 0,
         profile_path: None,
         expand: expand_cfg,
-        qsearch_leaf_label: cli.qsearch_leaf_label,
-        qsearch_max_ply: cli.max_ply,
-        qsearch_nnue_path: cli.nnue.as_deref(),
-        qsearch_ls_bucket_mode: cli.ls_bucket_mode.as_deref(),
-        qsearch_ls_progress_buckets: cli.ls_progress_buckets,
-        qsearch_ls_progress_coeff_path: cli.ls_progress_coeff.as_deref(),
-        replacement_output,
     };
     let current = build_run_fingerprint(&cfg)?;
 
@@ -726,9 +405,6 @@ fn onnx_marker_decide(
     let canonical_input = current.input_path.clone();
     ensure_safe_output_path(rescore_output_path, &canonical_input)?;
     if let Some(p) = expand_output_path {
-        ensure_safe_output_path(p, &canonical_input)?;
-    }
-    if let Some(p) = replacement_output {
         ensure_safe_output_path(p, &canonical_input)?;
     }
 
@@ -747,34 +423,18 @@ fn onnx_marker_decide(
                 }
                 (false, None, None) => true,
                 _ => false,
-            }
-            && match (
-                marker.fingerprint.replacement,
-                marker.output_sizes.replacement_output_size,
-                marker.fingerprint.replacement_output_path.as_ref(),
-            ) {
-                (true, Some(size), Some(path)) => {
-                    path.exists() && fs::metadata(path)?.len() == size
-                }
-                (false, None, None) => true,
-                _ => false,
             };
 
         if marker.fingerprint == current && bodies_match {
-            if cli.out_scores {
-                remove_in_progress_marker(protection, rescore_output_path)?;
-            }
             return Ok(OnnxMarkerDecision::Skip);
         }
 
         // 不一致時の再生成手順。
         // 破壊操作の順序は意図的:
         //   1. 旧 expand artifact 削除（失敗しうる、入力衝突も事前検証）
-        //   2. 旧 replacement artifact 削除（同上）
-        //   3. 現 rescore 出力 truncate
-        //   4. 現 expand 出力 truncate
-        //   5. 現 replacement 出力 truncate
-        //   6. marker 削除（最後）
+        //   2. 現 rescore 出力 truncate
+        //   3. 現 expand 出力 truncate
+        //   4. marker 削除（最後）
         // この順なら、どの段階で失敗しても次回実行時に marker 不一致判定が
         // 働き、続きからやり直せる。"truncate してから remove_file" の順だと、
         // 後段失敗時に truncate 済み出力 + 古い marker が残ってデータ損失に
@@ -784,7 +444,7 @@ fn onnx_marker_decide(
         if let Some(old) = &marker.fingerprint.expand_output_path {
             // 段階的パイプライン（前回 expand 出力を次回入力に使う）対策。
             // 旧 artifact が現在 run の入力と同一ファイルなら絶対に削除しない。
-            if paths_match(old, &canonical_input)? {
+            if is_same_file(old, &canonical_input) {
                 anyhow::bail!(
                     "Stale expand artifact {} resolves to the current input file {}. \
                      Refusing to delete to prevent input data loss. \
@@ -794,89 +454,44 @@ fn onnx_marker_decide(
                 );
             }
             // 現在 run の expand 出力と同一なら truncate ステップで処理されるのでスキップ
-            let same_as_current =
-                expand_output_path.map(|p| paths_match(p, old)).transpose()?.unwrap_or(false);
+            let same_as_current = expand_output_path.is_some_and(|p| is_same_file(p, old));
             if !same_as_current && old.exists() {
-                protection.remove(old).with_context(|| {
+                fs::remove_file(old).with_context(|| {
                     format!("Failed to remove stale expand artifact {}", old.display())
                 })?;
             }
         }
 
-        // 2. 旧 replacement artifact 削除
-        if let Some(old) = &marker.fingerprint.replacement_output_path {
-            if paths_match(old, &canonical_input)? {
-                anyhow::bail!(
-                    "Stale leaf-replacement artifact {} resolves to the current input file {}. \
-                     Refusing to delete to prevent input data loss. \
-                     Move the input or change --qsearch-leaf-replacement-output.",
-                    old.display(),
-                    canonical_input.display()
-                );
-            }
-            let same_as_current =
-                replacement_output.map(|p| paths_match(p, old)).transpose()?.unwrap_or(false);
-            if !same_as_current && old.exists() {
-                protection.remove(old).with_context(|| {
-                    format!("Failed to remove stale leaf-replacement artifact {}", old.display())
-                })?;
-            }
-        }
-
-        // 3. 現 rescore 出力 truncate
+        // 2. 現 rescore 出力 truncate
         if rescore_output_path.exists() {
-            protection.truncate(rescore_output_path, 0)?;
+            File::options().write(true).open(rescore_output_path)?.set_len(0)?;
         }
-        // 4. 現 expand 出力 truncate
+        // 3. 現 expand 出力 truncate
         if let Some(p) = expand_output_path
             && p.exists()
         {
-            protection.truncate(p, 0)?;
+            File::options().write(true).open(p)?.set_len(0)?;
         }
-        // 5. 現 replacement 出力 truncate
-        if let Some(p) = replacement_output
-            && p.exists()
-        {
-            protection.truncate(p, 0)?;
-        }
-        // 6. marker 削除（最後）
-        protection
-            .remove(&marker_path)
+        // 4. marker 削除（最後）
+        fs::remove_file(&marker_path)
             .with_context(|| format!("Failed to remove stale marker {}", marker_path.display()))?;
-        if cli.out_scores {
-            prepare_in_progress_marker(protection, rescore_output_path, &current, true)?;
-        }
         return Ok(OnnxMarkerDecision::TruncateAndProcess);
     }
 
     // marker 不存在
-    if cli.out_scores {
-        let decision =
-            prepare_in_progress_marker(protection, rescore_output_path, &current, false)?
-                .context("out_scores=true did not create an in-progress marker")?;
-        return match decision {
-            SidecarStartDecision::Resume => Ok(OnnxMarkerDecision::ResumeSidecar),
-            SidecarStartDecision::Truncate => Ok(OnnxMarkerDecision::TruncateAndProcess),
-        };
-    }
-    // 補助出力や葉ラベルの由来は、主出力の PSV レコードだけでは確認できない。
-    if expand_output_path.is_some() || replacement_output.is_some() || cli.qsearch_leaf_label {
+    if expand_output_path.is_some() {
+        // expand 有効時は marker 必須。truncate して最初から
         if rescore_output_path.exists() {
-            protection.truncate(rescore_output_path, 0)?;
+            File::options().write(true).open(rescore_output_path)?.set_len(0)?;
         }
         if let Some(p) = expand_output_path
             && p.exists()
         {
-            protection.truncate(p, 0)?;
-        }
-        if let Some(p) = replacement_output
-            && p.exists()
-        {
-            protection.truncate(p, 0)?;
+            File::options().write(true).open(p)?.set_len(0)?;
         }
         Ok(OnnxMarkerDecision::TruncateAndProcess)
     } else {
-        Ok(OnnxMarkerDecision::ResumeFullPsv)
+        Ok(OnnxMarkerDecision::LegacyResume)
     }
 }
 
@@ -922,47 +537,6 @@ fn main() -> Result<()> {
     let use_onnx = cli.onnx_model.is_some();
     let use_dlshogi_onnx = cli.dlshogi_onnx_model.is_some();
 
-    // --out-scores の NNUE 静的評価モード: NNUE を直接ロードし、qsearch も探索も
-    // 使わない構成のみ。行対応を崩す/出力内容を混ぜる他モードとの併用は下で reject。
-    let nnue_static_scores =
-        cli.out_scores && !use_engine && !use_onnx && !use_dlshogi_onnx && cli.nnue.is_some();
-    if cli.out_scores {
-        if cli.limit > 0 {
-            anyhow::bail!(
-                "--out-scores cannot be combined with --limit because the score sidecar must cover every base PSV record"
-            );
-        }
-        if cli.delete_input {
-            anyhow::bail!(
-                "--out-scores cannot be combined with --delete-input because the base PSV is required to interpret the score sidecar"
-            );
-        }
-        if !use_dlshogi_onnx && !nnue_static_scores {
-            anyhow::bail!(
-                "--out-scores requires --dlshogi-onnx-model or --nnue (static evaluation)"
-            );
-        }
-        if use_onnx
-            || use_engine
-            || cli.use_qsearch
-            || cli.search_depth.is_some()
-            || cli.qsearch_leaf_label
-            || cli.apply_qsearch_leaf
-            || cli.expand_output_dir.is_some()
-            || cli.qsearch_leaf_replacement_output.is_some()
-            || (use_dlshogi_onnx && cli.nnue.is_some())
-        {
-            anyhow::bail!(
-                "--out-scores supports only direct --dlshogi-onnx-model inference or NNUE static evaluation and cannot be combined with other evaluation, qsearch, search, expand, or replacement modes"
-            );
-        }
-        if cli.skip_in_check {
-            anyhow::bail!(
-                "--out-scores cannot be combined with --skip-in-check because it breaks row alignment"
-            );
-        }
-    }
-
     // 排他チェック
     if use_onnx && (use_dlshogi_onnx || use_engine || cli.use_qsearch || cli.search_depth.is_some())
     {
@@ -975,7 +549,7 @@ fn main() -> Result<()> {
             "--dlshogi-onnx-model is mutually exclusive with --engine, --use-qsearch, --search-depth"
         );
     }
-    if cli.onnx_tensorrt && cli.onnx_gpu_id.is_cpu() {
+    if cli.onnx_tensorrt && cli.onnx_gpu_id < 0 {
         anyhow::bail!("--onnx-tensorrt requires a GPU (--onnx-gpu-id >= 0)");
     }
     if use_engine && (cli.use_qsearch || cli.search_depth.is_some()) {
@@ -984,49 +558,9 @@ fn main() -> Result<()> {
     if cli.use_qsearch && cli.search_depth.is_some() {
         anyhow::bail!("--use-qsearch and --search-depth are mutually exclusive");
     }
-    if cli.emit_bestmove && cli.search_depth.is_none() {
-        anyhow::bail!("--emit-bestmove requires --search-depth");
-    }
     if !use_engine && !use_onnx && !use_dlshogi_onnx && cli.nnue.is_none() {
         anyhow::bail!(
             "--nnue is required when --engine/--onnx-model/--dlshogi-onnx-model is not specified"
-        );
-    }
-
-    // --qsearch-leaf-label の前提チェック
-    // root 局面を保持しつつラベルだけ葉評価にするには、葉を求める NNUE と
-    // 葉を評価する ONNX ラベラーの両方が要る。AobaZero 特徴量は手数 (game_ply) を
-    // 含み、葉へ進めても root の game_ply が渡って葉特徴量に混入するため dlshogi 限定。
-    if cli.qsearch_leaf_label {
-        if cli.nnue.is_none() {
-            anyhow::bail!("--qsearch-leaf-label requires --nnue (qsearch で葉局面を求めるため)");
-        }
-        if !use_dlshogi_onnx {
-            anyhow::bail!(
-                "--qsearch-leaf-label requires --dlshogi-onnx-model \
-                 (AobaZero 特徴量は game_ply を含み葉局面と不整合のため非対応)"
-            );
-        }
-        if cli.apply_qsearch_leaf {
-            anyhow::bail!(
-                "--qsearch-leaf-label and --apply-qsearch-leaf are mutually exclusive \
-                 (前者は局面据え置き・ラベルのみ、後者は局面置換)"
-            );
-        }
-        if cli.expand_output_dir.is_some() {
-            anyhow::bail!(
-                "--qsearch-leaf-label is mutually exclusive with --expand-output-dir \
-                 (policy 出力は葉局面に対応し root 局面と不整合になるため)"
-            );
-        }
-    }
-
-    // --qsearch-leaf-replacement-output は --qsearch-leaf-label 前提。
-    // leaf-label の qsearch 葉を再利用して、葉局面置換 arm を同時生成する。
-    if cli.qsearch_leaf_replacement_output.is_some() && !cli.qsearch_leaf_label {
-        anyhow::bail!(
-            "--qsearch-leaf-replacement-output requires --qsearch-leaf-label \
-             (葉局面は leaf-label の qsearch 結果を再利用するため)"
         );
     }
 
@@ -1061,8 +595,8 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "dlshogi-onnx"))]
     if use_dlshogi_onnx {
         anyhow::bail!(
-            "--dlshogi-onnx-model requires the 'dlshogi-onnx' feature (on by default; this build disabled it).\n\
-             Rebuild with default features: cargo build --release -p tools --bin rescore_psv"
+            "--dlshogi-onnx-model requires the 'dlshogi-onnx' feature.\n\
+             Rebuild with: cargo build --release -p tools --features dlshogi-onnx --bin rescore_psv"
         );
     }
 
@@ -1093,15 +627,7 @@ fn main() -> Result<()> {
             format!("Failed to create expand output directory: {}", d.display())
         })?;
     }
-    // leaf-replacement 出力ディレクトリの作成
-    if let Some(d) = &cli.qsearch_leaf_replacement_output
-        && !d.exists()
-    {
-        fs::create_dir_all(d).with_context(|| {
-            format!("Failed to create leaf-replacement output directory: {}", d.display())
-        })?;
-    }
-    // 各 dir を canonicalize して衝突を検出
+    // 両 dir を canonicalize して衝突を検出
     let canonical_rescore_dir = cli.output_dir.canonicalize().with_context(|| {
         format!("Failed to canonicalize --output-dir {}", cli.output_dir.display())
     })?;
@@ -1116,84 +642,15 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--output-dir and --expand-output-dir must point to different directories");
     }
-    let canonical_replacement_dir = match &cli.qsearch_leaf_replacement_output {
-        Some(d) => Some(d.canonicalize().with_context(|| {
-            format!("Failed to canonicalize --qsearch-leaf-replacement-output {}", d.display())
-        })?),
-        None => None,
-    };
-    if let Some(rd) = &canonical_replacement_dir
-        && &canonical_rescore_dir == rd
-    {
-        anyhow::bail!(
-            "--output-dir and --qsearch-leaf-replacement-output must point to different directories"
-        );
-    }
 
-    let mut protection = output_protection(&cli, &input_files)?;
-
-    // NNUEモデルのロード（NNUE内部評価モード、または ONNX ラベラー併用の
-    // --qsearch-leaf-label で葉探索に NNUE を使う場合）
-    let mut nnue_scores_identity: Option<NnueScoresIdentity> = None;
-    if (!use_engine && !use_onnx && !use_dlshogi_onnx) || cli.qsearch_leaf_label {
+    // NNUEモデルのロード（NNUE内部評価モードのみ）
+    if !use_engine && !use_onnx && !use_dlshogi_onnx {
         let nnue = cli.nnue.as_ref().unwrap();
         if !nnue.exists() {
             anyhow::bail!("NNUE model file not found: {}", nnue.display());
         }
         init_nnue(nnue).context("Failed to load NNUE model")?;
         eprintln!("NNUE model loaded: {}", nnue.display());
-        let network = get_network().context("NNUE was not initialized")?;
-        if let Some(implementation) = network.layer_stack_implementation() {
-            eprintln!("NNUE LayerStack implementation={implementation}");
-        }
-        let mut loaded_coeff_sha: Option<String> = None;
-        let mode = cli
-            .ls_bucket_mode
-            .as_deref()
-            .map(parse_native_layer_stack_bucket_mode)
-            .transpose()?;
-        if let Some(plan) = NativeRouting::prepare(
-            network.layer_stack_num_buckets(),
-            mode,
-            cli.ls_progress_buckets,
-            cli.ls_progress_coeff.is_some(),
-        )
-        .context("native routing: --ls-bucket-mode / --ls-progress-buckets / --ls-progress-coeff")?
-        {
-            if matches!(
-                plan.mode(),
-                LayerStackBucketMode::ProgressKPAbs | LayerStackBucketMode::ProgressKPAbsQ16
-            ) {
-                validate_progress_routing_buckets(
-                    cli.ls_progress_buckets,
-                    network.layer_stack_num_buckets().unwrap(),
-                    cli.allow_routing_buckets_mismatch,
-                )?;
-            }
-            plan.apply(|| {
-                cli.ls_progress_coeff
-                    .as_deref()
-                    .map(|path| {
-                        // fingerprint は読み直したファイルでなく、実際にロードする bytes に対応させる。
-                        let bytes = fs::read(path).with_context(|| {
-                            format!("Failed to read --ls-progress-coeff {}", path.display())
-                        })?;
-                        let weights = ProgressCoefficients::from_f64_bytes(&bytes)?;
-                        if nnue_static_scores {
-                            loaded_coeff_sha = Some(format!("{:x}", Sha256::digest(&bytes)));
-                        }
-                        Ok(weights)
-                    })
-                    .transpose()
-            })?;
-        }
-        // sidecar fingerprint の識別情報はロード直後のこの時点で固定する。
-        if nnue_static_scores {
-            nnue_scores_identity = Some(NnueScoresIdentity::capture(
-                nnue,
-                cli.ls_progress_coeff.as_deref().zip(loaded_coeff_sha),
-            )?);
-        }
     }
 
     // Ctrl-Cハンドラを設定
@@ -1294,9 +751,6 @@ fn main() -> Result<()> {
             cli.expand_skip_child_in_check,
         );
     }
-    if let Some(d) = &cli.qsearch_leaf_replacement_output {
-        eprintln!("Leaf-replacement output directory: {}", d.display());
-    }
     if cli.delete_input {
         eprintln!("Delete input after processing: yes");
     }
@@ -1304,23 +758,6 @@ fn main() -> Result<()> {
 
     // 各ファイルを処理
     let total_files = input_files.len();
-    // 全ファイル件数（--limit を各ファイルに適用）を合算し overall 進捗の分母にする。
-    // metadata の stat だけで全件 load しない。skip / resume は処理中に overall へ反映する。
-    let overall_total: u64 = input_files
-        .iter()
-        .map(|p| {
-            let rc = fs::metadata(p).map(|m| m.len()).unwrap_or(0) / PackedSfenValue::SIZE as u64;
-            if cli.limit > 0 && cli.limit < rc {
-                cli.limit
-            } else {
-                rc
-            }
-        })
-        .sum();
-    let rprog = MultiFileProgress::new(overall_total, total_files, "rescore");
-    // 全ファイルが skip される実行で ONNX Runtime を読み込まないよう、最初に処理するファイルで作る。
-    #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-    let mut onnx_sessions: Option<OnnxSessions> = None;
     for (file_idx, input_path) in input_files.iter().enumerate() {
         if INTERRUPTED.load(Ordering::SeqCst) {
             eprintln!("Processing interrupted");
@@ -1331,27 +768,12 @@ fn main() -> Result<()> {
         let file_name = input_path
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("Invalid input file name: {}", input_path.display()))?;
-        let output_path = if cli.out_scores {
-            let mut sidecar_name = file_name.to_os_string();
-            sidecar_name.push(".scores.i16");
-            cli.output_dir.join(sidecar_name)
-        } else {
-            cli.output_dir.join(file_name)
-        };
+        let output_path = cli.output_dir.join(file_name);
         #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
         let expand_output_path = canonical_expand_dir.as_ref().map(|d| d.join(file_name));
-        #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-        let replacement_output_path = canonical_replacement_dir.as_ref().map(|d| d.join(file_name));
 
         // 入力ファイルサイズと process_count を最初に確定（marker 判定の前提）
         let input_file_size = fs::metadata(input_path)?.len();
-        if cli.out_scores && input_file_size % PackedSfenValue::SIZE as u64 != 0 {
-            anyhow::bail!(
-                "Input size is not a multiple of {}: {} ({input_file_size} bytes)",
-                PackedSfenValue::SIZE,
-                input_path.display()
-            );
-        }
         let input_record_count = input_file_size / PackedSfenValue::SIZE as u64;
         let process_count = if cli.limit > 0 && cli.limit < input_record_count {
             cli.limit
@@ -1361,26 +783,23 @@ fn main() -> Result<()> {
 
         // ONNX モードでは marker ベースで skip / truncate 判定
         #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+        let mut use_legacy_resume_check = !(use_onnx || use_dlshogi_onnx);
+        #[cfg(not(any(feature = "aobazero-onnx", feature = "dlshogi-onnx")))]
+        let use_legacy_resume_check = !(use_onnx || use_dlshogi_onnx);
+        #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
         if use_onnx || use_dlshogi_onnx {
             let (model_kind, onnx_path): (&str, &std::path::Path) = if use_onnx {
                 ("aobazero", cli.onnx_model.as_ref().unwrap().as_path())
             } else {
                 ("dlshogi", cli.dlshogi_onnx_model.as_ref().unwrap().as_path())
             };
-            // 前のファイルで作ったセッションのモデルが置き換わっていたら、ここで止める。マーカーの
-            // 判定は今のモデルファイルで fingerprint を作り、合わない完了済みの出力を消すため。
-            if let Some(sessions) = onnx_sessions.as_ref() {
-                sessions.model.ensure_unchanged(onnx_path)?;
-            }
             let decision = onnx_marker_decide(
-                &protection,
                 &cli,
                 model_kind,
                 onnx_path,
                 input_path,
                 &output_path,
                 expand_output_path.as_deref(),
-                replacement_output_path.as_deref(),
                 process_count,
             )?;
             match decision {
@@ -1391,7 +810,6 @@ fn main() -> Result<()> {
                         total_files,
                         output_path.display()
                     );
-                    rprog.skip_file(process_count);
                     continue;
                 }
                 OnnxMarkerDecision::TruncateAndProcess => {
@@ -1402,44 +820,14 @@ fn main() -> Result<()> {
                         input_path.display()
                     );
                 }
-                OnnxMarkerDecision::ResumeSidecar => {
-                    eprintln!(
-                        "=== [{}/{}] Resuming (in-progress marker matches): {} ===",
-                        file_idx + 1,
-                        total_files,
-                        input_path.display()
-                    );
+                OnnxMarkerDecision::LegacyResume => {
+                    use_legacy_resume_check = true;
                 }
-                OnnxMarkerDecision::ResumeFullPsv => {}
             }
         }
 
-        // NNUE 静的評価 sidecar は完了 marker で skip / 作り直しを判定する
-        // (途中再開の判定は process_file_nnue_scores 内の in-progress marker が担う)。
-        if nnue_static_scores {
-            let identity = nnue_scores_identity
-                .as_ref()
-                .context("NNUE score sidecar identity must be captured at model load time")?;
-            if nnue_scores_marker_decide(
-                &protection,
-                &cli,
-                identity,
-                input_path,
-                &output_path,
-                process_count,
-            )? {
-                eprintln!(
-                    "=== [{}/{}] Skipping (marker matches): {} ===",
-                    file_idx + 1,
-                    total_files,
-                    output_path.display()
-                );
-                rprog.skip_file(process_count);
-                continue;
-            }
-        }
-
-        if !(use_onnx || use_dlshogi_onnx || nnue_static_scores) {
+        // legacy resume / skip 判定（NNUE/USI 全モード、または ONNX 無 marker + expand 無効）
+        if use_legacy_resume_check {
             // 入力と出力が同じパスの場合はエラー（--delete-input でデータ消失を防ぐ）
             if input_path.canonicalize().ok() == output_path.canonicalize().ok() {
                 anyhow::bail!(
@@ -1449,11 +837,9 @@ fn main() -> Result<()> {
             }
             if output_path.exists() {
                 let out_size = fs::metadata(&output_path)?.len();
-                let output_record_size = PackedSfenValue::SIZE as u64;
-                let out_records = out_size / output_record_size;
-                let complete = out_records >= input_record_count
-                    && out_size % PackedSfenValue::SIZE as u64 == 0;
-                if complete {
+                let out_records = out_size / PackedSfenValue::SIZE as u64;
+                if out_records >= input_record_count && out_size % PackedSfenValue::SIZE as u64 == 0
+                {
                     eprintln!(
                         "=== [{}/{}] Skipping (complete: {} records): {} ===",
                         file_idx + 1,
@@ -1461,12 +847,11 @@ fn main() -> Result<()> {
                         out_records,
                         output_path.display()
                     );
-                    rprog.skip_file(process_count);
                     continue;
                 }
                 if out_records > 0 {
                     eprintln!(
-                        "=== [{}/{}] Regenerating partial output ({}/{} records): {} ===",
+                        "=== [{}/{}] Resuming ({}/{} records): {} ===",
                         file_idx + 1,
                         total_files,
                         out_records,
@@ -1496,72 +881,50 @@ fn main() -> Result<()> {
 
         eprintln!("Records: {record_count}, Processing: {process_count}");
 
+        // 必要メモリの概算と警告（入力バッファ + 出力バッファ）
+        let required_memory_mb =
+            (process_count as usize * PackedSfenValue::SIZE * 2) / (1024 * 1024);
+        if required_memory_mb > 1024 {
+            eprintln!(
+                "Warning: Estimated memory usage: {} GB. Ensure sufficient RAM is available.",
+                required_memory_mb / 1024
+            );
+        }
+
         // 処理実行
-        let fprog = rprog.start_file(&file_name.to_string_lossy(), file_idx + 1, process_count);
         #[cfg(feature = "aobazero-onnx")]
         if use_onnx {
             process_file_with_onnx(
-                &protection,
                 &cli,
                 input_path,
                 &output_path,
                 expand_output_path.as_deref(),
                 process_count,
-                &fprog,
-                &mut onnx_sessions,
             )?;
         }
         #[cfg(feature = "dlshogi-onnx")]
         if use_dlshogi_onnx {
             process_file_with_dlshogi_onnx(
-                &protection,
                 &cli,
                 input_path,
                 &output_path,
-                (expand_output_path.as_deref(), replacement_output_path.as_deref()),
+                expand_output_path.as_deref(),
                 process_count,
-                &fprog,
-                &mut onnx_sessions,
             )?;
         }
         if !use_onnx && !use_dlshogi_onnx {
-            // engine モードの判定は engines.is_empty() ではなく CLI 指定で行う。
-            // 全エンジン死亡でプールが空になった場合に静的 NNUE モードへ
-            // fallback させない（engine モードでは NNUE をロードしていない）
-            if cli.engine.is_some() {
+            if !engines.is_empty() {
                 process_file_with_engine(
-                    &protection,
                     &cli,
                     &mut engines,
                     input_path,
                     &output_path,
                     process_count,
-                    &fprog,
                 )?;
             } else if cli.search_depth.is_some() {
-                process_file_with_search(
-                    &protection,
-                    &cli,
-                    input_path,
-                    &output_path,
-                    process_count,
-                    &fprog,
-                )?;
-            } else if nnue_static_scores {
-                let identity = nnue_scores_identity
-                    .as_ref()
-                    .context("NNUE score sidecar identity must be captured at model load time")?;
-                process_file_nnue_scores(
-                    &protection,
-                    &cli,
-                    identity,
-                    input_path,
-                    &output_path,
-                    process_count,
-                    &fprog,
-                )?;
+                process_file_with_search(&cli, input_path, &output_path, process_count)?;
             } else {
-                process_file(&protection, &cli, input_path, &output_path, process_count, &fprog)?;
+                process_file(&cli, input_path, &output_path, process_count)?;
             }
         }
 
@@ -1575,7 +938,6 @@ fn main() -> Result<()> {
                     fs::remove_file(input_path).with_context(|| {
                         format!("Failed to delete input file: {}", input_path.display())
                     })?;
-                    protection.forget_deleted_input(input_path);
                     eprintln!("Deleted input: {}", input_path.display());
                 } else {
                     eprintln!(
@@ -1586,16 +948,6 @@ fn main() -> Result<()> {
             }
         }
         eprintln!();
-    }
-    rprog.finish();
-
-    // 全ファイルの処理を終えたらセッションを閉じる（`--ort-profile` の JSON はここで書く）。
-    #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-    if let Some(mut sessions) = onnx_sessions.take() {
-        if cli.ort_profile.is_some() {
-            sessions.end_profiling();
-        }
-        drop(sessions);
     }
 
     // エンジン終了
@@ -1609,431 +961,24 @@ fn main() -> Result<()> {
         eprintln!("All {} file(s) processed successfully", total_files);
     }
 
-    if use_onnx || use_dlshogi_onnx {
-        tools::ort_teardown::exit_skipping_ort_teardown(0);
-    }
-
     Ok(())
 }
 
 /// ファイルを処理
-/// 進行度方式の routing bucket 数指定と NNUE 格納 bucket 数の整合を検証する。
-///
-/// 現行世代の net は格納数 = 学習時 routing 数なので、不一致は bucket 数の指定ミス
-/// (誤った routing は全行を無警告で誤評価にする) として拒否する。格納 bucket 数より
-/// 少ない routing で学習した旧世代 net だけが正当な不一致で、
-/// `--allow-routing-buckets-mismatch` で明示的に通す。未指定 (None) の explicit 必須
-/// 検査は `configure_layer_stack_routing` 側が担う。
-fn validate_progress_routing_buckets(
-    requested: Option<usize>,
-    stored: usize,
-    allow_mismatch: bool,
-) -> Result<()> {
-    let Some(requested) = requested else {
-        return Ok(());
-    };
-    if requested == stored {
-        return Ok(());
-    }
-    if allow_mismatch {
-        eprintln!(
-            "Warning: --ls-progress-buckets {requested} != stored bucket count {stored}; \
-             proceeding because --allow-routing-buckets-mismatch is set"
-        );
-        return Ok(());
-    }
-    anyhow::bail!(
-        "--ls-progress-buckets {requested} does not match the stored bucket count {stored} of \
-         the NNUE file. A mismatched routing count silently mis-routes every position. Pass \
-         the stored count, or pass --allow-routing-buckets-mismatch if this net was really \
-         trained with {requested}-bucket routing on a {stored}-bucket layout."
-    );
-}
-
-/// NNUE score sidecar 用のモデル識別情報。
-///
-/// プロセスは NNUE と progress 係数を起動時に 1 回だけロードする。fingerprint に
-/// 書く識別情報 (path / size / mtime、係数はロードした byte 列の sha256) も
-/// ロード直後に 1 回だけ取得して固定し、以後の全 fingerprint はこの値を使う。
-/// 入力ファイルごとに stat し直すと、複数入力の長時間実行中にファイルが
-/// 差し替わった場合に「旧モデルで生成した sidecar へ新モデルの識別情報で
-/// `.done` が付き、次回誤って skip される」取り違えが起きる。
-struct NnueScoresIdentity {
-    model_path: PathBuf,
-    model_size: u64,
-    model_mtime_ns: u128,
-    coeff_path: Option<PathBuf>,
-    coeff_size: Option<u64>,
-    coeff_mtime_ns: Option<u128>,
-    coeff_sha256: Option<String>,
-}
-
-impl NnueScoresIdentity {
-    /// NNUE ロード直後に識別情報を取得する。`coeff` の sha256 はロードに使った
-    /// byte 列から計算済みの値を受け取る (ここでファイルを読み直すと、差し替え時
-    /// にロード内容と sha が乖離するため)。
-    fn capture(nnue: &std::path::Path, coeff: Option<(&std::path::Path, String)>) -> Result<Self> {
-        let model_path = nnue
-            .canonicalize()
-            .with_context(|| format!("Failed to canonicalize --nnue {}", nnue.display()))?;
-        ensure_marker_safe_path("--nnue", &model_path)?;
-        let (model_size, model_mtime_ns) = file_size_mtime_ns(&model_path)?;
-        let (coeff_path, coeff_size, coeff_mtime_ns, coeff_sha256) = match coeff {
-            Some((path, sha256)) => {
-                let canonical = path.canonicalize().with_context(|| {
-                    format!("Failed to canonicalize --ls-progress-coeff {}", path.display())
-                })?;
-                ensure_marker_safe_path("--ls-progress-coeff", &canonical)?;
-                let (size, mtime_ns) = file_size_mtime_ns(&canonical)?;
-                (Some(canonical), Some(size), Some(mtime_ns), Some(sha256))
-            }
-            None => (None, None, None, None),
-        };
-        Ok(Self {
-            model_path,
-            model_size,
-            model_mtime_ns,
-            coeff_path,
-            coeff_size,
-            coeff_mtime_ns,
-            coeff_sha256,
-        })
-    }
-
-    /// 現物がロード時の識別情報から差し替わっていないかを stat で検証する
-    /// (係数は再ハッシュしない — sha はロード時の byte 列に固定済み)。差し替えを
-    /// 検出したら硬いエラーにする: ロード済み weight で評価を続けても、marker が
-    /// 指すファイルと実体が一致しなくなるため。
-    fn verify_unchanged(&self) -> Result<()> {
-        let (size, mtime_ns) = file_size_mtime_ns(&self.model_path)?;
-        if (size, mtime_ns) != (self.model_size, self.model_mtime_ns) {
-            anyhow::bail!(
-                "NNUE model {} changed while rescoring (loaded size {} / current size {size}); \
-                 the loaded weights no longer match the file on disk. Restart the run.",
-                self.model_path.display(),
-                self.model_size,
-            );
-        }
-        if let (Some(path), Some(c_size), Some(c_mtime)) =
-            (&self.coeff_path, self.coeff_size, self.coeff_mtime_ns)
-        {
-            let (size, mtime_ns) = file_size_mtime_ns(path)?;
-            if (size, mtime_ns) != (c_size, c_mtime) {
-                anyhow::bail!(
-                    "--ls-progress-coeff {} changed while rescoring; the loaded coefficients \
-                     no longer match the file on disk. Restart the run.",
-                    path.display()
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-/// NNUE 静的評価 score sidecar の同一性 fingerprint を構築する。
-///
-/// model_* / nnue_ls_progress_coeff_* はロード時に固定した [`NnueScoresIdentity`]
-/// から取り、入力 (path / size / mtime) だけを都度 stat する。nnue_* の残りは
-/// 出力スコアを変える routing (`--ls-bucket-mode` / `--ls-progress-buckets`) と
-/// スケール変換 (`--source-fv-scale` / `--target-fv-scale`)。`eval_scale_bits` /
-/// `onnx_draw_ply` は ONNX 専用キーだが marker format 上必須のため固定値 (0) を書く。
-fn build_nnue_scores_fingerprint(
-    cli: &Cli,
-    identity: &NnueScoresIdentity,
-    input_path: &std::path::Path,
-    process_count: u64,
-) -> Result<RunFingerprint> {
-    let input_path = input_path
-        .canonicalize()
-        .with_context(|| format!("Failed to canonicalize {}", input_path.display()))?;
-    ensure_marker_safe_path("input", &input_path)?;
-    let (input_size, input_mtime_ns) = file_size_mtime_ns(&input_path)?;
-    Ok(RunFingerprint {
-        version: MARKER_VERSION,
-        mode: "nnue-static".to_string(),
-        model_kind: "nnue".to_string(),
-        model_path: identity.model_path.clone(),
-        model_size: identity.model_size,
-        model_mtime_ns: identity.model_mtime_ns,
-        input_path,
-        input_size,
-        input_mtime_ns,
-        process_count,
-        out_scores: true,
-        skip_in_check: false,
-        score_clip: cli.score_clip,
-        eval_scale_bits: 0,
-        use_tensorrt: None,
-        onnx_draw_ply: 0,
-        qsearch_leaf_label: false,
-        qsearch_max_ply: None,
-        qsearch_nnue_path: None,
-        qsearch_nnue_size: None,
-        qsearch_nnue_mtime_ns: None,
-        qsearch_ls_bucket_mode: None,
-        qsearch_ls_progress_buckets: None,
-        qsearch_ls_progress_coeff_path: None,
-        qsearch_ls_progress_coeff_sha256: None,
-        nnue_ls_bucket_mode: cli.ls_bucket_mode.clone(),
-        nnue_ls_progress_buckets: cli.ls_progress_buckets,
-        nnue_ls_progress_coeff_path: identity.coeff_path.clone(),
-        nnue_ls_progress_coeff_sha256: identity.coeff_sha256.clone(),
-        nnue_source_fv_scale: Some(cli.source_fv_scale),
-        nnue_target_fv_scale: Some(cli.target_fv_scale),
-        expand: false,
-        expand_threshold_bits: None,
-        expand_skip_parent_in_check: None,
-        expand_skip_child_in_check: None,
-        expand_output_path: None,
-        replacement: false,
-        replacement_output_path: None,
-    })
-}
-
-/// NNUE 静的評価 sidecar の完了 marker を判定する。`true` = 完了済み (skip)。
-///
-/// marker 不一致 (net / 入力 / routing / スケールの差し替え) は sidecar を空にして
-/// から `.done` を削除する。逆順だと truncate 失敗時に「古い marker + 別設定の
-/// sidecar」が残って誤 skip し得る。途中再開の判定は
-/// [`process_file_nnue_scores`] 内の in-progress marker が担う。
-fn nnue_scores_marker_decide(
-    protection: &OutputProtection,
-    cli: &Cli,
-    identity: &NnueScoresIdentity,
-    input_path: &std::path::Path,
-    output_path: &std::path::Path,
-    process_count: u64,
-) -> Result<bool> {
-    let current = build_nnue_scores_fingerprint(cli, identity, input_path, process_count)?;
-    ensure_safe_output_path(output_path, &current.input_path)?;
-    let marker_path = marker_path_for(output_path);
-    if marker_path.exists() {
-        let marker = parse_marker(&marker_path)?;
-        let body_matches = output_path.exists()
-            && fs::metadata(output_path)?.len() == marker.output_sizes.rescore_output_size;
-        if marker.fingerprint == current && body_matches {
-            remove_in_progress_marker(protection, output_path)?;
-            return Ok(true);
-        }
-        if output_path.exists() {
-            protection.truncate(output_path, 0)?;
-        }
-        protection
-            .remove(&marker_path)
-            .with_context(|| format!("Failed to remove stale marker {}", marker_path.display()))?;
-    }
-    Ok(false)
-}
-
-/// NNUE 静的評価で little-endian i16 score sidecar を出力する。
-///
-/// 不変条件は「sidecar 行 i = 入力 record i」の行対応で、エラーを含むチャンクは
-/// 1 byte も書かない ([`write_rescore_batch`])。in-progress marker の fingerprint が
-/// 一致すれば件数ベースで追記再開し、完了時に行数 == 入力 record 数を検証して
-/// `.done` へ昇格する。Ctrl-C はチャンク境界で停止し、marker を残して次回の
-/// 再開に備える。
-fn process_file_nnue_scores(
-    protection: &OutputProtection,
-    cli: &Cli,
-    identity: &NnueScoresIdentity,
-    input_path: &PathBuf,
-    output_path: &PathBuf,
-    process_count: u64,
-    progress: &FileProgress,
-) -> Result<()> {
-    const CHUNK_SIZE: usize = 1_000_000;
-    let max_ply = cli.max_ply;
-    let score_clip = cli.score_clip;
-    let source_fv_scale = cli.source_fv_scale;
-    let target_fv_scale = cli.target_fv_scale;
-    run_nnue_scores_pipeline(
-        protection,
-        cli,
-        identity,
-        input_path,
-        output_path,
-        process_count,
-        progress,
-        CHUNK_SIZE,
-        &|record| {
-            thread_local! {
-                static NNUE_STACKS: RefCell<NnueStacks> = RefCell::new(NnueStacks::new());
-            }
-            NNUE_STACKS.with(|stacks| {
-                let mut stacks = stacks.borrow_mut();
-                stacks.reset();
-                process_record(
-                    record,
-                    &mut stacks,
-                    max_ply,
-                    false,
-                    false,
-                    score_clip,
-                    false,
-                    source_fv_scale,
-                    target_fv_scale,
-                )
-            })
-        },
-    )
-}
-
-/// [`process_file_nnue_scores`] の本体。record 評価関数と chunk サイズを注入可能に
-/// して、NNUE ロードなし・小 chunk での統合テスト (順序保存 / chunk 境界 /
-/// fail-closed / resume) を成立させる。marker / resume / 件数検証のセマンティクスは
-/// この関数が単一の実装である。
-#[allow(clippy::too_many_arguments)]
-fn run_nnue_scores_pipeline(
-    protection: &OutputProtection,
-    cli: &Cli,
-    identity: &NnueScoresIdentity,
-    input_path: &PathBuf,
-    output_path: &PathBuf,
-    process_count: u64,
-    progress: &FileProgress,
-    chunk_size: usize,
-    eval_record: &(dyn Fn(&[u8; PackedSfenValue::SIZE]) -> ProcessResult + Sync),
-) -> Result<()> {
-    assert!(chunk_size >= 1, "chunk_size must be >= 1");
-
-    // ロード済みモデルと disk 上の実体が処理開始時点で一致していることを確認する。
-    identity.verify_unchanged()?;
-    let start_fingerprint =
-        build_nnue_scores_fingerprint(cli, identity, input_path, process_count)?;
-    prepare_in_progress_marker(protection, output_path, &start_fingerprint, false)?
-        .context("out_scores=true did not create an in-progress marker")?;
-    let resume_count = score_sidecar_resume_count(output_path)?;
-    if resume_count > process_count {
-        anyhow::bail!(
-            "Existing sidecar has {resume_count} records but the input has only {process_count}. \
-             Delete the sidecar {} and its .in-progress marker to regenerate.",
-            output_path.display()
-        );
-    }
-
-    let in_file = File::open(input_path)
-        .with_context(|| format!("Failed to open {}", input_path.display()))?;
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
-    seek_to_record(&mut reader, resume_count)?;
-    let out_file = protection
-        .open(output_path, true)
-        .with_context(|| format!("Failed to open {}", output_path.display()))?;
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
-
-    let verbose = cli.verbose;
-
-    progress.set_message("Processing...");
-    if resume_count > 0 {
-        eprintln!("Resuming sidecar at record {resume_count}/{process_count}");
-        progress.inc(resume_count);
-    }
-    let mut total_written = resume_count;
-    let mut interrupted = false;
-
-    while total_written < process_count {
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            interrupted = true;
-            break;
-        }
-
-        let want = (chunk_size as u64).min(process_count - total_written) as usize;
-        let mut chunk: Vec<[u8; PackedSfenValue::SIZE]> = Vec::with_capacity(want);
-        let mut buffer = [0u8; PackedSfenValue::SIZE];
-        for _ in 0..want {
-            match reader.read_exact(&mut buffer) {
-                Ok(()) => chunk.push(buffer),
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if chunk.is_empty() {
-            break;
-        }
-
-        // 行対応維持のためチャンク全件を評価してから一括書き出しする。process_file と
-        // 違い INTERRUPTED での record 単位 early-out はしない (None 化した行が
-        // fail-closed でエラー扱いになり、正常な中断がエラー終了に化けるため)。
-        let results: Vec<ProcessResult> = chunk.par_iter().map(eval_record).collect();
-
-        let mut bytes: Vec<u8> = Vec::with_capacity(results.len() * SCORE_RECORD_SIZE as usize);
-        let mut errors = 0u64;
-        for result in &results {
-            match result {
-                ProcessResult::Ok(record, _clipped) => match PackedSfenValue::from_bytes(record) {
-                    Some(psv) => append_rescore_bytes(&mut bytes, &psv, true),
-                    None => errors += 1,
-                },
-                // skip_in_check=false 固定なので Skip は返らない想定。防御として
-                // 行落ちさせず fail-closed のエラー扱いにする。
-                ProcessResult::Skip => errors += 1,
-                ProcessResult::Error(e) => {
-                    errors += 1;
-                    if verbose {
-                        eprintln!("Error processing record: {e}");
-                    }
-                }
-            }
-        }
-        write_rescore_batch(&mut writer, &bytes, true, errors)?;
-        total_written += chunk.len() as u64;
-        progress.inc(chunk.len() as u64);
-    }
-
-    writer.flush()?;
-
-    if interrupted {
-        progress.abandon_with_message("Interrupted");
-        eprintln!(
-            "Interrupted at {total_written}/{process_count} records; the in-progress marker is \
-             kept so the next run resumes by record count"
-        );
-        return Ok(());
-    }
-    if total_written != process_count {
-        anyhow::bail!(
-            "Input ended early: wrote {total_written} of {process_count} score records for {}",
-            input_path.display()
-        );
-    }
-
-    // model / coeff の差し替えは identity の stat 検証で、入力の変化は fingerprint
-    // 再構築 (入力 stat のみ都度取得) の比較で、それぞれ `.done` 昇格前に検出する。
-    identity.verify_unchanged()?;
-    let final_fingerprint =
-        build_nnue_scores_fingerprint(cli, identity, input_path, process_count)?;
-    reject_changed_sidecar_fingerprint(
-        protection,
-        output_path,
-        &start_fingerprint,
-        &final_fingerprint,
-        "during the run",
-    )?;
-    let rescore_output_size = fs::metadata(output_path)?.len();
-    promote_score_sidecar_marker(
-        protection,
-        output_path,
-        &DoneMarker {
-            fingerprint: final_fingerprint,
-            output_sizes: OutputSizes {
-                rescore_output_size,
-                expand_output_size: None,
-                replacement_output_size: None,
-            },
-        },
-    )?;
-    progress.finish_with_message("Done");
-    eprintln!("Wrote {total_written} score records");
-    Ok(())
-}
-
 fn process_file(
-    protection: &OutputProtection,
     cli: &Cli,
     input_path: &PathBuf,
-    output_path: &std::path::Path,
+    output_path: &PathBuf,
     process_count: u64,
-    progress: &FileProgress,
 ) -> Result<()> {
+    // 進捗バー設定
+    let progress = ProgressBar::new(process_count);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({per_sec}) {msg}")
+            .expect("valid template"),
+    );
+
     // チャンクストリーミング: 読み込み → rayon 並列処理 → 書き出しをチャンク単位で繰り返す
     // 全レコードをメモリに溜めず、ピークメモリ = チャンクサイズ分のみ
     const CHUNK_SIZE: usize = 1_000_000;
@@ -2042,12 +987,7 @@ fn process_file(
         .with_context(|| format!("Failed to open {}", input_path.display()))?;
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
 
-    let out_file = protection
-        .open(output_path, false)
-        .and_then(|file| {
-            file.set_len(0)?;
-            Ok(file)
-        })
+    let out_file = File::create(output_path)
         .with_context(|| format!("Failed to create {}", output_path.display()))?;
     let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
 
@@ -2209,15 +1149,15 @@ fn process_record(
         None => return ProcessResult::Error(anyhow::anyhow!("Failed to parse PackedSfenValue")),
     };
 
-    // PackedSfen → 局面（String/Position 経由の往復を避け、parts から直接構築）
-    let parts = match unpack_sfen_to_parts(&psv.sfen) {
-        Ok(p) => p,
+    // PackedSfen → SFEN → Position
+    let sfen = match unpack_sfen(&psv.sfen) {
+        Ok(s) => s,
         Err(e) => return ProcessResult::Error(anyhow::anyhow!("Failed to unpack SFEN: {e}")),
     };
 
     let mut pos = Position::new();
-    if let Err(e) = pos.set_from_parts(&parts.board, &parts.hands, parts.side_to_move) {
-        return ProcessResult::Error(anyhow::anyhow!("Failed to set position: {e:?}"));
+    if let Err(e) = pos.set_sfen(&sfen) {
+        return ProcessResult::Error(anyhow::anyhow!("Failed to set SFEN: {e:?}"));
     }
 
     // 王手局面をスキップ
@@ -2225,8 +1165,11 @@ fn process_record(
         return ProcessResult::Skip;
     }
 
+    // 元の手番を記録
+    let original_stm = pos.side_to_move();
+
     // qsearch leaf置換を適用する場合
-    let (final_sfen, stm_changed, position_replaced) = if apply_leaf && !pos.in_check() {
+    let (final_sfen, stm_changed) = if apply_leaf && !pos.in_check() {
         let result = qsearch_with_pv_nnue(
             &mut pos,
             stacks,
@@ -2236,12 +1179,17 @@ fn process_record(
             max_ply,
         );
 
-        // PV に沿って葉局面まで進める。STM 反転有無も同時に得る。
-        let stm_changed = apply_pv(&mut pos, &result.pv);
+        // PVに沿って局面を進める
+        for mv in &result.pv {
+            let gives_check = pos.gives_check(*mv);
+            let _ = pos.do_move(*mv, gives_check);
+        }
+
+        let stm_changed = pos.side_to_move() != original_stm;
         let new_sfen = pack_position(&pos);
-        (new_sfen, stm_changed, true)
+        (new_sfen, stm_changed)
     } else {
-        (psv.sfen, false, false)
+        (psv.sfen, false)
     };
 
     // NNUEで評価
@@ -2259,7 +1207,7 @@ fn process_record(
         result.value
     } else {
         // 静的評価
-        stacks.evaluate(&pos)
+        stacks.evaluate(&mut pos)
     };
 
     // STM視点で統一（エンジン評価は常にSTM視点）
@@ -2284,54 +1232,69 @@ fn process_record(
     let new_psv = PackedSfenValue {
         sfen: final_sfen,
         score: new_score,
-        move16: if position_replaced { 0 } else { psv.move16 },
+        move16: 0, // 無効値
+        game_ply: psv.game_ply,
         game_result: new_game_result,
-        padding: if position_replaced {
-            psv.padding_after_move16_rewrite()
-        } else {
-            psv.padding
-        },
-        ..psv
+        padding: 0,
     };
 
     ProcessResult::Ok(new_psv.to_bytes(), clipped)
 }
 
-/// 探索モードで、空いたワーカーに一度に渡す局面数。塊の先頭で探索状態を初期化するので、
-/// 出力はこの値で決まる（スレッド数には依存しない）。初期化は履歴の表だけで約 100 MB を
-/// 消すため、局面ごとではなく塊ごとに行う。
-const SEARCH_BLOCK_RECORDS: usize = 256;
-/// 探索モードで、配布済みで書き出していない局面数の上限。ピークメモリをこの件数で抑える。
-/// 1 局面だけ極端に重いときも、他のワーカーがこの件数まで先へ進めるようにする。
-const SEARCH_WINDOW_RECORDS: usize = 1_000_000;
-/// `--verbose` で表示するために持っておくエラーの件数。
-const SEARCH_ERROR_SAMPLES: usize = 16;
-
-/// 深さ指定探索でファイルを処理。入力を塊に切って空いたワーカーへ順に配り、結果は入力順に
-/// 並べ直して書く。各ワーカーは独自の Search を持ち、塊の先頭で探索状態を初期化するので、
-/// どの塊をどのワーカーが受け持っても出力は変わらない。
+/// 深さ指定探索でファイルを処理
+///
+/// 探索は重いため、rayon並列処理ではなく、複数のワーカースレッドが
+/// それぞれ独自のSearchインスタンスを持ってチャンク単位で処理する。
 fn process_file_with_search(
-    protection: &OutputProtection,
     cli: &Cli,
     input_path: &PathBuf,
-    output_path: &std::path::Path,
+    output_path: &PathBuf,
     process_count: u64,
-    progress: &FileProgress,
 ) -> Result<()> {
     let search_depth = cli.search_depth.expect("search_depth should be Some");
 
+    // 進捗バー設定
+    let progress = ProgressBar::new(process_count);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({per_sec}) {msg}")
+            .expect("valid template"),
+    );
+
+    // 入力ファイルを読み込み
     let in_file = File::open(input_path)
         .with_context(|| format!("Failed to open {}", input_path.display()))?;
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
+    let mut reader = BufReader::new(in_file);
 
-    let out_file = protection
-        .open(output_path, false)
-        .and_then(|file| {
-            file.set_len(0)?;
-            Ok(file)
-        })
-        .with_context(|| format!("Failed to create {}", output_path.display()))?;
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+    // 全レコードを読み込み
+    let mut records: Vec<[u8; PackedSfenValue::SIZE]> = Vec::with_capacity(process_count as usize);
+    let mut buffer = [0u8; PackedSfenValue::SIZE];
+
+    progress.set_message("Reading...");
+    for _ in 0..process_count {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            progress.abandon_with_message("Interrupted");
+            return Ok(());
+        }
+
+        match reader.read_exact(&mut buffer) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+
+        records.push(buffer);
+    }
+
+    let actual_count = records.len();
+    eprintln!("Read {actual_count} records");
+
+    // 空ファイルガード（chunks(0)でpanicを防ぐ）
+    if actual_count == 0 {
+        eprintln!("Warning: No records to process, creating empty output file");
+        File::create(output_path)?;
+        return Ok(());
+    }
 
     // スレッド数を決定（0なら利用可能なCPU数）
     let num_threads = if cli.threads > 0 {
@@ -2354,291 +1317,158 @@ fn process_file_with_search(
         );
     }
 
-    progress.set_message("Processing...");
+    // レコードをチャンクに分割（chunk_sizeは最低1を保証）
+    let chunk_size = records.len().div_ceil(num_threads).max(1);
+    let chunks: Vec<Vec<[u8; PackedSfenValue::SIZE]>> =
+        records.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect();
 
+    // 設定値をキャプチャ
     let hash_mb = cli.hash_mb;
-    let counts = run_search_pipeline(
-        &mut reader,
-        &mut writer,
-        &SearchPipeline {
-            process_count,
-            num_threads,
-            block_records: SEARCH_BLOCK_RECORDS,
-            window_records: SEARCH_WINDOW_RECORDS,
-            make_state: &|| {
-                let mut search = Search::new(hash_mb);
-                search.set_num_threads(1);
-                search
-            },
-            start_block: &|search: &mut Search| search.reset_to_fresh_state(),
-            process: &|search: &mut Search, record: &[u8; PackedSfenValue::SIZE]| {
-                process_record_with_search(
-                    record,
-                    search,
-                    search_depth,
-                    cli.max_nodes,
-                    cli.max_time,
-                    cli.score_clip,
-                    cli.skip_in_check,
-                    cli.source_fv_scale,
-                    cli.target_fv_scale,
-                    cli.emit_bestmove,
-                )
-            },
-            on_record: &|| progress.inc(1),
-        },
-    )?;
+    let max_nodes = cli.max_nodes;
+    let max_time = cli.max_time;
+    let score_clip = cli.score_clip;
+    let skip_in_check = cli.skip_in_check;
+    let source_fv_scale = cli.source_fv_scale;
+    let target_fv_scale = cli.target_fv_scale;
+    let verbose = cli.verbose;
 
-    writer.flush()?;
-    if INTERRUPTED.load(Ordering::SeqCst) {
-        progress.abandon_with_message("Interrupted");
-    } else {
-        progress.finish_with_message("Done");
+    // カウンタ
+    let error_count = AtomicU64::new(0);
+    let clipped_count = AtomicU64::new(0);
+    let skipped_count = AtomicU64::new(0);
+
+    // 結果収集用チャネル
+    let (tx, rx) = mpsc::channel::<SearchProcessResult>();
+
+    // 進捗カウンタ（スレッド間共有）
+    let progress_arc = std::sync::Arc::new(progress);
+
+    progress_arc.set_message("Processing...");
+
+    // ワーカースレッドを起動
+    let handles: Vec<_> = chunks
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_idx, chunk)| {
+            let tx = tx.clone();
+            let progress = std::sync::Arc::clone(&progress_arc);
+
+            thread::Builder::new()
+                .stack_size(SEARCH_STACK_SIZE)
+                .spawn(move || {
+                    // 各ワーカースレッドで独自のSearchインスタンスを作成
+                    // 各ワーカーは1スレッドで探索（マルチスレッド探索を無効化）
+                    let mut search = Search::new(hash_mb);
+                    search.set_num_threads(1);
+
+                    for (record_idx, record) in chunk.iter().enumerate() {
+                        if INTERRUPTED.load(Ordering::SeqCst) {
+                            break;
+                        }
+
+                        let result = process_record_with_search(
+                            record,
+                            &mut search,
+                            search_depth,
+                            max_nodes,
+                            max_time,
+                            score_clip,
+                            skip_in_check,
+                            source_fv_scale,
+                            target_fv_scale,
+                        );
+
+                        let global_idx = chunk_idx * chunk_size + record_idx;
+                        let send_result = SearchProcessResult {
+                            index: global_idx,
+                            result,
+                        };
+
+                        if tx.send(send_result).is_err() {
+                            break;
+                        }
+
+                        progress.inc(1);
+                    }
+                })
+                .expect("Failed to spawn worker thread")
+        })
+        .collect();
+
+    // 送信側をドロップ（全ワーカーが終了したらチャネルがクローズされる）
+    drop(tx);
+
+    // 結果を収集（順序を保持するためにインデックス付きで受け取る）
+    let mut results_with_index: Vec<(usize, ProcessResult)> = Vec::with_capacity(actual_count);
+    for search_result in rx {
+        results_with_index.push((search_result.index, search_result.result));
     }
 
-    let total_read = counts.read;
-    if total_read == 0 {
-        eprintln!("Warning: No records to process, output file is empty");
+    // インデックスでソート
+    results_with_index.sort_by_key(|(idx, _)| *idx);
+
+    // rx のドレインが完了した時点でワーカーは既に終了しているため、join は即座に返る
+    for handle in handles {
+        let _ = handle.join();
     }
-    if counts.errors > 0 {
-        eprintln!("Note: {} positions had errors", counts.errors);
-        if cli.verbose {
-            for e in &counts.error_samples {
-                eprintln!("Error processing record: {e}");
+
+    progress_arc.finish_with_message("Done");
+
+    // ソート済み結果から直接書き出し（中間 Vec を排除）
+    eprintln!("Writing output...");
+    let out_file = File::create(output_path)
+        .with_context(|| format!("Failed to create {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+
+    let mut written = 0u64;
+    for (_, result) in results_with_index {
+        match result {
+            ProcessResult::Ok(record, clipped) => {
+                if clipped {
+                    clipped_count.fetch_add(1, Ordering::Relaxed);
+                }
+                writer.write_all(&record)?;
+                written += 1;
+            }
+            ProcessResult::Skip => {
+                skipped_count.fetch_add(1, Ordering::Relaxed);
+            }
+            ProcessResult::Error(e) => {
+                error_count.fetch_add(1, Ordering::Relaxed);
+                if verbose {
+                    eprintln!("Error processing record: {e}");
+                }
             }
         }
     }
-    if counts.skipped > 0 && total_read > 0 {
+
+    writer.flush()?;
+
+    let final_errors = error_count.load(Ordering::SeqCst);
+    let final_clipped = clipped_count.load(Ordering::SeqCst);
+    let final_skipped = skipped_count.load(Ordering::SeqCst);
+    if final_errors > 0 {
+        eprintln!("Note: {final_errors} positions had errors");
+    }
+    if final_skipped > 0 {
         eprintln!(
-            "Skipped (in check): {} ({:.2}%)",
-            counts.skipped,
-            counts.skipped as f64 / total_read as f64 * 100.0
+            "Skipped (in check): {final_skipped} ({:.2}%)",
+            final_skipped as f64 / actual_count as f64 * 100.0
         );
     }
-    if total_read > 0 {
-        eprintln!(
-            "Clipped scores: {} ({:.2}%)",
-            counts.clipped,
-            counts.clipped as f64 / total_read as f64 * 100.0
-        );
-    }
-    eprintln!("Wrote {} records", counts.written);
+    eprintln!(
+        "Clipped scores: {final_clipped} ({:.2}%)",
+        final_clipped as f64 / actual_count as f64 * 100.0
+    );
+    eprintln!("Wrote {written} records");
 
     Ok(())
 }
 
-/// `run_search_pipeline` の設定。`S` はワーカーごとに持つ状態（探索では `Search`）。
-struct SearchPipeline<'a, S> {
-    /// 入力の先頭から処理する件数
-    process_count: u64,
-    num_threads: usize,
-    /// 空いたワーカーに一度に渡す件数
-    block_records: usize,
-    /// 配布済みで書き出していない件数の上限
-    window_records: usize,
-    make_state: &'a (dyn Fn() -> S + Sync),
-    /// 塊を処理し始める前に呼ぶ
-    start_block: &'a (dyn Fn(&mut S) + Sync),
-    process: &'a (dyn Fn(&mut S, &[u8; PackedSfenValue::SIZE]) -> ProcessResult + Sync),
-    /// 1 件処理するたびに呼ぶ（進捗表示用）
-    on_record: &'a (dyn Fn() + Sync),
-}
-
-/// `run_search_pipeline` の集計。
-#[derive(Default)]
-struct SearchCounts {
-    read: u64,
-    written: u64,
-    skipped: u64,
-    errors: u64,
-    clipped: u64,
-    /// 先頭の `SEARCH_ERROR_SAMPLES` 件のエラー
-    error_samples: Vec<String>,
-}
-
-/// ワーカーが共有する読み込み側の状態。
-struct SearchDispatch<'r, R> {
-    reader: &'r mut R,
-    read: u64,
-    next_block: u64,
-    /// 入力順に書き終えた塊の数
-    flushed_blocks: u64,
-    /// これ以上配らない（入力の終わり・読み込みエラー・中断・書き込み側の停止）
-    done: bool,
-    read_error: Option<std::io::Error>,
-}
-
-/// drop 時に配布を止め、待っているワーカーを起こす。ワーカーの panic や書き込み側の
-/// 早期 return（スレッド生成・書き込みの失敗）で、待ちが残って scope が終わらないのを防ぐ。
-struct StopDispatchOnDrop<'a, 'r, R> {
-    dispatch: &'a Mutex<SearchDispatch<'r, R>>,
-    ready: &'a std::sync::Condvar,
-    /// true なら panic で抜けるときだけ止める（ワーカーの正常終了では止めない）
-    only_on_panic: bool,
-}
-
-impl<R> Drop for StopDispatchOnDrop<'_, '_, R> {
-    fn drop(&mut self) {
-        if !self.only_on_panic || thread::panicking() {
-            let mut d = self.dispatch.lock().unwrap_or_else(|e| e.into_inner());
-            d.done = true;
-            self.ready.notify_all();
-        }
-    }
-}
-
-/// `reader` の先頭 `process_count` 件を `block_records` 件ずつの塊にして空いたワーカーへ配り、
-/// 結果を入力順に `writer` へ書く。配布済みで書いていない塊を `window_records` 件分（最低 1 塊）
-/// までに抑え、ピークメモリを入力件数に依存させない。中断でワーカーが塊の途中で止まったら、そこで
-/// 書き出しを打ち切り、出力を入力の連続した先頭部分に保つ。
-fn run_search_pipeline<S, R: Read + Send, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    config: &SearchPipeline<'_, S>,
-) -> Result<SearchCounts> {
-    type Block = (u64, Vec<ProcessResult>, bool);
-    let process_count = config.process_count;
-    let block_records = config.block_records.max(1);
-    // window が塊より小さいときも、1 塊は配れるようにする
-    let window_blocks = (config.window_records / block_records).max(1) as u64;
-    let dispatch = Mutex::new(SearchDispatch {
-        reader,
-        read: 0,
-        next_block: 0,
-        flushed_blocks: 0,
-        done: process_count == 0,
-        read_error: None,
-    });
-    let ready = std::sync::Condvar::new();
-    let (tx, rx) = mpsc::channel::<Block>();
-
-    let worker = |tx: mpsc::Sender<Block>| {
-        let _guard = StopDispatchOnDrop {
-            dispatch: &dispatch,
-            ready: &ready,
-            only_on_panic: true,
-        };
-        let mut state = (config.make_state)();
-        loop {
-            let (seq, block) = {
-                let mut d = dispatch.lock().expect("search dispatch poisoned");
-                while !d.done && d.next_block >= d.flushed_blocks + window_blocks {
-                    d = ready.wait(d).expect("search dispatch poisoned");
-                }
-                if d.done || INTERRUPTED.load(Ordering::SeqCst) {
-                    return;
-                }
-                let want = (block_records as u64).min(process_count - d.read) as usize;
-                let mut block = Vec::with_capacity(want);
-                let mut buffer = [0u8; PackedSfenValue::SIZE];
-                for _ in 0..want {
-                    match d.reader.read_exact(&mut buffer) {
-                        Ok(()) => block.push(buffer),
-                        Err(e) => {
-                            if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                                d.read_error = Some(e);
-                            }
-                            d.done = true;
-                            break;
-                        }
-                    }
-                }
-                d.read += block.len() as u64;
-                if d.read >= process_count {
-                    d.done = true;
-                }
-                if d.done {
-                    ready.notify_all();
-                }
-                if block.is_empty() {
-                    return;
-                }
-                let seq = d.next_block;
-                d.next_block += 1;
-                (seq, block)
-            };
-            let mut results = Vec::with_capacity(block.len());
-            (config.start_block)(&mut state);
-            for record in &block {
-                if INTERRUPTED.load(Ordering::SeqCst) {
-                    break;
-                }
-                results.push((config.process)(&mut state, record));
-                (config.on_record)();
-            }
-            let complete = results.len() == block.len();
-            if tx.send((seq, results, complete)).is_err() {
-                return;
-            }
-        }
-    };
-
-    let mut counts = SearchCounts::default();
-    let write_result = thread::scope(|s| -> Result<()> {
-        let _stop = StopDispatchOnDrop {
-            dispatch: &dispatch,
-            ready: &ready,
-            only_on_panic: false,
-        };
-        for _ in 0..config.num_threads {
-            let tx = tx.clone();
-            let worker = &worker;
-            thread::Builder::new()
-                .stack_size(SEARCH_STACK_SIZE)
-                .spawn_scoped(s, move || worker(tx))
-                .context("Failed to spawn worker thread")?;
-        }
-        drop(tx);
-
-        let mut pending: std::collections::BTreeMap<u64, (Vec<ProcessResult>, bool)> =
-            std::collections::BTreeMap::new();
-        let mut next_block = 0u64;
-        let mut write_in_order = || -> Result<()> {
-            for (seq, results, complete) in &rx {
-                pending.insert(seq, (results, complete));
-                let mut stop = false;
-                while let Some((results, complete)) = pending.remove(&next_block) {
-                    for result in results {
-                        match result {
-                            ProcessResult::Ok(record, clipped) => {
-                                counts.clipped += u64::from(clipped);
-                                writer.write_all(&record)?;
-                                counts.written += 1;
-                            }
-                            ProcessResult::Skip => counts.skipped += 1,
-                            ProcessResult::Error(e) => {
-                                counts.errors += 1;
-                                if counts.error_samples.len() < SEARCH_ERROR_SAMPLES {
-                                    counts.error_samples.push(e.to_string());
-                                }
-                            }
-                        }
-                    }
-                    next_block += 1;
-                    if !complete {
-                        stop = true;
-                        break;
-                    }
-                }
-                let mut d = dispatch.lock().expect("search dispatch poisoned");
-                d.flushed_blocks = next_block;
-                d.done |= stop;
-                ready.notify_all();
-                if stop {
-                    break;
-                }
-            }
-            Ok(())
-        };
-        write_in_order()
-    });
-    let dispatch = dispatch.into_inner().unwrap_or_else(|e| e.into_inner());
-    counts.read = dispatch.read;
-    write_result?;
-    if let Some(e) = dispatch.read_error {
-        return Err(e.into());
-    }
-    Ok(counts)
+/// 探索結果（インデックス付き）
+struct SearchProcessResult {
+    index: usize,
+    result: ProcessResult,
 }
 
 /// 深さ指定探索で1レコードを処理
@@ -2652,7 +1482,6 @@ fn process_record_with_search(
     skip_in_check: bool,
     source_fv_scale: i32,
     target_fv_scale: i32,
-    emit_bestmove: bool,
 ) -> ProcessResult {
     // PackedSfenValueを読み込み
     let psv = match PackedSfenValue::from_bytes(record) {
@@ -2660,15 +1489,15 @@ fn process_record_with_search(
         None => return ProcessResult::Error(anyhow::anyhow!("Failed to parse PackedSfenValue")),
     };
 
-    // PackedSfen → 局面（String/Position 経由の往復を避け、parts から直接構築）
-    let parts = match unpack_sfen_to_parts(&psv.sfen) {
-        Ok(p) => p,
+    // PackedSfen → SFEN → Position
+    let sfen = match unpack_sfen(&psv.sfen) {
+        Ok(s) => s,
         Err(e) => return ProcessResult::Error(anyhow::anyhow!("Failed to unpack SFEN: {e}")),
     };
 
     let mut pos = Position::new();
-    if let Err(e) = pos.set_from_parts(&parts.board, &parts.hands, parts.side_to_move) {
-        return ProcessResult::Error(anyhow::anyhow!("Failed to set position: {e:?}"));
+    if let Err(e) = pos.set_sfen(&sfen) {
+        return ProcessResult::Error(anyhow::anyhow!("Failed to set SFEN: {e:?}"));
     }
 
     // 王手局面をスキップ
@@ -2679,7 +1508,6 @@ fn process_record_with_search(
     // 探索を実行
     let mut limits = LimitsType::default();
     limits.depth = depth;
-    limits.return_completed_iteration = true;
     if max_nodes > 0 {
         limits.nodes = max_nodes;
     }
@@ -2702,18 +1530,12 @@ fn process_record_with_search(
 
     // 新しいPackedSfenValueを作成（局面は変更しない）
     let new_psv = PackedSfenValue {
+        sfen: psv.sfen,
         score: new_score,
-        move16: if emit_bestmove {
-            move_to_psv_move16(search_result.best_move)
-        } else {
-            psv.move16
-        },
-        padding: if emit_bestmove {
-            psv.padding_after_move16_rewrite()
-        } else {
-            psv.padding
-        },
-        ..psv
+        move16: 0, // 無効値
+        game_ply: psv.game_ply,
+        game_result: psv.game_result,
+        padding: 0,
     };
 
     ProcessResult::Ok(new_psv.to_bytes(), clipped)
@@ -2762,7 +1584,7 @@ impl UsiEngine {
 
         // USIオプション設定
         for opt in usi_options {
-            if let Some((name, value)) = parsed_usi_option(opt) {
+            if let Some((name, value)) = opt.split_once('=') {
                 engine.send_command(&format!("setoption name {name} value {value}"))?;
             } else {
                 eprintln!("Warning: invalid USI option format (expected Name=Value): {opt}");
@@ -2832,12 +1654,16 @@ impl UsiEngine {
     }
 
     /// 局面を評価し、score cp 値を返す
-    fn evaluate_position(&mut self, sfen: &str, nodes: u64) -> Result<Option<i32>> {
+    ///
+    /// depth と nodes を併用すると `go depth D nodes N` を送り、
+    /// エンジンは深さ・ノードのうち早く到達した方で停止する。
+    fn evaluate_position(&mut self, sfen: &str, depth: u32, nodes: u64) -> Result<Option<i32>> {
         self.send_command(&format!("position sfen {sfen}"))?;
-        if nodes > 0 {
-            self.send_command(&format!("go nodes {nodes}"))?;
-        } else {
-            self.send_command("go depth 1")?;
+        match (depth > 0, nodes > 0) {
+            (true, true) => self.send_command(&format!("go depth {depth} nodes {nodes}"))?,
+            (true, false) => self.send_command(&format!("go depth {depth}"))?,
+            (false, true) => self.send_command(&format!("go nodes {nodes}"))?,
+            (false, false) => self.send_command("go depth 1")?,
         }
 
         let mut score: Option<i32> = None;
@@ -2886,256 +1712,231 @@ impl UsiEngine {
     }
 }
 
-/// 外部USIエンジンでファイルを処理（複数エンジン並列対応）。チャンクストリーミング
-/// （読み込み → 生存エンジンへ連続分割 → 入力順書き出し）でピークメモリを入力件数に
-/// 非依存にする。
+/// エンジン処理結果（インデックス付き）
+struct EngineProcessResult {
+    index: usize,
+    score: Option<i32>,
+    psv: PackedSfenValue,
+}
+
+/// 外部USIエンジンでファイルを処理（複数エンジン並列対応）
 fn process_file_with_engine(
-    protection: &OutputProtection,
     cli: &Cli,
-    engines: &mut Vec<UsiEngine>,
+    engines: &mut [UsiEngine],
     input_path: &PathBuf,
-    output_path: &std::path::Path,
+    output_path: &PathBuf,
     process_count: u64,
-    progress: &FileProgress,
 ) -> Result<()> {
-    const CHUNK_SIZE: usize = 1_000_000;
+    let num_engines = engines.len();
 
-    // 前の入力ファイルで全エンジンが死んでいると空プールで呼ばれうる
-    if engines.is_empty() {
-        anyhow::bail!("All engine processes have failed");
-    }
+    let progress = ProgressBar::new(process_count);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({per_sec}) {msg}")
+            .expect("valid template"),
+    );
 
+    // 入力ファイルを読み込み
     let in_file = File::open(input_path)
         .with_context(|| format!("Failed to open {}", input_path.display()))?;
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, in_file);
+    let mut reader = BufReader::new(in_file);
 
-    let out_file = protection
-        .open(output_path, false)
-        .and_then(|file| {
-            file.set_len(0)?;
-            Ok(file)
-        })
-        .with_context(|| format!("Failed to create {}", output_path.display()))?;
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+    // 全レコードを読み込み（SFEN展開・フィルタリング含む）
+    progress.set_message("Reading...");
+    let mut records: Vec<(usize, PackedSfenValue, String)> = Vec::new(); // (global_index, psv, sfen)
+    let mut buffer = [0u8; PackedSfenValue::SIZE];
+    let mut skipped_count: u64 = 0;
+    let mut read_errors: u64 = 0;
 
+    for global_idx in 0..process_count as usize {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            break;
+        }
+        match reader.read_exact(&mut buffer) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let psv = match PackedSfenValue::from_bytes(&buffer) {
+            Some(p) => p,
+            None => {
+                read_errors += 1;
+                progress.inc(1);
+                continue;
+            }
+        };
+        let sfen = match unpack_sfen(&psv.sfen) {
+            Ok(s) => s,
+            Err(_) => {
+                read_errors += 1;
+                progress.inc(1);
+                continue;
+            }
+        };
+        if cli.skip_in_check {
+            let mut pos = Position::new();
+            if pos.set_sfen(&sfen).is_ok() && pos.in_check() {
+                skipped_count += 1;
+                progress.inc(1);
+                continue;
+            }
+        }
+        records.push((global_idx, psv, sfen));
+    }
+
+    let actual_count = records.len();
+    eprintln!(
+        "Read {} records ({} skipped, {} errors)",
+        actual_count, skipped_count, read_errors
+    );
+
+    if actual_count == 0 {
+        progress.finish_with_message("Done (empty)");
+        File::create(output_path)?;
+        return Ok(());
+    }
+
+    // レコードをチャンクに分割
+    let chunk_size = actual_count.div_ceil(num_engines).max(1);
+    let chunks: Vec<Vec<(usize, PackedSfenValue, String)>> =
+        records.chunks(chunk_size).map(|c| c.to_vec()).collect();
+
+    eprintln!("Using {} engine process(es), chunk_size={}", chunks.len(), chunk_size);
+
+    // 各チャンクをワーカースレッドで処理
     let score_clip = cli.score_clip;
     let engine_nodes = cli.engine_nodes;
+    let engine_depth = cli.engine_depth;
     let verbose = cli.verbose;
 
-    eprintln!("Using {} engine process(es)", engines.len());
+    let error_count = AtomicU64::new(read_errors);
+    let clipped_count = AtomicU64::new(0);
 
-    // usinewgame はファイル冒頭で 1 回だけ送る（チャンクごとに送るとエンジン内部の
-    // キャッシュ類がリセットされ、評価値が変わりうるため）
-    for engine in engines.iter_mut() {
-        let _ = engine.send_command("usinewgame");
-    }
+    let (tx, rx) = mpsc::channel::<EngineProcessResult>();
+    let progress_arc = std::sync::Arc::new(progress);
 
-    // 死んだエンジンプロセスは以降の割り当てから除外する
-    let mut alive: Vec<bool> = vec![true; engines.len()];
+    progress_arc.set_message("Processing...");
 
-    let mut error_count = 0u64;
-    let mut clipped_count = 0u64;
-    let mut skipped_count = 0u64;
-    let mut total_read = 0u64;
-    let mut total_written = 0u64;
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
 
-    progress.set_message("Processing...");
+        for (engine, chunk) in engines.iter_mut().zip(chunks) {
+            let tx = tx.clone();
+            let progress = std::sync::Arc::clone(&progress_arc);
+            let error_count = &error_count;
+            let _clipped_count = &clipped_count;
 
-    loop {
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            progress.abandon_with_message("Interrupted");
-            break;
-        }
+            handles.push(s.spawn(move || {
+                // usinewgame でリセット
+                let _ = engine.send_command("usinewgame");
 
-        // チャンク読み込み（パース + SFEN 展開 + 王手フィルタ）
-        let want = (CHUNK_SIZE as u64).min(process_count.saturating_sub(total_read)) as usize;
-        let mut chunk: Vec<(PackedSfenValue, String)> = Vec::with_capacity(want);
-        let mut buffer = [0u8; PackedSfenValue::SIZE];
-        let mut read_this_chunk = 0usize;
-        while read_this_chunk < want {
-            match reader.read_exact(&mut buffer) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
-            read_this_chunk += 1;
-            let Some(psv) = PackedSfenValue::from_bytes(&buffer) else {
-                error_count += 1;
-                progress.inc(1);
-                continue;
-            };
-            let Ok(sfen) = unpack_sfen(&psv.sfen) else {
-                error_count += 1;
-                progress.inc(1);
-                continue;
-            };
-            if cli.skip_in_check {
-                let mut pos = Position::new();
-                if pos.set_sfen(&sfen).is_ok() && pos.in_check() {
-                    skipped_count += 1;
-                    progress.inc(1);
-                    continue;
-                }
-            }
-            chunk.push((psv, sfen));
-        }
-        if read_this_chunk == 0 {
-            break;
-        }
-        total_read += read_this_chunk as u64;
-        if chunk.is_empty() {
-            continue;
-        }
+                for (global_idx, psv, sfen) in &chunk {
+                    if INTERRUPTED.load(Ordering::SeqCst) {
+                        break;
+                    }
 
-        // チャンク内の全レコードを評価してから入力順で書き出す。
-        // エンジン死亡でスライス途中に未評価が残った場合は、同一チャンク内で
-        // 生存エンジンに再割り当てして評価し切る（出力順を崩さないため、
-        // 次チャンクへは持ち越さない）。
-        // None = 未評価、Some(None) = 評価失敗、Some(Some(cp)) = 評価済み
-        let mut chunk_scores: Vec<Option<Option<i32>>> = vec![None; chunk.len()];
-        let mut pending: Vec<usize> = (0..chunk.len()).collect();
-
-        while !pending.is_empty() && !INTERRUPTED.load(Ordering::SeqCst) {
-            let mut alive_engines: Vec<(usize, &mut UsiEngine)> =
-                engines.iter_mut().enumerate().filter(|(idx, _)| alive[*idx]).collect();
-            if alive_engines.is_empty() {
-                // 全滅。評価済み prefix を書き出してからエラーにするため、
-                // ここでは抜けるだけにする（書き出し後の全滅チェックで bail）
-                break;
-            }
-            let slice_size = pending.len().div_ceil(alive_engines.len()).max(1);
-
-            // (エンジン番号, 担当 index 列先頭からの評価値列, エンジン死亡フラグ)
-            let chunk_ref = &chunk;
-            let results: Vec<(usize, Vec<Option<i32>>, bool)> = thread::scope(|s| {
-                let handles: Vec<_> = alive_engines
-                    .iter_mut()
-                    .zip(pending.chunks(slice_size))
-                    .map(|((engine_idx, engine), idx_slice)| {
-                        let engine_idx = *engine_idx;
-                        let progress = progress.clone();
-                        s.spawn(move || {
-                            let mut scores = Vec::with_capacity(idx_slice.len());
-                            let mut died = false;
-                            for &i in idx_slice {
-                                if INTERRUPTED.load(Ordering::SeqCst) {
-                                    break;
+                    match engine.evaluate_position(sfen, engine_depth, engine_nodes) {
+                        Ok(score) => {
+                            if score.is_none() {
+                                error_count.fetch_add(1, Ordering::Relaxed);
+                                if verbose {
+                                    eprintln!("No score returned for: {sfen}");
                                 }
-                                let sfen = &chunk_ref[i].1;
-                                match engine.evaluate_position(sfen, engine_nodes) {
-                                    Ok(score) => {
-                                        if score.is_none() && verbose {
-                                            eprintln!("No score returned for: {sfen}");
-                                        }
-                                        scores.push(score);
-                                    }
-                                    Err(e) => {
-                                        if verbose {
-                                            eprintln!("Engine error for {sfen}: {e}");
-                                        }
-                                        scores.push(None);
-                                        died = true;
-                                        progress.inc(1);
-                                        break;
-                                    }
-                                }
-                                progress.inc(1);
                             }
-                            (engine_idx, scores, died)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("Engine worker thread panicked"))
-                    .collect()
-            });
+                            let _ = tx.send(EngineProcessResult {
+                                index: *global_idx,
+                                score,
+                                psv: *psv,
+                            });
+                        }
+                        Err(e) => {
+                            error_count.fetch_add(1, Ordering::Relaxed);
+                            if verbose {
+                                eprintln!("Engine error for {sfen}: {e}");
+                            }
+                            // スコアなしで送信（エンジン死亡時はループを抜ける）
+                            let _ = tx.send(EngineProcessResult {
+                                index: *global_idx,
+                                score: None,
+                                psv: *psv,
+                            });
+                            break;
+                        }
+                    }
 
-            // 評価結果を chunk 添字へ反映し、死亡ワーカーの未評価分を再キューする
-            let mut next_pending: Vec<usize> = Vec::new();
-            let mut idx_slices = pending.chunks(slice_size);
-            for (engine_idx, scores, died) in results {
-                let idx_slice = idx_slices.next().unwrap_or(&[]);
-                for (&i, score) in idx_slice.iter().zip(&scores) {
-                    chunk_scores[i] = Some(*score);
+                    progress.inc(1);
                 }
-                if died {
-                    alive[engine_idx] = false;
-                    next_pending.extend_from_slice(&idx_slice[scores.len()..]);
-                    eprintln!(
-                        "Warning: engine process #{engine_idx} failed and is excluded from further processing"
-                    );
+            }));
+        }
+
+        drop(tx); // 全ワーカーの送信側をドロップ
+
+        // 結果を収集
+        let mut results: Vec<EngineProcessResult> = rx.into_iter().collect();
+        results.sort_by_key(|r| r.index);
+
+        // 出力レコードを構築
+        let mut processed_records: Vec<[u8; PackedSfenValue::SIZE]> =
+            Vec::with_capacity(results.len());
+
+        for r in &results {
+            if let Some(raw_score) = r.score {
+                let clipped = raw_score.abs() > score_clip as i32;
+                let new_score = raw_score.clamp(-score_clip as i32, score_clip as i32) as i16;
+                if clipped {
+                    clipped_count.fetch_add(1, Ordering::Relaxed);
                 }
-                // 中断（died でない）で残った分は再キューしない: ループ条件の
-                // INTERRUPTED チェックで打ち切られ、部分出力になる
+                let new_psv = PackedSfenValue {
+                    sfen: r.psv.sfen,
+                    score: new_score,
+                    move16: 0,
+                    game_ply: r.psv.game_ply,
+                    game_result: r.psv.game_result,
+                    padding: 0,
+                };
+                processed_records.push(new_psv.to_bytes());
             }
-            pending = next_pending;
         }
 
-        // 入力順で書き出し。未評価（None）は中断か全エンジン死亡時にのみ残り、
-        // そこで打ち切って出力を入力の連続 prefix に保つ（歯抜けの部分出力を作らない）
-        for ((psv, _), score) in chunk.iter().zip(&chunk_scores) {
-            let Some(evaluated) = score else {
-                break;
-            };
-            let Some(raw_score) = *evaluated else {
-                error_count += 1;
-                continue;
-            };
-            let clipped = raw_score.abs() > score_clip as i32;
-            if clipped {
-                clipped_count += 1;
-            }
-            let new_psv = PackedSfenValue {
-                score: raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16,
-                ..*psv
-            };
-            writer.write_all(&new_psv.to_bytes())?;
-            total_written += 1;
+        // ワーカースレッド完了待ち
+        for h in handles {
+            let _ = h.join();
         }
 
-        // 全エンジン死亡はファイル失敗として扱う（未評価が残らず正常にチャンクを
-        // 消化し切った場合も含む）。成功扱いにすると評価失敗レコードを欠いた出力の
-        // まま完了し、--delete-input が入力を削除しうる
-        if alive.iter().all(|a| !*a) {
-            writer.flush()?;
-            anyhow::bail!("All engine processes have failed");
+        progress_arc.finish_with_message("Done");
+
+        let final_errors = error_count.load(Ordering::SeqCst);
+        let final_clipped = clipped_count.load(Ordering::SeqCst);
+        let total = actual_count as u64 + skipped_count + read_errors;
+        if final_errors > 0 {
+            eprintln!("Note: {final_errors} positions had errors");
         }
-    }
-
-    writer.flush()?;
-    progress.finish_with_message("Done");
-
-    if total_read == 0 {
-        eprintln!("Warning: No records to process, output file is empty");
-    }
-    if error_count > 0 {
-        eprintln!("Note: {error_count} positions had errors");
-    }
-    if skipped_count > 0 && total_read > 0 {
-        eprintln!(
-            "Skipped (in check): {skipped_count} ({:.2}%)",
-            skipped_count as f64 / total_read as f64 * 100.0
-        );
-    }
-    if total_read > 0 {
-        eprintln!(
-            "Clipped scores: {clipped_count} ({:.2}%)",
-            clipped_count as f64 / total_read as f64 * 100.0
-        );
-    }
-    eprintln!("Wrote {total_written} records");
-
-    // 死亡エンジンをプールから除去し、後続の入力ファイルに割り当てない。
-    // quit() で child を wait し、run 終了までゾンビプロセスを残さない
-    let mut alive_flags = alive.into_iter();
-    engines.retain_mut(|engine| {
-        if alive_flags.next().expect("alive length matches engines") {
-            true
-        } else {
-            let _ = engine.quit();
-            false
+        if skipped_count > 0 {
+            eprintln!(
+                "Skipped (in check): {skipped_count} ({:.2}%)",
+                skipped_count as f64 / total as f64 * 100.0
+            );
         }
+        if total > 0 {
+            eprintln!(
+                "Clipped scores: {final_clipped} ({:.2}%)",
+                final_clipped as f64 / total as f64 * 100.0
+            );
+        }
+
+        // 出力ファイルに書き込み
+        eprintln!("Writing output...");
+        let out_file = File::create(output_path)
+            .with_context(|| format!("Failed to create {}", output_path.display()))
+            .unwrap();
+        let mut writer = BufWriter::new(out_file);
+
+        for record in &processed_records {
+            writer.write_all(record).unwrap();
+        }
+
+        writer.flush().unwrap();
+        eprintln!("Wrote {} records", processed_records.len());
     });
 
     Ok(())
@@ -3151,166 +1952,6 @@ fn onnx_ort_err(e: ort::Error) -> anyhow::Error {
     anyhow::anyhow!("ONNX Runtime error: {e}")
 }
 
-/// score 決定後のレコードを通常 PSV または score sidecar として直列化する。
-fn append_rescore_bytes(output: &mut Vec<u8>, psv: &PackedSfenValue, out_scores: bool) {
-    if out_scores {
-        output.extend_from_slice(&psv.score.to_le_bytes());
-    } else {
-        output.extend_from_slice(&psv.to_bytes());
-    }
-}
-
-/// score sidecar ではエラーを含むバッチを 1 byte も書かない。
-///
-/// reader の decode 失敗と producer の局面構築失敗を同じ errors に集約し、
-/// seq 順 writer が書き出し直前に拒否することで、既存 prefix の行対応を保つ。
-fn write_rescore_batch<W: Write>(
-    writer: &mut W,
-    bytes: &[u8],
-    out_scores: bool,
-    errors: u64,
-) -> Result<()> {
-    if out_scores && errors > 0 {
-        anyhow::bail!(
-            "score sidecar aborted before writing batch: {errors} input record(s) failed to decode or build"
-        );
-    }
-    writer.write_all(bytes)?;
-    Ok(())
-}
-
-fn score_sidecar_resume_count(output_path: &std::path::Path) -> Result<u64> {
-    if !output_path.exists() {
-        return Ok(0);
-    }
-    let out_size = fs::metadata(output_path)?.len();
-    if out_size % SCORE_RECORD_SIZE != 0 {
-        anyhow::bail!(
-            "Output size is not a multiple of {SCORE_RECORD_SIZE}: {} ({out_size} bytes). \
-             Delete the .in-progress marker {} so the next run truncates and regenerates the sidecar.",
-            output_path.display(),
-            in_progress_marker_path_for(output_path).display()
-        );
-    }
-    Ok(out_size / SCORE_RECORD_SIZE)
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn decode_onnx_record(
-    buffer: &[u8; PackedSfenValue::SIZE],
-) -> Option<(PackedSfenValue, UnpackedSfen)> {
-    let psv = PackedSfenValue::from_bytes(buffer)?;
-    let parts = unpack_sfen_to_parts(&psv.sfen).ok()?;
-    Some((psv, parts))
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn set_onnx_root_position(
-    pos: &mut Position,
-    parts: &UnpackedSfen,
-) -> Result<bool, rshogi_core::position::SfenError> {
-    pos.set_from_parts(&parts.board, &parts.hands, parts.side_to_move)?;
-    Ok(pos.in_check())
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn prepare_onnx_psv_resume(
-    protection: &OutputProtection,
-    output_path: &std::path::Path,
-    input: &mut impl Read,
-    process_count: u64,
-    skip_in_check: bool,
-) -> Result<(File, u64)> {
-    const NEW_OUTPUT: &str = "Use a new output path (--output-dir).";
-    protection.check_path(output_path)?;
-    let mut file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(output_path)
-        .with_context(|| format!("Failed to open {}", output_path.display()))?;
-    protection.check_file(output_path, &file)?;
-    let out_size = file.metadata()?.len();
-    let record_size = PackedSfenValue::SIZE as u64;
-    let output_count = out_size / record_size;
-    let aligned_size = output_count * record_size;
-    let mut consumed = 0;
-
-    if output_count > 0 {
-        let mut output = BufReader::new(&file);
-        let mut pos = skip_in_check.then(Position::new);
-        let mut input_bytes = [0; PackedSfenValue::SIZE];
-        let mut output_bytes = [0; PackedSfenValue::SIZE];
-        for output_index in 1..=output_count {
-            let expected = loop {
-                // 除外が続く巨大な shard でも Ctrl-C で切り詰めや .done に進まず止める。
-                anyhow::ensure!(
-                    !INTERRUPTED.load(Ordering::SeqCst),
-                    "Interrupted while aligning {} with its input",
-                    output_path.display()
-                );
-                anyhow::ensure!(
-                    consumed < process_count,
-                    "Cannot align {} at output record {output_index}: no more kept input records. {NEW_OUTPUT}",
-                    output_path.display()
-                );
-                input.read_exact(&mut input_bytes)?;
-                consumed += 1;
-                let Some((psv, parts)) = decode_onnx_record(&input_bytes) else {
-                    continue;
-                };
-                // 局面構築失敗時も full PSV の writer はこのレコードを残す。
-                if let Some(pos) = pos.as_mut()
-                    && set_onnx_root_position(pos, &parts).unwrap_or(false)
-                {
-                    continue;
-                }
-                break psv;
-            };
-            output.read_exact(&mut output_bytes)?;
-            let existing =
-                PackedSfenValue::from_bytes(&output_bytes).context("Invalid PSV record")?;
-            anyhow::ensure!(
-                existing.sfen == expected.sfen
-                    && existing.move16 == expected.move16
-                    && existing.game_ply == expected.game_ply
-                    && existing.game_result == expected.game_result,
-                "Cannot align {} at output record {output_index} with input record {consumed}. {NEW_OUTPUT}",
-                output_path.display()
-            );
-            anyhow::ensure!(
-                existing.padding == expected.padding,
-                "PSV padding mismatch in {} at output record {output_index} (input record {consumed}): \
-                 found {:#04x}, expected {:#04x}. {NEW_OUTPUT}",
-                output_path.display(),
-                existing.padding,
-                expected.padding
-            );
-        }
-    }
-
-    if aligned_size != out_size {
-        file.set_len(aligned_size)?;
-        eprintln!(
-            "Truncated partial output record: {} ({out_size} -> {aligned_size} bytes)",
-            output_path.display()
-        );
-    }
-    file.seek(SeekFrom::Start(aligned_size))?;
-    Ok((file, consumed))
-}
-
-/// 入力を既処理レコードの直後へ移動する。巨大 sidecar の resume で入力 prefix を
-/// 空読みせず、checked offset に直接 seek する。
-fn seek_to_record<R: Seek>(reader: &mut R, record_count: u64) -> Result<u64> {
-    let offset = record_count
-        .checked_mul(PackedSfenValue::SIZE as u64)
-        .ok_or_else(|| anyhow::anyhow!("resume input offset overflow: {record_count} records"))?;
-    reader.seek(SeekFrom::Start(offset))?;
-    Ok(offset)
-}
-
 /// ONNX 直接推論パイプラインの共通設定
 ///
 /// 全フィールドが `Copy` のため、関数内で destructure して既存ローカル変数名と
@@ -3323,16 +1964,9 @@ struct OnnxPipelineConfig<'a> {
     onnx_path: &'a std::path::Path,
     input_path: &'a std::path::Path,
     output_path: &'a std::path::Path,
-    /// score sidecar（little-endian i16 × records）として出力する
-    out_scores: bool,
     process_count: u64,
     batch_size: usize,
-    /// `--onnx-gpu-id` の GPU 番号列。`[-1]` は CPU 推論。
-    gpu_ids: &'a [i32],
-    /// GPU 1 つあたりの推論セッション数（`--onnx-sessions`）。2 以上で in-flight 多重化。
-    /// GPU 構成とセッション数は fingerprint に含めない。出力の順序はバッチ順に再整列されて
-    /// 変わらず、構成を変えても完了済みの出力は作り直さずに再利用する（単一 GPU のマーカーとも互換）。
-    sessions: usize,
+    gpu_id: i32,
     use_tensorrt: bool,
     tensorrt_cache: Option<&'a std::path::Path>,
     score_clip: i16,
@@ -3345,25 +1979,6 @@ struct OnnxPipelineConfig<'a> {
     input2_channels: usize,
     profile_path: Option<&'a std::path::Path>,
     expand: Option<ExpandConfig<'a>>,
-    /// root 局面据え置き・ラベルのみ葉評価モード（`--qsearch-leaf-label`）。
-    /// 真のとき各局面を NNUE qsearch で葉まで進めてから特徴量を構築し、
-    /// 出力 sfen は root のまま・STM 変化時はスコアを符号反転する。
-    qsearch_leaf_label: bool,
-    /// qsearch の最大深さ（`qsearch_leaf_label` 時のみ使用）
-    qsearch_max_ply: i32,
-    /// 葉探索用 NNUE モデルのパス（`qsearch_leaf_label` 時のみ Some）。
-    /// 葉 PV ＝ ONNX が評価する葉局面が NNUE に依存するため、NNUE 差し替えを
-    /// marker で検知できるよう fingerprint に path/size/mtime を含める。
-    qsearch_nnue_path: Option<&'a std::path::Path>,
-    /// 葉探索 NNUE が LayerStacks の場合の明示 routing 設定。
-    qsearch_ls_bucket_mode: Option<&'a str>,
-    qsearch_ls_progress_buckets: Option<usize>,
-    qsearch_ls_progress_coeff_path: Option<&'a std::path::Path>,
-    /// leaf-REPLACEMENT arm の出力パス（`--qsearch-leaf-replacement-output`）。
-    /// `qsearch_leaf_label` 併用時のみ Some。葉局面に置換したレコード
-    /// （葉 sfen + 葉評価・符号反転なし）をこのパスに書き出す。leaf-LABEL arm
-    /// （`output_path`）とは 1:1 lockstep で同数のレコードを書く。
-    replacement_output: Option<&'a std::path::Path>,
 }
 
 /// ポリシー展開機能の設定（`OnnxPipelineConfig::expand` が `Some` のときのみ動作）
@@ -3381,9 +1996,11 @@ struct ExpandConfig<'a> {
 }
 
 /// 完了マーカーのフォーマットバージョン
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 const MARKER_VERSION: u32 = 1;
 
 /// 完了マーカーの fingerprint 部（出力内容を一意に決める実行設定）
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunFingerprint {
     version: u32,
@@ -3396,57 +2013,27 @@ struct RunFingerprint {
     input_size: u64,
     input_mtime_ns: u128,
     process_count: u64,
-    out_scores: bool,
     skip_in_check: bool,
     score_clip: i16,
     eval_scale_bits: u32,
-    // 旧 marker のキー欠落は unknown (`None`)。現行実行は常に `Some` を設定するため、
-    // CUDA / TensorRT のどちらとも一致せず一度だけ再生成される。
-    use_tensorrt: Option<bool>,
     onnx_draw_ply: i32,
-    // 出力内容を変える要素: root 据え置き・葉ラベルモードと葉探索深さ。
-    // モード差で resume / marker が誤って一致しないよう fingerprint に含める。
-    // max_ply は葉ラベル時のみ意味を持つので Option（expand_* と同じ扱い）。
-    qsearch_leaf_label: bool,
-    qsearch_max_ply: Option<i32>,
-    // 葉探索用 NNUE（`--nnue`）。葉ラベルモードでは葉局面＝出力が NNUE に依存するため、
-    // path/size/mtime を fingerprint に含める。qsearch_max_ply と同じく leaf_label 時のみ Some。
-    qsearch_nnue_path: Option<PathBuf>,
-    qsearch_nnue_size: Option<u64>,
-    qsearch_nnue_mtime_ns: Option<u128>,
-    qsearch_ls_bucket_mode: Option<String>,
-    qsearch_ls_progress_buckets: Option<usize>,
-    qsearch_ls_progress_coeff_path: Option<PathBuf>,
-    qsearch_ls_progress_coeff_sha256: Option<String>,
-    // NNUE 静的評価 sidecar (mode="nnue-static") のみ Some。model_* が NNUE 本体を
-    // 指すのに対し、こちらは出力スコアを変える routing / スケール設定を固定する。
-    // LayerStacks でない NNUE では routing 3 兄弟は None のまま。
-    nnue_ls_bucket_mode: Option<String>,
-    nnue_ls_progress_buckets: Option<usize>,
-    nnue_ls_progress_coeff_path: Option<PathBuf>,
-    nnue_ls_progress_coeff_sha256: Option<String>,
-    nnue_source_fv_scale: Option<i32>,
-    nnue_target_fv_scale: Option<i32>,
     expand: bool,
     expand_threshold_bits: Option<u32>,
     expand_skip_parent_in_check: Option<bool>,
     expand_skip_child_in_check: Option<bool>,
     expand_output_path: Option<PathBuf>,
-    // leaf-REPLACEMENT arm（`--qsearch-leaf-replacement-output`）。expand_* と同じ
-    // Option パターン。出力内容を変えるため fingerprint に含める。
-    replacement: bool,
-    replacement_output_path: Option<PathBuf>,
 }
 
 /// 完了マーカーの出力サイズ情報（fingerprint とは分離）
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutputSizes {
     rescore_output_size: u64,
     expand_output_size: Option<u64>,
-    replacement_output_size: Option<u64>,
 }
 
 /// 完了マーカー全体（fingerprint + output sizes）
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DoneMarker {
     fingerprint: RunFingerprint,
@@ -3454,20 +2041,15 @@ struct DoneMarker {
 }
 
 /// `<rescore_output>.done` を返す
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn marker_path_for(rescore_output: &std::path::Path) -> PathBuf {
     let mut s = rescore_output.as_os_str().to_owned();
     s.push(".done");
     PathBuf::from(s)
 }
 
-/// `<rescore_output>.in-progress` を返す
-fn in_progress_marker_path_for(rescore_output: &std::path::Path) -> PathBuf {
-    let mut s = rescore_output.as_os_str().to_owned();
-    s.push(".in-progress");
-    PathBuf::from(s)
-}
-
 /// ファイルの `(len, modified_unix_ns)` を取得
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn file_size_mtime_ns(path: &std::path::Path) -> Result<(u64, u128)> {
     let m = fs::metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
     let mtime = m
@@ -3480,6 +2062,7 @@ fn file_size_mtime_ns(path: &std::path::Path) -> Result<(u64, u128)> {
 }
 
 /// `DoneMarker` をテキスト key=value 形式にシリアライズ
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn serialize_marker(marker: &DoneMarker) -> String {
     let f = &marker.fingerprint;
     let mut out = String::new();
@@ -3494,70 +2077,10 @@ fn serialize_marker(marker: &DoneMarker) -> String {
     let _ = writeln!(out, "input_size={}", f.input_size);
     let _ = writeln!(out, "input_mtime_ns={}", f.input_mtime_ns);
     let _ = writeln!(out, "process_count={}", f.process_count);
-    let _ = writeln!(out, "out_scores={}", f.out_scores);
     let _ = writeln!(out, "skip_in_check={}", f.skip_in_check);
     let _ = writeln!(out, "score_clip={}", f.score_clip);
     let _ = writeln!(out, "eval_scale_bits=0x{:08x}", f.eval_scale_bits);
-    if let Some(use_tensorrt) = f.use_tensorrt {
-        let _ = writeln!(out, "use_tensorrt={use_tensorrt}");
-    }
     let _ = writeln!(out, "onnx_draw_ply={}", f.onnx_draw_ply);
-    let _ = writeln!(out, "qsearch_leaf_label={}", f.qsearch_leaf_label);
-    if f.qsearch_leaf_label {
-        let _ = writeln!(
-            out,
-            "qsearch_max_ply={}",
-            f.qsearch_max_ply.expect("qsearch_leaf_label=true requires max_ply")
-        );
-        let _ = writeln!(
-            out,
-            "qsearch_nnue_path={}",
-            f.qsearch_nnue_path
-                .as_ref()
-                .expect("qsearch_leaf_label=true requires nnue path")
-                .display()
-        );
-        let _ = writeln!(
-            out,
-            "qsearch_nnue_size={}",
-            f.qsearch_nnue_size.expect("qsearch_leaf_label=true requires nnue size")
-        );
-        let _ = writeln!(
-            out,
-            "qsearch_nnue_mtime_ns={}",
-            f.qsearch_nnue_mtime_ns.expect("qsearch_leaf_label=true requires nnue mtime")
-        );
-        if let Some(mode) = &f.qsearch_ls_bucket_mode {
-            let _ = writeln!(out, "qsearch_ls_bucket_mode={mode}");
-        }
-        if let Some(buckets) = f.qsearch_ls_progress_buckets {
-            let _ = writeln!(out, "qsearch_ls_progress_buckets={buckets}");
-        }
-        if let Some(path) = &f.qsearch_ls_progress_coeff_path {
-            let _ = writeln!(out, "qsearch_ls_progress_coeff_path={}", path.display());
-        }
-        if let Some(sha256) = &f.qsearch_ls_progress_coeff_sha256 {
-            let _ = writeln!(out, "qsearch_ls_progress_coeff_sha256={sha256}");
-        }
-    }
-    if let Some(mode) = &f.nnue_ls_bucket_mode {
-        let _ = writeln!(out, "nnue_ls_bucket_mode={mode}");
-    }
-    if let Some(buckets) = f.nnue_ls_progress_buckets {
-        let _ = writeln!(out, "nnue_ls_progress_buckets={buckets}");
-    }
-    if let Some(path) = &f.nnue_ls_progress_coeff_path {
-        let _ = writeln!(out, "nnue_ls_progress_coeff_path={}", path.display());
-    }
-    if let Some(sha256) = &f.nnue_ls_progress_coeff_sha256 {
-        let _ = writeln!(out, "nnue_ls_progress_coeff_sha256={sha256}");
-    }
-    if let Some(v) = f.nnue_source_fv_scale {
-        let _ = writeln!(out, "nnue_source_fv_scale={v}");
-    }
-    if let Some(v) = f.nnue_target_fv_scale {
-        let _ = writeln!(out, "nnue_target_fv_scale={v}");
-    }
     let _ = writeln!(out, "expand={}", f.expand);
     if f.expand {
         let _ = writeln!(
@@ -3581,17 +2104,6 @@ fn serialize_marker(marker: &DoneMarker) -> String {
             f.expand_output_path.as_ref().expect("expand=true requires path").display()
         );
     }
-    let _ = writeln!(out, "replacement={}", f.replacement);
-    if f.replacement {
-        let _ = writeln!(
-            out,
-            "replacement_output_path={}",
-            f.replacement_output_path
-                .as_ref()
-                .expect("replacement=true requires path")
-                .display()
-        );
-    }
     let _ = writeln!(out, "rescore_output_size={}", marker.output_sizes.rescore_output_size);
     if f.expand {
         let _ = writeln!(
@@ -3603,20 +2115,11 @@ fn serialize_marker(marker: &DoneMarker) -> String {
                 .expect("expand=true requires expand_output_size")
         );
     }
-    if f.replacement {
-        let _ = writeln!(
-            out,
-            "replacement_output_size={}",
-            marker
-                .output_sizes
-                .replacement_output_size
-                .expect("replacement=true requires replacement_output_size")
-        );
-    }
     out
 }
 
 /// マーカーファイルをパース（key=value テキスト形式、行頭空白・コメントは未対応）
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("Failed to read marker {}", path.display()))?;
@@ -3653,16 +2156,6 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
         anyhow::bail!("Unsupported marker version: {version} (expected {MARKER_VERSION})");
     }
     let expand = parse_bool(get("expand")?)?;
-    // 後方互換: 旧 marker には無いキー。欠落時は false（葉ラベル未使用）扱い。
-    let qsearch_leaf_label = match map.get("qsearch_leaf_label") {
-        Some(v) => parse_bool(v)?,
-        None => false,
-    };
-    // 後方互換: 旧 marker には無いキー。欠落時は false（replacement arm 未使用）扱い。
-    let replacement = match map.get("replacement") {
-        Some(v) => parse_bool(v)?,
-        None => false,
-    };
     let fingerprint = RunFingerprint {
         version,
         mode: get("mode")?.clone(),
@@ -3674,60 +2167,10 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
         input_size: get("input_size")?.parse().context("invalid input_size")?,
         input_mtime_ns: get("input_mtime_ns")?.parse().context("invalid input_mtime_ns")?,
         process_count: get("process_count")?.parse().context("invalid process_count")?,
-        // 旧 marker はフル PSV 出力なので false として扱う。
-        out_scores: match map.get("out_scores") {
-            Some(v) => parse_bool(v)?,
-            None => false,
-        },
         skip_in_check: parse_bool(get("skip_in_check")?)?,
         score_clip: get("score_clip")?.parse().context("invalid score_clip")?,
         eval_scale_bits: parse_hex_u32(get("eval_scale_bits")?)?,
-        // 旧 marker は実行 backend を追跡していなかった。欠落は unknown として保持し、
-        // 現行の CUDA / TensorRT のどちらとも fingerprint が一致しないようにする。
-        use_tensorrt: map.get("use_tensorrt").map(|v| parse_bool(v)).transpose()?,
         onnx_draw_ply: get("onnx_draw_ply")?.parse().context("invalid onnx_draw_ply")?,
-        qsearch_leaf_label,
-        qsearch_max_ply: if qsearch_leaf_label {
-            Some(get("qsearch_max_ply")?.parse().context("invalid qsearch_max_ply")?)
-        } else {
-            None
-        },
-        // 葉探索 NNUE のメタは leaf-label モードより後に追加したキーのため、leaf_label=true でも
-        // キー欠落（葉探索 NNUE 未追跡の旧 leaf-label marker）を None として許容する。現 fingerprint は
-        // Some(nnue) になるので不一致 → marker 不一致経路で再生成され、hard parse error にはしない。
-        qsearch_nnue_path: map.get("qsearch_nnue_path").map(PathBuf::from),
-        qsearch_nnue_size: map
-            .get("qsearch_nnue_size")
-            .map(|v| v.parse().context("invalid qsearch_nnue_size"))
-            .transpose()?,
-        qsearch_nnue_mtime_ns: map
-            .get("qsearch_nnue_mtime_ns")
-            .map(|v| v.parse().context("invalid qsearch_nnue_mtime_ns"))
-            .transpose()?,
-        qsearch_ls_bucket_mode: map.get("qsearch_ls_bucket_mode").cloned(),
-        qsearch_ls_progress_buckets: map
-            .get("qsearch_ls_progress_buckets")
-            .map(|value| value.parse().context("invalid qsearch_ls_progress_buckets"))
-            .transpose()?,
-        qsearch_ls_progress_coeff_path: map
-            .get("qsearch_ls_progress_coeff_path")
-            .map(PathBuf::from),
-        qsearch_ls_progress_coeff_sha256: map.get("qsearch_ls_progress_coeff_sha256").cloned(),
-        nnue_ls_bucket_mode: map.get("nnue_ls_bucket_mode").cloned(),
-        nnue_ls_progress_buckets: map
-            .get("nnue_ls_progress_buckets")
-            .map(|value| value.parse().context("invalid nnue_ls_progress_buckets"))
-            .transpose()?,
-        nnue_ls_progress_coeff_path: map.get("nnue_ls_progress_coeff_path").map(PathBuf::from),
-        nnue_ls_progress_coeff_sha256: map.get("nnue_ls_progress_coeff_sha256").cloned(),
-        nnue_source_fv_scale: map
-            .get("nnue_source_fv_scale")
-            .map(|value| value.parse().context("invalid nnue_source_fv_scale"))
-            .transpose()?,
-        nnue_target_fv_scale: map
-            .get("nnue_target_fv_scale")
-            .map(|value| value.parse().context("invalid nnue_target_fv_scale"))
-            .transpose()?,
         expand,
         expand_threshold_bits: if expand {
             Some(parse_hex_u32(get("expand_threshold_bits")?)?)
@@ -3749,12 +2192,6 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
         } else {
             None
         },
-        replacement,
-        replacement_output_path: if replacement {
-            Some(PathBuf::from(get("replacement_output_path")?))
-        } else {
-            None
-        },
     };
     let output_sizes = OutputSizes {
         rescore_output_size: get("rescore_output_size")?
@@ -3762,15 +2199,6 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
             .context("invalid rescore_output_size")?,
         expand_output_size: if expand {
             Some(get("expand_output_size")?.parse().context("invalid expand_output_size")?)
-        } else {
-            None
-        },
-        replacement_output_size: if replacement {
-            Some(
-                get("replacement_output_size")?
-                    .parse()
-                    .context("invalid replacement_output_size")?,
-            )
         } else {
             None
         },
@@ -3784,28 +2212,16 @@ fn parse_marker(path: &std::path::Path) -> Result<DoneMarker> {
 /// マーカーを atomic に書き出す（tmp に書く → sync_all → rename）。
 /// 他の出力パスと同様、tmp / final が symlink の場合は拒否する
 /// （symlink を follow して任意ファイルを上書きするのを防ぐ）。
-fn write_marker_atomic(
-    protection: &OutputProtection,
-    rescore_output: &std::path::Path,
-    marker: &DoneMarker,
-) -> Result<()> {
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
+fn write_marker_atomic(rescore_output: &std::path::Path, marker: &DoneMarker) -> Result<()> {
     let final_path = marker_path_for(rescore_output);
-    write_marker_atomic_at(protection, &final_path, marker)
-}
-
-/// 指定したパスへマーカーを atomic に書き出す。
-fn write_marker_atomic_at(
-    protection: &OutputProtection,
-    final_path: &std::path::Path,
-    marker: &DoneMarker,
-) -> Result<()> {
     let mut tmp_os = final_path.as_os_str().to_owned();
     tmp_os.push(".tmp");
     let tmp_path = PathBuf::from(tmp_os);
 
     // symlink 拒否: final / tmp どちらも symlink 経由の書き込みをブロック。
     // tmp に前回クラッシュの残骸 (通常ファイル) があれば事前削除する。
-    for p in [final_path, tmp_path.as_path()] {
+    for p in [&final_path, &tmp_path] {
         if let Ok(meta) = fs::symlink_metadata(p)
             && meta.file_type().is_symlink()
         {
@@ -3817,8 +2233,7 @@ fn write_marker_atomic_at(
         }
     }
     if tmp_path.exists() {
-        protection
-            .remove(&tmp_path)
+        fs::remove_file(&tmp_path)
             .with_context(|| format!("Failed to remove stale marker tmp {}", tmp_path.display()))?;
     }
 
@@ -3831,173 +2246,13 @@ fn write_marker_atomic_at(
             .create_new(true)
             .open(&tmp_path)
             .with_context(|| format!("Failed to create marker tmp {}", tmp_path.display()))?;
-        protection.check_file(&tmp_path, &f)?;
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
     }
-    protection.check_path(&tmp_path)?;
-    protection.check_path(final_path)?;
-    protection.check_existing(final_path)?;
-    fs::rename(&tmp_path, final_path).with_context(|| {
+    fs::rename(&tmp_path, &final_path).with_context(|| {
         format!("Failed to rename marker {} → {}", tmp_path.display(), final_path.display())
     })?;
     Ok(())
-}
-
-/// score sidecar の run 開始時に選ぶ処理方法。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SidecarStartDecision {
-    Resume,
-    Truncate,
-}
-
-/// in-progress marker が通常ファイルなら削除する。symlink は追跡せず拒否する。
-fn remove_in_progress_marker(
-    protection: &OutputProtection,
-    rescore_output: &std::path::Path,
-) -> Result<()> {
-    let path = in_progress_marker_path_for(rescore_output);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to stat in-progress marker {}", path.display()));
-        }
-    };
-    if metadata.file_type().is_symlink() {
-        anyhow::bail!(
-            "In-progress marker path is a symlink (refusing to remove): {}",
-            path.display()
-        );
-    }
-    protection
-        .remove(&path)
-        .with_context(|| format!("Failed to remove in-progress marker {}", path.display()))
-}
-
-/// score sidecar の in-progress marker を書く。
-///
-/// 完了 marker と同じ key=value 形式を再利用し、output size は未完了を表す 0 とする。
-/// fingerprint だけを resume の根拠にし、変化する sidecar 自身の mtime は記録しない。
-fn write_in_progress_marker(
-    protection: &OutputProtection,
-    rescore_output: &std::path::Path,
-    fingerprint: &RunFingerprint,
-) -> Result<()> {
-    let marker = DoneMarker {
-        fingerprint: fingerprint.clone(),
-        output_sizes: OutputSizes {
-            rescore_output_size: 0,
-            expand_output_size: None,
-            replacement_output_size: None,
-        },
-    };
-    write_marker_atomic_at(protection, &in_progress_marker_path_for(rescore_output), &marker)
-}
-
-/// score sidecar の安全な resume 条件を確認し、run 開始状態を用意する。
-///
-/// full PSV では何もせず、marker / PSV 照合へ委ねる。sidecar では
-/// 出力と in-progress marker の両方が存在し fingerprint が一致するときだけ追記を許可する。
-/// それ以外は出力を truncate して現在 fingerprint の marker を書き直す。
-fn prepare_in_progress_marker(
-    protection: &OutputProtection,
-    rescore_output: &std::path::Path,
-    current: &RunFingerprint,
-    force_truncate: bool,
-) -> Result<Option<SidecarStartDecision>> {
-    if !current.out_scores {
-        return Ok(None);
-    }
-
-    let in_progress_path = in_progress_marker_path_for(rescore_output);
-    let marker_matches = if force_truncate || !rescore_output.exists() {
-        false
-    } else {
-        match fs::symlink_metadata(&in_progress_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                anyhow::bail!(
-                    "In-progress marker path is a symlink (refusing to resume): {}",
-                    in_progress_path.display()
-                );
-            }
-            Ok(_) => match parse_marker(&in_progress_path) {
-                Ok(marker) => marker.fingerprint == *current,
-                Err(error) => {
-                    eprintln!(
-                        "Warning: invalid in-progress marker {}, regenerating sidecar: {error:#}",
-                        in_progress_path.display()
-                    );
-                    false
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to stat in-progress marker {}", in_progress_path.display())
-                });
-            }
-        }
-    };
-
-    if marker_matches {
-        return Ok(Some(SidecarStartDecision::Resume));
-    }
-
-    if rescore_output.exists() {
-        protection.truncate(rescore_output, 0)?;
-    }
-    remove_in_progress_marker(protection, rescore_output)?;
-    write_in_progress_marker(protection, rescore_output, current)?;
-    Ok(Some(SidecarStartDecision::Truncate))
-}
-
-/// sidecar の正常完了を `.done` へ昇格し、その後 in-progress marker を削除する。
-/// この順序なら両操作の間で停止しても、次回は `.done` を正として回収できる。
-fn promote_score_sidecar_marker(
-    protection: &OutputProtection,
-    rescore_output: &std::path::Path,
-    marker: &DoneMarker,
-) -> Result<()> {
-    write_marker_atomic(protection, rescore_output, marker)?;
-    remove_in_progress_marker(protection, rescore_output)
-}
-
-/// sidecar run の開始時 fingerprint が現在も有効か確認する。
-fn ensure_sidecar_fingerprint_unchanged(
-    start: &RunFingerprint,
-    current: &RunFingerprint,
-    phase: &str,
-) -> Result<()> {
-    if start != current {
-        anyhow::bail!(
-            "score sidecar fingerprint changed {phase}; refusing to finalize mixed/stale output"
-        );
-    }
-    Ok(())
-}
-
-/// run 中の fingerprint 変更を検出した sidecar を、次回 resume 不能な状態へ戻す。
-fn reject_changed_sidecar_fingerprint(
-    protection: &OutputProtection,
-    rescore_output: &std::path::Path,
-    start: &RunFingerprint,
-    current: &RunFingerprint,
-    phase: &str,
-) -> Result<()> {
-    let error = match ensure_sidecar_fingerprint_unchanged(start, current, phase) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-
-    // marker だけを残すと入力/model の mtime を元に戻した際に満杯の sidecar が再利用
-    // され得る。出力を空にしてから marker を削除し、次回を必ず先頭から始める。
-    if rescore_output.exists() {
-        protection.truncate(rescore_output, 0)?;
-    }
-    remove_in_progress_marker(protection, rescore_output)?;
-    Err(error)
 }
 
 /// マーカーの `key=value\n` テキスト形式で安全に round-trip できないパスを拒否する。
@@ -4010,6 +2265,7 @@ fn reject_changed_sidecar_fingerprint(
 /// 現実的には `=` を含むパスだけが稀に発生する（例:
 /// `v1.0=alpha/model.onnx`）。非 UTF-8 と改行はほぼ起こらないが、同じ
 /// 検証枠で拾っておく。遭遇時はパスをリネームすることで回避可能。
+#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
 fn ensure_marker_safe_path(kind: &str, path: &std::path::Path) -> Result<()> {
     let s = path.to_str().ok_or_else(|| {
         anyhow::anyhow!(
@@ -4059,49 +2315,6 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
         }
         None => None,
     };
-    let replacement_output_path = match config.replacement_output {
-        Some(rp) => {
-            let p = canonicalize_predicted_path(rp)?;
-            ensure_marker_safe_path("--qsearch-leaf-replacement-output (entry)", &p)?;
-            Some(p)
-        }
-        None => None,
-    };
-    // 葉探索用 NNUE のメタを fingerprint へ（葉ラベル時のみ）。NNUE を差し替えると葉局面＝
-    // 出力が変わるのに、含めないと marker が一致して stale な葉ラベルを再利用してしまう。
-    let (qsearch_nnue_path, qsearch_nnue_size, qsearch_nnue_mtime_ns) = if config.qsearch_leaf_label
-    {
-        let p = config
-            .qsearch_nnue_path
-            .context("--qsearch-leaf-label requires --nnue path for fingerprint")?;
-        let cp = p
-            .canonicalize()
-            .with_context(|| format!("Failed to canonicalize --nnue {}", p.display()))?;
-        ensure_marker_safe_path("--nnue (qsearch leaf)", &cp)?;
-        let (size, mtime) = file_size_mtime_ns(&cp)?;
-        (Some(cp), Some(size), Some(mtime))
-    } else {
-        (None, None, None)
-    };
-    let (qsearch_ls_progress_coeff_path, qsearch_ls_progress_coeff_sha256) =
-        if config.qsearch_leaf_label {
-            match config.qsearch_ls_progress_coeff_path {
-                Some(path) => {
-                    let canonical = path.canonicalize().with_context(|| {
-                        format!("Failed to canonicalize --ls-progress-coeff {}", path.display())
-                    })?;
-                    ensure_marker_safe_path("--ls-progress-coeff", &canonical)?;
-                    let bytes = fs::read(&canonical).with_context(|| {
-                        format!("Failed to read --ls-progress-coeff {}", canonical.display())
-                    })?;
-                    let sha256 = format!("{:x}", Sha256::digest(bytes));
-                    (Some(canonical), Some(sha256))
-                }
-                None => (None, None),
-            }
-        } else {
-            (None, None)
-        };
     Ok(RunFingerprint {
         version: MARKER_VERSION,
         mode: "onnx".to_string(),
@@ -4113,40 +2326,15 @@ fn build_run_fingerprint(config: &OnnxPipelineConfig<'_>) -> Result<RunFingerpri
         input_size,
         input_mtime_ns,
         process_count: config.process_count,
-        out_scores: config.out_scores,
         skip_in_check: config.skip_in_check,
         score_clip: config.score_clip,
         eval_scale_bits: config.eval_scale.to_bits(),
-        use_tensorrt: Some(config.use_tensorrt),
         onnx_draw_ply: config.onnx_draw_ply,
-        qsearch_leaf_label: config.qsearch_leaf_label,
-        qsearch_max_ply: config.qsearch_leaf_label.then_some(config.qsearch_max_ply),
-        qsearch_nnue_path,
-        qsearch_nnue_size,
-        qsearch_nnue_mtime_ns,
-        qsearch_ls_bucket_mode: config
-            .qsearch_leaf_label
-            .then(|| config.qsearch_ls_bucket_mode.map(str::to_string))
-            .flatten(),
-        qsearch_ls_progress_buckets: config
-            .qsearch_leaf_label
-            .then_some(config.qsearch_ls_progress_buckets)
-            .flatten(),
-        qsearch_ls_progress_coeff_path,
-        qsearch_ls_progress_coeff_sha256,
-        nnue_ls_bucket_mode: None,
-        nnue_ls_progress_buckets: None,
-        nnue_ls_progress_coeff_path: None,
-        nnue_ls_progress_coeff_sha256: None,
-        nnue_source_fv_scale: None,
-        nnue_target_fv_scale: None,
         expand: config.expand.is_some(),
         expand_threshold_bits: config.expand.map(|e| e.threshold.to_bits()),
         expand_skip_parent_in_check: config.expand.map(|e| e.skip_parent_in_check),
         expand_skip_child_in_check: config.expand.map(|e| e.skip_child_in_check),
         expand_output_path,
-        replacement: config.replacement_output.is_some(),
-        replacement_output_path,
     })
 }
 
@@ -4166,673 +2354,29 @@ fn canonicalize_predicted_path(path: &std::path::Path) -> Result<PathBuf> {
     Ok(canonical_parent.join(file_name))
 }
 
-/// 入力特徴の host バッファ。CUDA pinned (page-locked) が使える環境では真の async H2D に
-/// なり、pageable→pinned ステージング (CPU 介在) が消える。pinned 割当に失敗する環境
-/// (CPU 推論など) では通常の `Vec` にフォールバックする。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-enum HostBuf {
-    Paged(Vec<f32>),
-    /// CUDA pinned 確保ブロックへの生ポインタ。free は `PinnedPool` が一括で行う。
-    Pinned(PinnedBuf),
-}
-
-/// CUDA pinned 確保ブロックを指す生ポインタ。確保・解放は [`PinnedPool`] が所有する。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-struct PinnedBuf {
-    ptr: *mut f32,
-    len: usize,
-}
-
-// SAFETY: pinned host memory (cudaHostAlloc 由来) は任意の CPU スレッドからアクセス可能な
-// 通常のホストメモリである。スロット (= PinnedBuf への &mut を含む PreparedBatch) は mpsc
-// channel で move 移送され、同一バッファに同時アクセスするスレッドは高々 1 つに保たれる
-// (producer が書き込み → ready 送信 → consumer が読み取り → free 返却)。よって PinnedBuf を
-// スレッド間で送っても data race は発生しない。ort の `Allocator` 自体は Sync でないため、
-// スロットには Allocator ではなく生ポインタを載せて channel 越しに渡す。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-unsafe impl Send for PinnedBuf {}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-impl HostBuf {
-    #[inline]
-    fn as_slice(&self) -> &[f32] {
-        match self {
-            HostBuf::Paged(v) => v.as_slice(),
-            // SAFETY: ptr/len は生存中の pinned 割当を指し、len 要素分が有効。排他アクセスは
-            // channel による所有権移送で保証される (上の unsafe impl Send 参照)。
-            HostBuf::Pinned(p) => unsafe { std::slice::from_raw_parts(p.ptr, p.len) },
-        }
-    }
-
-    #[inline]
-    fn as_mut_slice(&mut self) -> &mut [f32] {
-        match self {
-            HostBuf::Paged(v) => v.as_mut_slice(),
-            // SAFETY: 上と同じ不変条件。`&mut self` 経由なので Rust の借用規則でも排他。
-            HostBuf::Pinned(p) => unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) },
-        }
-    }
-}
-
-/// pinned 割当の所有者。ort `Allocator` と確保済み生ポインタ群を保持し、drop 時にまとめて
-/// free する。`Allocator` は Sync でないため、確保したメモリはスロットへ生ポインタで渡し、
-/// 解放だけをこの型に集約する。`PinnedPool` は thread::scope より長生きさせること
-/// (スコープ内で全スロットが drop された後に free する)。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-struct PinnedPool {
-    allocator: ort::memory::Allocator,
-    ptrs: Vec<*mut f32>,
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-impl PinnedPool {
-    /// `len` 要素 (f32) 分の pinned バッファを確保しゼロ初期化して返す。
-    fn alloc_zeroed(&mut self, len: usize) -> Result<PinnedBuf> {
-        let mut block = self.allocator.alloc::<f32>(len).map_err(onnx_ort_err)?;
-        // ゼロ初期化用に block を借用して書き込む（所有権はまだ block 側）。
-        {
-            let zero_ptr = block.as_mut_ptr().cast::<f32>();
-            // SAFETY: alloc が len*size_of::<f32>() バイトを確保済み（pinned は CPU アクセス可）。
-            // write_bytes::<f32>(_, 0, len) は len*size_of::<f32>() = len*4 バイトをゼロ化し、
-            // 確保サイズと一致する。
-            unsafe { std::ptr::write_bytes(zero_ptr, 0, len) };
-        }
-        // 所有権を block から取り出す（以後の free は PinnedPool::drop が担う）。zero_ptr と
-        // 同一アドレスだが、こちらは「移動した所有ポインタ」を表す。
-        let ptr = block.into_raw().cast::<f32>();
-        self.ptrs.push(ptr);
-        Ok(PinnedBuf { ptr, len })
-    }
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-impl Drop for PinnedPool {
-    fn drop(&mut self) {
-        for &ptr in &self.ptrs {
-            // SAFETY: ptr は self.allocator.alloc → into_raw で得たもの。確保した allocator で
-            // ちょうど 1 回だけ free する (ptrs に重複登録しない)。
-            unsafe { self.allocator.free(ptr) };
-        }
-    }
-}
-
-/// モデルファイルの置き換えで止めたときの、再実行の案内。
-///
-/// TensorRT EP のエンジンキャッシュは、モデルのファイル名とグラフの入出力・ノードの名前などで
-/// 引き当てて重みを見ない。キャッシュを残したまま再実行すると、古いモデルから作ったエンジンで推論する。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-const RERUN_AFTER_MODEL_CHANGE: &str = "Rerun to load the new model. With --onnx-tensorrt-cache, \
-     first delete the cached *.engine and *.profile files or use another cache directory: \
-     the TensorRT engine cache does not check the model weights.";
-
-/// ONNX セッションを作ったときのモデルファイル。
-///
-/// セッションは実行中の全入力ファイルで使い回すため、途中でモデルファイルが置き換わると
-/// 古いモデルの出力に新しいモデルの fingerprint を付けてしまう。各ファイルの完了マーカーの
-/// 判定 (fingerprint が変わると出力を消す) の前と、完了マーカーを書く前に照合して止める。
-/// 照合するのはモデルの本体ファイルの path/size/mtime だけ (外部データの `.onnx.data` は見ない)。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-#[derive(Debug, PartialEq, Eq)]
-struct OnnxModelIdentity {
-    path: PathBuf,
-    size: u64,
-    mtime_ns: u128,
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-impl OnnxModelIdentity {
-    fn capture(path: &std::path::Path) -> Result<Self> {
-        let path = path
-            .canonicalize()
-            .with_context(|| format!("Failed to canonicalize {}", path.display()))?;
-        let (size, mtime_ns) = file_size_mtime_ns(&path)?;
-        Ok(Self {
-            path,
-            size,
-            mtime_ns,
-        })
-    }
-
-    fn ensure_unchanged(&self, path: &std::path::Path) -> Result<()> {
-        let current = Self::capture(path)?;
-        anyhow::ensure!(
-            current == *self,
-            "ONNX model file changed after it was loaded: {} \
-             (size/mtime {}/{} -> {}/{}). {RERUN_AFTER_MODEL_CHANGE}",
-            current.path.display(),
-            self.size,
-            self.mtime_ns,
-            current.size,
-            current.mtime_ns
-        );
-        Ok(())
-    }
-
-    /// 完了マーカーの fingerprint が記録するモデルが、このモデルと同じか。
-    fn matches(&self, fingerprint: &RunFingerprint) -> bool {
-        self.path == fingerprint.model_path
-            && self.size == fingerprint.model_size
-            && self.mtime_ns == fingerprint.model_mtime_ns
-    }
-}
-
-/// 推論に使ったのはセッションを作ったときのモデル。`model_path` が置き換わっていた (または
-/// 読めない) なら出力を空にしてエラーを返す。marker の無い PSV 出力を残すと、次の実行が続きから
-/// 別のモデルの値を追記するか、件数がそろっていれば完了扱いで skip する。
-///
-/// モデルが消えていると `protection` の検査 (読み取り専用の資源の canonicalize) で truncate
-/// できず、出力が残る。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn discard_output_if_model_changed(
-    protection: &OutputProtection,
-    loaded: &OnnxModelIdentity,
-    model_path: &std::path::Path,
-    input_path: &std::path::Path,
-    output_path: &std::path::Path,
-    out_scores: bool,
-) -> Result<()> {
-    let Err(e) = loaded.ensure_unchanged(model_path) else {
-        return Ok(());
-    };
-    let discarded = protection.truncate(output_path, 0).and_then(|()| {
-        if out_scores {
-            remove_in_progress_marker(protection, output_path)?;
-        }
-        Ok(())
-    });
-    if let Err(discard_error) = discarded {
-        return Err(discard_error.context(format!(
-            "{e:#}; could not discard the output {}. Delete it before rerunning",
-            output_path.display()
-        )));
-    }
-    Err(e.context(format!("discarded the output of {}", input_path.display())))
-}
-
-/// セッションごとの GPU 番号。`--onnx-gpu-id` の各項目に 1 本ずつ配る一巡を `sessions_per_gpu`
-/// 回繰り返す並びにして、先頭の `warmup_leader_count` 本が各項目の 1 本目になるようにする。
-/// CPU 推論は intra-op のスレッドを奪い合うだけなので常に 1 本。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn session_gpu_ids(gpu_ids: &[i32], sessions_per_gpu: usize) -> Vec<i32> {
-    if gpu_ids.first().is_none_or(|&id| id < 0) {
-        return vec![-1];
-    }
-    (0..sessions_per_gpu.max(1)).flat_map(|_| gpu_ids.iter().copied()).collect()
-}
-
-/// `session_gpu_ids` の先頭から、最初のバッチを 1 本ずつ順に推論するセッションの数。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn warmup_leader_count(gpu_ids: &[i32]) -> usize {
-    if gpu_ids.first().is_none_or(|&id| id < 0) {
-        1
-    } else {
-        gpu_ids.len()
-    }
-}
-
-/// TensorRT EP は動的な入力形のエンジンを最初の推論で作り、キャッシュがあればそこから読む。
-/// 同じキャッシュを書くセッションが同時に作ると書き込みが競合し、セッションごとに別の
-/// エンジン (最下位 bit が違いうる) になるため、先導役 (`turn` 0..leaders) は 1 本ずつ順に
-/// 最初のバッチを推論し、残りのセッションは先導役が全員終えてから受信を始める。
-/// 先導役は 1 バッチも処理せずに終わっても `WarmupTurn` の drop で番を進める。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-struct WarmupGate {
-    finished: Mutex<usize>,
-    cv: std::sync::Condvar,
-    leaders: usize,
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-impl WarmupGate {
-    fn new(leaders: usize) -> Self {
-        Self {
-            finished: Mutex::new(0),
-            cv: std::sync::Condvar::new(),
-            leaders,
-        }
-    }
-
-    /// `worker_idx` の番まで待つ。先導役なら番を進める義務 (`WarmupTurn`) を返す。
-    fn wait(&self, worker_idx: usize) -> Option<WarmupTurn<'_>> {
-        let turn = worker_idx.min(self.leaders);
-        let guard = self.finished.lock().expect("warmup mutex poisoned");
-        drop(
-            self.cv
-                .wait_while(guard, |finished| *finished < turn)
-                .expect("warmup mutex poisoned"),
-        );
-        (worker_idx < self.leaders).then(|| WarmupTurn { gate: self })
-    }
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-struct WarmupTurn<'g> {
-    gate: &'g WarmupGate,
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-impl Drop for WarmupTurn<'_> {
-    fn drop(&mut self) {
-        *self.gate.finished.lock().expect("warmup mutex poisoned") += 1;
-        self.gate.cv.notify_all();
-    }
-}
-
-/// 番号付きで順不同に届く結果を、通し番号の順に取り出す。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-struct SeqReorder<T> {
-    pending: std::collections::BTreeMap<u64, T>,
-    next_seq: u64,
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-impl<T> SeqReorder<T> {
-    fn new() -> Self {
-        Self {
-            pending: std::collections::BTreeMap::new(),
-            next_seq: 0,
-        }
-    }
-
-    fn insert(&mut self, seq: u64, item: T) {
-        let previous = self.pending.insert(seq, item);
-        debug_assert!(previous.is_none() && seq >= self.next_seq, "duplicate seq {seq}");
-    }
-
-    /// 次の通し番号の結果が届いていれば取り出す。
-    fn pop_next(&mut self) -> Option<T> {
-        let item = self.pending.remove(&self.next_seq)?;
-        self.next_seq += 1;
-        Some(item)
-    }
-}
-
-/// GPU worker の受信ループ。共有の受け口から空いた worker がバッチを取り、`process` の結果を
-/// 通し番号付きで writer へ送る。`process` が `true` (EOF sentinel) を返すか、結果が `Err`
-/// か、writer が受け口を閉じたら終える。先導役は最初のバッチを送った時点で番を進める。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn drive_pull_worker<B, D>(
-    mut warmup_turn: Option<WarmupTurn<'_>>,
-    ready_rx: &Mutex<mpsc::Receiver<(u64, B)>>,
-    done_tx: &mpsc::Sender<(u64, Result<D>)>,
-    mut process: impl FnMut(B) -> (Result<D>, bool),
-) {
-    loop {
-        // recv を Mutex 内で待つ: ロック保持者だけが次のバッチを取り、他 worker は
-        // ロック待ちで並ぶ（取り合いの順序は出力に影響しない）。
-        let msg = ready_rx.lock().expect("ready_rx mutex poisoned").recv();
-        let Ok((seq, batch)) = msg else {
-            break; // producer 終了・供給済みバッチも処理済み
-        };
-        let (result, last) = process(batch);
-        let failed = result.is_err();
-        if done_tx.send((seq, result)).is_err() || failed || last {
-            break;
-        }
-        // 初バッチ完了（= TRT engine 確定・キャッシュ書き込み済み）。次の番へ進める。
-        drop(warmup_turn.take());
-    }
-}
-
-/// ONNX Runtime のセッションと入力特徴の host バッファ。1 回の実行の全入力ファイルで使い回す。
-///
-/// ファイルごとに作り直すと、TensorRT EP ではセッションの数だけモデルの解析と
-/// エンジンの読み込みを毎回やり直すため、小さい入力ファイルが多いと推論より長くかかる。
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-struct OnnxSessions {
-    gpu_sessions: Vec<ort::session::Session>,
-    /// `gpu_sessions` と同じ並びの、各セッションの GPU 番号 (CPU 推論は -1)。
-    session_gpus: Vec<i32>,
-    /// `gpu_sessions` の先頭からこの本数が、最初のバッチを 1 本ずつ順に推論する (`WarmupGate`)。
-    warmup_leaders: usize,
-    /// パイプラインの slot ごとの入力特徴バッファ (f1, f2)。数は 2 × セッション数。
-    slot_bufs: Vec<(HostBuf, HostBuf)>,
-    /// `slot_bufs` を pinned で確保できたときの所有者 (drop で free する)。`None` なら
-    /// `slot_bufs` は pageable で、出力バッファも pageable にする。
-    pinned_pool: Option<PinnedPool>,
-    model: OnnxModelIdentity,
-}
-
-#[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-impl OnnxSessions {
-    /// 初回の呼び出しでセッションを作り、2 回目以降は同じセッションを返す。全入力が skip
-    /// される実行ではセッションを作らない。モデルファイルの置き換えは、main が各ファイルの
-    /// 完了マーカーの判定の前に照合する。
-    fn get_or_create<'s>(
-        slot: &'s mut Option<OnnxSessions>,
-        config: &OnnxPipelineConfig<'_>,
-    ) -> Result<&'s mut OnnxSessions> {
-        match slot {
-            Some(sessions) => Ok(sessions),
-            None => Ok(slot.insert(OnnxSessions::new(config)?)),
-        }
-    }
-
-    fn new(config: &OnnxPipelineConfig<'_>) -> Result<Self> {
-        use ort::ep::ExecutionProvider;
-        use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
-        use ort::session::Session;
-
-        let OnnxPipelineConfig {
-            model_name,
-            onnx_path,
-            batch_size,
-            gpu_ids,
-            sessions,
-            use_tensorrt,
-            tensorrt_cache,
-            f1_size,
-            f2_size,
-            profile_path,
-            ..
-        } = *config;
-        let use_gpu = gpu_ids.first().is_some_and(|&id| id >= 0);
-
-        // ORT_DYLIB_PATH 事前検証（load-dynamic feature）
-        //
-        // ort クレートは load-dynamic feature 有効時、ORT_DYLIB_PATH 環境変数で指定された
-        // ライブラリを dlopen する。未設定時はシステムパスから "libonnxruntime.so" を探すが、
-        // 見つからない場合にハングする（エラーではなくブロックする）。
-        //
-        // ort の default features には download-binaries（ビルド時に CPU 版ランタイムを
-        // 自動ダウンロード）が含まれるが、load-dynamic とは #[cfg] で排他のため共存不可。
-        // また download-binaries で取得されるのは CPU 版のみで GPU 版は提供されない。
-        //
-        // したがって load-dynamic を使い、ランタイムはユーザーが自前で用意する設計とする。
-        // GPU 推論がデフォルト。暗黙の CPU フォールバックは CUDA EP チェックで防止する。
-        //
-        // ORT_DYLIB_PATH は GPU/CPU どちらのモードでも必須。
-        // 未設定時に ort がシステムパスから探すとハングするため。
-        match std::env::var("ORT_DYLIB_PATH") {
-            Ok(path) if !path.is_empty() => {
-                if !std::path::Path::new(&path).is_file() {
-                    anyhow::bail!(
-                        "ORT_DYLIB_PATH is set to '{path}' but the file does not exist \
-                         (or is not a regular file).\n\
-                         Download ONNX Runtime from:\n  \
-                         https://github.com/microsoft/onnxruntime/releases"
-                    );
-                }
-                eprintln!("ORT_DYLIB_PATH: {path}");
-            }
-            _ => {
-                let mode_hint = if use_gpu {
-                    "GPU inference requires a GPU-enabled ONNX Runtime (onnxruntime-linux-x64-gpu-*)."
-                } else {
-                    "CPU inference requires an ONNX Runtime library (GPU or CPU build)."
-                };
-                anyhow::bail!(
-                    "ORT_DYLIB_PATH environment variable is not set.\n\
-                     {mode_hint}\n\
-                     Download from: https://github.com/microsoft/onnxruntime/releases\n\
-                     Example:\n  \
-                     ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run ..."
-                );
-            }
-        }
-
-        // ONNX Runtime セッション初期化
-        let model = OnnxModelIdentity::capture(onnx_path)?;
-        eprintln!("Loading {model_name} ONNX model: {}", onnx_path.display());
-
-        // セッションを 1 本構築する。EP の可用性チェックと ORT profiling は全体の 1 本目
-        // (`verbose`) だけ、使う GPU のログは `--onnx-gpu-id` の項目ごとの 1 本目 (`announce`) で出す。
-        let build_session = |gpu_id: i32, verbose: bool, announce: bool| -> Result<Session> {
-            let builder = tools::onnx_env::session_builder()?
-                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::All)
-                .map_err(|e| anyhow::anyhow!("ORT builder error: {e}"))?
-                .with_intra_threads(1)
-                .map_err(|e| anyhow::anyhow!("ORT builder error: {e}"))?;
-
-            let mut builder = match (verbose, profile_path) {
-                (true, Some(path)) => {
-                    eprintln!("ORT profiling enabled: {}", path.display());
-                    builder
-                        .with_profiling(path)
-                        .map_err(|e| anyhow::anyhow!("ORT profiling error: {e}"))?
-                }
-                _ => builder,
-            };
-
-            let session = if gpu_id >= 0 {
-                if use_tensorrt {
-                    if announce {
-                        eprintln!("Using TensorRT (FP16) on GPU {gpu_id}");
-                    }
-
-                    let trt_ep = ort::execution_providers::TensorRTExecutionProvider::default()
-                        .with_device_id(gpu_id)
-                        .with_fp16(true)
-                        .with_engine_cache(tensorrt_cache.is_some());
-                    let trt_ep = if let Some(cache_path) = tensorrt_cache {
-                        let cache_str = cache_path.to_str().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "TensorRT cache path contains non-UTF-8 characters: {}",
-                                cache_path.display()
-                            )
-                        })?;
-                        if verbose {
-                            eprintln!("TensorRT engine cache: {}", cache_path.display());
-                        }
-                        trt_ep.with_engine_cache_path(cache_str)
-                    } else {
-                        if verbose {
-                            eprintln!(
-                                "TensorRT engine cache: disabled (use --onnx-tensorrt-cache to enable)"
-                            );
-                        }
-                        trt_ep
-                    };
-
-                    if verbose {
-                        match trt_ep.is_available() {
-                            Ok(true) => eprintln!("TensorRT execution provider: available"),
-                            Ok(false) => {
-                                anyhow::bail!(
-                                    "TensorRTExecutionProvider is NOT available.\n\
-                                     Ensure TensorRT (libnvinfer.so.10) is in LD_LIBRARY_PATH.\n\
-                                     To use CUDA EP instead, omit --onnx-tensorrt."
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("WARNING: Failed to check TensorRT EP availability: {e}");
-                            }
-                        }
-                    }
-
-                    // TensorRT EP + CUDA EP をフォールバックとして登録
-                    let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default()
-                        .with_device_id(gpu_id)
-                        .build()
-                        .error_on_failure();
-                    let trt_ep = trt_ep.build().error_on_failure();
-
-                    builder
-                        .with_execution_providers([trt_ep, cuda_ep])
-                        .map_err(|e| anyhow::anyhow!("TensorRT/CUDA EP registration failed: {e}"))?
-                        .commit_from_file(onnx_path)
-                        .map_err(onnx_ort_err)?
-                } else {
-                    if announce {
-                        eprintln!("Using CUDA GPU {gpu_id}");
-                    }
-
-                    let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default()
-                        .with_device_id(gpu_id);
-                    if verbose {
-                        match cuda_ep.is_available() {
-                            Ok(true) => eprintln!("CUDA execution provider: available"),
-                            Ok(false) => {
-                                anyhow::bail!(
-                                    "CUDAExecutionProvider is NOT available in the loaded ONNX Runtime library.\n\
-                                     The library may be a CPU-only build.\n\
-                                     Check ORT_DYLIB_PATH points to a GPU-enabled onnxruntime.\n\
-                                     To use CPU inference instead, omit --onnx-gpu-id."
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("WARNING: Failed to check CUDA EP availability: {e}");
-                            }
-                        }
-                    }
-
-                    let ep = cuda_ep.build().error_on_failure();
-                    builder
-                        .with_execution_providers([ep])
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "CUDA EP registration failed (is onnxruntime-gpu installed?): {e}"
-                            )
-                        })?
-                        .commit_from_file(onnx_path)
-                        .map_err(onnx_ort_err)?
-                }
-            } else {
-                if verbose {
-                    eprintln!("Using CPU");
-                }
-                builder.commit_from_file(onnx_path).map_err(onnx_ort_err)?
-            };
-            Ok(session)
-        };
-
-        // 2 本目以降は同じ TensorRT engine cache を読むだけなので構築は軽い。
-        let session_gpus = session_gpu_ids(gpu_ids, sessions);
-        let warmup_leaders = warmup_leader_count(gpu_ids);
-        let num_sessions = session_gpus.len();
-        let mut gpu_sessions: Vec<Session> = Vec::with_capacity(num_sessions);
-        for (i, &gpu_id) in session_gpus.iter().enumerate() {
-            gpu_sessions.push(build_session(gpu_id, i == 0, i < warmup_leaders)?);
-        }
-        if num_sessions > 1 {
-            eprintln!(
-                "ONNX sessions: {num_sessions} (in-flight multiplexing; outputs re-ordered by batch)"
-            );
-        }
-
-        eprintln!("{model_name} ONNX model loaded. Batch size: {batch_size}");
-
-        let pipeline_slots = 2 * num_sessions;
-        // 入力特徴 host バッファを CUDA pinned (page-locked) 化するための allocator。
-        // pinned 化で pageable→pinned ステージング (CPU 介在) が消え、真の async H2D になる。
-        // GPU 推論のときのみ確保を試み、失敗したら pageable Vec にフォールバック。
-        // slot はどの GPU のセッションにも渡るため、全 GPU から pinned として使えるメモリが要る。
-        // ORT の CUDA pinned allocator は cudaMallocHost で確保し、64 bit の UVA 環境ではこれが
-        // portable (全デバイスの context で pinned 扱い) になるので、1 本目のセッションの
-        // allocator で一括確保する。
-        let mut pinned_pool = if use_gpu {
-            MemoryInfo::new(
-                AllocationDevice::CUDA_PINNED,
-                session_gpus[0],
-                AllocatorType::Device,
-                MemoryType::CPUInput,
-            )
-            .and_then(|info| ort::memory::Allocator::new(&gpu_sessions[0], info))
-            .map(|allocator| PinnedPool {
-                allocator,
-                ptrs: Vec::new(),
-            })
-            .ok()
-        } else {
-            None
-        };
-
-        // 入力特徴バッファ (f1/f2) を pipeline_slots 個ぶん確保。pinned_pool があれば pinned で
-        // 全スロットを一括確保し、1 件でも失敗したら pool を捨てて全スロットを pageable Vec で
-        // 作り直す (all-or-nothing。pinned/pageable 混在を避ける)。確保したバッファは全入力
-        // ファイルで使い回し、pinned_pool は OnnxSessions の drop で free する。
-        let mut slot_bufs: Vec<(HostBuf, HostBuf)> = Vec::with_capacity(pipeline_slots);
-        let pinned_ok = if let Some(pool) = pinned_pool.as_mut() {
-            let mut ok = true;
-            for _ in 0..pipeline_slots {
-                // 個別に評価してから match (同一 pool への &mut 借用を逐次化する)。f1 が Err でも
-                // f2 の確保は走るが、その PinnedBuf は `_` アームで即 drop される。ptr は確保成功時に
-                // pool.ptrs へ登録済みなので PinnedPool::drop で漏れなく free される (リークなし)。
-                let f1 = pool.alloc_zeroed(batch_size * f1_size);
-                let f2 = pool.alloc_zeroed(batch_size * f2_size);
-                match (f1, f2) {
-                    (Ok(f1), Ok(f2)) => slot_bufs.push((HostBuf::Pinned(f1), HostBuf::Pinned(f2))),
-                    _ => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            ok
-        } else {
-            false
-        };
-        if !pinned_ok {
-            if use_gpu {
-                eprintln!(
-                    "Warning: CUDA pinned host buffer の確保に失敗。pageable Vec にフォールバックします"
-                );
-            }
-            // ここまでに確保した pinned (slot_bufs 内 + pool.ptrs に登録済) を解放する。
-            // PinnedBuf 自体は Drop を持たず、free は pinned_pool の drop に集約しているため、
-            // 先に slot_bufs を空にしてから pinned_pool を drop する (登録 ptr を 1 回ずつ free)。
-            slot_bufs.clear();
-            drop(pinned_pool.take());
-            for _ in 0..pipeline_slots {
-                slot_bufs.push((
-                    HostBuf::Paged(vec![0.0f32; batch_size * f1_size]),
-                    HostBuf::Paged(vec![0.0f32; batch_size * f2_size]),
-                ));
-            }
-        }
-
-        Ok(OnnxSessions {
-            gpu_sessions,
-            session_gpus,
-            warmup_leaders,
-            slot_bufs,
-            pinned_pool,
-            model,
-        })
-    }
-
-    /// `--ort-profile` の profiling を終えて JSON を書く (profiling は 1 本目のセッションだけ)。
-    fn end_profiling(&mut self) {
-        if let Some(session) = self.gpu_sessions.first_mut() {
-            match session.end_profiling() {
-                Ok(path) => eprintln!("ORT profile saved: {path}"),
-                Err(e) => eprintln!("ORT profile error: {e}"),
-            }
-        }
-    }
-}
-
 /// ストリーミング読み込み + rayon 並列特徴量構築 + ゼロコピー GPU 推論
 ///
 /// AobaZero / 標準 dlshogi の両方で共通のパイプライン処理。
 /// `build_features` クロージャで特徴量構築の差異を吸収する。
-/// セッションと入力特徴バッファは `onnx_sessions` のものをファイルをまたいで使い回す。
 #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-fn process_file_with_onnx_pipeline<'s, F>(
-    protection: &OutputProtection,
+fn process_file_with_onnx_pipeline<F>(
     config: &OnnxPipelineConfig<'_>,
     build_features: F,
-    progress: &FileProgress,
-    onnx_sessions: &'s mut OnnxSessions,
 ) -> Result<()>
 where
     F: Fn(&Position, &mut [f32], &mut [f32], &PackedSfenValue) + Send + Sync,
 {
     let OnnxPipelineConfig {
-        // モデルはセッションを作るときに読み、fingerprint は build_run_fingerprint(config) で取る。
-        model_name: _,
+        model_name,
         model_kind: _,
-        onnx_path: _,
+        onnx_path,
         input_path,
         output_path,
-        out_scores,
         process_count,
         batch_size,
-        // GPU の割り当て・セッション数・TensorRT キャッシュ・profiling はセッションを作るときだけ使う。
-        gpu_ids: _,
-        sessions: _,
+        gpu_id,
         use_tensorrt,
-        tensorrt_cache: _,
+        tensorrt_cache,
         score_clip,
         eval_scale,
         skip_in_check,
@@ -4841,34 +2385,14 @@ where
         f2_size,
         input1_channels,
         input2_channels,
-        profile_path: _,
+        profile_path,
         expand,
-        qsearch_leaf_label,
-        qsearch_max_ply,
-        // fingerprint 用。pipeline 本体では使わず build_run_fingerprint(config) で参照する。
-        qsearch_nnue_path: _,
-        qsearch_ls_bucket_mode: _,
-        qsearch_ls_progress_buckets: _,
-        qsearch_ls_progress_coeff_path: _,
-        replacement_output,
     } = *config;
-
-    // marker 判定から処理開始までの間に入力・モデルが変わっていないことを確認し、
-    // この run の基準 fingerprint を固定する。完了時にも再検証し、run 中の差し替えを
-    // 新しい条件の .done として誤って確定しない。
-    let sidecar_start_fingerprint = if out_scores {
-        let marker = parse_marker(&in_progress_marker_path_for(output_path))?;
-        let current = build_run_fingerprint(config)?;
-        ensure_sidecar_fingerprint_unchanged(&marker.fingerprint, &current, "before processing")?;
-        Some(current)
-    } else {
-        None
-    };
+    use ort::ep::ExecutionProvider;
     use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
     use ort::session::Session;
     use ort::value::TensorRef;
     use rshogi_core::movegen::{MoveList, generate_legal};
-    // ONNX パイプライン専用のため fn 内 use（top-level だと non-ONNX ビルドで unused-import）。
     use tools::dlshogi_features::{MAX_MOVE_LABEL_NUM, make_move_label};
 
     /// 合法手のロジットを softmax 正規化して `out` に書き込む
@@ -4886,21 +2410,161 @@ where
         }
     }
 
-    let OnnxSessions {
-        gpu_sessions,
-        session_gpus,
-        warmup_leaders,
-        slot_bufs,
-        pinned_pool,
-        model: loaded_model,
-    } = onnx_sessions;
-    let pinned_ok = pinned_pool.is_some();
-    let num_sessions = gpu_sessions.len();
-    // TensorRT EP は、推論の入力形がそれまでに見た範囲より小さいとエンジンを作り直す
-    // (セッションごと。数十秒かかり、作り直したエンジンでは最下位 bit が変わりうる)。
-    // 最後の端数バッチもゼロで埋めて batch_size 行で推論し、どのファイルも同じエンジンで推論する。
-    let pad_to_batch = use_tensorrt;
+    // ORT_DYLIB_PATH 事前検証（load-dynamic feature）
+    //
+    // ort クレートは load-dynamic feature 有効時、ORT_DYLIB_PATH 環境変数で指定された
+    // ライブラリを dlopen する。未設定時はシステムパスから "libonnxruntime.so" を探すが、
+    // 見つからない場合にハングする（エラーではなくブロックする）。
+    //
+    // ort の default features には download-binaries（ビルド時に CPU 版ランタイムを
+    // 自動ダウンロード）が含まれるが、load-dynamic とは #[cfg] で排他のため共存不可。
+    // また download-binaries で取得されるのは CPU 版のみで GPU 版は提供されない。
+    //
+    // したがって load-dynamic を使い、ランタイムはユーザーが自前で用意する設計とする。
+    // GPU 推論がデフォルト。暗黙の CPU フォールバックは CUDA EP チェックで防止する。
+    //
+    // ORT_DYLIB_PATH は GPU/CPU どちらのモードでも必須。
+    // 未設定時に ort がシステムパスから探すとハングするため。
+    match std::env::var("ORT_DYLIB_PATH") {
+        Ok(path) if !path.is_empty() => {
+            if !std::path::Path::new(&path).is_file() {
+                anyhow::bail!(
+                    "ORT_DYLIB_PATH is set to '{path}' but the file does not exist \
+                     (or is not a regular file).\n\
+                     Download ONNX Runtime from:\n  \
+                     https://github.com/microsoft/onnxruntime/releases"
+                );
+            }
+            eprintln!("ORT_DYLIB_PATH: {path}");
+        }
+        _ => {
+            let mode_hint = if gpu_id >= 0 {
+                "GPU inference requires a GPU-enabled ONNX Runtime (onnxruntime-linux-x64-gpu-*)."
+            } else {
+                "CPU inference requires an ONNX Runtime library (GPU or CPU build)."
+            };
+            anyhow::bail!(
+                "ORT_DYLIB_PATH environment variable is not set.\n\
+                 {mode_hint}\n\
+                 Download from: https://github.com/microsoft/onnxruntime/releases\n\
+                 Example:\n  \
+                 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run ..."
+            );
+        }
+    }
 
+    // ONNX Runtime セッション初期化
+    eprintln!("Loading {model_name} ONNX model: {}", onnx_path.display());
+
+    let builder = Session::builder()
+        .map_err(onnx_ort_err)?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::All)
+        .map_err(|e| anyhow::anyhow!("ORT builder error: {e}"))?
+        .with_intra_threads(1)
+        .map_err(|e| anyhow::anyhow!("ORT builder error: {e}"))?;
+
+    let mut builder = if let Some(path) = profile_path {
+        eprintln!("ORT profiling enabled: {}", path.display());
+        builder
+            .with_profiling(path)
+            .map_err(|e| anyhow::anyhow!("ORT profiling error: {e}"))?
+    } else {
+        builder
+    };
+
+    let mut session = if gpu_id >= 0 {
+        if use_tensorrt {
+            eprintln!("Using TensorRT (FP16) on GPU {gpu_id}");
+
+            let trt_ep = ort::execution_providers::TensorRTExecutionProvider::default()
+                .with_device_id(gpu_id)
+                .with_fp16(true)
+                .with_engine_cache(tensorrt_cache.is_some());
+            let trt_ep = if let Some(cache_path) = tensorrt_cache {
+                let cache_str = cache_path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "TensorRT cache path contains non-UTF-8 characters: {}",
+                        cache_path.display()
+                    )
+                })?;
+                eprintln!("TensorRT engine cache: {}", cache_path.display());
+                trt_ep.with_engine_cache_path(cache_str)
+            } else {
+                eprintln!("TensorRT engine cache: disabled (use --onnx-tensorrt-cache to enable)");
+                trt_ep
+            };
+
+            match trt_ep.is_available() {
+                Ok(true) => eprintln!("TensorRT execution provider: available"),
+                Ok(false) => {
+                    anyhow::bail!(
+                        "TensorRTExecutionProvider is NOT available.\n\
+                         Ensure TensorRT (libnvinfer.so.10) is in LD_LIBRARY_PATH.\n\
+                         To use CUDA EP instead, omit --onnx-tensorrt."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("WARNING: Failed to check TensorRT EP availability: {e}");
+                }
+            }
+
+            // TensorRT EP + CUDA EP をフォールバックとして登録
+            let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default()
+                .with_device_id(gpu_id)
+                .build()
+                .error_on_failure();
+            let trt_ep = trt_ep.build().error_on_failure();
+
+            builder
+                .with_execution_providers([trt_ep, cuda_ep])
+                .map_err(|e| anyhow::anyhow!("TensorRT/CUDA EP registration failed: {e}"))?
+                .commit_from_file(onnx_path)
+                .map_err(onnx_ort_err)?
+        } else {
+            eprintln!("Using CUDA GPU {gpu_id}");
+
+            let cuda_ep =
+                ort::execution_providers::CUDAExecutionProvider::default().with_device_id(gpu_id);
+            match cuda_ep.is_available() {
+                Ok(true) => eprintln!("CUDA execution provider: available"),
+                Ok(false) => {
+                    anyhow::bail!(
+                        "CUDAExecutionProvider is NOT available in the loaded ONNX Runtime library.\n\
+                         The library may be a CPU-only build.\n\
+                         Check ORT_DYLIB_PATH points to a GPU-enabled onnxruntime.\n\
+                         To use CPU inference instead, omit --onnx-gpu-id."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("WARNING: Failed to check CUDA EP availability: {e}");
+                }
+            }
+
+            let ep = cuda_ep.build().error_on_failure();
+            builder
+                .with_execution_providers([ep])
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "CUDA EP registration failed (is onnxruntime-gpu installed?): {e}"
+                    )
+                })?
+                .commit_from_file(onnx_path)
+                .map_err(onnx_ort_err)?
+        }
+    } else {
+        eprintln!("Using CPU");
+        builder.commit_from_file(onnx_path).map_err(onnx_ort_err)?
+    };
+
+    eprintln!("{model_name} ONNX model loaded. Batch size: {batch_size}");
+
+    // 進捗バー
+    let progress = ProgressBar::new(process_count);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({per_sec}) {msg}")
+            .expect("valid template"),
+    );
     progress.set_message("Processing...");
 
     // ストリーミング読み込み + バッチ処理
@@ -4908,826 +2572,314 @@ where
         .with_context(|| format!("Failed to open {}", input_path.display()))?;
     let mut reader = BufReader::new(in_file);
 
-    let output_record_size = if out_scores {
-        SCORE_RECORD_SIZE
+    // レジューム対応: 出力ファイルに既存レコードがあればスキップして追記
+    let resume_count = if output_path.exists() {
+        let out_size = fs::metadata(output_path)?.len();
+        let records = out_size / PackedSfenValue::SIZE as u64;
+        // 不完全レコードがあれば切り捨て
+        let clean_size = records * PackedSfenValue::SIZE as u64;
+        if out_size != clean_size {
+            let f = File::options().write(true).open(output_path)?;
+            f.set_len(clean_size)?;
+        }
+        records
     } else {
-        PackedSfenValue::SIZE as u64
+        0
     };
-    let (out_file, consumed) = if out_scores {
-        let count = score_sidecar_resume_count(output_path)?;
-        anyhow::ensure!(
-            count <= process_count,
-            "score sidecar has {count} records, exceeding expected {process_count}: {}",
-            output_path.display()
-        );
-        seek_to_record(&mut reader, count)?;
-        (protection.open(output_path, true)?, count)
-    } else {
-        prepare_onnx_psv_resume(protection, output_path, &mut reader, process_count, skip_in_check)?
-    };
-    let writer = BufWriter::new(out_file);
-    let remaining = process_count - consumed;
-    if consumed > 0 {
-        progress.advance_start(consumed);
-        eprintln!("Resuming after {consumed} input records");
-    }
+
+    let out_file = File::options()
+        .create(true)
+        .append(true)
+        .open(output_path)
+        .with_context(|| format!("Failed to open {}", output_path.display()))?;
+    let mut writer = BufWriter::new(out_file);
 
     // expand 出力 writer（expand 有効時のみ）。main 側で truncate(0) 済みなので
     // append open で常に先頭から書く。
-    let expand_writer: Option<BufWriter<File>> = if let Some(e) = expand {
-        let f = protection
-            .open(e.output_path, true)
-            .with_context(|| format!("Failed to open expand output {}", e.output_path.display()))?;
+    let mut expand_writer: Option<BufWriter<File>> = if let Some(e) = expand {
+        let f =
+            File::options().create(true).append(true).open(e.output_path).with_context(|| {
+                format!("Failed to open expand output {}", e.output_path.display())
+            })?;
         Some(BufWriter::new(f))
     } else {
         None
     };
 
-    // leaf-REPLACEMENT 出力 writer（replacement 有効時のみ）。expand と同様 main 側で
-    // truncate(0) 済みなので append open で常に先頭から書く。leaf-LABEL 出力（writer）と
-    // 同一ループで 1:1 lockstep に書くため、レコード数は両者で一致する。
-    let replacement_writer: Option<BufWriter<File>> = if let Some(rp) = replacement_output {
-        let f = protection
-            .open(rp, true)
-            .with_context(|| format!("Failed to open leaf-replacement output {}", rp.display()))?;
-        Some(BufWriter::new(f))
-    } else {
-        None
-    };
+    // 既存レコード分の入力をスキップ（expand 無効 + marker 不存在の legacy
+    // resume パス。main 側で truncate(0) 済みなら resume_count == 0 になり no-op）
+    let mut remaining = process_count;
+    if resume_count > 0 {
+        let skip = resume_count.min(remaining);
+        let mut skip_buf = [0u8; PackedSfenValue::SIZE];
+        for _ in 0..skip {
+            if reader.read_exact(&mut skip_buf).is_err() {
+                break;
+            }
+            remaining -= 1;
+        }
+        eprintln!("Resuming: skipped {skip} already-processed records");
+    }
 
+    let mut f1_buf = vec![0.0f32; batch_size * f1_size];
+    let mut f2_buf = vec![0.0f32; batch_size * f2_size];
+    let mut buffer = [0u8; PackedSfenValue::SIZE];
     let mut skipped_count: u64 = 0;
     let mut error_count: u64 = 0;
     let mut clipped_count: u64 = 0;
     let mut total_processed: u64 = 0;
     let mut total_expanded: u64 = 0;
+    // expand 用 softmax バッファ（バッチ・局面間で再利用）
+    let mut logits_buf: Vec<f32> = Vec::with_capacity(600);
+    let mut probs_buf: Vec<f32> = Vec::with_capacity(600);
 
-    // フェーズ別 wall time 計測（RESCORE_PHASE_TIMING=1 のとき末尾で出力）。read は reader、
-    // build は producer、run と write の後処理分は各 GPU worker、write のファイル書き出し分
-    // は writer と、それぞれ別スレッドで計測して合算するため、オーバーラップ分は各フェーズ
-    // の合算が wall を超える（`--onnx-sessions` ≥ 2 では run の合算だけでも wall を超えうる）。
-    // 供給コストと GPU コストの絶対値切り分けに使う。
-    let phase_timing = std::env::var_os("RESCORE_PHASE_TIMING").is_some();
-    let (mut t_run, mut t_write) = (0u128, 0u128);
+    // MemoryInfo はバッチサイズに依存しないのでループ外で1回だけ作成
+    let output_mem =
+        MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::CPUOutput)
+            .map_err(onnx_ort_err)?;
 
-    // 推論バッチ 1 個分の CPU 成果物（読み込み済み records + 構築済み特徴量 + フラグ）。
-    // producer が埋め、consumer（主スレッド）が GPU 推論・書き出しに使う。f1/f2 等は
-    // slot プールで再利用し、ピークメモリは入力件数に非依存（pipeline_slots 個ぶん）。
-    struct PreparedBatch<'b> {
-        f1: &'b mut HostBuf,
-        f2: &'b mut HostBuf,
-        records: Vec<(PackedSfenValue, UnpackedSfen)>,
-        stm_flags: Vec<bool>,
-        in_checks: Vec<bool>,
-        leaf_sfens: Vec<[u8; 32]>,
-        actual_batch: usize,
-        errors: u64,
-    }
-
-    let want_leaf_sfens = replacement_output.is_some();
-
-    // 供給（read/build）・GPU 推論・書き出しを別スレッドに分けて直列実行をオーバーラップ。
-    // - reader: ストリーム読み込み + レコードデコード（直列。バッチ構成をここで確定）
-    // - producer: rayon 並列特徴量構築
-    // - GPU worker × num_sessions: 各自の ORT セッションで推論し後処理（score 変換 /
-    //   シリアライズ / expand）まで行う。num_sessions ≥ 2 なら別セッション＝別 CUDA
-    //   ストリームで in-flight 多重化され、H2D/D2H 転送と compute が重なる。バッチは空いた
-    //   worker が取るので、速さの違う GPU が混ざっても遅い GPU の分だけ待たない
-    // - writer（主スレッド）: バッチ index（seq）で再整列してファイルへ書き出し
-    // 決定性: バッチ構成は reader の直列段階で不変に確定し、どのセッションで推論しても
-    // 同一エンジンなら結果は同一、書き出しは seq 順に再整列するため、出力はスレッド数・
-    // セッション数・パイプライン化に依存せず旧・直列ループ実装と bit 一致する。
-    // slot は free/ready の 2 本のチャネルで循環し、同時生存は pipeline_slots 個
-    // （ピークメモリは入力件数に非依存）。
-    let pipeline_slots = slot_bufs.len();
-
-    // GPU worker → writer。推論+後処理済みバッチ。書き出しバイト列まで worker 側で
-    // 構築し、writer は seq 順に再整列して write するだけにする（後処理を GPU
-    // クリティカルパスから外し、別セッションの推論と重ねる）。
-    struct DoneBatch<'b> {
-        slot: PreparedBatch<'b>,
-        rescore_bytes: Vec<u8>,
-        replacement_bytes: Vec<u8>,
-        expand_bytes: Vec<u8>,
-        skipped: u64,
-        clipped: u64,
-        expanded: u64,
-    }
-    let (done_tx, done_rx) = mpsc::channel::<(u64, Result<DoneBatch<'s>>)>();
-
-    // ---- GPU worker × num_sessions: 推論 + 後処理 ----
-    // 最初のバッチは先導役 (各 `--onnx-gpu-id` 項目の 1 本目) が 1 本ずつ順に推論する
-    // (`WarmupGate`)。`--onnx-tensorrt-cache` を指定したときは、cold cache でもエンジンの構築と
-    // キャッシュの書き込みが競合せず、後のセッションは書かれたキャッシュを読むので、同じ GPU の
-    // セッションは同一エンジンで推論する (指定しないとキャッシュは無効で、各セッションが作る)。
-    let warmup = WarmupGate::new(*warmup_leaders);
-    let want_replacement = replacement_output.is_some();
-    // worker 本体。worker 0 は主スレッドで直接実行する（writer 分離後の主スレッドを
-    // 遊ばせず、総スレッド数を最小に保つ）。2 本目以降のセッションのみスレッドを spawn する。
-    let run_gpu_worker = |worker_idx: usize,
-                          gpu_id: i32,
-                          session: &mut Session,
-                          done_tx: mpsc::Sender<(u64, Result<DoneBatch<'s>>)>,
-                          ready_rx: &Mutex<mpsc::Receiver<(u64, PreparedBatch<'s>)>>|
-     -> (u128, u128) {
-        // 下の早期 return でも drop で番が進むよう、最初に番を待つ。
-        let warmup_turn = warmup.wait(worker_idx);
-        let (mut t_run, mut t_write) = (0u128, 0u128);
-        // expand 用 softmax バッファ（worker 内でバッチ間再利用）
-        let mut logits_buf: Vec<f32> = Vec::with_capacity(600);
-        let mut probs_buf: Vec<f32> = Vec::with_capacity(600);
-        // 出力 host バッファのメモリ種別（バッチサイズ非依存なのでループ外で 1 回だけ
-        // 作成。`MemoryInfo` は Send/Sync でないため worker スレッド内で作る）。
-        // pinned 化の可否は入力 pinned (pinned_ok) に従う: 入力を pinned 化できた GPU
-        // 経路では出力も CUDA pinned (page-locked) にして run_binding 内の D2H を真の
-        // async D2H にする。それ以外 (CPU 推論 / 入力 pinned 確保失敗) は CPU pageable。
-        // pinned 化はメモリ場所のみの差で出力は bit 一致。出力 pinned の実確保は
-        // run_binding 内で行われ、失敗時は fallback せずエラーになる。
-        let output_mem = if pinned_ok {
-            MemoryInfo::new(
-                AllocationDevice::CUDA_PINNED,
-                gpu_id,
-                AllocatorType::Device,
-                MemoryType::CPUOutput,
-            )
-        } else {
-            MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::CPUOutput)
-        };
-        let output_mem = match output_mem.map_err(onnx_ort_err) {
-            Ok(m) => m,
-            Err(e) => {
-                // seq 値は使われない（writer は Err を再整列より先に伝播する）。
-                let _ = done_tx.send((u64::MAX, Err(e)));
-                return (t_run, t_write);
+    loop {
+        // バッチ分のレコードをストリーム読み込み。
+        // 注: 旧実装は `--skip-in-check` でこの段階で親をドロップしていたが、
+        // expand 機能（ポリシー推論）と独立に動かすため、推論は常に実行し、
+        // 王手フラグだけを記録して rescore 書き出し / expand 書き出しの個別判定に使う。
+        let mut batch_records: Vec<(PackedSfenValue, String, bool)> =
+            Vec::with_capacity(batch_size);
+        while batch_records.len() < batch_size && remaining > 0 {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                remaining = 0;
+                break;
             }
-        };
-        let output_mem = &output_mem;
-        drive_pull_worker(warmup_turn, ready_rx, &done_tx, |batch| {
-            if batch.actual_batch == 0 {
-                // EOF / 中断 sentinel はそのまま writer へ中継（最終 seq なので writer
-                // は全バッチ書き出し後に必ず最後に処理する）。
-                let sentinel = DoneBatch {
-                    slot: batch,
-                    rescore_bytes: Vec::new(),
-                    replacement_bytes: Vec::new(),
-                    expand_bytes: Vec::new(),
-                    skipped: 0,
-                    clipped: 0,
-                    expanded: 0,
-                };
-                return (Ok(sentinel), true);
+            remaining -= 1;
+            match reader.read_exact(&mut buffer) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    remaining = 0;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
             }
-            let actual_batch = batch.actual_batch;
-            // 推論する行数。埋めた行 (actual_batch 以降) の推論結果は読まない。
-            let infer_rows = if pad_to_batch {
-                batch_size
-            } else {
-                actual_batch
+            let psv = match PackedSfenValue::from_bytes(&buffer) {
+                Some(p) => p,
+                None => {
+                    error_count += 1;
+                    continue;
+                }
             };
-            // ort エラーは Result のまま writer へ送って伝播させる（ここで ? を使うと
-            // writer が seq 待ちのままデッドロックするため）。
-            let result = (|| -> Result<DoneBatch> {
-                let mut phase_t = Instant::now();
-                // IoBinding で推論（Python の run_with_iobinding に対応）
-                // session.run() より ORT 内部のメモリ管理が効率的
-                //
-                // 最適化検証で得られた知見:
-                // - create_binding() のループ外化（再利用）は逆効果（4.6〜36% 悪化）。
-                //   rebind 時に ORT 内部で前回バインドのクリーンアップコストが発生する
-                //   ため、毎回新規作成の方が速い。
-                // - output_policy のバインド省略も逆効果（10% 悪化）。
-                //   ORT が未バインド出力の処理にオーバーヘッドを生じる。
-                // - 旧実装は pageable な Vec から H2D していたため cudaMemcpyAsync が
-                //   実質同期 (CPU staging 介在) となり全体の ~96% を占めていた (nsys)。
-                //   入力 host バッファを pinned (page-locked) 化することでこの staging を
-                //   消し、真の async H2D にしている (HostBuf / PinnedPool 参照)。
-                let shape1: [usize; 4] = [infer_rows, input1_channels, 9, 9];
-                let input1 = TensorRef::<f32>::from_array_view((
-                    shape1,
-                    &batch.f1.as_slice()[..infer_rows * f1_size],
-                ))
-                .map_err(onnx_ort_err)?;
-
-                let shape2: [usize; 4] = [infer_rows, input2_channels, 9, 9];
-                let input2 = TensorRef::<f32>::from_array_view((
-                    shape2,
-                    &batch.f2.as_slice()[..infer_rows * f2_size],
-                ))
-                .map_err(onnx_ort_err)?;
-
-                let mut binding = session.create_binding().map_err(onnx_ort_err)?;
-                binding.bind_input("input1", &input1).map_err(onnx_ort_err)?;
-                binding.bind_input("input2", &input2).map_err(onnx_ort_err)?;
-                // output_policy: スコアリングには不使用だが、省略すると ORT 内部処理で
-                // オーバーヘッドが増加するため全出力をバインドする
-                binding
-                    .bind_output_to_device("output_policy", output_mem)
-                    .map_err(onnx_ort_err)?;
-                binding
-                    .bind_output_to_device("output_value", output_mem)
-                    .map_err(onnx_ort_err)?;
-
-                let outputs = session.run_binding(&binding).map_err(onnx_ort_err)?;
-
-                let (_, values) =
-                    outputs["output_value"].try_extract_tensor::<f32>().map_err(onnx_ort_err)?;
-                if phase_timing {
-                    t_run += phase_t.elapsed().as_nanos();
-                    phase_t = Instant::now();
+            let sfen = match unpack_sfen(&psv.sfen) {
+                Ok(s) => s,
+                Err(_) => {
+                    error_count += 1;
+                    continue;
                 }
-
-                // rescore 後処理（テンソルから直接読み取り、書き出しバイト列を構築）。
-                // skip_in_check が真かつ親が王手の場合は書き出しを抑制（推論結果は破棄）。
-                let mut skipped = 0u64;
-                let mut clipped_n = 0u64;
-                let mut rescore_bytes =
-                    Vec::with_capacity(actual_batch * output_record_size as usize);
-                let mut replacement_bytes = if want_replacement {
-                    Vec::with_capacity(actual_batch * PackedSfenValue::SIZE)
-                } else {
-                    Vec::new()
-                };
-                for (i, (psv, _parts)) in batch.records.iter().enumerate() {
-                    if skip_in_check && batch.in_checks[i] {
-                        skipped += 1;
-                        continue;
-                    }
-                    let winrate = values[i];
-                    let clamped = winrate.clamp(0.001, 0.999);
-                    let logit = (clamped / (1.0 - clamped)).ln();
-                    // qsearch-leaf-label モードで葉の STM が root と異なる場合、推論値は
-                    // 葉の手番視点なので root 視点へ符号反転する。
-                    let leaf_score = logit * eval_scale;
-                    let signed_score = if batch.stm_flags[i] {
-                        -leaf_score
-                    } else {
-                        leaf_score
-                    };
-                    let raw_score = signed_score as i32;
-                    let clipped = raw_score.abs() > score_clip as i32;
-                    let new_score = raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16;
-                    if clipped {
-                        clipped_n += 1;
-                    }
-                    // leaf-LABEL arm: 出力 sfen は常に root の `psv.sfen`（局面は置換
-                    // しない）。葉評価はラベルのみに反映（符号反転は signed_score に
-                    // 適用済み）。
-                    let new_psv = PackedSfenValue {
-                        score: new_score,
-                        ..*psv
-                    };
-                    append_rescore_bytes(&mut rescore_bytes, &new_psv, out_scores);
-
-                    // leaf-REPLACEMENT arm（有効時のみ、leaf-LABEL と 1:1 lockstep）。
-                    // 葉探索を行った局面を `--apply-qsearch-leaf` → DL rescore と一致させる:
-                    // - sfen は葉局面の packed sfen
-                    // - score は葉評価（符号反転なし＝葉手番視点）に clip 適用
-                    // - game_result は STM 反転時のみ符号反転
-                    if want_replacement {
-                        let leaf_raw = leaf_score as i32;
-                        let leaf_clipped_score =
-                            leaf_raw.clamp(-(score_clip as i32), score_clip as i32) as i16;
-                        let leaf_game_result = if batch.stm_flags[i] {
-                            -psv.game_result
-                        } else {
-                            psv.game_result
-                        };
-                        let replacement_psv = PackedSfenValue {
-                            sfen: batch.leaf_sfens[i],
-                            score: leaf_clipped_score,
-                            move16: 0,
-                            game_ply: psv.game_ply,
-                            game_result: leaf_game_result,
-                            padding: psv.padding_after_move16_rewrite(),
-                        };
-                        replacement_bytes.extend_from_slice(&replacement_psv.to_bytes());
-                    }
-                }
-
-                // expand 機能（policy ベースの子局面生成）
-                let mut expanded = 0u64;
-                let mut expand_bytes = Vec::new();
-                if let Some(expand_cfg) = expand {
-                    let (policy_shape, policy_data) = outputs["output_policy"]
-                        .try_extract_tensor::<f32>()
-                        .map_err(onnx_ort_err)?;
-                    let expected_len = infer_rows * MAX_MOVE_LABEL_NUM;
-                    if policy_data.len() != expected_len {
-                        anyhow::bail!(
-                            "Policy output shape mismatch: expected [{infer_rows}, \
-                                     {MAX_MOVE_LABEL_NUM}] ({expected_len} elements), got shape \
-                                     {:?} ({} elements). Is the ONNX model a compatible policy \
-                                     network?",
-                            policy_shape,
-                            policy_data.len()
-                        );
-                    }
-
-                    for (i, (psv, parts)) in batch.records.iter().enumerate() {
-                        if expand_cfg.skip_parent_in_check && batch.in_checks[i] {
-                            continue;
-                        }
-
-                        let mut pos = Position::new();
-                        if pos
-                            .set_from_parts(&parts.board, &parts.hands, parts.side_to_move)
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let color = pos.side_to_move();
-
-                        let mut list = MoveList::new();
-                        generate_legal(&pos, &mut list);
-                        if list.is_empty() {
-                            continue;
-                        }
-
-                        let policy_row =
-                            &policy_data[i * MAX_MOVE_LABEL_NUM..(i + 1) * MAX_MOVE_LABEL_NUM];
-
-                        logits_buf.clear();
-                        for mv in list.iter() {
-                            let label = make_move_label(*mv, color);
-                            logits_buf.push(policy_row[label]);
-                        }
-                        probs_buf.resize(logits_buf.len(), 0.0);
-                        softmax_normalize(&logits_buf, &mut probs_buf);
-
-                        for (j, mv) in list.iter().enumerate() {
-                            if probs_buf[j] > expand_cfg.threshold {
-                                let gives_check = pos.gives_check(*mv);
-                                pos.do_move(*mv, gives_check);
-
-                                let child_in_check = pos.in_check();
-                                if !(expand_cfg.skip_child_in_check && child_in_check) {
-                                    let packed = pack_position(&pos);
-                                    let child = PackedSfenValue {
-                                        sfen: packed,
-                                        score: 0,
-                                        move16: 0,
-                                        game_ply: psv.game_ply.saturating_add(1),
-                                        game_result: 0,
-                                        padding: psv.padding_after_move16_rewrite(),
-                                    };
-                                    expand_bytes.extend_from_slice(&child.to_bytes());
-                                    expanded += 1;
-                                }
-
-                                pos.undo_move(*mv);
-                            }
-                        }
-                    }
-                }
-
-                if phase_timing {
-                    t_write += phase_t.elapsed().as_nanos();
-                }
-                Ok(DoneBatch {
-                    slot: batch,
-                    rescore_bytes,
-                    replacement_bytes,
-                    expand_bytes,
-                    skipped,
-                    clipped: clipped_n,
-                    expanded,
-                })
-            })();
-            (result, false)
-        });
-        (t_run, t_write)
-    };
-    let (t_read, t_build) = thread::scope(|scope| -> Result<(u128, u128)> {
-        let (free_tx, free_rx) = mpsc::channel::<PreparedBatch<'s>>();
-        // producer→GPU worker。バッチ通番 seq を添えて送り、writer が seq で再整列する。
-        // Receiver は複数 worker で分け合う（Mutex 越しに recv した worker がそのバッチを
-        // 担当する。担当順は任意でよく、出力順は writer の再整列が保証する）。
-        let (ready_tx, ready_rx) = mpsc::channel::<(u64, PreparedBatch<'s>)>();
-        let ready_rx = Arc::new(Mutex::new(ready_rx));
-        for (f1, f2) in slot_bufs {
-            free_tx
-                .send(PreparedBatch {
-                    f1,
-                    f2,
-                    records: Vec::with_capacity(batch_size),
-                    stm_flags: vec![false; batch_size],
-                    in_checks: vec![false; batch_size],
-                    leaf_sfens: if want_leaf_sfens {
-                        vec![[0u8; 32]; batch_size]
-                    } else {
-                        Vec::new()
-                    },
-                    actual_batch: 0,
-                    errors: 0,
-                })
-                .expect("initial slot send must succeed");
-        }
-
-        // reader→producer 間で受け渡す 1 バッチ分の読み込み+デコード済みレコード。
-        // バッファは chunk_free/chunk_ready の 2 本のチャネルで循環し、同時生存は
-        // reader_chunks 個（ピークメモリは入力件数に非依存）。build 中も reader が
-        // 先読みできるよう slot 数より 1 つ多くする。
-        struct RecordChunk {
-            records: Vec<(PackedSfenValue, UnpackedSfen)>,
-            errors: u64,
-        }
-        let reader_chunks = pipeline_slots + 1;
-        let (chunk_free_tx, chunk_free_rx) = mpsc::channel::<RecordChunk>();
-        let (chunk_ready_tx, chunk_ready_rx) = mpsc::channel::<RecordChunk>();
-        for _ in 0..reader_chunks {
-            chunk_free_tx
-                .send(RecordChunk {
-                    records: Vec::with_capacity(batch_size),
-                    errors: 0,
-                })
-                .expect("initial chunk send must succeed");
-        }
-
-        // ---- reader: ストリーム読み込み + レコードデコード（直列） ----
-        // 旧実装は producer が read→build を直列に行っていたが、read+decode を専用
-        // スレッドへ分離して特徴量構築とオーバーラップさせる。1 バッチ分のレコード列は
-        // 旧実装と同一の直列ロジックで確定するため、バッチ構成は不変（= 出力 bit 一致）。
-        let reader_handle = scope.spawn(move || -> Result<u128> {
-            let mut reader = reader;
-            let mut remaining = remaining;
-            let mut buffer = [0u8; PackedSfenValue::SIZE];
-            let mut t_read = 0u128;
-            loop {
-                // 空きチャンクを取得。producer が終了して free 側が切れたら reader も終了。
-                let mut chunk = match chunk_free_rx.recv() {
-                    Ok(c) => c,
-                    Err(_) => return Ok(t_read),
-                };
-                let phase_t = Instant::now();
-                // バッチ分のレコードをストリーム読み込み。
-                // `--skip-in-check` 指定時もこの段階で親局面はドロップしない。推論は常に実行し
-                // 王手フラグだけを記録して、rescore 書き出しと expand 書き出しの王手スキップを
-                // 個別判定する（expand のポリシー推論を --skip-in-check と独立に動かすため）。
-                chunk.records.clear();
-                chunk.errors = 0;
-                while chunk.records.len() < batch_size && remaining > 0 {
-                    if INTERRUPTED.load(Ordering::SeqCst) {
-                        remaining = 0;
-                        break;
-                    }
-                    remaining -= 1;
-                    match reader.read_exact(&mut buffer) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                            remaining = 0;
-                            break;
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                    let Some(record) = decode_onnx_record(&buffer) else {
-                        chunk.errors += 1;
-                        continue;
-                    };
-                    chunk.records.push(record);
-                }
-                if phase_timing {
-                    t_read += phase_t.elapsed().as_nanos();
-                }
-                // 空チャンクは EOF / 中断 sentinel として producer へ伝えて reader 終了。
-                let eof = chunk.records.is_empty();
-                if chunk_ready_tx.send(chunk).is_err() || eof {
-                    return Ok(t_read);
-                }
-            }
-        });
-
-        // ---- producer: rayon 並列特徴量構築 ----
-        let producer = scope.spawn(move || -> u128 {
-            let mut t_build = 0u128;
-            let mut seq = 0u64;
-            loop {
-                // 空き slot を取得。writer が終了して free 側が切れたら producer も終了。
-                let mut slot = match free_rx.recv() {
-                    Ok(s) => s,
-                    Err(_) => return t_build,
-                };
-                // reader からデコード済みレコードを受け取る。reader が read エラーで途中
-                // 終了した場合はチャネルが切れるのでここで producer も終了する（エラー自体
-                // は reader の join 結果として伝播する）。
-                let mut chunk = match chunk_ready_rx.recv() {
-                    Ok(c) => c,
-                    Err(_) => return t_build,
-                };
-                std::mem::swap(&mut slot.records, &mut chunk.records);
-                let errs = chunk.errors;
-                // チャンクバッファを reader へ返却（reader が終了済みでも無視）。swap で
-                // 入った古い records は次回 reader 側で clear されて再利用される。
-                let _ = chunk_free_tx.send(chunk);
-                let actual_batch = slot.records.len();
-                if actual_batch == 0 {
-                    // reader からの EOF / 中断 sentinel を GPU worker へ中継して終了。
-                    // sentinel は最終 seq を持つため、writer は再整列後に必ず最後に処理する。
-                    slot.actual_batch = 0;
-                    slot.errors = errs;
-                    let _ = ready_tx.send((seq, slot));
-                    return t_build;
-                }
-
-                let phase_t = Instant::now();
-                // rayon 並列で特徴量構築
-                let batch_errors = AtomicU64::new(0);
-                {
-                    let PreparedBatch {
-                        f1,
-                        f2,
-                        records,
-                        stm_flags,
-                        in_checks,
-                        leaf_sfens,
-                        ..
-                    } = &mut slot;
-                    let f1 = f1.as_mut_slice();
-                    let f2 = f2.as_mut_slice();
-                    // 埋める行も推論に渡すので、前のバッチの特徴量を残さずゼロにする。
-                    let zero_rows = if pad_to_batch {
-                        batch_size
-                    } else {
-                        actual_batch
-                    };
-                    f1[..zero_rows * f1_size].fill(0.0);
-                    f2[..zero_rows * f2_size].fill(0.0);
-                    let f1_slices: Vec<&mut [f32]> =
-                        f1[..actual_batch * f1_size].chunks_mut(f1_size).collect();
-                    let f2_slices: Vec<&mut [f32]> =
-                        f2[..actual_batch * f2_size].chunks_mut(f2_size).collect();
-
-                    // 葉で STM が反転したかの記録領域を当バッチ分だけ reset（非モード時は全 false）。
-                    let stm_flags = &mut stm_flags[..actual_batch];
-                    stm_flags.fill(false);
-                    // root 王手フラグの記録領域も当バッチ分だけ reset（局面構築失敗時は false 据え置き）。
-                    let in_checks = &mut in_checks[..actual_batch];
-                    in_checks.fill(false);
-                    // leaf-REPLACEMENT 有効時のみ葉局面の packed sfen を書き込む領域を当バッチ分に絞る。
-                    // 非有効時は空スライス（pack を行わないため zip しない）。
-                    let leaf_sfens_slice: &mut [[u8; 32]] = if want_leaf_sfens {
-                        &mut leaf_sfens[..actual_batch]
-                    } else {
-                        &mut []
-                    };
-
-                    // 1 局面分の特徴量構築（必要なら葉まで進めて葉 sfen を packed_leaf に書く）。
-                    let build_one =
-                        |f1: &mut [f32],
-                         f2: &mut [f32],
-                         psv: &PackedSfenValue,
-                         parts: &UnpackedSfen,
-                         stm_flag: &mut bool,
-                         in_check_slot: &mut bool,
-                         packed_leaf: Option<&mut [u8; 32]>| {
-                            let mut pos = Position::new();
-                            let Ok(root_in_check) = set_onnx_root_position(&mut pos, parts) else {
-                                batch_errors.fetch_add(1, Ordering::Relaxed);
-                                return;
-                            };
-                            *in_check_slot = root_in_check;
-                            // root 局面据え置き・ラベルのみ葉評価: NNUE qsearch で葉まで進めてから
-                            // 特徴量を構築する（DL は葉局面を評価）。王手 root は葉探索せず原局面のまま。
-                            if qsearch_leaf_label && !root_in_check {
-                                thread_local! {
-                                    static NNUE_STACKS: RefCell<NnueStacks> =
-                                        RefCell::new(NnueStacks::new());
-                                }
-                                NNUE_STACKS.with(|stacks| {
-                                    let mut stacks = stacks.borrow_mut();
-                                    stacks.reset();
-                                    let result = qsearch_with_pv_nnue(
-                                        &mut pos,
-                                        &mut stacks,
-                                        QSEARCH_ALPHA_INIT,
-                                        QSEARCH_BETA_INIT,
-                                        0,
-                                        qsearch_max_ply,
-                                    );
-                                    *stm_flag = apply_pv(&mut pos, &result.pv);
-                                });
-                            }
-                            // 葉まで進めた pos を pack（王手 root は原局面のまま）。replacement arm 用。
-                            if let Some(slot) = packed_leaf {
-                                *slot = pack_position(&pos);
-                            }
-                            build_features(&pos, f1, f2, psv);
-                        };
-
-                    if want_leaf_sfens {
-                        f1_slices
-                            .into_par_iter()
-                            .zip(f2_slices)
-                            .zip(records.par_iter())
-                            .zip(stm_flags.par_iter_mut())
-                            .zip(in_checks.par_iter_mut())
-                            .zip(leaf_sfens_slice.par_iter_mut())
-                            .for_each(
-                                |(((((f1, f2), (psv, parts)), stm_flag), in_check), leaf)| {
-                                    build_one(f1, f2, psv, parts, stm_flag, in_check, Some(leaf));
-                                },
-                            );
-                    } else {
-                        f1_slices
-                            .into_par_iter()
-                            .zip(f2_slices)
-                            .zip(records.par_iter())
-                            .zip(stm_flags.par_iter_mut())
-                            .zip(in_checks.par_iter_mut())
-                            .for_each(|((((f1, f2), (psv, parts)), stm_flag), in_check)| {
-                                build_one(f1, f2, psv, parts, stm_flag, in_check, None);
-                            });
-                    }
-                }
-
-                slot.actual_batch = actual_batch;
-                slot.errors = errs + batch_errors.load(Ordering::Relaxed);
-                if phase_timing {
-                    t_build += phase_t.elapsed().as_nanos();
-                }
-                // ready へ送る。worker 側が全て終了して受け口が切れたら producer も終了。
-                if ready_tx.send((seq, slot)).is_err() {
-                    return t_build;
-                }
-                seq += 1;
-            }
-        });
-
-        // 2 本目以降のセッション用 worker スレッドを spawn（worker 0 は後で主スレッドで実行）。
-        let mut worker_handles = Vec::with_capacity(num_sessions - 1);
-        let mut sessions_iter = gpu_sessions.iter_mut().zip(session_gpus.iter().copied());
-        let (session0, gpu0) = sessions_iter.next().expect("num_sessions >= 1");
-        for (i, (session, gpu_id)) in sessions_iter.enumerate() {
-            let done_tx = done_tx.clone();
-            let ready_rx = Arc::clone(&ready_rx);
-            let worker = &run_gpu_worker;
-            worker_handles
-                .push(scope.spawn(move || worker(i + 1, gpu_id, session, done_tx, &ready_rx)));
-        }
-
-        // ---- writer: seq 再整列 + 書き出し ----
-        // 主スレッドは worker 0 として GPU submit を担うため、書き出しは専用スレッドに移す。
-        struct WriterStats {
-            skipped: u64,
-            clipped: u64,
-            expanded: u64,
-            processed: u64,
-            errors: u64,
-            t_write: u128,
-        }
-        let writer_handle = scope.spawn(move || -> Result<WriterStats> {
-            let mut writer = writer;
-            let mut expand_writer = expand_writer;
-            let mut replacement_writer = replacement_writer;
-            let mut stats = WriterStats {
-                skipped: 0,
-                clipped: 0,
-                expanded: 0,
-                processed: 0,
-                errors: 0,
-                t_write: 0,
             };
-            let mut pending: SeqReorder<DoneBatch> = SeqReorder::new();
-            'writer_loop: loop {
-                // 全 worker が終了して done が閉じたらループを抜ける（正常系は sentinel 処理の
-                // break で抜ける。こちらの経路は reader エラー等で sentinel が届かない場合）。
-                let (seq, done) = match done_rx.recv() {
-                    Ok(x) => x,
-                    Err(_) => break,
-                };
-                // worker の推論エラーは seq 順を待たず即時伝播する。writer の早期 return で
-                // free_tx が drop され、producer→reader→worker が連鎖的に終了する。
-                let done = done?;
-                pending.insert(seq, done);
-                // 揃った分だけ seq 順に書き出す。pending は同時生存 slot 数で抑えられる。
-                while let Some(done) = pending.pop_next() {
-                    let phase_t = Instant::now();
-                    // sidecar は i16 列だけで行ずれを事後検出できない。reader / producer
-                    // 由来のどちらのエラーも、当該バッチの最初の byte より前で拒否する。
-                    write_rescore_batch(
-                        &mut writer,
-                        &done.rescore_bytes,
-                        out_scores,
-                        done.slot.errors,
-                    )?;
-                    stats.errors += done.slot.errors;
-                    if done.slot.actual_batch == 0 {
-                        break 'writer_loop; // EOF / 中断 sentinel（最終 seq）
-                    }
-                    if let Some(rw) = replacement_writer.as_mut() {
-                        rw.write_all(&done.replacement_bytes)?;
-                    }
-                    if let Some(ew) = expand_writer.as_mut() {
-                        ew.write_all(&done.expand_bytes)?;
-                    }
-                    if phase_timing {
-                        stats.t_write += phase_t.elapsed().as_nanos();
-                    }
-                    stats.skipped += done.skipped;
-                    stats.clipped += done.clipped;
-                    stats.expanded += done.expanded;
-                    stats.processed += done.slot.actual_batch as u64;
-                    progress.inc(done.slot.actual_batch as u64);
-                    // slot を再利用に戻す。producer が既に終了していて受け口が切れていても無視。
-                    let _ = free_tx.send(done.slot);
+            // 王手判定はバッチ読み込み時に 1 回だけ行う。ここで
+            // Position::set_sfen に失敗した場合は in_check=false 扱いとする
+            // （後段の特徴量構築で同じ局面を再パースしたときに失敗すれば
+            //  batch_errors → error_count に計上される）。
+            let mut probe = Position::new();
+            let in_check = match probe.set_sfen(&sfen) {
+                Ok(()) => probe.in_check(),
+                Err(_) => false,
+            };
+            batch_records.push((psv, sfen, in_check));
+        }
+
+        let actual_batch = batch_records.len();
+        if actual_batch == 0 {
+            break;
+        }
+
+        // rayon 並列で特徴量構築
+        f1_buf[..actual_batch * f1_size].fill(0.0);
+        f2_buf[..actual_batch * f2_size].fill(0.0);
+
+        let batch_errors = AtomicU64::new(0);
+        let f1_slices: Vec<&mut [f32]> =
+            f1_buf[..actual_batch * f1_size].chunks_mut(f1_size).collect();
+        let f2_slices: Vec<&mut [f32]> =
+            f2_buf[..actual_batch * f2_size].chunks_mut(f2_size).collect();
+
+        f1_slices.into_par_iter().zip(f2_slices).zip(batch_records.par_iter()).for_each(
+            |((f1, f2), (psv, sfen, _in_check))| {
+                let mut pos = Position::new();
+                if pos.set_sfen(sfen).is_err() {
+                    batch_errors.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
-            }
-
-            // 出力ファイル本体を flush + sync して、マーカー書き出し前にクラッシュしても
-            // 書き出し済みバイト列が確実にディスクに着地している状態を作る。
-            // sync_all() は内部の File に対して実行（BufWriter::flush + into_inner で取り出し）。
-            writer.flush()?;
-            let rescore_inner = writer
-                .into_inner()
-                .map_err(|e| anyhow::anyhow!("rescore writer into_inner error: {}", e.error()))?;
-            rescore_inner.sync_all()?;
-            drop(rescore_inner);
-
-            if let Some(mut ew) = expand_writer.take() {
-                ew.flush()?;
-                let inner = ew.into_inner().map_err(|e| {
-                    anyhow::anyhow!("expand writer into_inner error: {}", e.error())
-                })?;
-                inner.sync_all()?;
-            }
-
-            if let Some(mut rw) = replacement_writer.take() {
-                rw.flush()?;
-                let inner = rw.into_inner().map_err(|e| {
-                    anyhow::anyhow!("replacement writer into_inner error: {}", e.error())
-                })?;
-                inner.sync_all()?;
-            }
-
-            Ok(stats)
-        });
-
-        // ---- worker 0（主スレッド）: GPU 推論 + 後処理 ----
-        // done_tx の元 Sender は worker 0 に move して終了時に drop させる（spawn した
-        // worker が全て終了した時点で done が閉じ、writer も必ず終了できる）。
-        {
-            let (r, w) = run_gpu_worker(0, gpu0, session0, done_tx, &ready_rx);
-            t_run += r;
-            t_write += w;
-        }
-
-        // 全スレッドを join する。spawn した worker は producer 終了（ready 閉鎖）で、reader
-        // は producer 終了（chunk_free 閉鎖）で、producer は sentinel 送信後または writer 終了
-        // （free 閉鎖）で終了する。writer は sentinel 処理後または done 閉鎖後に flush まで
-        // 済ませて終了する。reader の read エラー・worker の推論エラー・writer の書き出し
-        // エラーはここで伝播する（join 結果が Err）。
-        for handle in worker_handles {
-            let (r, w) = handle.join().expect("gpu worker thread panicked");
-            t_run += r;
-            t_write += w;
-        }
-        let t_build = producer.join().expect("producer thread panicked");
-        let t_read = reader_handle.join().expect("reader thread panicked")?;
-        let stats = writer_handle.join().expect("writer thread panicked")?;
-        skipped_count += stats.skipped;
-        clipped_count += stats.clipped;
-        total_expanded += stats.expanded;
-        total_processed += stats.processed;
-        error_count += stats.errors;
-        t_write += stats.t_write;
-        Ok((t_read, t_build))
-    })?;
-
-    if phase_timing {
-        let ms = |ns: u128| ns as f64 / 1.0e6;
-        let total = (t_read + t_build + t_run + t_write).max(1) as f64;
-        let pct = |ns: u128| ns as f64 / total * 100.0;
-        eprintln!(
-            "[phase timing] read={:.0}ms ({:.1}%)  build={:.0}ms ({:.1}%)  \
-             run={:.0}ms ({:.1}%)  write={:.0}ms ({:.1}%)",
-            ms(t_read),
-            pct(t_read),
-            ms(t_build),
-            pct(t_build),
-            ms(t_run),
-            pct(t_run),
-            ms(t_write),
-            pct(t_write)
+                build_features(&pos, f1, f2, psv);
+            },
         );
+
+        error_count += batch_errors.load(Ordering::Relaxed);
+
+        // IoBinding で推論（Python の run_with_iobinding に対応）
+        // session.run() より ORT 内部のメモリ管理が効率的
+        //
+        // 最適化検証で得られた知見:
+        // - create_binding() のループ外化（再利用）は逆効果（4.6〜36% 悪化）。
+        //   rebind 時に ORT 内部で前回バインドのクリーンアップコストが発生するため、
+        //   毎回新規作成の方が速い。
+        // - output_policy のバインド省略も逆効果（10% 悪化）。
+        //   ORT が未バインド出力の処理にオーバーヘッドを生じる。
+        // - ボトルネックは cudaMemcpyAsync（CPU→GPU 転送）で全体の 96.1%（nsys 計測）。
+        //   転送量削減（FP16 化等）以外での大幅改善は困難。
+        let shape1: [usize; 4] = [actual_batch, input1_channels, 9, 9];
+        let input1 = TensorRef::<f32>::from_array_view((shape1, &f1_buf[..actual_batch * f1_size]))
+            .map_err(onnx_ort_err)?;
+
+        let shape2: [usize; 4] = [actual_batch, input2_channels, 9, 9];
+        let input2 = TensorRef::<f32>::from_array_view((shape2, &f2_buf[..actual_batch * f2_size]))
+            .map_err(onnx_ort_err)?;
+
+        let mut binding = session.create_binding().map_err(onnx_ort_err)?;
+        binding.bind_input("input1", &input1).map_err(onnx_ort_err)?;
+        binding.bind_input("input2", &input2).map_err(onnx_ort_err)?;
+        // output_policy: スコアリングには不使用だが、省略すると ORT 内部処理で
+        // オーバーヘッドが増加するため全出力をバインドする
+        binding
+            .bind_output_to_device("output_policy", &output_mem)
+            .map_err(onnx_ort_err)?;
+        binding
+            .bind_output_to_device("output_value", &output_mem)
+            .map_err(onnx_ort_err)?;
+
+        let outputs = session.run_binding(&binding).map_err(onnx_ort_err)?;
+
+        let (_, values) =
+            outputs["output_value"].try_extract_tensor::<f32>().map_err(onnx_ort_err)?;
+
+        // rescore 書き出し（テンソルから直接読み取り、to_vec() コピーを排除）
+        // skip_in_check が真かつ親が王手の場合は書き出しを抑制（推論結果は破棄）。
+        for (i, (psv, _sfen, in_check)) in batch_records.iter().enumerate() {
+            if skip_in_check && *in_check {
+                skipped_count += 1;
+                continue;
+            }
+            let winrate = values[i];
+            let clamped = winrate.clamp(0.001, 0.999);
+            let logit = (clamped / (1.0 - clamped)).ln();
+            let raw_score = (logit * eval_scale) as i32;
+            let clipped = raw_score.abs() > score_clip as i32;
+            let new_score = raw_score.clamp(-(score_clip as i32), score_clip as i32) as i16;
+            if clipped {
+                clipped_count += 1;
+            }
+            let new_psv = PackedSfenValue {
+                sfen: psv.sfen,
+                score: new_score,
+                move16: 0,
+                game_ply: psv.game_ply,
+                game_result: psv.game_result,
+                padding: 0,
+            };
+            writer.write_all(&new_psv.to_bytes())?;
+        }
+
+        // expand 機能（policy ベースの子局面生成）
+        if let (Some(expand_cfg), Some(ew)) = (expand, expand_writer.as_mut()) {
+            let (policy_shape, policy_data) =
+                outputs["output_policy"].try_extract_tensor::<f32>().map_err(onnx_ort_err)?;
+            let expected_len = actual_batch * MAX_MOVE_LABEL_NUM;
+            if policy_data.len() != expected_len {
+                anyhow::bail!(
+                    "Policy output shape mismatch: expected [{actual_batch}, \
+                     {MAX_MOVE_LABEL_NUM}] ({expected_len} elements), got shape {:?} \
+                     ({} elements). Is the ONNX model a compatible policy network?",
+                    policy_shape,
+                    policy_data.len()
+                );
+            }
+
+            for (i, (psv, sfen, parent_in_check)) in batch_records.iter().enumerate() {
+                if expand_cfg.skip_parent_in_check && *parent_in_check {
+                    continue;
+                }
+
+                let mut pos = Position::new();
+                if pos.set_sfen(sfen).is_err() {
+                    continue;
+                }
+                let color = pos.side_to_move();
+
+                let mut list = MoveList::new();
+                generate_legal(&pos, &mut list);
+                if list.is_empty() {
+                    continue;
+                }
+
+                let policy_row = &policy_data[i * MAX_MOVE_LABEL_NUM..(i + 1) * MAX_MOVE_LABEL_NUM];
+
+                logits_buf.clear();
+                for mv in list.iter() {
+                    let label = make_move_label(*mv, color);
+                    logits_buf.push(policy_row[label]);
+                }
+                probs_buf.resize(logits_buf.len(), 0.0);
+                softmax_normalize(&logits_buf, &mut probs_buf);
+
+                for (j, mv) in list.iter().enumerate() {
+                    if probs_buf[j] > expand_cfg.threshold {
+                        let gives_check = pos.gives_check(*mv);
+                        pos.do_move(*mv, gives_check);
+
+                        let child_in_check = pos.in_check();
+                        if !(expand_cfg.skip_child_in_check && child_in_check) {
+                            let packed = pack_position(&pos);
+                            let child = PackedSfenValue {
+                                sfen: packed,
+                                score: 0,
+                                move16: 0,
+                                game_ply: psv.game_ply.saturating_add(1),
+                                game_result: 0,
+                                padding: 0,
+                            };
+                            ew.write_all(&child.to_bytes())?;
+                            total_expanded += 1;
+                        }
+
+                        pos.undo_move(*mv);
+                    }
+                }
+            }
+        }
+
+        total_processed += actual_batch as u64;
+        progress.inc(actual_batch as u64);
     }
 
-    // 出力ファイル本体の flush + sync は writer スレッドが終了時に実施済み
-    //（マーカー書き出し前にクラッシュしても書き出し済みバイト列がディスクに着地している）。
+    if profile_path.is_some() {
+        match session.end_profiling() {
+            Ok(path) => eprintln!("ORT profile saved: {path}"),
+            Err(e) => eprintln!("ORT profile error: {e}"),
+        }
+    }
+
+    // 出力ファイル本体を flush + sync して、マーカー書き出し前にクラッシュしても
+    // 書き出し済みバイト列が確実にディスクに着地している状態を作る。
+    // sync_all() は内部の File に対して実行（BufWriter::flush + into_inner で取り出し）。
+    writer.flush()?;
+    let rescore_inner = writer
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("rescore writer into_inner error: {}", e.error()))?;
+    rescore_inner.sync_all()?;
+    drop(rescore_inner);
+
+    if let Some(mut ew) = expand_writer.take() {
+        ew.flush()?;
+        let inner = ew
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("expand writer into_inner error: {}", e.error()))?;
+        inner.sync_all()?;
+    }
+
     progress.finish_with_message("Done");
 
     // 統計情報
     let rescore_written = total_processed.saturating_sub(skipped_count);
     let total = total_processed + error_count;
-    if out_scores && error_count > 0 {
-        anyhow::bail!(
-            "score sidecar aborted: {error_count} input record(s) failed to decode or build; row alignment cannot be guaranteed"
-        );
-    }
     if error_count > 0 {
-        // 破損/パース不能でスキップしたレコードは推論バッチに入らず進捗に計上されないため、
-        // それらがあると進捗表示が 100% に届かないことがある（rescore 出力は有効分のみで正常）。
-        eprintln!(
-            "Note: {error_count} 件のレコードでエラー（破損 / パース不能）。スキップ分は \
-             進捗に計上されないため、進捗表示が 100% に届かないことがある（rescore 出力は正常）。"
-        );
+        eprintln!("Note: {error_count} positions had errors");
     }
     if skipped_count > 0 && total > 0 {
         eprintln!(
@@ -5755,72 +2907,14 @@ where
         );
     }
 
-    // Ctrl-C で打ち切った場合も含めて照合する。
-    discard_output_if_model_changed(
-        protection,
-        loaded_model,
-        config.onnx_path,
-        input_path,
-        output_path,
-        out_scores,
-    )?;
-
     // 完了マーカー書き出し（atomic rename）。
     // INTERRUPTED が立っている場合（Ctrl-C で残ファイル分を打ち切った場合）も
     // 書き出した分は完了扱いとはせず、marker を作らない。
     if !INTERRUPTED.load(Ordering::SeqCst) {
-        if out_scores {
-            let expected_size = process_count
-                .checked_mul(output_record_size)
-                .context("Expected output size overflow")?;
-            let actual_size = fs::metadata(output_path)?.len();
-            if actual_size != expected_size {
-                anyhow::bail!(
-                    "Output size mismatch: {} has {actual_size} bytes, expected {expected_size}",
-                    output_path.display()
-                );
-            }
-        }
-        let fingerprint = if let Some(start) = sidecar_start_fingerprint {
-            let current = build_run_fingerprint(config)?;
-            reject_changed_sidecar_fingerprint(
-                protection,
-                output_path,
-                &start,
-                &current,
-                "during processing",
-            )?;
-            let active_marker = parse_marker(&in_progress_marker_path_for(output_path))?;
-            reject_changed_sidecar_fingerprint(
-                protection,
-                output_path,
-                &start,
-                &active_marker.fingerprint,
-                "in the active marker",
-            )?;
-            start
-        } else {
-            build_run_fingerprint(config)?
-        };
-        // 上の照合から fingerprint を取るまでの間の置き換えも、完了にせず出力を空にする。
-        if !loaded_model.matches(&fingerprint) {
-            protection.truncate(output_path, 0)?;
-            if out_scores {
-                remove_in_progress_marker(protection, output_path)?;
-            }
-            anyhow::bail!(
-                "ONNX model file changed while processing {}; discarded the output. \
-                 {RERUN_AFTER_MODEL_CHANGE}",
-                input_path.display()
-            );
-        }
+        let fingerprint = build_run_fingerprint(config)?;
         let rescore_size = fs::metadata(output_path)?.len();
         let expand_size = match expand {
             Some(e) => Some(fs::metadata(e.output_path)?.len()),
-            None => None,
-        };
-        let replacement_size = match replacement_output {
-            Some(rp) => Some(fs::metadata(rp)?.len()),
             None => None,
         };
         let marker = DoneMarker {
@@ -5828,14 +2922,9 @@ where
             output_sizes: OutputSizes {
                 rescore_output_size: rescore_size,
                 expand_output_size: expand_size,
-                replacement_output_size: replacement_size,
             },
         };
-        if out_scores {
-            promote_score_sidecar_marker(protection, output_path, &marker)?;
-        } else {
-            write_marker_atomic(protection, output_path, &marker)?;
-        }
+        write_marker_atomic(output_path, &marker)?;
         eprintln!("Marker written: {}", marker_path_for(output_path).display());
     }
 
@@ -5848,14 +2937,11 @@ where
 
 #[cfg(feature = "aobazero-onnx")]
 fn process_file_with_onnx(
-    protection: &OutputProtection,
     cli: &Cli,
     input_path: &std::path::Path,
     output_path: &std::path::Path,
     expand_output_path: Option<&std::path::Path>,
     process_count: u64,
-    progress: &FileProgress,
-    onnx_sessions: &mut Option<OnnxSessions>,
 ) -> Result<()> {
     use tools::aobazero_features::{
         FEATURES1_SIZE, FEATURES2_SIZE, INPUT1_CHANNELS, INPUT2_CHANNELS, make_input_features,
@@ -5874,11 +2960,9 @@ fn process_file_with_onnx(
         onnx_path: cli.onnx_model.as_ref().unwrap(),
         input_path,
         output_path,
-        out_scores: cli.out_scores,
         process_count,
         batch_size: cli.onnx_batch_size,
-        gpu_ids: cli.onnx_gpu_id.ids(),
-        sessions: cli.onnx_sessions as usize,
+        gpu_id: cli.onnx_gpu_id,
         use_tensorrt: cli.onnx_tensorrt,
         tensorrt_cache: cli.onnx_tensorrt_cache.as_deref(),
         score_clip: cli.score_clip,
@@ -5891,25 +2975,10 @@ fn process_file_with_onnx(
         input2_channels: INPUT2_CHANNELS,
         profile_path: cli.ort_profile.as_deref(),
         expand,
-        qsearch_leaf_label: cli.qsearch_leaf_label,
-        qsearch_max_ply: cli.max_ply,
-        // leaf-label は dlshogi 限定のため AobaZero では葉探索 NNUE / replacement arm を持たない。
-        qsearch_nnue_path: None,
-        qsearch_ls_bucket_mode: None,
-        qsearch_ls_progress_buckets: None,
-        qsearch_ls_progress_coeff_path: None,
-        replacement_output: None,
     };
-    let onnx_sessions = OnnxSessions::get_or_create(onnx_sessions, &config)?;
-    process_file_with_onnx_pipeline(
-        protection,
-        &config,
-        move |pos, f1, f2, psv| {
-            make_input_features(pos, f1, f2, psv.game_ply as i32, draw_ply);
-        },
-        progress,
-        onnx_sessions,
-    )
+    process_file_with_onnx_pipeline(&config, move |pos, f1, f2, psv| {
+        make_input_features(pos, f1, f2, psv.game_ply as i32, draw_ply);
+    })
 }
 
 // ============================================================
@@ -5918,16 +2987,12 @@ fn process_file_with_onnx(
 
 #[cfg(feature = "dlshogi-onnx")]
 fn process_file_with_dlshogi_onnx(
-    protection: &OutputProtection,
     cli: &Cli,
     input_path: &std::path::Path,
     output_path: &std::path::Path,
-    auxiliary_outputs: (Option<&std::path::Path>, Option<&std::path::Path>),
+    expand_output_path: Option<&std::path::Path>,
     process_count: u64,
-    progress: &FileProgress,
-    onnx_sessions: &mut Option<OnnxSessions>,
 ) -> Result<()> {
-    let (expand_output_path, replacement_output_path) = auxiliary_outputs;
     use tools::dlshogi_features::{
         FEATURES1_SIZE, FEATURES2_SIZE, INPUT1_CHANNELS, INPUT2_CHANNELS, make_input_features,
     };
@@ -5944,11 +3009,9 @@ fn process_file_with_dlshogi_onnx(
         onnx_path: cli.dlshogi_onnx_model.as_ref().unwrap(),
         input_path,
         output_path,
-        out_scores: cli.out_scores,
         process_count,
         batch_size: cli.onnx_batch_size,
-        gpu_ids: cli.onnx_gpu_id.ids(),
-        sessions: cli.onnx_sessions as usize,
+        gpu_id: cli.onnx_gpu_id,
         use_tensorrt: cli.onnx_tensorrt,
         tensorrt_cache: cli.onnx_tensorrt_cache.as_deref(),
         score_clip: cli.score_clip,
@@ -5963,2021 +3026,8 @@ fn process_file_with_dlshogi_onnx(
         input2_channels: INPUT2_CHANNELS,
         profile_path: cli.ort_profile.as_deref(),
         expand,
-        qsearch_leaf_label: cli.qsearch_leaf_label,
-        qsearch_max_ply: cli.max_ply,
-        qsearch_nnue_path: cli.nnue.as_deref(),
-        qsearch_ls_bucket_mode: cli.ls_bucket_mode.as_deref(),
-        qsearch_ls_progress_buckets: cli.ls_progress_buckets,
-        qsearch_ls_progress_coeff_path: cli.ls_progress_coeff.as_deref(),
-        replacement_output: replacement_output_path,
     };
-    let onnx_sessions = OnnxSessions::get_or_create(onnx_sessions, &config)?;
-    process_file_with_onnx_pipeline(
-        protection,
-        &config,
-        |pos, f1, f2, _psv| {
-            make_input_features(pos, f1, f2);
-        },
-        progress,
-        onnx_sessions,
-    )
-}
-
-#[cfg(test)]
-mod marker_tests {
-    use super::*;
-
-    fn no_protected_paths() -> OutputProtection {
-        OutputProtection {
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-        }
-    }
-
-    use std::io::{Read, Write};
-
-    #[test]
-    fn protection_rejects_late_resource_and_output_aliases_without_mutation() {
-        for resource_alias in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let input = dir.path().join("input");
-            let first = dir.path().join("first");
-            let last = dir.path().join("last");
-            std::fs::write(&input, b"resource").unwrap();
-            std::fs::write(&first, b"previous output").unwrap();
-            std::fs::hard_link(if resource_alias { &input } else { &first }, &last).unwrap();
-            assert!(OutputProtection::new(vec![input.clone()], vec![first.clone(), last]).is_err());
-            assert_eq!(std::fs::read(input).unwrap(), b"resource");
-            assert_eq!(std::fs::read(first).unwrap(), b"previous output");
-        }
-    }
-
-    #[test]
-    fn protection_rechecks_actual_handle_and_preserves_append() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("input");
-        let output = dir.path().join("output");
-        std::fs::write(&input, b"resource").unwrap();
-        std::fs::write(&output, b"prefix").unwrap();
-        let protection = OutputProtection::new(vec![input.clone()], vec![output.clone()]).unwrap();
-        protection.open(&output, true).unwrap().write_all(b"-suffix").unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), b"prefix-suffix");
-        std::fs::remove_file(&output).unwrap();
-        std::fs::hard_link(&input, &output).unwrap();
-        let file = File::options().write(true).open(&output).unwrap();
-        assert!(protection.check_file(&output, &file).is_err());
-        assert!(protection.truncate(&output, 0).is_err());
-        assert_eq!(std::fs::read(input).unwrap(), b"resource");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn protection_rejects_symlink_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("input");
-        let output = dir.path().join("output");
-        std::fs::write(&input, b"resource").unwrap();
-        std::os::unix::fs::symlink(&input, &output).unwrap();
-        assert!(OutputProtection::new(vec![input.clone()], vec![output]).is_err());
-        assert_eq!(std::fs::read(input).unwrap(), b"resource");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn protection_rejects_case_alias_before_first_write() {
-        for suffix in ["", ".done", ".in-progress", ".done.tmp", ".in-progress.tmp"] {
-            let dir = tempfile::tempdir().unwrap();
-            let existing = dir.path().join("first");
-            let first = dir.path().join(format!("output{suffix}"));
-            let last = dir.path().join(format!("OUTPUT{suffix}"));
-            std::fs::write(&existing, b"previous").unwrap();
-            assert!(
-                OutputProtection::new(
-                    Vec::new(),
-                    vec![existing.clone(), first.clone(), last.clone()]
-                )
-                .is_err()
-            );
-            assert_eq!(std::fs::read(existing).unwrap(), b"previous");
-            assert!(!first.exists());
-            assert!(!last.exists());
-        }
-    }
-
-    #[test]
-    fn startup_protects_all_inputs_resources_and_marker_paths() {
-        for suffix in ["", ".done", ".in-progress", ".done.tmp", ".in-progress.tmp"] {
-            let dir = tempfile::tempdir().unwrap();
-            let input = dir.path().join("input.psv");
-            let later = dir.path().join("later.psv");
-            let model = dir.path().join("model");
-            let out_dir = dir.path().join("out");
-            std::fs::create_dir(&out_dir).unwrap();
-            for path in [&input, &later, &model] {
-                std::fs::write(path, [7; 40]).unwrap();
-            }
-            let first_output = out_dir.join("input.psv.scores.i16");
-            std::fs::write(&first_output, b"previous").unwrap();
-            let collision = out_dir.join(format!("later.psv.scores.i16{suffix}"));
-            std::fs::hard_link(&model, collision).unwrap();
-            let cli = Cli::parse_from([
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                later.to_str().unwrap(),
-                "--output-dir",
-                out_dir.to_str().unwrap(),
-                "--nnue",
-                model.to_str().unwrap(),
-                "--out-scores",
-            ]);
-            assert!(output_protection(&cli, &[input.clone(), later.clone()]).is_err());
-            assert_eq!(std::fs::read(first_output).unwrap(), b"previous");
-            for path in [&input, &later, &model] {
-                assert_eq!(std::fs::read(path).unwrap(), [7; 40]);
-            }
-        }
-    }
-
-    #[test]
-    fn startup_rejects_old_marker_cleanup_of_resources_or_outputs() {
-        for (replacement, target) in [
-            (false, "input"),
-            (false, "model"),
-            (false, "output"),
-            (true, "input"),
-            (true, "model"),
-            (true, "output"),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let input = dir.path().join("input.psv");
-            let later = dir.path().join("later.psv");
-            let model = dir.path().join("model");
-            let out_dir = dir.path().join("out");
-            std::fs::create_dir(&out_dir).unwrap();
-            for path in [&input, &later, &model] {
-                std::fs::write(path, [7; 40]).unwrap();
-            }
-            let output = out_dir.join("input.psv.scores.i16");
-            std::fs::write(&output, b"previous").unwrap();
-            let mut fingerprint = test_fingerprint(true);
-            let old = match target {
-                "input" => later.clone(),
-                "model" => model.clone(),
-                "output" => output.clone(),
-                _ => unreachable!(),
-            };
-            fingerprint.expand = !replacement;
-            fingerprint.expand_threshold_bits = (!replacement).then_some(0.1_f32.to_bits());
-            fingerprint.expand_skip_parent_in_check = (!replacement).then_some(false);
-            fingerprint.expand_skip_child_in_check = (!replacement).then_some(false);
-            fingerprint.replacement = replacement;
-            fingerprint.expand_output_path = (!replacement).then_some(old.clone());
-            fingerprint.replacement_output_path = replacement.then_some(old);
-            let marker = DoneMarker {
-                fingerprint,
-                output_sizes: OutputSizes {
-                    rescore_output_size: 8,
-                    expand_output_size: (!replacement).then_some(40),
-                    replacement_output_size: replacement.then_some(40),
-                },
-            };
-            write_marker_atomic(&no_protected_paths(), &output, &marker).unwrap();
-            let done = marker_path_for(&output);
-            let before = std::fs::read(&done).unwrap();
-            let cli = Cli::parse_from([
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                later.to_str().unwrap(),
-                "--output-dir",
-                out_dir.to_str().unwrap(),
-                "--nnue",
-                model.to_str().unwrap(),
-                "--out-scores",
-            ]);
-            assert!(output_protection(&cli, &[input, later.clone()]).is_err());
-            assert_eq!(std::fs::read(later).unwrap(), [7; 40]);
-            assert_eq!(std::fs::read(output).unwrap(), b"previous");
-            assert_eq!(std::fs::read(done).unwrap(), before);
-        }
-    }
-
-    #[test]
-    fn startup_does_not_create_markers_and_matching_marker_resumes() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("input.psv");
-        let model = dir.path().join("model");
-        let out_dir = dir.path().join("out");
-        std::fs::create_dir(&out_dir).unwrap();
-        for path in [&input, &model] {
-            std::fs::write(path, [7; 40]).unwrap();
-        }
-        let output = out_dir.join("input.psv.scores.i16");
-        let cli = Cli::parse_from([
-            "rescore_psv",
-            "--input",
-            input.to_str().unwrap(),
-            "--output-dir",
-            out_dir.to_str().unwrap(),
-            "--nnue",
-            model.to_str().unwrap(),
-            "--out-scores",
-        ]);
-        let protection = output_protection(&cli, &[input]).unwrap();
-        assert!(!marker_path_for(&output).exists());
-        assert!(!in_progress_marker_path_for(&output).exists());
-        let fingerprint = test_fingerprint(true);
-        prepare_in_progress_marker(&protection, &output, &fingerprint, false).unwrap();
-        protection.open(&output, true).unwrap().write_all(&[1, 0, 2, 0]).unwrap();
-        assert_eq!(
-            prepare_in_progress_marker(&protection, &output, &fingerprint, false).unwrap(),
-            Some(SidecarStartDecision::Resume)
-        );
-        assert_eq!(std::fs::read(output).unwrap(), [1, 0, 2, 0]);
-    }
-
-    #[test]
-    fn deleted_input_does_not_block_later_output_or_unprotect_remaining_input() {
-        let dir = tempfile::tempdir().unwrap();
-        let first_input = dir.path().join("first.psv");
-        let second_input = dir.path().join("second.psv");
-        let first_output = dir.path().join("first.out");
-        let second_output = dir.path().join("second.out");
-        std::fs::write(&first_input, b"first").unwrap();
-        std::fs::write(&second_input, b"second").unwrap();
-        let mut protection = OutputProtection::new(
-            vec![first_input.clone(), second_input.clone()],
-            vec![first_output.clone(), second_output.clone()],
-        )
-        .unwrap();
-        protection.open(&first_output, false).unwrap().write_all(b"finished").unwrap();
-        std::fs::remove_file(&first_input).unwrap();
-        protection.forget_deleted_input(&first_input);
-        protection.open(&second_output, true).unwrap().write_all(b"resumed").unwrap();
-        std::fs::remove_file(&second_output).unwrap();
-        std::fs::hard_link(&second_input, &second_output).unwrap();
-        assert!(protection.truncate(&second_output, 0).is_err());
-        assert_eq!(std::fs::read(second_input).unwrap(), b"second");
-        assert_eq!(std::fs::read(first_output).unwrap(), b"finished");
-    }
-
-    #[test]
-    fn startup_protects_each_explicit_resource_and_engine_relative_options() {
-        for resource in [
-            "later-input",
-            "nnue",
-            "coeff",
-            "engine",
-            "option",
-            "automatic-spsa",
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let input = dir.path().join("first.psv");
-            let later = dir.path().join("second.psv");
-            let model = dir.path().join("model");
-            let coeff = dir.path().join("coeff");
-            let engine_dir = dir.path().join("engine");
-            let out_dir = dir.path().join("out");
-            std::fs::create_dir(&engine_dir).unwrap();
-            std::fs::create_dir(&out_dir).unwrap();
-            let engine = engine_dir.join("engine.bin");
-            let option = engine_dir.join("model.onnx");
-            let automatic = engine_dir.join("spsa.params");
-            for path in [&input, &later, &model, &coeff, &engine, &option, &automatic] {
-                std::fs::write(path, [9; 40]).unwrap();
-            }
-            let first_output = out_dir.join("first.psv");
-            std::fs::write(&first_output, b"previous").unwrap();
-            let protected = match resource {
-                "later-input" => &later,
-                "nnue" => &model,
-                "coeff" => &coeff,
-                "engine" => &engine,
-                "option" => &option,
-                "automatic-spsa" => &automatic,
-                _ => unreachable!(),
-            };
-            std::fs::hard_link(protected, out_dir.join("second.psv")).unwrap();
-            let mut args = vec![
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                later.to_str().unwrap(),
-                "--output-dir",
-                out_dir.to_str().unwrap(),
-            ];
-            if matches!(resource, "engine" | "option" | "automatic-spsa") {
-                args.extend([
-                    "--engine",
-                    engine.to_str().unwrap(),
-                    "--usi-option",
-                    "DNN_Model=model.onnx",
-                ]);
-            } else {
-                args.extend([
-                    "--nnue",
-                    model.to_str().unwrap(),
-                    "--ls-progress-coeff",
-                    coeff.to_str().unwrap(),
-                ]);
-            }
-            let cli = Cli::parse_from(args);
-            let error = output_protection(&cli, &[input, later.clone()]).err().unwrap();
-            assert!(
-                error.to_string().contains("Output path resolves to input file"),
-                "{resource}: {error:#}"
-            );
-            assert_eq!(std::fs::read(first_output).unwrap(), b"previous");
-            assert_eq!(std::fs::read(protected).unwrap(), [9; 40]);
-        }
-    }
-
-    #[test]
-    fn existing_resource_same_path_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("input");
-        std::fs::write(&input, b"resource").unwrap();
-        assert!(OutputProtection::new(vec![input.clone()], vec![input.clone()]).is_err());
-        assert_eq!(std::fs::read(input).unwrap(), b"resource");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn existing_resource_case_alias_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("resource");
-        std::fs::write(&input, b"resource").unwrap();
-        assert!(
-            OutputProtection::new(vec![input.clone()], vec![dir.path().join("RESOURCE")]).is_err()
-        );
-        assert_eq!(std::fs::read(input).unwrap(), b"resource");
-    }
-
-    #[test]
-    fn auxiliary_outputs_share_canonical_spelling_and_missing_marker_artifacts_are_retained() {
-        let dir = tempfile::tempdir_in(".").unwrap();
-        let input = dir.path().join("input.psv");
-        let model = dir.path().join("model");
-        let output_dir = dir.path().join("out");
-        let expand_dir = dir.path().join("expand");
-        let replacement_dir = dir.path().join("replacement");
-        for path in [&output_dir, &expand_dir, &replacement_dir] {
-            std::fs::create_dir(path).unwrap();
-        }
-        for path in [&input, &model] {
-            std::fs::write(path, [7; 40]).unwrap();
-        }
-        let cli = Cli::parse_from([
-            "rescore_psv",
-            "--input",
-            input.to_str().unwrap(),
-            "--nnue",
-            model.to_str().unwrap(),
-            "--output-dir",
-            output_dir.to_str().unwrap(),
-            "--out-scores",
-            "--expand-output-dir",
-            expand_dir.to_str().unwrap(),
-            "--qsearch-leaf-replacement-output",
-            replacement_dir.to_str().unwrap(),
-        ]);
-        let expand = expand_dir.canonicalize().unwrap().join("input.psv");
-        let replacement = replacement_dir.canonicalize().unwrap().join("input.psv");
-        let protection = output_protection(&cli, std::slice::from_ref(&input)).unwrap();
-        for path in [&expand, &replacement] {
-            protection.open(path, true).unwrap().write_all(b"auxiliary").unwrap();
-            protection.truncate(path, 0).unwrap();
-            std::fs::remove_file(path).unwrap();
-        }
-        let mut fingerprint = test_fingerprint(true);
-        fingerprint.expand = true;
-        fingerprint.expand_threshold_bits = Some(0.1_f32.to_bits());
-        fingerprint.expand_skip_parent_in_check = Some(false);
-        fingerprint.expand_skip_child_in_check = Some(false);
-        fingerprint.expand_output_path = Some(expand.clone());
-        fingerprint.replacement = true;
-        fingerprint.replacement_output_path = Some(replacement.clone());
-        let marker = DoneMarker {
-            fingerprint,
-            output_sizes: OutputSizes {
-                rescore_output_size: 0,
-                expand_output_size: Some(0),
-                replacement_output_size: Some(0),
-            },
-        };
-        let output = output_dir.join("input.psv.scores.i16");
-        write_marker_atomic(&no_protected_paths(), &output, &marker).unwrap();
-        let protection = output_protection(&cli, &[input]).unwrap();
-        for path in [&expand, &replacement] {
-            protection.open(path, true).unwrap();
-        }
-    }
-
-    #[test]
-    fn usi_empty_disabled_and_missing_resources_do_not_scan_engine_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = dir.path().join("engine");
-        let input = dir.path().join("input.psv");
-        let output_dir = dir.path().join("out");
-        std::fs::create_dir(&output_dir).unwrap();
-        std::fs::write(&engine, b"engine").unwrap();
-        std::fs::write(&input, [7; 40]).unwrap();
-        let output = output_dir.join("input.psv");
-        std::fs::write(&output, b"previous").unwrap();
-        let cli = Cli::parse_from([
-            "rescore_psv",
-            "--input",
-            input.to_str().unwrap(),
-            "--engine",
-            engine.to_str().unwrap(),
-            "--output-dir",
-            output_dir.to_str().unwrap(),
-            "--usi-option",
-            "BookFile=no_book",
-            "--usi-option",
-            "EvalFile=",
-            "--usi-option",
-            "BookExploreFile=<empty>",
-            "--usi-option",
-            "LogFile=missing.log",
-        ]);
-        let protection = output_protection(&cli, &[input]).unwrap();
-        assert_eq!(protection.inputs.len(), 2);
-        assert_eq!(std::fs::read(output).unwrap(), b"previous");
-        assert_eq!(parsed_usi_option(" EvalFile = model "), Some(("EvalFile", "model")));
-    }
-
-    #[test]
-    fn automatic_spsa_sentinels_keep_implicit_resource_protected() {
-        for value in ["", "<auto>", "<empty>"] {
-            let dir = tempfile::tempdir().unwrap();
-            let engine = dir.path().join("engine");
-            let input = dir.path().join("input.psv");
-            let params = dir.path().join("spsa.params");
-            let output_dir = dir.path().join("out");
-            std::fs::create_dir(&output_dir).unwrap();
-            for path in [&engine, &input, &params] {
-                std::fs::write(path, [7; 40]).unwrap();
-            }
-            std::fs::hard_link(&params, output_dir.join("input.psv")).unwrap();
-            let option = format!("SPSAParamsFile={value}");
-            let cli = Cli::parse_from([
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                "--engine",
-                engine.to_str().unwrap(),
-                "--output-dir",
-                output_dir.to_str().unwrap(),
-                "--usi-option",
-                &option,
-            ]);
-            assert!(output_protection(&cli, &[input]).is_err());
-            assert_eq!(std::fs::read(params).unwrap(), [7; 40]);
-        }
-    }
-
-    #[test]
-    fn book_file_resolves_against_book_dir_independently_of_option_order() {
-        for explicit in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let engine = dir.path().join("engine");
-            let input = dir.path().join("input.psv");
-            let output_dir = dir.path().join("out");
-            let book_dir = dir.path().join(if explicit { "books" } else { "book" });
-            std::fs::create_dir(&output_dir).unwrap();
-            std::fs::create_dir(&book_dir).unwrap();
-            let book = book_dir.join("opening.db");
-            for path in [&engine, &input, &book] {
-                std::fs::write(path, [7; 40]).unwrap();
-            }
-            std::fs::hard_link(&book, output_dir.join("input.psv")).unwrap();
-            let mut args = vec![
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                "--engine",
-                engine.to_str().unwrap(),
-                "--output-dir",
-                output_dir.to_str().unwrap(),
-                "--usi-option",
-                " BookFile = opening.db ",
-            ];
-            if explicit {
-                args.extend(["--usi-option", "BookDir=books"]);
-            }
-            let cli = Cli::parse_from(args);
-            assert!(output_protection(&cli, &[input]).is_err());
-            assert_eq!(std::fs::read(book).unwrap(), [7; 40]);
-        }
-    }
-
-    #[test]
-    fn reserved_usi_tokens_are_rejected_before_resource_classification() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = dir.path().join("engine");
-        let input = dir.path().join("input.psv");
-        let resource = dir.path().join("spsa.params");
-        let output_dir = dir.path().join("out");
-        std::fs::create_dir(&output_dir).unwrap();
-        for path in [&engine, &input, &resource] {
-            std::fs::write(path, [7; 40]).unwrap();
-        }
-        let output = output_dir.join("input.psv");
-        std::fs::hard_link(&resource, &output).unwrap();
-        for option in [
-            "SPSAParamsFile=value",
-            "SPSAParamsFile=tune value params",
-            "SPSAParamsFile=tune name params",
-            "SPSAParamsFile value=tune params",
-            "SPSAParamsFile name=tune params",
-            "BookDir=books value other",
-            "BookDir=books NAME other",
-            "Unrecognized=VALUE",
-            "Unrecognized name=ignored",
-        ] {
-            let cli = Cli::parse_from([
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                "--engine",
-                engine.to_str().unwrap(),
-                "--output-dir",
-                output_dir.to_str().unwrap(),
-                "--usi-option",
-                option,
-            ]);
-            let error = output_protection(&cli, std::slice::from_ref(&input)).err().unwrap();
-            assert!(error.to_string().contains("Reserved USI token"), "{error}");
-            for path in [&engine, &input, &resource, &output] {
-                assert_eq!(std::fs::read(path).unwrap(), [7; 40]);
-            }
-        }
-        std::fs::remove_file(&output).unwrap();
-        let models = dir.path().join("path");
-        std::fs::create_dir(&models).unwrap();
-        for filename in ["value.nnue", "name.nnue"] {
-            let model = models.join(filename);
-            std::fs::write(&model, b"model bytes").unwrap();
-            let option = format!("EvalFile=path/{filename}");
-            let cli = Cli::parse_from([
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                "--engine",
-                engine.to_str().unwrap(),
-                "--output-dir",
-                output_dir.to_str().unwrap(),
-                "--usi-option",
-                &option,
-            ]);
-            let protection = output_protection(&cli, std::slice::from_ref(&input)).unwrap();
-            assert!(protection.inputs.contains(&model));
-            std::fs::hard_link(&model, &output).unwrap();
-            assert!(output_protection(&cli, std::slice::from_ref(&input)).is_err());
-            assert!(protection.truncate(&output, 0).is_err());
-            assert_eq!(std::fs::read(&model).unwrap(), b"model bytes");
-            std::fs::remove_file(&output).unwrap();
-        }
-    }
-
-    #[test]
-    fn resource_option_whitespace_is_unambiguous_before_any_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = dir.path().join("engine");
-        let input = dir.path().join("input.psv");
-        let resource = dir.path().join("tune params");
-        let output_dir = dir.path().join("out");
-        std::fs::create_dir(&output_dir).unwrap();
-        for path in [&engine, &input, &resource] {
-            std::fs::write(path, [7; 40]).unwrap();
-        }
-        let output = output_dir.join("input.psv");
-        for option in [
-            "SPSAParamsFile=tune  params",
-            "SPSAParamsFile=tune\tparams",
-            "SPSAParamsFile=tune\nparams",
-            "BookDir=tune  params",
-            "BookDir=tune\tparams",
-            "BookDir=tune\nparams",
-            "Custom  File=",
-            "Custom\tFile=<auto>",
-            "Custom\nFile=<empty>",
-        ] {
-            std::fs::write(&output, b"previous output").unwrap();
-            let cli = Cli::parse_from([
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                "--engine",
-                engine.to_str().unwrap(),
-                "--output-dir",
-                output_dir.to_str().unwrap(),
-                "--usi-option",
-                option,
-            ]);
-            let error = output_protection(&cli, std::slice::from_ref(&input)).err().unwrap();
-            assert!(error.to_string().contains("Ambiguous whitespace"), "{error}");
-            assert_eq!(std::fs::read(&output).unwrap(), b"previous output");
-            assert_eq!(std::fs::read(&resource).unwrap(), [7; 40]);
-        }
-        std::fs::remove_file(&output).unwrap();
-        let cli = Cli::parse_from([
-            "rescore_psv",
-            "--input",
-            input.to_str().unwrap(),
-            "--engine",
-            engine.to_str().unwrap(),
-            "--output-dir",
-            output_dir.to_str().unwrap(),
-            "--usi-option",
-            " SPSAParamsFile = tune params ",
-        ]);
-        let protection = output_protection(&cli, std::slice::from_ref(&input)).unwrap();
-        assert!(protection.inputs.contains(&resource));
-        std::fs::hard_link(&resource, &output).unwrap();
-        assert!(output_protection(&cli, std::slice::from_ref(&input)).is_err());
-        assert!(protection.truncate(&output, 0).is_err());
-        assert_eq!(std::fs::read(&resource).unwrap(), [7; 40]);
-    }
-
-    #[test]
-    fn mixed_case_book_dirs_preserve_all_engine_interpretations() {
-        let cases = [
-            (vec!["bookdir=books"], vec!["book", "books"]),
-            (vec!["BookDir=books", "bookdir=other"], vec!["books", "other"]),
-            (vec!["BookDir=", "BOOKDIR=other"], vec!["book", "other"]),
-            (vec!["BookDir=books", "bookdir="], vec!["book", "books"]),
-        ];
-        for (options, expected) in cases {
-            let dir = tempfile::tempdir().unwrap();
-            let engine = dir.path().join("engine");
-            let input = dir.path().join("input.psv");
-            let output_dir = dir.path().join("out");
-            std::fs::create_dir(&output_dir).unwrap();
-            for path in [&engine, &input] {
-                std::fs::write(path, [7; 40]).unwrap();
-            }
-            for name in ["book", "books", "other"] {
-                let directory = dir.path().join(name);
-                std::fs::create_dir(&directory).unwrap();
-                std::fs::write(directory.join("opening.db"), b"book bytes").unwrap();
-            }
-            let mut args = vec![
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                "--engine",
-                engine.to_str().unwrap(),
-                "--output-dir",
-                output_dir.to_str().unwrap(),
-                "--usi-option",
-                "BookFile=opening.db",
-            ];
-            for option in options {
-                args.extend(["--usi-option", option]);
-            }
-            let cli = Cli::parse_from(args);
-            let output = output_dir.join("input.psv");
-            for directory in expected {
-                let book = dir.path().join(directory).join("opening.db");
-                let protection = output_protection(&cli, std::slice::from_ref(&input)).unwrap();
-                assert!(protection.inputs.contains(&book));
-                std::fs::hard_link(&book, &output).unwrap();
-                assert!(output_protection(&cli, std::slice::from_ref(&input)).is_err());
-                assert!(protection.truncate(&output, 0).is_err());
-                assert_eq!(std::fs::read(book).unwrap(), b"book bytes");
-                std::fs::remove_file(&output).unwrap();
-            }
-        }
-    }
-
-    #[test]
-    fn engine_options_next_to_engine_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = dir.path().join("engine");
-        let input = dir.path().join("input.psv");
-        let engine_options = dir.path().join("engine_options.txt");
-        let output_dir = dir.path().join("out");
-        std::fs::create_dir(&output_dir).unwrap();
-        for path in [&engine, &input, &engine_options] {
-            std::fs::write(path, [7; 40]).unwrap();
-        }
-        let cli = Cli::parse_from([
-            "rescore_psv",
-            "--input",
-            input.to_str().unwrap(),
-            "--engine",
-            engine.to_str().unwrap(),
-            "--output-dir",
-            output_dir.to_str().unwrap(),
-        ]);
-        assert!(output_protection(&cli, std::slice::from_ref(&input)).is_err());
-    }
-
-    #[test]
-    fn mixed_case_spsa_candidates_keep_explicit_and_automatic_resources() {
-        let cases = [
-            vec!["spsaparamsfile=custom.params"],
-            vec!["SPSAParamsFile=custom.params", "spsaparamsfile=<auto>"],
-            vec!["SPSAParamsFile=custom.params", "SPSAPARAMSFILE=<empty>"],
-            vec!["SPSAParamsFile=custom.params", "spsaparamsfile="],
-            vec!["SPSAParamsFile=<auto>", "spsaparamsfile=custom.params"],
-        ];
-        for options in cases {
-            let dir = tempfile::tempdir().unwrap();
-            let engine = dir.path().join("engine");
-            let input = dir.path().join("input.psv");
-            let automatic = dir.path().join("spsa.params");
-            let explicit = dir.path().join("custom.params");
-            let output_dir = dir.path().join("out");
-            std::fs::create_dir(&output_dir).unwrap();
-            for path in [&engine, &input, &automatic, &explicit] {
-                std::fs::write(path, [7; 40]).unwrap();
-            }
-            let mut args = vec![
-                "rescore_psv",
-                "--input",
-                input.to_str().unwrap(),
-                "--engine",
-                engine.to_str().unwrap(),
-                "--output-dir",
-                output_dir.to_str().unwrap(),
-            ];
-            for option in options {
-                args.extend(["--usi-option", option]);
-            }
-            let cli = Cli::parse_from(args);
-            let output = output_dir.join("input.psv");
-            for params in [&automatic, &explicit] {
-                let protection = output_protection(&cli, std::slice::from_ref(&input)).unwrap();
-                assert!(protection.inputs.iter().any(|path| paths_match(path, params).unwrap()));
-                std::fs::hard_link(params, &output).unwrap();
-                assert!(output_protection(&cli, std::slice::from_ref(&input)).is_err());
-                assert!(protection.truncate(&output, 0).is_err());
-                assert_eq!(std::fs::read(params).unwrap(), [7; 40]);
-                std::fs::remove_file(&output).unwrap();
-            }
-        }
-    }
-
-    /// 必須キーを満たす最小 marker テキスト（expand=false）。`extra` に qsearch 系の追加行を差し込む。
-    fn base_marker(extra: &str) -> String {
-        format!(
-            "version={MARKER_VERSION}\n\
-             mode=onnx\n\
-             model_kind=dlshogi\n\
-             model_path=/tmp/model.onnx\n\
-             model_size=100\n\
-             model_mtime_ns=123\n\
-             input_path=/tmp/in.psv\n\
-             input_size=200\n\
-             input_mtime_ns=456\n\
-             process_count=10\n\
-             skip_in_check=false\n\
-             score_clip=10000\n\
-             eval_scale_bits=0x44160000\n\
-             onnx_draw_ply=0\n\
-             {extra}\
-             expand=false\n\
-             rescore_output_size=400\n"
-        )
-    }
-
-    fn parse_text(text: &str) -> DoneMarker {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("m.done");
-        std::fs::File::create(&path).unwrap().write_all(text.as_bytes()).unwrap();
-        parse_marker(&path).unwrap()
-    }
-
-    /// leaf-label=true の marker に必要な qsearch 系キー（max_ply + 葉探索 NNUE のメタ）。
-    const LEAF_LABEL_KEYS: &str = "qsearch_leaf_label=true\n\
-         qsearch_max_ply=20\n\
-         qsearch_nnue_path=/tmp/nn.bin\n\
-         qsearch_nnue_size=42\n\
-         qsearch_nnue_mtime_ns=789\n";
-
-    #[test]
-    fn legacy_marker_defaults() {
-        for extra in ["", "qsearch_leaf_label=false\nreplacement=false\n"] {
-            let m = parse_text(&base_marker(extra));
-            assert!(!m.fingerprint.qsearch_leaf_label);
-            assert_eq!(m.fingerprint.qsearch_max_ply, None);
-            assert_eq!(m.fingerprint.qsearch_nnue_path, None);
-            assert_eq!(m.fingerprint.qsearch_nnue_size, None);
-            assert_eq!(m.fingerprint.qsearch_nnue_mtime_ns, None);
-            assert!(!m.fingerprint.out_scores);
-            assert!(!m.fingerprint.replacement);
-            assert_eq!(m.fingerprint.replacement_output_path, None);
-            assert_eq!(m.output_sizes.replacement_output_size, None);
-        }
-    }
-
-    #[test]
-    fn old_marker_without_tensorrt_is_unknown_and_mismatches_both_values() {
-        let old = parse_text(&base_marker(""));
-        assert_eq!(old.fingerprint.use_tensorrt, None);
-
-        let cuda = parse_text(&base_marker("use_tensorrt=false\n"));
-        assert_eq!(cuda.fingerprint.use_tensorrt, Some(false));
-        assert_ne!(old.fingerprint, cuda.fingerprint);
-
-        let tensorrt = parse_text(&base_marker("use_tensorrt=true\n"));
-        assert_eq!(tensorrt.fingerprint.use_tensorrt, Some(true));
-        assert_ne!(old.fingerprint, tensorrt.fingerprint);
-        assert_eq!(tensorrt, parse_text(&serialize_marker(&tensorrt)));
-    }
-
-    #[test]
-    fn new_marker_leaf_label_true_roundtrips() {
-        let m = parse_text(&base_marker(&format!("{LEAF_LABEL_KEYS}out_scores=true\n")));
-        assert!(m.fingerprint.qsearch_leaf_label);
-        assert!(m.fingerprint.out_scores);
-        assert_eq!(m.fingerprint.qsearch_max_ply, Some(20));
-        // 葉探索 NNUE のメタも fingerprint に取り込まれる（差し替え検知用）。
-        assert_eq!(m.fingerprint.qsearch_nnue_path, Some(PathBuf::from("/tmp/nn.bin")));
-        assert_eq!(m.fingerprint.qsearch_nnue_size, Some(42));
-        assert_eq!(m.fingerprint.qsearch_nnue_mtime_ns, Some(789));
-        // serialize → parse で一致（max_ply / nnue 行は leaf_label=true 時のみ出力）
-        assert_eq!(m, parse_text(&serialize_marker(&m)));
-    }
-
-    #[test]
-    fn layer_stack_leaf_routing_changes_fingerprint() {
-        let n8 = parse_text(&base_marker(&format!(
-            "{LEAF_LABEL_KEYS}qsearch_ls_bucket_mode=progresskpabs\n\
-             qsearch_ls_progress_buckets=8\n\
-             qsearch_ls_progress_coeff_path=/tmp/progress.bin\n\
-             qsearch_ls_progress_coeff_sha256=abc123\n"
-        )));
-        assert_eq!(n8.fingerprint.qsearch_ls_progress_buckets, Some(8));
-        assert_eq!(n8, parse_text(&serialize_marker(&n8)));
-
-        let n9 = parse_text(&base_marker(&format!(
-            "{LEAF_LABEL_KEYS}qsearch_ls_bucket_mode=progresskpabs\n\
-             qsearch_ls_progress_buckets=9\n\
-             qsearch_ls_progress_coeff_path=/tmp/progress.bin\n\
-             qsearch_ls_progress_coeff_sha256=abc123\n"
-        )));
-        assert_ne!(n8.fingerprint, n9.fingerprint);
-    }
-
-    #[test]
-    fn old_leaf_label_marker_without_nnue_keys_parses_as_none() {
-        // 葉探索 NNUE キーを持たない旧 leaf-label marker は parse error にせず None として読む。
-        // 現 fingerprint は Some(nnue) のため不一致になり、marker 不一致経路で再生成される。
-        let m = parse_text(&base_marker("qsearch_leaf_label=true\nqsearch_max_ply=20\n"));
-        assert!(m.fingerprint.qsearch_leaf_label);
-        assert_eq!(m.fingerprint.qsearch_max_ply, Some(20));
-        assert_eq!(m.fingerprint.qsearch_nnue_path, None);
-        assert_eq!(m.fingerprint.qsearch_nnue_size, None);
-        assert_eq!(m.fingerprint.qsearch_nnue_mtime_ns, None);
-    }
-
-    #[test]
-    fn replacement_true_roundtrips() {
-        let m = parse_text(&base_marker(
-            "qsearch_leaf_label=true\nqsearch_max_ply=16\n\
-             qsearch_nnue_path=/tmp/nn.bin\n\
-             qsearch_nnue_size=42\n\
-             qsearch_nnue_mtime_ns=789\n\
-             replacement=true\n\
-             replacement_output_path=/tmp/repl/in.psv\n\
-             replacement_output_size=320\n",
-        ));
-        assert!(m.fingerprint.replacement);
-        assert_eq!(m.fingerprint.replacement_output_path, Some(PathBuf::from("/tmp/repl/in.psv")));
-        assert_eq!(m.output_sizes.replacement_output_size, Some(320));
-        // serialize → parse で一致（replacement_* 行は replacement=true 時のみ出力）
-        assert_eq!(m, parse_text(&serialize_marker(&m)));
-    }
-
-    fn test_psv(score: i16) -> PackedSfenValue {
-        PackedSfenValue {
-            sfen: [7; 32],
-            score,
-            move16: 123,
-            game_ply: 45,
-            game_result: -1,
-            padding: 0,
-        }
-    }
-
-    pub(super) fn test_fingerprint(out_scores: bool) -> RunFingerprint {
-        let extra = if out_scores { "out_scores=true\n" } else { "" };
-        parse_text(&base_marker(extra)).fingerprint
-    }
-
-    fn sidecar_bytes(records: &[PackedSfenValue]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for record in records {
-            append_rescore_bytes(&mut bytes, record, true);
-        }
-        bytes
-    }
-
-    #[test]
-    fn in_progress_marker_roundtrips() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("scores.i16");
-        let fingerprint = test_fingerprint(true);
-
-        write_in_progress_marker(&no_protected_paths(), &output, &fingerprint).unwrap();
-
-        let parsed = parse_marker(&in_progress_marker_path_for(&output)).unwrap();
-        assert_eq!(parsed.fingerprint, fingerprint);
-        assert_eq!(parsed.output_sizes.rescore_output_size, 0);
-    }
-
-    #[test]
-    fn matching_in_progress_marker_resumes_bit_identically() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("scores.i16");
-        let fingerprint = test_fingerprint(true);
-        let complete = sidecar_bytes(&[test_psv(-5), test_psv(6), test_psv(300)]);
-
-        assert_eq!(
-            prepare_in_progress_marker(&no_protected_paths(), &output, &fingerprint, false)
-                .unwrap(),
-            Some(SidecarStartDecision::Truncate)
-        );
-        std::fs::write(&output, &complete[..2]).unwrap();
-        assert_eq!(
-            prepare_in_progress_marker(&no_protected_paths(), &output, &fingerprint, false)
-                .unwrap(),
-            Some(SidecarStartDecision::Resume)
-        );
-        assert_eq!(std::fs::read(&output).unwrap(), complete[..2]);
-
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&output)
-            .unwrap()
-            .write_all(&complete[2..])
-            .unwrap();
-        assert_eq!(std::fs::read(output).unwrap(), complete);
-    }
-
-    #[test]
-    fn mismatched_in_progress_marker_truncates_and_regenerates() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("scores.i16");
-        let fingerprint = test_fingerprint(true);
-        let complete = sidecar_bytes(&[test_psv(-5), test_psv(6), test_psv(300)]);
-
-        prepare_in_progress_marker(&no_protected_paths(), &output, &fingerprint, false).unwrap();
-        std::fs::write(&output, &complete[..2]).unwrap();
-
-        let mut changed = fingerprint.clone();
-        changed.score_clip = 9999;
-        assert_eq!(
-            prepare_in_progress_marker(&no_protected_paths(), &output, &changed, false).unwrap(),
-            Some(SidecarStartDecision::Truncate)
-        );
-        assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
-        assert_eq!(
-            parse_marker(&in_progress_marker_path_for(&output)).unwrap().fingerprint,
-            changed
-        );
-
-        std::fs::write(&output, &complete).unwrap();
-        assert_eq!(std::fs::read(output).unwrap(), complete);
-    }
-
-    #[test]
-    fn missing_in_progress_marker_truncates_existing_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("scores.i16");
-        let fingerprint = test_fingerprint(true);
-        std::fs::write(&output, sidecar_bytes(&[test_psv(-5)])).unwrap();
-
-        assert_eq!(
-            prepare_in_progress_marker(&no_protected_paths(), &output, &fingerprint, false)
-                .unwrap(),
-            Some(SidecarStartDecision::Truncate)
-        );
-        assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
-        assert!(in_progress_marker_path_for(&output).exists());
-    }
-
-    #[test]
-    fn completed_sidecar_promotes_done_and_removes_in_progress() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("scores.i16");
-        let fingerprint = test_fingerprint(true);
-        let complete = sidecar_bytes(&[test_psv(-5), test_psv(6)]);
-
-        prepare_in_progress_marker(&no_protected_paths(), &output, &fingerprint, false).unwrap();
-        std::fs::write(&output, &complete).unwrap();
-        let done = DoneMarker {
-            fingerprint: fingerprint.clone(),
-            output_sizes: OutputSizes {
-                rescore_output_size: complete.len() as u64,
-                expand_output_size: None,
-                replacement_output_size: None,
-            },
-        };
-
-        promote_score_sidecar_marker(&no_protected_paths(), &output, &done).unwrap();
-
-        assert_eq!(parse_marker(&marker_path_for(&output)).unwrap(), done);
-        assert!(!in_progress_marker_path_for(&output).exists());
-    }
-
-    #[test]
-    fn full_psv_mode_does_not_create_in_progress_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("output.psv");
-        std::fs::write(&output, [1, 2, 3]).unwrap();
-
-        assert_eq!(
-            prepare_in_progress_marker(
-                &no_protected_paths(),
-                &output,
-                &test_fingerprint(false),
-                false
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(std::fs::read(&output).unwrap(), [1, 2, 3]);
-        assert!(!in_progress_marker_path_for(&output).exists());
-    }
-
-    #[test]
-    fn changed_input_fingerprint_is_not_finalized() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("scores.i16");
-        let start = test_fingerprint(true);
-        let mut changed = start.clone();
-        changed.input_mtime_ns += 1;
-
-        prepare_in_progress_marker(&no_protected_paths(), &output, &start, false).unwrap();
-        std::fs::write(&output, [1, 2, 3, 4]).unwrap();
-        assert!(
-            reject_changed_sidecar_fingerprint(
-                &no_protected_paths(),
-                &output,
-                &start,
-                &start,
-                "during processing"
-            )
-            .is_ok()
-        );
-        let error = reject_changed_sidecar_fingerprint(
-            &no_protected_paths(),
-            &output,
-            &start,
-            &changed,
-            "during processing",
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("changed during processing"));
-        assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
-        assert!(!in_progress_marker_path_for(&output).exists());
-        assert_eq!(
-            prepare_in_progress_marker(&no_protected_paths(), &output, &start, false).unwrap(),
-            Some(SidecarStartDecision::Truncate)
-        );
-    }
-
-    #[test]
-    fn score_sidecar_matches_full_psv_score_column() {
-        let records = [test_psv(-1234), test_psv(0), test_psv(9876)];
-        let mut full = Vec::new();
-        let mut scores = Vec::new();
-        for record in &records {
-            append_rescore_bytes(&mut full, record, false);
-            append_rescore_bytes(&mut scores, record, true);
-        }
-        let extracted: Vec<u8> = full
-            .as_chunks::<{ PackedSfenValue::SIZE }>()
-            .0
-            .iter()
-            .flat_map(|record| record[32..34].iter().copied())
-            .collect();
-        assert_eq!(scores, extracted);
-    }
-
-    #[test]
-    fn score_sidecar_error_batch_keeps_clean_prefix() {
-        let mut output = Vec::new();
-        write_rescore_batch(&mut output, &[9, 8], true, 0).unwrap();
-        let error = write_rescore_batch(&mut output, &[1, 2], true, 1).unwrap_err();
-        assert!(error.to_string().contains("before writing batch"));
-        assert_eq!(output, [9, 8]);
-
-        write_rescore_batch(&mut output, &[3, 4], false, 1).unwrap();
-        assert_eq!(output, [9, 8, 3, 4]);
-    }
-
-    #[test]
-    fn sidecar_resume_rejects_partial_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let sidecar = dir.path().join("scores.i16");
-        std::fs::write(&sidecar, [0u8; 3]).unwrap();
-        let error = score_sidecar_resume_count(&sidecar).unwrap_err();
-        assert!(error.to_string().contains("Delete the .in-progress marker"));
-        assert_eq!(std::fs::metadata(sidecar).unwrap().len(), 3);
-    }
-
-    #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-    #[test]
-    fn onnx_psv_resume_consumes_skipped_input_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("normal.psv");
-        let mut pos = Position::new();
-        pos.set_sfen("4k4/9/9/9/4r4/9/9/9/4K4 b - 1").unwrap();
-        let a = PackedSfenValue {
-            sfen: pack_position(&pos),
-            ..test_psv(1)
-        }
-        .to_bytes();
-        let (_, parts) = decode_onnx_record(&a).unwrap();
-        assert!(set_onnx_root_position(&mut pos, &parts).unwrap());
-        pos.set_hirate();
-        let b = PackedSfenValue {
-            sfen: pack_position(&pos),
-            ..test_psv(2)
-        };
-        let c = PackedSfenValue {
-            game_ply: b.game_ply + 1,
-            ..b
-        }
-        .to_bytes();
-        let rescored_b = PackedSfenValue { score: 42, ..b }.to_bytes();
-        let invalid = [u8::MAX; PackedSfenValue::SIZE];
-        assert!(decode_onnx_record(&invalid).is_none());
-
-        for skipped in [vec![a], vec![a, invalid]] {
-            let process_count = skipped.len() as u64 + 2;
-            let input = skipped.into_iter().chain([b.to_bytes(), c]).flatten().collect::<Vec<_>>();
-            std::fs::write(&output, [rescored_b.as_slice(), &c[..1]].concat()).unwrap();
-            let mut reader = input.as_slice();
-            let (mut file, consumed) = prepare_onnx_psv_resume(
-                &no_protected_paths(),
-                &output,
-                &mut reader,
-                process_count,
-                true,
-            )
-            .unwrap();
-            assert_eq!(consumed, process_count - 1);
-            assert_eq!(reader, c);
-            file.write_all(reader).unwrap();
-            assert_eq!(std::fs::read(&output).unwrap(), [rescored_b, c].concat());
-        }
-    }
-
-    #[cfg(any(feature = "aobazero-onnx", feature = "dlshogi-onnx"))]
-    #[test]
-    fn onnx_psv_resume_rejects_legacy_padding_before_writing() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("normal.psv");
-        let mut pos = Position::new();
-        pos.set_hirate();
-        let first = PackedSfenValue {
-            sfen: pack_position(&pos),
-            padding: 1,
-            ..test_psv(1)
-        };
-        let marked = PackedSfenValue {
-            game_ply: first.game_ply + 1,
-            padding: 2,
-            ..first
-        };
-        let legacy = PackedSfenValue {
-            score: 42,
-            padding: 0,
-            ..marked
-        };
-        let partial = [first.to_bytes().as_slice(), &legacy.to_bytes(), &[0]].concat();
-        std::fs::write(&output, &partial).unwrap();
-        let input = [first.to_bytes(), marked.to_bytes(), marked.to_bytes()].concat();
-        let error = prepare_onnx_psv_resume(
-            &no_protected_paths(),
-            &output,
-            &mut input.as_slice(),
-            3,
-            false,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("PSV padding mismatch"), "{error}");
-        assert!(error.contains("output record 2 (input record 2)"), "{error}");
-        assert!(error.contains("Use a new output path (--output-dir)"), "{error}");
-        assert_eq!(std::fs::read(&output).unwrap(), partial);
-    }
-
-    #[test]
-    fn nnue_static_marker_keys_roundtrip() {
-        const NNUE_KEYS: &str = concat!(
-            "nnue_ls_bucket_mode=progresskpabs\n",
-            "nnue_ls_progress_buckets=9\n",
-            "nnue_ls_progress_coeff_path=/tmp/progress.bin\n",
-            "nnue_ls_progress_coeff_sha256=deadbeef\n",
-            "nnue_source_fv_scale=14\n",
-            "nnue_target_fv_scale=14\n",
-        );
-        let m = parse_text(&base_marker(NNUE_KEYS));
-        assert_eq!(m.fingerprint.nnue_ls_bucket_mode.as_deref(), Some("progresskpabs"));
-        assert_eq!(m.fingerprint.nnue_ls_progress_buckets, Some(9));
-        assert_eq!(
-            m.fingerprint.nnue_ls_progress_coeff_path,
-            Some(PathBuf::from("/tmp/progress.bin"))
-        );
-        assert_eq!(m.fingerprint.nnue_ls_progress_coeff_sha256.as_deref(), Some("deadbeef"));
-        assert_eq!(m.fingerprint.nnue_source_fv_scale, Some(14));
-        assert_eq!(m.fingerprint.nnue_target_fv_scale, Some(14));
-        assert_eq!(m, parse_text(&serialize_marker(&m)));
-    }
-
-    #[test]
-    fn old_marker_without_nnue_keys_defaults_to_none_and_mismatches_new_marker() {
-        let old = parse_text(&base_marker(""));
-        assert_eq!(old.fingerprint.nnue_ls_bucket_mode, None);
-        assert_eq!(old.fingerprint.nnue_ls_progress_buckets, None);
-        assert_eq!(old.fingerprint.nnue_ls_progress_coeff_path, None);
-        assert_eq!(old.fingerprint.nnue_ls_progress_coeff_sha256, None);
-        assert_eq!(old.fingerprint.nnue_source_fv_scale, None);
-        assert_eq!(old.fingerprint.nnue_target_fv_scale, None);
-
-        // routing 設定の差は fingerprint 不一致 → 再生成側に倒れる。
-        let with_keys = parse_text(&base_marker("nnue_ls_progress_buckets=8\n"));
-        assert_ne!(old.fingerprint, with_keys.fingerprint);
-    }
-
-    #[test]
-    fn progress_routing_bucket_mismatch_is_rejected_without_override() {
-        // 未指定は configure_layer_stack_routing 側の explicit 必須検査に委ねる。
-        assert!(validate_progress_routing_buckets(None, 9, false).is_ok());
-        assert!(validate_progress_routing_buckets(Some(9), 9, false).is_ok());
-
-        // 9-bucket net への 8 指定 (無警告の誤 routing を生んでいた組合せ) は拒否。
-        let err = validate_progress_routing_buckets(Some(8), 9, false).unwrap_err().to_string();
-        assert!(err.contains("stored bucket count 9"), "{err}");
-        assert!(err.contains("--allow-routing-buckets-mismatch"), "{err}");
-
-        // 旧世代 (格納 9 / routing 8) net は override flag で警告付きに通す。
-        assert!(validate_progress_routing_buckets(Some(8), 9, true).is_ok());
-    }
-
-    /// record 番号から一意な入力 score を作る (順序検証用。線形なので重複しない)。
-    fn pipeline_input_score(i: u64) -> i16 {
-        (i as i16) * 3 - 11
-    }
-
-    /// 統合テスト用の record 評価: score を 2 倍にした PSV を返す (NNUE 非依存)。
-    fn pipeline_double_score(record: &[u8; PackedSfenValue::SIZE]) -> ProcessResult {
-        let psv = PackedSfenValue::from_bytes(record).expect("test record must parse");
-        let doubled = PackedSfenValue {
-            score: psv.score.wrapping_mul(2),
-            ..psv
-        };
-        ProcessResult::Ok(doubled.to_bytes(), false)
-    }
-
-    /// fingerprint のモデル識別情報はロード時に固定した [`NnueScoresIdentity`] から
-    /// 来る: 実ファイルを後から差し替えても fingerprint は変わらず、差し替え自体は
-    /// `verify_unchanged` が検出する。
-    #[test]
-    fn nnue_identity_is_fixed_at_capture_and_swap_is_detected() {
-        let dir = tempfile::tempdir().unwrap();
-        let nnue = dir.path().join("nn.bin");
-        std::fs::write(&nnue, b"model v1").unwrap();
-        let coeff = dir.path().join("progress.bin");
-        let coeff_bytes = b"coeff v1 bytes".to_vec();
-        std::fs::write(&coeff, &coeff_bytes).unwrap();
-        let loaded_sha = format!("{:x}", Sha256::digest(&coeff_bytes));
-
-        let input = dir.path().join("in.psv");
-        std::fs::write(&input, test_psv(1).to_bytes()).unwrap();
-        let out_dir = dir.path().join("scores");
-        std::fs::create_dir_all(&out_dir).unwrap();
-        let cli = Cli::try_parse_from([
-            "rescore_psv",
-            "--input",
-            input.to_str().unwrap(),
-            "--output-dir",
-            out_dir.to_str().unwrap(),
-            "--nnue",
-            nnue.to_str().unwrap(),
-            "--ls-progress-coeff",
-            coeff.to_str().unwrap(),
-            "--out-scores",
-        ])
-        .unwrap();
-
-        let identity =
-            NnueScoresIdentity::capture(&nnue, Some((&coeff, loaded_sha.clone()))).unwrap();
-        identity.verify_unchanged().expect("unchanged files must verify");
-        let fp1 = build_nnue_scores_fingerprint(&cli, &identity, &input, 1).unwrap();
-        assert_eq!(fp1.model_size, 8, "size of the loaded model v1");
-        assert_eq!(fp1.nnue_ls_progress_coeff_sha256.as_deref(), Some(loaded_sha.as_str()));
-
-        // モデルと係数を別内容 (別サイズ) に差し替えても fingerprint は固定値のまま。
-        std::fs::write(&nnue, b"model v2 with a different size").unwrap();
-        std::fs::write(&coeff, b"swapped coefficients v2").unwrap();
-        let fp2 = build_nnue_scores_fingerprint(&cli, &identity, &input, 1).unwrap();
-        assert_eq!(fp1, fp2, "identity fields must not re-stat the files");
-
-        // 差し替えは stat 検証が硬いエラーで検出する。
-        let err = identity.verify_unchanged().expect_err("swapped model must be detected");
-        assert!(err.to_string().contains("changed while rescoring"), "{err}");
-    }
-
-    /// [`run_nnue_scores_pipeline`] の統合テスト: 小 chunk で順序保存・chunk 境界・
-    /// 最終端数・エラー chunk の fail-closed prefix・件数 resume を一気に固定する。
-    #[test]
-    fn nnue_scores_pipeline_preserves_order_and_resumes_after_error_chunk() {
-        let dir = tempfile::tempdir().unwrap();
-        let n: u64 = 25;
-        let input = dir.path().join("in.psv");
-        let mut input_bytes = Vec::new();
-        for i in 0..n {
-            input_bytes.extend_from_slice(&test_psv(pipeline_input_score(i)).to_bytes());
-        }
-        std::fs::write(&input, &input_bytes).unwrap();
-        // fingerprint は NNUE の path/size/mtime しか見ないため中身は任意でよい。
-        let nnue = dir.path().join("nn.bin");
-        std::fs::write(&nnue, b"not a real net").unwrap();
-        let out_dir = dir.path().join("scores");
-        std::fs::create_dir_all(&out_dir).unwrap();
-        let output = out_dir.join("in.psv.scores.i16");
-
-        let cli = Cli::try_parse_from([
-            "rescore_psv",
-            "--input",
-            input.to_str().unwrap(),
-            "--output-dir",
-            out_dir.to_str().unwrap(),
-            "--nnue",
-            nnue.to_str().unwrap(),
-            "--out-scores",
-        ])
-        .unwrap();
-        let identity = NnueScoresIdentity::capture(&nnue, None).unwrap();
-        let mut expected = Vec::new();
-        for i in 0..n {
-            expected.extend_from_slice(&pipeline_input_score(i).wrapping_mul(2).to_le_bytes());
-        }
-        let mprog = MultiFileProgress::new(3 * n, 3, "test");
-
-        // chunk_size 4 / 25 records = 満杯 6 chunk + 端数 1 record。sidecar は入力順の
-        // 期待値と bit 一致し、`.done` へ昇格して in-progress marker は消える。
-        let input_pathbuf = input.clone();
-        run_nnue_scores_pipeline(
-            &no_protected_paths(),
-            &cli,
-            &identity,
-            &input_pathbuf,
-            &output,
-            n,
-            &mprog.start_file("full", 1, n),
-            4,
-            &pipeline_double_score,
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), expected);
-        assert!(marker_path_for(&output).exists());
-        assert!(!in_progress_marker_path_for(&output).exists());
-
-        // 作り直し: record 10 (chunk 2 = record 8..12 に含まれる) がエラーになる評価で
-        // 流すと、chunk 0..=1 の 8 records だけが書かれた時点で fail-closed に停止し、
-        // 既存 prefix は行対応を保つ。in-progress marker は残り `.done` は無い。
-        std::fs::remove_file(marker_path_for(&output)).unwrap();
-        std::fs::remove_file(&output).unwrap();
-        let error_score = pipeline_input_score(10);
-        let inject_error = move |record: &[u8; PackedSfenValue::SIZE]| -> ProcessResult {
-            let psv = PackedSfenValue::from_bytes(record).expect("test record must parse");
-            if psv.score == error_score {
-                return ProcessResult::Error(anyhow::anyhow!("injected failure"));
-            }
-            pipeline_double_score(record)
-        };
-        let err = run_nnue_scores_pipeline(
-            &no_protected_paths(),
-            &cli,
-            &identity,
-            &input_pathbuf,
-            &output,
-            n,
-            &mprog.start_file("error", 2, n),
-            4,
-            &inject_error,
-        )
-        .expect_err("a chunk containing an error must abort before writing");
-        assert!(err.to_string().contains("score sidecar aborted"), "{err}");
-        let partial = std::fs::read(&output).unwrap();
-        assert_eq!(partial, expected[..8 * 2], "prefix must stay row-aligned");
-        assert!(!marker_path_for(&output).exists());
-        assert!(in_progress_marker_path_for(&output).exists());
-
-        // 件数 resume: fingerprint 一致の in-progress marker が残っているので record 8
-        // から追記され、最終 sidecar は一気通貫実行と bit 一致して `.done` へ昇格する。
-        run_nnue_scores_pipeline(
-            &no_protected_paths(),
-            &cli,
-            &identity,
-            &input_pathbuf,
-            &output,
-            n,
-            &mprog.start_file("resume", 3, n),
-            4,
-            &pipeline_double_score,
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), expected);
-        assert!(marker_path_for(&output).exists());
-        assert!(!in_progress_marker_path_for(&output).exists());
-    }
-
-    #[test]
-    fn sidecar_resume_seek_preserves_record_alignment() {
-        let mut input = Vec::new();
-        for score in [-5, 6, 300] {
-            input.extend_from_slice(&test_psv(score).to_bytes());
-        }
-        let mut cursor = std::io::Cursor::new(input);
-        assert_eq!(seek_to_record(&mut cursor, 2).unwrap(), 2 * PackedSfenValue::SIZE as u64);
-        let mut record = [0u8; PackedSfenValue::SIZE];
-        cursor.read_exact(&mut record).unwrap();
-        assert_eq!(PackedSfenValue::from_bytes(&record).unwrap().score, 300);
-        assert!(seek_to_record(&mut cursor, u64::MAX).is_err());
-    }
-}
-
-#[cfg(test)]
-mod onnx_gpu_ids_tests {
-    use super::*;
-
-    fn parse_cli_gpu_ids(value: Option<&str>) -> std::result::Result<OnnxGpuIds, clap::Error> {
-        let mut args = vec!["rescore_psv", "--input", "in.psv", "--output-dir", "out"];
-        if let Some(value) = value {
-            args.extend(["--onnx-gpu-id", value]);
-        }
-        Cli::try_parse_from(args).map(|cli| cli.onnx_gpu_id)
-    }
-
-    #[test]
-    fn single_ids_keep_existing_meaning() {
-        assert_eq!(parse_cli_gpu_ids(None).unwrap(), OnnxGpuIds(vec![0]));
-        assert_eq!(parse_cli_gpu_ids(Some("1")).unwrap(), OnnxGpuIds(vec![1]));
-        let cpu = parse_cli_gpu_ids(Some("-1")).unwrap();
-        assert!(cpu.is_cpu());
-        assert_eq!(cpu.to_string(), "-1");
-        assert!(!OnnxGpuIds(vec![0]).is_cpu());
-    }
-
-    #[test]
-    fn comma_separated_ids_keep_order_and_duplicates() {
-        assert_eq!(parse_onnx_gpu_ids("0,1").unwrap(), OnnxGpuIds(vec![0, 1]));
-        assert_eq!(parse_onnx_gpu_ids(" 1, 0 ").unwrap(), OnnxGpuIds(vec![1, 0]));
-        let same_gpu = parse_cli_gpu_ids(Some("0,0")).unwrap();
-        assert_eq!(same_gpu, OnnxGpuIds(vec![0, 0]));
-        assert_eq!(same_gpu.to_string(), "0,0");
-    }
-
-    #[test]
-    fn malformed_ids_are_rejected() {
-        for value in ["", "0,", ",1", "a", "0;1", "-2", "-1,0", "0,-1"] {
-            assert!(parse_onnx_gpu_ids(value).is_err(), "{value:?} must be rejected");
-        }
-        assert!(parse_cli_gpu_ids(Some("-1,0")).is_err());
-    }
-}
-
-#[cfg(all(test, any(feature = "aobazero-onnx", feature = "dlshogi-onnx")))]
-mod onnx_sessions_tests {
-    use super::*;
-
-    #[test]
-    fn sessions_are_listed_round_by_round_with_leaders_first() {
-        assert_eq!(session_gpu_ids(&[0], 2), vec![0, 0]);
-        assert_eq!(warmup_leader_count(&[0]), 1);
-        assert_eq!(session_gpu_ids(&[0, 1], 2), vec![0, 1, 0, 1]);
-        assert_eq!(warmup_leader_count(&[0, 1]), 2);
-        assert_eq!(session_gpu_ids(&[0, 0], 1), vec![0, 0]);
-        assert_eq!(session_gpu_ids(&[-1], 4), vec![-1]);
-        assert_eq!(warmup_leader_count(&[-1]), 1);
-    }
-
-    #[test]
-    fn reorder_releases_results_in_sequence_order() {
-        let mut reorder = SeqReorder::new();
-        reorder.insert(2, "c");
-        reorder.insert(1, "b");
-        assert_eq!(reorder.pop_next(), None);
-        reorder.insert(0, "a");
-        assert_eq!(reorder.pop_next(), Some("a"));
-        assert_eq!(reorder.pop_next(), Some("b"));
-        assert_eq!(reorder.pop_next(), Some("c"));
-        assert_eq!(reorder.pop_next(), None);
-    }
-
-    #[test]
-    fn warmup_followers_do_not_advance_the_turn_counter() {
-        let gate = WarmupGate::new(1);
-        drop(gate.wait(0));
-        assert_eq!(*gate.finished.lock().unwrap(), 1);
-        assert!(gate.wait(1).is_none());
-        assert!(gate.wait(3).is_none());
-        assert_eq!(*gate.finished.lock().unwrap(), 1);
-    }
-
-    /// 模擬の writer: `SeqReorder` で並べ直し、`Err` か `fail_at` の番号で止まる
-    /// (実パイプラインの writer と同じく、止まると受け口を閉じる)。
-    fn simulated_writer(
-        done_rx: mpsc::Receiver<(u64, Result<u64>)>,
-        fail_at: Option<u64>,
-    ) -> Result<Vec<u64>> {
-        let mut reorder = SeqReorder::new();
-        let mut written = Vec::new();
-        for (seq, done) in done_rx {
-            reorder.insert(seq, done?);
-            while let Some(value) = reorder.pop_next() {
-                if Some(value) == fail_at {
-                    anyhow::bail!("simulated write error at {value}");
-                }
-                written.push(value);
-            }
-        }
-        Ok(written)
-    }
-
-    /// `drive_pull_worker` を worker ごとのスレッドで回す。`process` は (worker, seq) を受け取る。
-    fn run_simulated_pipeline(
-        workers: usize,
-        leaders: usize,
-        batches: u64,
-        fail_write_at: Option<u64>,
-        process: impl Fn(usize, u64) -> (Result<u64>, bool) + Sync,
-    ) -> Result<Vec<u64>> {
-        let (ready_tx, ready_rx) = mpsc::channel::<(u64, u64)>();
-        for seq in 0..batches {
-            ready_tx.send((seq, seq)).unwrap();
-        }
-        drop(ready_tx);
-        let ready_rx = Mutex::new(ready_rx);
-        let (done_tx, done_rx) = mpsc::channel::<(u64, Result<u64>)>();
-        let gate = WarmupGate::new(leaders);
-        thread::scope(|scope| {
-            for worker in 0..workers {
-                let done_tx = done_tx.clone();
-                let (ready_rx, gate, process) = (&ready_rx, &gate, &process);
-                scope.spawn(move || {
-                    let turn = gate.wait(worker);
-                    drive_pull_worker(turn, ready_rx, &done_tx, |seq| process(worker, seq));
-                });
-            }
-            drop(done_tx);
-            simulated_writer(done_rx, fail_write_at)
-        })
-    }
-
-    #[test]
-    fn simulated_pull_workers_serialize_first_batches_and_restore_order() {
-        use std::time::Duration;
-        // worker 0, 1 が先導役 (GPU 2 枚の各 1 本目)、worker 2, 3 が 2 本目。各 worker は
-        // バッチを取ったことを知らせ、テストが許すまで結果を返さない。
-        const WORKERS: usize = 4;
-        let (took_tx, took_rx) = mpsc::channel::<(usize, u64)>();
-        let took_tx = Mutex::new(took_tx);
-        let (release_txs, release_rxs): (Vec<_>, Vec<_>) =
-            (0..WORKERS).map(|_| mpsc::channel::<()>()).unzip();
-        let release_rxs: Vec<Mutex<mpsc::Receiver<()>>> =
-            release_rxs.into_iter().map(Mutex::new).collect();
-        let quiet = |took_rx: &mpsc::Receiver<(usize, u64)>| {
-            assert!(took_rx.recv_timeout(Duration::from_millis(50)).is_err());
-        };
-        let next_took = |took_rx: &mpsc::Receiver<(usize, u64)>| {
-            took_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("expected a worker to take a batch")
-        };
-        let took_by = |took_rx: &mpsc::Receiver<(usize, u64)>, n: usize| {
-            let mut took: Vec<(usize, u64)> = (0..n).map(|_| next_took(took_rx)).collect();
-            took.sort();
-            took
-        };
-
-        let written = thread::scope(|scope| {
-            // assertion が失敗して unwind したときも送信側を drop し、待っている worker を
-            // recv の失敗で抜けさせる (scope の join で止まらないように)。
-            let release_txs = release_txs;
-            let pipeline = scope.spawn(|| {
-                run_simulated_pipeline(WORKERS, 2, 6, None, |worker, seq| {
-                    took_tx.lock().unwrap().send((worker, seq)).unwrap();
-                    release_rxs[worker].lock().unwrap().recv().unwrap();
-                    (Ok(seq), false)
-                })
-            });
-            // 最初は先導役 0 だけが取る。
-            assert_eq!(next_took(&took_rx), (0, 0));
-            quiet(&took_rx);
-            release_txs[0].send(()).unwrap();
-            // 先導役 0 が終えると先導役 1 の番。2 本目の worker はまだ取らない。
-            let took = took_by(&took_rx, 2);
-            assert_eq!(took.iter().map(|&(w, _)| w).collect::<Vec<_>>(), vec![0, 1]);
-            let mut seqs: Vec<u64> = took.iter().map(|&(_, seq)| seq).collect();
-            seqs.sort();
-            assert_eq!(seqs, vec![1, 2]);
-            quiet(&took_rx);
-            // 先導役 1 が終えると全員が取る (先導役 0 はまだ 2 個目を保持中)。
-            release_txs[1].send(()).unwrap();
-            let took = took_by(&took_rx, 3);
-            assert_eq!(took.iter().map(|&(w, _)| w).collect::<Vec<_>>(), vec![1, 2, 3]);
-            // 後から取ったバッチから先に返し、writer が通し番号順に並べ直すことを見る。
-            for worker in [3, 2, 1, 0] {
-                release_txs[worker].send(()).unwrap();
-            }
-            pipeline.join().unwrap()
-        })
-        .unwrap();
-        assert_eq!(written, (0..6).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn simulated_pipeline_ends_when_batches_are_fewer_than_leaders() {
-        let written = run_simulated_pipeline(4, 3, 1, None, |_, seq| (Ok(seq), false)).unwrap();
-        assert_eq!(written, vec![0]);
-        let written = run_simulated_pipeline(3, 2, 0, None, |_, seq| (Ok(seq), false)).unwrap();
-        assert!(written.is_empty());
-    }
-
-    #[test]
-    fn simulated_pipeline_ends_at_eof_sentinel() {
-        // 最後のバッチ (sentinel) を処理した worker は抜け、他は受け口が閉じて抜ける。
-        let written = run_simulated_pipeline(3, 2, 5, None, |_, seq| (Ok(seq), seq == 4)).unwrap();
-        assert_eq!(written, (0..5).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn simulated_pipeline_propagates_leader_first_batch_error() {
-        let err = run_simulated_pipeline(3, 2, 20, None, |worker, seq| {
-            if worker == 0 && seq == 0 {
-                (Err(anyhow::anyhow!("leader failed")), false)
-            } else {
-                (Ok(seq), false)
-            }
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("leader failed"), "{err}");
-    }
-
-    #[test]
-    fn simulated_pipeline_stops_workers_when_writer_fails() {
-        let err = run_simulated_pipeline(4, 2, 50, Some(3), |_, seq| (Ok(seq), false)).unwrap_err();
-        assert!(err.to_string().contains("simulated write error at 3"), "{err}");
-    }
-
-    #[test]
-    fn replaced_model_discards_output_so_next_run_starts_over() {
-        let dir = tempfile::tempdir().unwrap();
-        let model = dir.path().join("model.onnx");
-        let input = dir.path().join("in.psv");
-        std::fs::write(&model, b"weights-a").unwrap();
-        std::fs::write(&input, b"").unwrap();
-        let loaded = OnnxModelIdentity::capture(&model).unwrap();
-        let protection = OutputProtection {
-            inputs: vec![model.clone(), input.clone()],
-            outputs: Vec::new(),
-        };
-
-        // 置き換わっていなければ出力を残す (中断後に続きから再開できる)。
-        let psv = dir.path().join("out.psv");
-        std::fs::write(&psv, [1, 2, 3]).unwrap();
-        discard_output_if_model_changed(&protection, &loaded, &model, &input, &psv, false).unwrap();
-        assert_eq!(std::fs::read(&psv).unwrap(), [1, 2, 3]);
-
-        let scores = dir.path().join("out.scores.i16");
-        let start = marker_tests::test_fingerprint(true);
-        prepare_in_progress_marker(&protection, &scores, &start, false).unwrap();
-        std::fs::write(&scores, [1, 2, 3, 4]).unwrap();
-
-        std::fs::write(&model, b"weights-bb").unwrap();
-        let error =
-            discard_output_if_model_changed(&protection, &loaded, &model, &input, &psv, false)
-                .unwrap_err();
-        assert!(format!("{error:#}").contains("ONNX model file changed"));
-        assert_eq!(std::fs::metadata(&psv).unwrap().len(), 0);
-
-        discard_output_if_model_changed(&protection, &loaded, &model, &input, &scores, true)
-            .unwrap_err();
-        assert_eq!(std::fs::metadata(&scores).unwrap().len(), 0);
-        assert!(!in_progress_marker_path_for(&scores).exists());
-        assert_eq!(
-            prepare_in_progress_marker(&protection, &scores, &start, false).unwrap(),
-            Some(SidecarStartDecision::Truncate)
-        );
-
-        // モデルが消えていると出力保護の検査で空にできないので、消すべき出力を案内する。
-        std::fs::write(&psv, [1, 2, 3]).unwrap();
-        std::fs::remove_file(&model).unwrap();
-        let error =
-            discard_output_if_model_changed(&protection, &loaded, &model, &input, &psv, false)
-                .unwrap_err();
-        assert!(format!("{error:#}").contains("could not discard the output"));
-        assert_eq!(std::fs::read(&psv).unwrap(), [1, 2, 3]);
-    }
-
-    #[test]
-    fn model_identity_detects_replaced_model_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let model = dir.path().join("model.onnx");
-        std::fs::write(&model, b"weights-a").unwrap();
-        let loaded = OnnxModelIdentity::capture(&model).unwrap();
-        loaded.ensure_unchanged(&model).unwrap();
-
-        // 同じサイズの別の重みに置き換わっても、mtime の違いで止める。
-        let modified = std::fs::metadata(&model).unwrap().modified().unwrap();
-        std::fs::write(&model, b"weights-b").unwrap();
-        File::options()
-            .write(true)
-            .open(&model)
-            .unwrap()
-            .set_modified(modified + std::time::Duration::from_secs(1))
-            .unwrap();
-        assert!(loaded.ensure_unchanged(&model).is_err());
-
-        // サイズが変わっても止める。
-        std::fs::write(&model, b"weights-longer").unwrap();
-        assert!(loaded.ensure_unchanged(&model).is_err());
-    }
-
-    #[test]
-    fn model_identity_matches_marker_fingerprint_until_model_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let model = dir.path().join("model.onnx");
-        let input = dir.path().join("input.psv");
-        let output = dir.path().join("output.psv");
-        std::fs::write(&model, b"weights").unwrap();
-        std::fs::write(&input, [0u8; PackedSfenValue::SIZE]).unwrap();
-        let config = OnnxPipelineConfig {
-            model_name: "dlshogi",
-            model_kind: "dlshogi",
-            onnx_path: &model,
-            input_path: &input,
-            output_path: &output,
-            out_scores: false,
-            process_count: 1,
-            batch_size: 1024,
-            gpu_ids: &[-1],
-            sessions: 1,
-            use_tensorrt: false,
-            tensorrt_cache: None,
-            score_clip: 10000,
-            eval_scale: 600.0,
-            skip_in_check: false,
-            onnx_draw_ply: 0,
-            f1_size: 0,
-            f2_size: 0,
-            input1_channels: 0,
-            input2_channels: 0,
-            profile_path: None,
-            expand: None,
-            qsearch_leaf_label: false,
-            qsearch_max_ply: 16,
-            qsearch_nnue_path: None,
-            qsearch_ls_bucket_mode: None,
-            qsearch_ls_progress_buckets: None,
-            qsearch_ls_progress_coeff_path: None,
-            replacement_output: None,
-        };
-        let loaded = OnnxModelIdentity::capture(&model).unwrap();
-        assert!(loaded.matches(&build_run_fingerprint(&config).unwrap()));
-
-        std::fs::write(&model, b"weights-v2").unwrap();
-        assert!(!loaded.matches(&build_run_fingerprint(&config).unwrap()));
-    }
-}
-
-#[cfg(test)]
-mod search_pipeline_tests {
-    use super::*;
-    use rand::{Rng, SeedableRng};
-    use rand_chacha::ChaCha8Rng;
-    use rshogi_core::movegen::{MoveList, generate_legal};
-
-    #[test]
-    fn search_preserves_tree_sample_padding_with_or_without_bestmove() {
-        rshogi_core::eval::material::set_material_level(
-            rshogi_core::eval::material::MaterialLevel::Lv1,
-        );
-        let mut pos = Position::new();
-        pos.set_hirate();
-        let mut search = Search::new(1);
-        search.set_num_threads(1);
-
-        for (padding, rewritten_padding) in [(2, 2), (3, 2), (0x83, 2), (1, 0)] {
-            let input = PackedSfenValue {
-                sfen: pack_position(&pos),
-                score: 0,
-                move16: u16::MAX,
-                game_ply: 1,
-                game_result: 0,
-                padding,
-            };
-            for emit_bestmove in [false, true] {
-                let ProcessResult::Ok(bytes, _) = process_record_with_search(
-                    &input.to_bytes(),
-                    &mut search,
-                    1,
-                    0,
-                    0,
-                    10000,
-                    false,
-                    1,
-                    1,
-                    emit_bestmove,
-                ) else {
-                    panic!("expected a rescored record");
-                };
-                let output = PackedSfenValue::from_bytes(&bytes).unwrap();
-                if emit_bestmove {
-                    assert_ne!(output.move16, input.move16);
-                    assert_eq!(output.padding, rewritten_padding);
-                } else {
-                    assert_eq!(output.move16, input.move16);
-                    assert_eq!(output.padding, padding);
-                }
-            }
-        }
-    }
-
-    fn indexed_record(i: u16) -> [u8; PackedSfenValue::SIZE] {
-        PackedSfenValue {
-            sfen: [0; 32],
-            score: i as i16,
-            move16: i,
-            game_ply: 1,
-            game_result: 0,
-            padding: 0,
-        }
-        .to_bytes()
-    }
-
-    /// 平手から乱数で指し進めた局面の PSV 列。
-    fn random_positions(seed: u64, count: usize) -> Vec<u8> {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let mut input = Vec::new();
-        while input.len() < count * PackedSfenValue::SIZE {
-            let mut pos = Position::new();
-            pos.set_hirate();
-            for _ in 0..rng.random_range(0..60) {
-                let mut moves = MoveList::new();
-                generate_legal(&pos, &mut moves);
-                if moves.is_empty() {
-                    break;
-                }
-                let m = moves.as_slice()[rng.random_range(0..moves.len())];
-                let gives_check = pos.gives_check(m);
-                pos.do_move(m, gives_check);
-            }
-            let psv = PackedSfenValue {
-                sfen: pack_position(&pos),
-                score: 0,
-                move16: 0,
-                game_ply: 1,
-                game_result: 0,
-                padding: 0,
-            };
-            input.extend_from_slice(&psv.to_bytes());
-        }
-        input
-    }
-
-    fn run<S>(input: &[u8], config: &SearchPipeline<'_, S>) -> (Vec<u8>, SearchCounts) {
-        let mut reader = std::io::Cursor::new(input);
-        let mut output = Vec::new();
-        let counts = run_search_pipeline(&mut reader, &mut output, config).unwrap();
-        (output, counts)
-    }
-
-    /// 重さがばらつき、塊・窓が小さくても、出力は入力順で Skip だけが抜ける。
-    #[test]
-    fn writes_in_input_order_with_uneven_work() {
-        let n = 200u16;
-        let input: Vec<u8> = (0..n).flat_map(indexed_record).collect();
-        let expected: Vec<u8> =
-            (0..n).filter(|i| !i.is_multiple_of(11)).flat_map(indexed_record).collect();
-        let process = |_: &mut (), record: &[u8; PackedSfenValue::SIZE]| {
-            let i = PackedSfenValue::from_bytes(record).unwrap().move16;
-            std::thread::sleep(std::time::Duration::from_micros(u64::from(i % 7) * 300));
-            if i.is_multiple_of(11) {
-                ProcessResult::Skip
-            } else {
-                ProcessResult::Ok(*record, false)
-            }
-        };
-        for (threads, block, window, limit) in [(1, 1, 1, 200), (3, 2, 4, 200), (8, 5, 10, 137)] {
-            let (output, counts) = run(
-                &input,
-                &SearchPipeline {
-                    process_count: limit,
-                    num_threads: threads,
-                    block_records: block,
-                    window_records: window,
-                    make_state: &|| (),
-                    start_block: &|_| {},
-                    process: &process,
-                    on_record: &|| {},
-                },
-            );
-            let kept = (0..limit as u16).filter(|i| !i.is_multiple_of(11)).count();
-            assert_eq!(output, expected[..kept * PackedSfenValue::SIZE], "threads={threads}");
-            assert_eq!(counts.read, limit);
-            assert_eq!(counts.written + counts.skipped, limit);
-        }
-    }
-
-    /// 先頭の塊が書き出されるまで、window を超える位置の局面は配られない（スレッド数が多くても）。
-    #[test]
-    fn does_not_dispatch_beyond_window_before_first_block_is_written() {
-        let input: Vec<u8> = (0..60u16).flat_map(indexed_record).collect();
-        let first_done = AtomicBool::new(false);
-        let started_in_window = AtomicU64::new(0);
-        let process = |_: &mut (), record: &[u8; PackedSfenValue::SIZE]| {
-            let i = PackedSfenValue::from_bytes(record).unwrap().move16;
-            if i == 0 {
-                // window 内のもう 1 塊（5〜9）が全部処理を始め、空いたワーカーが次を取りに
-                // 行くまで先頭の塊を終わらせない。
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while started_in_window.load(Ordering::SeqCst) < 5
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::yield_now();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                first_done.store(true, Ordering::SeqCst);
-            } else if (5..10).contains(&i) {
-                started_in_window.fetch_add(1, Ordering::SeqCst);
-            } else if i >= 10 {
-                assert!(first_done.load(Ordering::SeqCst), "record {i} dispatched past window");
-            }
-            ProcessResult::Ok(*record, false)
-        };
-        let (output, counts) = run(
-            &input,
-            &SearchPipeline {
-                process_count: 60,
-                num_threads: 8,
-                block_records: 5,
-                window_records: 10,
-                make_state: &|| (),
-                start_block: &|_| {},
-                process: &process,
-                on_record: &|| {},
-            },
-        );
-        assert_eq!(output, input);
-        assert_eq!(counts.written, 60);
-    }
-
-    /// 塊の先頭で探索状態を初期化するので、同じ入力と塊の大きさなら、実行ごと・スレッド数に
-    /// よらず出力が bit 一致する。
-    #[test]
-    fn search_output_is_identical_across_runs_and_thread_counts() {
-        rshogi_core::eval::material::set_material_level(
-            rshogi_core::eval::material::MaterialLevel::Lv1,
-        );
-        let input = random_positions(2026, 40);
-        let search_output = |threads: usize| {
-            run(
-                &input,
-                &SearchPipeline {
-                    process_count: u64::MAX,
-                    num_threads: threads,
-                    block_records: 3,
-                    window_records: 8,
-                    make_state: &|| {
-                        let mut search = Search::new(1);
-                        search.set_num_threads(1);
-                        search
-                    },
-                    start_block: &|search: &mut Search| search.reset_to_fresh_state(),
-                    process: &|search: &mut Search, record: &[u8; PackedSfenValue::SIZE]| {
-                        process_record_with_search(
-                            record, search, 6, 0, 0, 10000, false, 1, 1, true,
-                        )
-                    },
-                    on_record: &|| {},
-                },
-            )
-        };
-        let (base, counts) = search_output(1);
-        assert_eq!(counts.written, 40);
-        let scores: std::collections::BTreeSet<i16> = base
-            .as_chunks::<{ PackedSfenValue::SIZE }>()
-            .0
-            .iter()
-            .map(|r| PackedSfenValue::from_bytes(r).unwrap().score)
-            .collect();
-        assert!(scores.len() > 1, "search must produce varied labels");
-        for threads in [1, 4, 4, 7] {
-            assert_eq!(search_output(threads).0, base, "threads={threads}");
-        }
-    }
+    process_file_with_onnx_pipeline(&config, |pos, f1, f2, _psv| {
+        make_input_features(pos, f1, f2);
+    })
 }

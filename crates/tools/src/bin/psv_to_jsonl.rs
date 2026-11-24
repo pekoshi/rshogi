@@ -27,8 +27,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tools::output_path::ensure_safe_output_path;
-use tools::packed_sfen::{PackedSfenValue, psv_move16_to_usi, unpack_sfen};
+use tools::packed_sfen::{PackedSfenValue, move16_to_usi, unpack_sfen};
 
 #[derive(Parser)]
 #[command(
@@ -84,7 +83,6 @@ fn main() -> Result<()> {
     if !cli.input.exists() {
         anyhow::bail!("Input file not found: {}", cli.input.display());
     }
-    ensure_safe_output_path(&cli.output, &cli.input)?;
 
     // Ctrl-Cハンドラを設定
     ctrlc::set_handler(|| {
@@ -182,7 +180,7 @@ fn main() -> Result<()> {
         };
 
         // Move16をUSI形式に変換
-        let best_move = psv_move16_to_usi(psv.move16);
+        let best_move = move16_to_usi(psv.move16);
 
         // TrainingRecordを作成
         let record = TrainingRecord {

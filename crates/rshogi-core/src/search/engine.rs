@@ -5,26 +5,26 @@
 use crate::eval::EvalHash;
 use crate::time::Instant;
 use std::collections::HashMap;
+// AtomicU64 is only needed for native multi-threaded builds.
+// Wasm Rayon model doesn't use SearchProgress.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
-use super::numa::{NumaPlan, NumaReplicas, NumaTopology};
 use super::time_manager::{
     DEFAULT_MAX_MOVES_TO_DRAW, calculate_falling_eval, calculate_time_reduction,
     normalize_nodes_effort,
 };
 use super::{
-    DEFAULT_DRAW_VALUE_BLACK, DEFAULT_DRAW_VALUE_WHITE, LimitsType, NumaPolicy, RootMove,
-    SearchTuneParams, SearchWorker, SharedHistories, Skill, SkillOptions, ThreadPool,
-    TimeManagement,
+    DEFAULT_DRAW_VALUE_BLACK, DEFAULT_DRAW_VALUE_WHITE, LimitsType, RootMove, SearchTuneParams,
+    SearchWorker, Skill, SkillOptions, ThreadPool, TimeManagement,
 };
-use crate::movegen::{MoveList, generate_legal_all_with_pass};
 use crate::position::Position;
 use crate::tt::TranspositionTable;
-use crate::types::{Bound, Depth, EnteringKingRule, MAX_PLY, Move, Value};
+use crate::types::{Depth, EnteringKingRule, MAX_PLY, Move, Value};
 
 // =============================================================================
 // SearchInfo - 探索情報（USI info出力用）
@@ -39,8 +39,6 @@ pub struct SearchInfo {
     pub sel_depth: i32,
     /// 最善手のスコア
     pub score: Value,
-    /// `score` の種類。探索窓の外で返った値は下界・上界になる
-    pub bound: Bound,
     /// 探索ノード数
     pub nodes: u64,
     /// 経過時間（ミリ秒）
@@ -49,7 +47,7 @@ pub struct SearchInfo {
     pub nps: u64,
     /// 置換表使用率（千分率）
     pub hashfull: u32,
-    /// Principal Variation（Search::go が公開する値は合法な接頭列。不正な続きは省略）
+    /// Principal Variation
     pub pv: Vec<Move>,
     /// MultiPV番号（1-indexed）
     pub multi_pv: usize,
@@ -71,11 +69,6 @@ impl SearchInfo {
             } else {
                 format!("cp {}", self.score.to_cp())
             };
-        let score_str = match self.bound {
-            Bound::Lower => format!("{score_str} lowerbound"),
-            Bound::Upper => format!("{score_str} upperbound"),
-            Bound::Exact | Bound::None => score_str,
-        };
 
         let mut s = format!(
             "info depth {depth} seldepth {sel_depth} multipv {multi_pv} score {score} nodes {nodes} time {time_ms} nps {nps} hashfull {hashfull}",
@@ -138,6 +131,28 @@ fn proven_mate_depth_exceeded(best_value: Value, depth: Depth) -> bool {
     false
 }
 
+/// `go mate` 指定時に、要求手数以内の詰みが見つかったか判定する
+#[inline]
+fn mate_within_limit(
+    best_value: Value,
+    score_lower_bound: bool,
+    score_upper_bound: bool,
+    mate_limit_moves: i32,
+) -> bool {
+    if mate_limit_moves <= 0
+        || score_lower_bound
+        || score_upper_bound
+        || !best_value.is_mate_score()
+    {
+        return false;
+    }
+
+    let mate_ply = best_value.mate_ply() as i64;
+    let limit_plies = (mate_limit_moves as i64).saturating_mul(2);
+
+    mate_ply <= limit_plies
+}
+
 // =============================================================================
 // SearchResult - 探索結果
 // =============================================================================
@@ -151,60 +166,15 @@ pub struct SearchResult {
     pub ponder_move: Move,
     /// 最善手のスコア
     pub score: Value,
-    /// `score` の種類。中断した反復の結果を返すとき、下界・上界になることがある
-    pub bound: Bound,
     /// 完了した探索深さ
     pub depth: Depth,
     /// 探索ノード数
     pub nodes: u64,
-    /// Principal Variation（読み筋）。不正な続きは省略し、合法な接頭列だけを返す。
+    /// Principal Variation（読み筋）
     pub pv: Vec<Move>,
     /// 探索統計レポート（search-stats feature有効時のみ内容あり）
     pub stats_report: String,
 }
-
-// =============================================================================
-// PonderhitHandle - ponderhit 通知用のハンドル
-// =============================================================================
-
-/// Ponderhit を外部スレッドから signal するための clone 可能な handle。
-///
-/// `Search::ponderhit_handle()` で取得し、driver / コントローラスレッドから
-/// `signal()` を呼ぶことで、探索ループ内部の ponderhit flag を立てる。
-///
-/// `Arc<AtomicBool>` を直接公開するのではなく型で wrap することで、
-/// 外部からの誤った `store(false)` 等の操作を防ぐ。
-///
-/// # Lifetime
-/// 内部に `Arc<AtomicBool>` を保持しているため、生成元の `Search` が
-/// drop された後でも `signal()` 呼び出しは安全 (panic しない) だが、
-/// 観測者がいないため no-op となる。
-///
-/// # `reset_flags` との相互作用
-/// `Search::reset_flags()` 呼び出し後は内部 flag が clear されるため、
-/// 必要に応じて再度 `signal()` を呼ぶ必要がある。
-#[derive(Clone, Debug)]
-pub struct PonderhitHandle {
-    flag: Arc<AtomicBool>,
-}
-
-impl PonderhitHandle {
-    /// Ponderhit を通知する。
-    ///
-    /// 複数回呼んでも安全 (冪等)。Search 側が観測 swap で消費するまで
-    /// flag は立ったままになる。
-    pub fn signal(&self) {
-        // Relaxed: 観測側 (search_with_callback の swap 三箇所) も Relaxed。
-        // flag 自体が唯一の同期点で、ponderhit 前に書いた他メモリの観測を
-        // 探索側に保証する必要は無い。
-        self.flag.store(true, Ordering::Relaxed);
-    }
-}
-
-const _: () = {
-    fn assert_send_sync<T: Send + Sync>() {}
-    let _ = assert_send_sync::<PonderhitHandle>;
-};
 
 // =============================================================================
 // Search - 探索エンジン
@@ -216,8 +186,6 @@ const _: () = {
 /// デフォルトのEvalHashサイズ（MB）
 pub const DEFAULT_EVAL_HASH_SIZE_MB: usize = 64;
 
-/// 探索状態と補助探索スレッドを所有する。
-/// native build では破棄時に補助探索へ停止を要求し、終了を待つ。
 pub struct Search {
     /// 置換表
     tt: Arc<TranspositionTable>,
@@ -227,8 +195,6 @@ pub struct Search {
     tt_size_mb: usize,
     /// EvalHashのサイズ（MB）
     eval_hash_size_mb: usize,
-    /// EvalHash の確保時に Large Pages を試みるか。
-    eval_hash_large_pages: bool,
     /// 停止フラグ
     stop: Arc<AtomicBool>,
     /// ponderhit通知フラグ
@@ -242,14 +208,8 @@ pub struct Search {
 
     /// 探索スレッド数
     num_threads: usize,
-    #[cfg(not(target_arch = "wasm32"))]
-    game_mate_config: Option<super::game_mate::Config>,
-    #[cfg(not(target_arch = "wasm32"))]
-    game_mate: super::game_mate::GameMateSearch,
     /// 探索スレッドプール（helper threads）
     thread_pool: ThreadPool,
-    /// main と helper の全スレッドで共有する履歴
-    shared_histories: Arc<SharedHistories>,
 
     /// SearchWorker（長期保持して再利用）
     /// 履歴統計を含み、usinewgameでクリア、goでは保持
@@ -259,7 +219,7 @@ pub struct Search {
     best_previous_score: Option<Value>,
     /// 直前イテレーションの平均スコア
     best_previous_average_score: Option<Value>,
-    /// 直近のイテレーション値（4要素リングバッファ）
+    /// 直近のイテレーション値（YaneuraOuは4要素リングバッファ）
     iter_value: [Value; 4],
     /// iter_valueの書き込み位置
     iter_idx: usize,
@@ -282,41 +242,29 @@ pub struct Search {
 
     /// 引き分けまでの最大手数（エンジンオプション）
     max_moves_to_draw: i32,
-    /// USI オプション `DrawValueBlack`
+    /// YaneuraOuオプション `DrawValueBlack`
     draw_value_black: i32,
-    /// USI オプション `DrawValueWhite`
+    /// YaneuraOuオプション `DrawValueWhite`
     draw_value_white: i32,
+    /// bucket 別 eval スケール (%)。default [100; 8] で無変化。
+    /// `LS_BUCKET_EVAL_SCALE` USI オプションで bucket 0..7 ごとに調整する。
+    bucket_eval_scale: [i32; 8],
     /// SPSA向け探索係数
     search_tune_params: SearchTuneParams,
     /// 入玉宣言勝ちルール
     entering_king_rule: EnteringKingRule,
-    /// `NumaPolicy=auto` で有効なときだけ持つ状態。`none` や無効のときは `None` のまま。
-    #[cfg(target_os = "linux")]
-    numa: Option<NumaState>,
-    /// `go` の中で起きた NUMA の失敗の理由。次の `prepare_numa_networks` で返す。
-    #[cfg(target_os = "linux")]
-    numa_report: Option<String>,
-    /// 公開直前の PV を差し替える列。公開経路の検証が働いていることを確かめる。
-    #[cfg(test)]
-    corrupt_public_pv: Option<Vec<Move>>,
-    /// 探索中の局面の書き出し。`go` の間だけ main worker に預ける。
-    #[cfg(feature = "search-tree-sample")]
-    tree_sampler: Option<Box<super::tree_sample::TreeSampler>>,
-}
-
-/// `NumaPolicy=auto` で有効なときの topology・割り当て・写し。
-#[cfg(target_os = "linux")]
-struct NumaState {
-    topology: NumaTopology,
-    plan: Arc<NumaPlan>,
-    replicas: Option<NumaReplicas>,
+    /// 防御的 mate-blunder check の df-pn budget (= USI `DefenseMateProbeNodes`)。
+    /// 0 で機能 OFF (= 完全無変化)。劣勢時 (eval ≤ -800) に bestmove が相手の
+    /// 即詰みを許す場合、詰まされない候補手へ差し替える。
+    defense_mate_probe_nodes: u32,
+    /// 防御 probe 用 df-pn engine (= lazy 構築、攻め側 mate_dfpn_engine とは別)。
+    defense_mate_dfpn_engine: Option<super::mate_dfpn::MateDfpnEngine>,
 }
 
 /// best_move_changes を集約する（並列探索対応のためのヘルパー）
 ///
 /// - `changes`: 各スレッドのbest_move_changes
 /// - 戻り値: (合計, スレッド数)。スレッド数0の場合は(0.0, 1)を返しゼロ除算を避ける。
-#[cfg(any(test, not(target_arch = "wasm32"), feature = "wasm-threads"))]
 fn aggregate_best_move_changes(changes: &[f64]) -> (f64, usize) {
     if changes.is_empty() {
         return (0.0, 1);
@@ -334,8 +282,8 @@ fn aggregate_best_move_changes(changes: &[f64]) -> (f64, usize) {
 pub(crate) struct SearchProgress {
     nodes: AtomicU64,
     _pad1: [u8; 56], // 64バイト境界までパディング
-    best_move_changes: super::progress::BestMoveChanges,
-    _pad2: [u8; 48], // 64バイト境界までパディング
+    best_move_changes_bits: AtomicU64,
+    _pad2: [u8; 56], // 64バイト境界までパディング
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -344,19 +292,20 @@ impl SearchProgress {
         Self {
             nodes: AtomicU64::new(0),
             _pad1: [0; 56],
-            best_move_changes: super::progress::BestMoveChanges::new(),
-            _pad2: [0; 48],
+            best_move_changes_bits: AtomicU64::new(0.0f64.to_bits()),
+            _pad2: [0; 56],
         }
     }
 
     pub(crate) fn reset(&self) {
         self.nodes.store(0, Ordering::Relaxed);
-        self.best_move_changes.reset();
+        self.best_move_changes_bits.store(0.0f64.to_bits(), Ordering::Relaxed);
     }
 
     pub(crate) fn update(&self, nodes: u64, best_move_changes: f64) {
         self.nodes.store(nodes, Ordering::Relaxed);
-        self.best_move_changes.publish(best_move_changes);
+        self.best_move_changes_bits
+            .store(best_move_changes.to_bits(), Ordering::Relaxed);
     }
 
     pub(crate) fn nodes(&self) -> u64 {
@@ -364,18 +313,13 @@ impl SearchProgress {
     }
 
     pub(crate) fn best_move_changes(&self) -> f64 {
-        self.best_move_changes.cumulative()
-    }
-
-    pub(crate) fn take_best_move_changes(&self) -> f64 {
-        self.best_move_changes.take_delta()
+        f64::from_bits(self.best_move_changes_bits.load(Ordering::Relaxed))
     }
 }
 
 struct ThreadSummary {
     id: usize,
     score: Value,
-    bound: Bound,
     completed_depth: Depth,
     best_move: Move,
     pv_len: usize,
@@ -388,7 +332,6 @@ impl ThreadSummary {
             Self {
                 id,
                 score: rm.score,
-                bound: rm.score_bound(),
                 completed_depth: worker.state.completed_depth,
                 best_move,
                 pv_len: rm.pv.len(),
@@ -426,20 +369,17 @@ fn select_best_summary_index(summaries: &[ThreadSummary]) -> usize {
         let best_vote = *votes.get(&best.best_move).unwrap_or(&0);
         let new_vote = *votes.get(&summary.best_move).unwrap_or(&0);
 
-        // 中断した反復の bound 付きの詰み評価は証明済みとして扱わない。
-        let best_exact = best.bound == Bound::Exact;
-        let new_exact = summary.bound == Bound::Exact;
-        let best_in_proven_win = best_exact && best.score.is_win();
-        let new_in_proven_win = new_exact && summary.score.is_win();
-        let best_in_proven_loss = best_exact && is_proven_loss(best.score);
-        let new_in_proven_loss = new_exact && is_proven_loss(summary.score);
+        let best_in_proven_win = best.score.is_win();
+        let new_in_proven_win = summary.score.is_win();
+        let best_in_proven_loss = is_proven_loss(best.score);
+        let new_in_proven_loss = is_proven_loss(summary.score);
 
         let better_voting_value = thread_voting_value(summary, min_score)
             * (summary.pv_len > 2) as i64
             > thread_voting_value(best, min_score) * (best.pv_len > 2) as i64;
 
         if best_in_proven_win {
-            if new_in_proven_win && summary.score > best.score {
+            if summary.score > best.score {
                 best_idx = idx;
             }
         } else if best_in_proven_loss {
@@ -460,8 +400,7 @@ fn select_best_summary_index(summaries: &[ThreadSummary]) -> usize {
     if best_idx != 0 {
         let main = &summaries[0];
         let selected = &summaries[best_idx];
-        let selected_proven_mate = selected.bound == Bound::Exact && selected.score.is_mate_score();
-        if selected.best_move != main.best_move && !selected_proven_mate {
+        if selected.best_move != main.best_move && !selected.score.is_mate_score() {
             let support_count =
                 summaries.iter().filter(|s| s.best_move == selected.best_move).count();
             if support_count < 2 {
@@ -517,7 +456,6 @@ fn emit_best_thread_debug(
 fn collect_thread_summaries(
     main_worker: &SearchWorker,
     thread_pool: &ThreadPool,
-    #[cfg(not(target_arch = "wasm32"))] active_helpers: usize,
 ) -> Vec<ThreadSummary> {
     let mut summaries = Vec::new();
     if let Some(summary) = ThreadSummary::from_worker(0, main_worker) {
@@ -526,7 +464,7 @@ fn collect_thread_summaries(
 
     // Native: Use helper_threads() to access Thread objects directly
     #[cfg(not(target_arch = "wasm32"))]
-    for thread in thread_pool.helper_threads().iter().take(active_helpers) {
+    for thread in thread_pool.helper_threads() {
         if let Some(summary) = thread.with_worker(|worker: &mut SearchWorker| {
             ThreadSummary::from_worker(thread.id(), worker)
         }) {
@@ -540,7 +478,6 @@ fn collect_thread_summaries(
         summaries.push(ThreadSummary {
             id: result.thread_id,
             score: result.best_score,
-            bound: result.best_bound,
             completed_depth: result.completed_depth,
             best_move: result.best_move,
             // Wasm helper結果にはPV長がないため、切り詰め判定を不利にしない値を与える。
@@ -557,9 +494,9 @@ fn collect_thread_summaries(
 
 fn should_use_best_thread_selection(limits: &LimitsType, skill_enabled: bool) -> bool {
     // - MultiPV=1
-    // - go depth では使わない
+    // - go depth/mate では使わない
     // - Skill有効時は使わない
-    limits.multi_pv == 1 && limits.depth == 0 && !skill_enabled
+    limits.multi_pv == 1 && limits.depth == 0 && limits.mate == 0 && !skill_enabled
 }
 
 fn get_best_thread_id(
@@ -567,14 +504,8 @@ fn get_best_thread_id(
     thread_pool: &ThreadPool,
     use_best_thread: bool,
     debug: bool,
-    #[cfg(not(target_arch = "wasm32"))] active_helpers: usize,
 ) -> usize {
-    let summaries = collect_thread_summaries(
-        main_worker,
-        thread_pool,
-        #[cfg(not(target_arch = "wasm32"))]
-        active_helpers,
-    );
+    let summaries = collect_thread_summaries(main_worker, thread_pool);
     if summaries.is_empty() {
         return 0;
     }
@@ -599,10 +530,9 @@ fn get_best_thread_id(
 
 struct BestThreadResult {
     best_move: Move,
+    ponder_move: Move,
     score: Value,
-    bound: Bound,
     completed_depth: Depth,
-    sel_depth: i32,
     nodes: u64,
     best_previous_score: Option<Value>,
     best_previous_average_score: Option<Value>,
@@ -611,7 +541,6 @@ struct BestThreadResult {
 
 fn collect_best_thread_result(
     worker: &SearchWorker,
-    pos: &Position,
     limits: &LimitsType,
     skill_enabled: bool,
     skill: &mut Skill,
@@ -630,15 +559,9 @@ fn collect_best_thread_result(
     if worker.state.root_moves.is_empty() {
         return BestThreadResult {
             best_move: Move::NONE,
-            // searchmoves による候補ゼロは、実際の合法手ゼロと区別する。
-            score: if super::RootMoves::from_legal_moves(pos, &[]).is_empty() {
-                Value::mated_in(0)
-            } else {
-                Value::ZERO
-            },
-            bound: Bound::Exact,
+            ponder_move: Move::NONE,
+            score: Value::ZERO,
             completed_depth,
-            sel_depth: worker.state.sel_depth,
             nodes,
             best_previous_score,
             best_previous_average_score,
@@ -663,20 +586,27 @@ fn collect_best_thread_result(
 
     let best_rm = worker.state.root_moves.iter().find(|rm| rm.mv() == best_move);
 
+    let ponder_move = best_rm
+        .and_then(|rm| {
+            if rm.pv.len() > 1 {
+                Some(rm.pv[1])
+            } else {
+                None
+            }
+        })
+        .unwrap_or(Move::NONE);
+
     let score = best_rm
         .map(|rm| rm.score)
         .unwrap_or(worker.state.root_moves.get(0).map(|rm| rm.score).unwrap_or(Value::ZERO));
 
-    let bound = best_rm.map_or(Bound::Exact, |rm| rm.score_bound());
-    let sel_depth = best_rm.map(|rm| rm.sel_depth).unwrap_or(worker.state.sel_depth);
     let pv = best_rm.map(|rm| rm.pv.clone()).unwrap_or_default();
 
     BestThreadResult {
         best_move,
+        ponder_move,
         score,
-        bound,
         completed_depth,
-        sel_depth,
         nodes,
         best_previous_score,
         best_previous_average_score,
@@ -720,13 +650,7 @@ impl Search {
         self.search_again_counter = 0;
     }
 
-    /// このSearchが共有するTTの書込診断。探索前後の差分で全workerを集計する。
-    #[cfg(feature = "tt-write-stats")]
-    pub fn tt_write_stats(&self) -> crate::tt::TTWriteStats {
-        self.tt.write_stats()
-    }
-
-    /// 通常ページの EvalHash を持つ新しいSearchを作成
+    /// 新しいSearchを作成
     ///
     /// # Arguments
     /// * `tt_size_mb` - 置換表のサイズ（MB）
@@ -734,34 +658,23 @@ impl Search {
         Self::new_with_eval_hash(tt_size_mb, DEFAULT_EVAL_HASH_SIZE_MB)
     }
 
-    /// 新しいSearchを作成し、通常ページの EvalHash サイズも同時に指定する。
+    /// 新しいSearchを作成し、EvalHashサイズも同時に指定する。
     ///
     /// # Arguments
     /// * `tt_size_mb` - 置換表のサイズ（MB）
     /// * `eval_hash_size_mb` - EvalHash のサイズ（MB）
     pub fn new_with_eval_hash(tt_size_mb: usize, eval_hash_size_mb: usize) -> Self {
-        Self::new_with_eval_hash_large_pages(tt_size_mb, eval_hash_size_mb, false)
-    }
-
-    /// EvalHash のサイズと Large Pages の使用設定を指定して作成する。
-    pub fn new_with_eval_hash_large_pages(
-        tt_size_mb: usize,
-        eval_hash_size_mb: usize,
-        large_pages: bool,
-    ) -> Self {
         let tt = Arc::new(TranspositionTable::new(tt_size_mb));
-        let eval_hash = Arc::new(EvalHash::new_with_large_pages(eval_hash_size_mb, large_pages));
+        let eval_hash = Arc::new(EvalHash::new(eval_hash_size_mb));
         let stop = Arc::new(AtomicBool::new(false));
         let ponderhit_flag = Arc::new(AtomicBool::new(false));
         let increase_depth_shared = Arc::new(AtomicBool::new(true));
         let max_moves_to_draw = DEFAULT_MAX_MOVES_TO_DRAW;
         let search_tune_params = SearchTuneParams::default();
-        let shared_histories = Arc::new(SharedHistories::new(1));
         let thread_pool = ThreadPool::new(
             1,
             Arc::clone(&tt),
             Arc::clone(&eval_hash),
-            Arc::clone(&shared_histories),
             Arc::clone(&stop),
             Arc::clone(&ponderhit_flag),
             Arc::clone(&increase_depth_shared),
@@ -774,19 +687,13 @@ impl Search {
             eval_hash,
             tt_size_mb,
             eval_hash_size_mb,
-            eval_hash_large_pages: large_pages,
             stop,
             ponderhit_flag,
             start_time: None,
             time_options: super::TimeOptions::default(),
             skill_options: SkillOptions::default(),
             num_threads: 1,
-            #[cfg(not(target_arch = "wasm32"))]
-            game_mate_config: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            game_mate: super::game_mate::GameMateSearch::default(),
             thread_pool,
-            shared_histories,
             // workerは遅延初期化（最初のgoで作成）
             worker: None,
             best_previous_score: Some(Value::INFINITE),
@@ -804,16 +711,11 @@ impl Search {
             max_moves_to_draw,
             draw_value_black: DEFAULT_DRAW_VALUE_BLACK,
             draw_value_white: DEFAULT_DRAW_VALUE_WHITE,
+            bucket_eval_scale: [100; 8],
             search_tune_params,
             entering_king_rule: EnteringKingRule::default(),
-            #[cfg(target_os = "linux")]
-            numa: None,
-            #[cfg(target_os = "linux")]
-            numa_report: None,
-            #[cfg(test)]
-            corrupt_public_pv: None,
-            #[cfg(feature = "search-tree-sample")]
-            tree_sampler: None,
+            defense_mate_probe_nodes: 0,
+            defense_mate_dfpn_engine: None,
         }
     }
 
@@ -830,22 +732,20 @@ impl Search {
 
     /// 置換表をクリア
     ///
-    /// 作り直さずに、Threads と同じ数のスレッドで並列にゼロへ戻す (YaneuraOu と同じ)。
-    /// 作り直すと表の大きさに比例した時間がかかり、usinewgame の直後の go の持ち時間を食う。
+    /// 新しい置換表を作成して置き換える。
     pub fn clear_tt(&mut self) {
-        self.thread_pool.wait_for_search_finished();
-        self.tt.clear_in_place(self.num_threads);
+        // Arc経由では&mutが取れないので、同じサイズの新しいTTを作成して置き換える
+        self.tt = Arc::new(TranspositionTable::new(self.tt_size_mb));
+        // workerが存在する場合、TT参照を更新
+        if let Some(worker) = &mut self.worker {
+            worker.tt = Arc::clone(&self.tt);
+        }
+        self.thread_pool.update_tt(Arc::clone(&self.tt));
     }
 
-    /// TTの明示的Large Pages確保に成功したかを返す（Windows）。
+    /// Large Pagesで確保されているかを返す
     pub fn tt_uses_large_pages(&self) -> bool {
         self.tt.uses_large_pages()
-    }
-
-    /// TTのhuge-page hint要求が成功したかを返す（Linux/Android）。
-    /// 実backingの確認ではない。
-    pub fn tt_huge_page_hint_requested(&self) -> bool {
-        self.tt.huge_page_hint_requested()
     }
 
     /// EvalHashのサイズを変更
@@ -856,36 +756,13 @@ impl Search {
     /// USIプロトコルでは `setoption` は探索中に送られないため、
     /// 通常の使用では問題ない。
     pub fn resize_eval_hash(&mut self, size_mb: usize) {
-        // 全 worker の参照を空の表へ差し替え、新しい領域の確保前に旧表を手放す。
-        // 呼び出し側が eval_hash() の Arc を保持している場合、その参照の寿命までは残る。
-        self.replace_eval_hash(Arc::new(EvalHash::new(0)));
-        self.replace_eval_hash(Arc::new(EvalHash::new_with_large_pages(
-            size_mb,
-            self.eval_hash_large_pages,
-        )));
+        self.eval_hash = Arc::new(EvalHash::new(size_mb));
         self.eval_hash_size_mb = size_mb;
-    }
-
-    fn replace_eval_hash(&mut self, eval_hash: Arc<EvalHash>) {
-        self.eval_hash = eval_hash;
         // workerが存在する場合、EvalHash参照を更新
         if let Some(worker) = &mut self.worker {
             worker.eval_hash = Arc::clone(&self.eval_hash);
         }
         self.thread_pool.update_eval_hash(Arc::clone(&self.eval_hash));
-    }
-
-    /// Large Pages の使用設定を変更し、現在のサイズで EvalHash を再確保する。
-    pub fn set_eval_hash_large_pages(&mut self, large_pages: bool) {
-        if self.eval_hash_large_pages != large_pages {
-            self.eval_hash_large_pages = large_pages;
-            self.resize_eval_hash(self.eval_hash_size_mb);
-        }
-    }
-
-    /// EvalHash を in-place でクリアする（worker と共有する Arc をそのまま使う）
-    pub fn clear_eval_hash(&self) {
-        self.eval_hash.clear();
     }
 
     /// EvalHashへの参照を取得
@@ -898,45 +775,14 @@ impl Search {
         self.eval_hash_size_mb
     }
 
-    /// 新しい対局の前に、置換表と EvalHash 以外の探索状態を初期化する（usinewgame 時に呼ぶ）。
+    /// 履歴統計をクリア（usinewgame時に呼び出し）
     ///
-    /// 全 worker の履歴（`SearchWorker::clear`）、共有履歴、前の対局から持ち越す時間配分と
-    /// 手番反転検出の状態を戻す。
-    /// 置換表と EvalHash は `clear_tt` / `clear_eval_hash` で別に消す。
-    pub fn clear_for_new_game(&mut self) {
+    /// Worker::clear()相当
+    pub fn clear_histories(&mut self) {
         if let Some(worker) = &mut self.worker {
             worker.clear();
         }
         self.thread_pool.clear_histories();
-        self.thread_pool.wait_for_search_finished();
-        // 最初の go までは共有表が設定値で初期化済みで、探索による更新もない。
-        if self.worker.is_some() {
-            self.shared_histories.clear(self.search_tune_params.pawn_history_init as i16);
-        }
-        self.best_previous_score = Some(Value::INFINITE);
-        self.best_previous_average_score = Some(Value::INFINITE);
-        self.iter_value = [Value::ZERO; 4];
-        self.iter_idx = 0;
-        self.last_best_move_depth = 0;
-        self.last_best_move = Move::NONE;
-        self.tot_best_move_changes = 0.0;
-        self.previous_time_reduction = 0.85;
-        self.last_game_ply = None;
-        self.increase_depth = true;
-        self.increase_depth_shared.store(true, Ordering::Relaxed);
-        self.search_again_counter = 0;
-    }
-
-    /// 次の `go` を、同じ設定で新しく作った `Search` と同じ探索にする。
-    ///
-    /// 互いに独立な局面を順に探索し、どの局面をどの `Search` が受け持っても結果を変えない用途向け。
-    /// 置換表は呼び出しスレッドだけで消す（[`TranspositionTable::clear_on_current_thread`]）。
-    /// EvalHash は局面の静的評価だけを 64 bit key 全体の照合で返すため探索結果を変えず、消さない。
-    pub fn reset_to_fresh_state(&mut self) {
-        self.tt.clear_on_current_thread();
-        self.clear_for_new_game();
-        // helper を使った go は終了時に stop を立てたまま戻る。
-        self.reset_flags();
     }
 
     /// 停止フラグを取得（探索スレッドに渡す用）
@@ -945,36 +791,18 @@ impl Search {
     }
 
     /// ponderhitフラグを取得（探索スレッドへの通知に使用）
-    #[deprecated(note = "use ponderhit_handle()")]
     pub fn ponderhit_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.ponderhit_flag)
     }
 
-    /// Ponderhit を外部スレッドから signal するための handle を取得する。
-    ///
-    /// 返り値の handle は `Clone` 可能で、探索 thread とは独立に保持できる。
-    /// 同一 `Search` から複数回取得した handle はすべて同じ ponderhit flag を共有する。
-    pub fn ponderhit_handle(&self) -> PonderhitHandle {
-        PonderhitHandle {
-            flag: Arc::clone(&self.ponderhit_flag),
-        }
+    /// ponderhitを要求（外部スレッドから）
+    pub fn request_ponderhit(&self) {
+        self.ponderhit_flag.store(true, Ordering::SeqCst);
     }
 
     /// 探索を停止
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
-    }
-
-    pub(crate) fn analysis_worker_depths(&self) -> Vec<Depth> {
-        let mut depths =
-            vec![self.worker.as_ref().map_or(0, |worker| worker.state.completed_depth)];
-        depths.extend(self.thread_pool.completed_depths());
-        depths
-    }
-
-    pub(crate) fn stop_and_wait(&self) {
-        self.stop();
-        self.thread_pool.wait_for_search_finished();
     }
 
     /// stop/ponderhitフラグをリセット（go() 呼び出し前にUSI層から呼ぶ）
@@ -1016,7 +844,7 @@ impl Search {
         self.max_moves_to_draw
     }
 
-    /// USI オプション `DrawValueBlack` を設定する。
+    /// YaneuraOuオプション `DrawValueBlack` を設定する。
     ///
     /// 有効範囲は `[-30000, 30000]`。
     pub fn set_draw_value_black(&mut self, v: i32) {
@@ -1031,7 +859,7 @@ impl Search {
         self.draw_value_black
     }
 
-    /// USI オプション `DrawValueWhite` を設定する。
+    /// YaneuraOuオプション `DrawValueWhite` を設定する。
     ///
     /// 有効範囲は `[-30000, 30000]`。
     pub fn set_draw_value_white(&mut self, v: i32) {
@@ -1046,6 +874,161 @@ impl Search {
         self.draw_value_white
     }
 
+    /// 防御的 mate-blunder check の df-pn budget (= `DefenseMateProbeNodes`) を設定する。
+    ///
+    /// `0` で機能 OFF (= 完全無変化)。`[0, 10_000_000]` にクランプする。
+    pub fn set_defense_mate_probe_nodes(&mut self, v: u32) {
+        self.defense_mate_probe_nodes = v.min(10_000_000);
+    }
+
+    /// 現在の `DefenseMateProbeNodes` を取得する。
+    pub fn defense_mate_probe_nodes(&self) -> u32 {
+        self.defense_mate_probe_nodes
+    }
+
+    /// 防御的 mate-blunder check (v3)。
+    ///
+    /// 探索完了後の bestmove 決定直後に 1 回だけ呼ぶ (= iterative deepening 中には
+    /// 呼ばない)。選んだ `best_move` が相手の即詰みを許す (= 相手番から df-pn で
+    /// 詰みが証明される) 場合、root_moves の score 順に最大4候補を probe し、最初の
+    /// 「詰み非証明 (= NoMate / Unknown)」候補へ差し替える。差し替え時は ponder move
+    /// を `Move::NONE` にする。
+    ///
+    /// v3 変更点: 二段構えの発動条件。
+    /// - `-2500 ≤ score ≤ -800`: probe_depth = 8 (= 7手詰めまで防御、v2 と同じ劣勢帯)。
+    /// - `score > -800` (通常時): probe_depth = 6 (= 5手詰めを常時防御、新設)。
+    /// - `score < -2500`: 介入しない (手遅れ局面)。
+    /// - mate 域 (|score| >= MATE_IN_MAX_PLY): 介入しない。
+    ///
+    /// 機能 OFF (= `defense_mate_probe_nodes == 0`) または候補不足のときは引数をそのまま返す。
+    fn defense_mate_probe(
+        &mut self,
+        pos: &mut Position,
+        best_move: Move,
+        ponder_move: Move,
+        score: Value,
+    ) -> (Move, Move) {
+        let budget = self.defense_mate_probe_nodes;
+        if budget == 0 {
+            return (best_move, ponder_move);
+        }
+
+        // mate 域は介入しない。
+        let score_raw = score.raw();
+        if score_raw.abs() >= Value::MATE_IN_MAX_PLY.raw() {
+            return (best_move, ponder_move);
+        }
+
+        // 二段構えの probe_depth 決定。
+        // - 劣勢帯 (-2500 ≤ score ≤ -800): depth 8 (= 7手詰めまで防御)
+        // - 通常時 (score > -800): depth 6 (= 5手詰めを常時防御)
+        // - 手遅れ (score < -2500): 介入しない
+        let probe_depth: u16 = if (-2500..=-800).contains(&score_raw) {
+            8
+        } else if score_raw > -800 {
+            6
+        } else {
+            return (best_move, ponder_move);
+        };
+
+        // root_moves を score 順 (= 既にソート済) で最大4候補だけ取り出す。
+        // best_score は先頭エントリのスコア (= candidates 収集後に使う)。
+        let candidates: Vec<(Move, Value)> = match self.worker.as_ref() {
+            Some(worker) => {
+                if worker.state.root_moves.len() < 2 {
+                    return (best_move, ponder_move);
+                }
+                worker.state.root_moves.iter().take(4).map(|rm| (rm.mv(), rm.score)).collect()
+            }
+            None => return (best_move, ponder_move),
+        };
+
+        // 先頭候補のスコアを best_score として参照 (= score 降順ソート済なので index 0 が最高)。
+        let best_score = candidates[0].1;
+        // best_score がセンチネル (-32001) のときは未探索状態なので介入しない。
+        if best_score.raw() <= -Value::INFINITE.raw() {
+            return (best_move, ponder_move);
+        }
+        let score_threshold = best_score.raw() - 300;
+
+        // 防御 probe 用 df-pn engine を lazy 構築 (= 攻め側とは別 engine、TT 4 MB)。
+        if self.defense_mate_dfpn_engine.is_none() {
+            self.defense_mate_dfpn_engine = Some(super::mate_dfpn::MateDfpnEngine::new(4));
+        }
+        let engine = self.defense_mate_dfpn_engine.as_mut().unwrap();
+
+        for &(cand, cand_score) in &candidates {
+            if cand == Move::NONE {
+                continue;
+            }
+            // 未探索センチネルまたは best_score から 300 以上劣る候補は probe しない。
+            if cand_score.raw() <= -Value::INFINITE.raw() || cand_score.raw() < score_threshold {
+                continue;
+            }
+            let gives_check = pos.gives_check(cand);
+            pos.do_move(cand, gives_check);
+            // do_move 後は相手番。相手が即詰みを掛けられるかを df-pn で判定。
+            // probe_depth は発動条件に応じて可変 (劣勢帯=8、通常時=6)。
+            let result = engine.probe(pos, budget, probe_depth);
+            pos.undo_move(cand);
+
+            match result {
+                super::mate_dfpn::MateDfpnResult::Mate { .. } => {
+                    // この候補は詰まされる。次候補へ。
+                    continue;
+                }
+                super::mate_dfpn::MateDfpnResult::NoMate
+                | super::mate_dfpn::MateDfpnResult::Unknown => {
+                    // 詰み非証明。これを bestmove に採用。
+                    if cand != best_move {
+                        println!(
+                            "info string defense_mate_probe: swapped {} -> {}",
+                            best_move.to_usi(),
+                            cand.to_usi()
+                        );
+                        // 差し替え時は ponder move を無効化 (= 元 PV と整合しないため)。
+                        return (cand, Move::NONE);
+                    }
+                    // 元の bestmove がそのまま安全 → 無変化。
+                    return (best_move, ponder_move);
+                }
+            }
+        }
+
+        // 全候補が Mate → 元の bestmove を維持。
+        (best_move, ponder_move)
+    }
+
+    /// bucket 別 eval スケール (%, 各要素 1..=400) を設定する。
+    ///
+    /// `LS_BUCKET_EVAL_SCALE` USI オプション用。
+    pub fn set_bucket_eval_scale(&mut self, scale: [i32; 8]) {
+        self.bucket_eval_scale = scale;
+        if let Some(worker) = &mut self.worker {
+            worker.bucket_eval_scale = self.bucket_eval_scale;
+        }
+    }
+
+    /// bucket 別 eval スケールの単一 index を設定する。
+    ///
+    /// `LS_BUCKET_EVAL_SCALE_0`..`_7` USI オプション (SPSA tune 用)。
+    /// `idx` が範囲外の場合は何もしない。
+    pub fn set_bucket_eval_scale_index(&mut self, idx: usize, v: i32) {
+        debug_assert!(idx < 8, "bucket eval scale index out of range: {idx}");
+        if idx >= 8 {
+            return;
+        }
+        self.bucket_eval_scale[idx] = v;
+        if let Some(worker) = &mut self.worker {
+            worker.bucket_eval_scale = self.bucket_eval_scale;
+        }
+    }
+
+    /// 現在の bucket eval scale を取得する。
+    pub fn bucket_eval_scale(&self) -> [i32; 8] {
+        self.bucket_eval_scale
+    }
+
     /// 入玉宣言勝ちルールを設定する。
     pub fn set_entering_king_rule(&mut self, rule: EnteringKingRule) {
         self.entering_king_rule = rule;
@@ -1056,28 +1039,7 @@ impl Search {
         self.entering_king_rule
     }
 
-    /// 通常対局で詰み探索に割ける最大スレッド数。0 で無効になる。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn set_game_mate_options(
-        &mut self,
-        threads: usize,
-        hash_mb: usize,
-        mode: crate::mate::dfpn::MateMode,
-    ) {
-        self.game_mate_config = (threads > 0).then_some(super::game_mate::Config {
-            threads,
-            hash_mb: hash_mb.clamp(1, 4096),
-            mode,
-        });
-    }
-
-    /// 通常対局の詰みワーカーを停止し、別の詰み探索を起動する前に回収する。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn wait_for_game_mate(&mut self) {
-        self.game_mate.drain();
-    }
-
-    /// 探索スレッド数を設定する。スレッド数が変わると、共有履歴と各 worker の履歴を初期化する。
+    /// 探索スレッド数を設定
     pub fn set_num_threads(&mut self, num: usize) {
         // WASM builds without wasm-threads feature use single-threaded search only.
         // With wasm-threads feature, multi-threading via wasm-bindgen-rayon is supported.
@@ -1087,104 +1049,19 @@ impl Search {
         let num = 1;
         #[cfg(not(all(target_arch = "wasm32", not(feature = "wasm-threads"))))]
         let num = num.clamp(1, 512);
-        let threads_changed = num != self.num_threads;
-        let rebuild_shared_histories =
-            SharedHistories::scale_for(num) != self.shared_histories.scale();
-        let pawn_history_init = self.search_tune_params.pawn_history_init as i16;
-        if rebuild_shared_histories {
-            // 表の大きさは倍率で決まるので、倍率が変わるときだけ作り直す。
-            self.shared_histories =
-                Arc::new(SharedHistories::new_with_pawn_history_init(num, pawn_history_init));
-            if let Some(worker) = &mut self.worker {
-                worker.shared_histories = Arc::clone(&self.shared_histories);
-            }
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        self.game_mate.ensure_thread_limit(num);
         self.num_threads = num;
-        #[cfg(target_os = "linux")]
-        self.update_numa_plan();
         self.thread_pool.set_num_threads(
             num,
             Arc::clone(&self.tt),
             Arc::clone(&self.eval_hash),
-            Arc::clone(&self.shared_histories),
             self.max_moves_to_draw,
             self.search_tune_params,
         );
-        if threads_changed {
-            if let Some(worker) = &mut self.worker {
-                worker.clear();
-            }
-            // Native は helper を作り直すが、Wasm は既存の worker を再利用する。
-            #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
-            self.thread_pool.clear_histories();
-            if !rebuild_shared_histories {
-                self.shared_histories.clear(pawn_history_init);
-            }
-        }
     }
 
     /// 探索スレッド数を取得
     pub fn num_threads(&self) -> usize {
         self.num_threads
-    }
-
-    /// USI オプション `NumaPolicy` を設定し、利用者に伝える 1 行 (有効にした割り当て、または
-    /// `none` と同じに振る舞う理由) を返す。`none` を設定したときは `None` を返す。
-    ///
-    /// 有効になると helper を node ごとに固定して作り直し、重みの写しは次の
-    /// [`Search::prepare_numa_networks`] か `go` で作る。
-    pub fn set_numa_policy(&mut self, policy: NumaPolicy) -> Option<String> {
-        #[cfg(target_os = "linux")]
-        {
-            let (topology, message) = match policy {
-                NumaPolicy::None => (None, None),
-                NumaPolicy::Auto => match super::numa::detect() {
-                    super::numa::NumaDetection::MultiNode(topology) => (Some(topology), None),
-                    super::numa::NumaDetection::Disabled(reason) => {
-                        (None, Some(format!("NumaPolicy=auto: {reason}; behaving as none")))
-                    }
-                },
-            };
-            match topology {
-                Some(topology) => self.enable_numa(topology),
-                None => {
-                    if self.numa.is_some() {
-                        self.release_numa_networks();
-                        self.numa = None;
-                        self.rebuild_helpers(None);
-                    }
-                }
-            }
-            message.or_else(|| self.numa.as_ref().map(|numa| numa.plan.describe()))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            (policy == NumaPolicy::Auto)
-                .then(|| "NumaPolicy=auto: supported only on Linux; behaving as none".to_string())
-        }
-    }
-
-    /// `NumaPolicy=auto` で有効なとき、ロード済みの評価関数の写しを node ごとに作り、各スレッドに
-    /// 渡す。評価関数・Threads・NumaPolicy が前回から変わっていなければ何もしない。
-    ///
-    /// 評価関数のロード後 (isready) に呼ぶと、最初の `go` の持ち時間で写しを作らずに済む。
-    /// 呼ばなくても `go` の開始時に同じ処理をする。写しを作れなかったときは NUMA を無効にして
-    /// 共有の重みに戻し、その理由を返す。CPU 固定に失敗したスレッドがあればその理由も返す。
-    /// 前回からの間に `go` の中で起きた失敗があれば、その理由も返す。
-    pub fn prepare_numa_networks(&mut self) -> Option<String> {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(message) = self.sync_numa_networks() {
-                self.add_numa_report(message);
-            }
-            self.numa_report.take()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
     }
 
     /// 探索チューニングパラメータを取得
@@ -1194,25 +1071,11 @@ impl Search {
 
     /// 探索チューニングパラメータを一括設定
     pub fn set_search_tune_params(&mut self, params: SearchTuneParams) {
-        let previous = self.search_tune_params;
         self.search_tune_params = params;
         if let Some(worker) = &mut self.worker {
-            worker.update_search_tune_params(params);
+            worker.search_tune_params = params;
         }
         self.thread_pool.update_search_tune_params(params);
-        if self.worker.is_none() {
-            if previous.pawn_history_init != params.pawn_history_init {
-                self.shared_histories.clear(params.pawn_history_init as i16);
-            }
-            // Threads が SPSA の読み込みより先に設定されると、helper はすでに生成されている。
-            if previous.main_history_init != params.main_history_init
-                || previous.low_ply_history_init != params.low_ply_history_init
-                || previous.capture_history_init != params.capture_history_init
-                || previous.continuation_history_init != params.continuation_history_init
-            {
-                self.thread_pool.clear_histories();
-            }
-        }
     }
 
     /// 探索チューニング項目を1つ更新（USI option名ベース）
@@ -1227,130 +1090,6 @@ impl Search {
         Some(result)
     }
 
-    /// `topology` に従ってスレッドを node に割り当て、helper を固定して作り直す。
-    #[cfg(target_os = "linux")]
-    fn enable_numa(&mut self, topology: NumaTopology) {
-        if self.numa.as_ref().is_some_and(|numa| numa.topology == topology) {
-            return;
-        }
-        self.release_numa_networks();
-        let plan = Arc::new(NumaPlan::new(&topology, self.num_threads));
-        self.numa = Some(NumaState {
-            topology,
-            plan: Arc::clone(&plan),
-            replicas: None,
-        });
-        self.rebuild_helpers(Some(plan));
-    }
-
-    /// 計画を作り直し、変わったら helper を新しい割り当てで作り直させる。古い写しも手放す。
-    #[cfg(target_os = "linux")]
-    fn update_numa_plan(&mut self) {
-        let Some(numa) = &self.numa else {
-            return;
-        };
-        let plan = NumaPlan::new(&numa.topology, self.num_threads);
-        if *numa.plan == plan {
-            return;
-        }
-        let plan = Arc::new(plan);
-        self.release_numa_networks();
-        if let Some(numa) = &mut self.numa {
-            numa.plan = Arc::clone(&plan);
-        }
-        self.thread_pool.set_numa_plan(Some(plan));
-    }
-
-    /// 全スレッドから写しを外し、写しの組を捨てる。
-    #[cfg(target_os = "linux")]
-    fn release_numa_networks(&mut self) {
-        if let Some(worker) = &mut self.worker {
-            worker.set_numa_network(None);
-        }
-        self.thread_pool.set_numa_networks(|_| None);
-        if let Some(numa) = &mut self.numa {
-            numa.replicas = None;
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn sync_numa_networks(&mut self) -> Option<String> {
-        let numa = self.numa.as_ref()?;
-        let plan = Arc::clone(&numa.plan);
-        let global = crate::nnue::get_network();
-        let fresh = match (&numa.replicas, &global) {
-            (Some(replicas), Some(global)) => {
-                Arc::ptr_eq(&replicas.source, global) && Arc::ptr_eq(&replicas.plan, &plan)
-            }
-            (None, None) => true,
-            _ => false,
-        };
-        if !fresh {
-            self.release_numa_networks();
-            if let Some(global) = global {
-                match NumaReplicas::build(plan, global) {
-                    Ok(replicas) => {
-                        if let Some(numa) = &mut self.numa {
-                            numa.replicas = Some(replicas);
-                        }
-                    }
-                    Err(reason) => {
-                        self.fall_back_to_shared_network();
-                        return Some(format!(
-                            "NumaPolicy=auto: cannot build per-node networks ({reason}); \
-                             behaving as none"
-                        ));
-                    }
-                }
-            }
-        }
-        let replicas = self.numa.as_ref().and_then(|numa| numa.replicas.as_ref());
-        if let Some(worker) = &mut self.worker {
-            worker.set_numa_network(replicas.and_then(|r| r.for_thread(0)));
-        }
-        self.thread_pool.set_numa_networks(|id| replicas.and_then(|r| r.for_thread(id)));
-        self.thread_pool
-            .numa_pin_error()
-            .map(|reason| format!("NumaPolicy=auto: {reason}"))
-    }
-
-    /// 次の `prepare_numa_networks` で返す理由に `message` を足す。
-    #[cfg(target_os = "linux")]
-    // 固定の失敗は helper が覚えたままで go のたびに同じ理由が返るので、同じ文は重ねない。
-    fn add_numa_report(&mut self, message: String) {
-        self.numa_report = Some(match self.numa_report.take() {
-            Some(earlier) if earlier.split("; ").any(|m| m == message) => earlier,
-            Some(earlier) => format!("{earlier}; {message}"),
-            None => message,
-        });
-    }
-
-    /// 写しを作れなかったときに NUMA をやめ、共有の重みで探索を続けられる状態に戻す。
-    ///
-    /// `go` の中からも呼ばれ、そこで helper を作り直すと探索の直前に履歴を失うので、作り直さずに
-    /// 各 helper をプロセスが使える CPU 全体へ固定し直す。
-    #[cfg(target_os = "linux")]
-    fn fall_back_to_shared_network(&mut self) {
-        self.release_numa_networks();
-        if let Some(numa) = self.numa.take() {
-            self.thread_pool.release_numa_plan(numa.topology.allowed());
-        }
-    }
-
-    /// helper を `plan` の割り当て (`None` なら固定なし) で作り直す。
-    #[cfg(target_os = "linux")]
-    fn rebuild_helpers(&mut self, plan: Option<Arc<NumaPlan>>) {
-        self.thread_pool.set_numa_plan(plan);
-        self.thread_pool.set_num_threads(
-            self.num_threads,
-            Arc::clone(&self.tt),
-            Arc::clone(&self.eval_hash),
-            Arc::clone(&self.shared_histories),
-            self.max_moves_to_draw,
-            self.search_tune_params,
-        );
-    }
-
     /// 探索を実行
     ///
     /// # Arguments
@@ -1363,40 +1102,23 @@ impl Search {
     pub fn go<F>(
         &mut self,
         pos: &mut Position,
-        mut limits: LimitsType,
-        mut on_info: Option<F>,
+        limits: LimitsType,
+        on_info: Option<F>,
     ) -> SearchResult
     where
         F: FnMut(&SearchInfo),
     {
         let ply = pos.game_ply();
-        #[cfg(feature = "allocation-stats")]
-        let _allocation_scope =
-            crate::allocation_stats::Scope::enter(crate::allocation_stats::Phase::Setup);
-        if !limits.analysis.as_ref().is_some_and(|run| run.resume) {
-            self.prepare_time_metrics(ply);
-        }
+        self.prepare_time_metrics(ply);
         // 注意: stop/ponderhitフラグのリセットは go() の呼び出し元
         // (USI層の cmd_go) でスレッド生成前に行うこと。
         // ここでリセットすると、USI層で既にセットされたフラグが失われる競合が発生する。
         self.start_time = Some(Instant::now());
         // 置換表の世代を進める
-        if !limits.analysis.as_ref().is_some_and(|run| run.resume) {
-            self.tt.new_search();
-        }
+        self.tt.new_search();
         // ヘルパースレッドの結果をクリア
         // スレッド数が1の場合でも呼び出し、前回のマルチスレッド探索の結果が残らないようにする
         self.thread_pool.clear_helper_results();
-
-        // デバッグ用の helper 有効化制御
-        // go depth を含め helper を有効化する。
-        // 追加の切り分けは環境変数 RSHOGI_DISABLE_HELPER_SEARCH で行う。
-        let helper_search_enabled = self.num_threads > 1 && !helper_search_disabled();
-
-        // go nodes は全スレッドの合計で打ち切る。
-        // helper が無いときは自分のノード数だけで判定し、共有カウンタの atomic 操作を避ける。
-        limits.searched_nodes =
-            (limits.nodes > 0 && helper_search_enabled).then(|| Arc::new(AtomicU64::new(0)));
 
         // 時間管理
         let mut time_manager =
@@ -1405,36 +1127,6 @@ impl Search {
         time_manager.set_previous_time_reduction(self.previous_time_reduction);
         // ply（現在の手数）は局面から取得、max_moves_to_drawはデフォルトを使う
         time_manager.init(&limits, pos.side_to_move(), ply, self.max_moves_to_draw);
-        log::trace!(
-            target: "rshogi_core::search::time",
-            "event=init ply={} side={:?} remaining_ms={} increment_ms={} byoyomi_ms={} optimum_ms={} maximum_ms={} minimum_ms={} network_delay_ms={} network_delay2_ms={} slow_mover={} round_up={} ponder={} usi_ponder={} stochastic_ponder={}",
-            ply, pos.side_to_move(), limits.time_left(pos.side_to_move()),
-            limits.increment(pos.side_to_move()), limits.byoyomi_time(pos.side_to_move()),
-            time_manager.optimum(), time_manager.maximum(), time_manager.minimum(),
-            self.time_options.network_delay, self.time_options.network_delay2,
-            self.time_options.slow_mover, self.time_options.round_up_to_full_second,
-            limits.ponder, self.time_options.usi_ponder, self.time_options.stochastic_ponder,
-        );
-
-        // NUMA が有効なら main スレッド (go を呼んだスレッド) も thread 0 の node に固定し、
-        // go を抜けるときに元の CPU 集合へ戻す。写しの用意は固定より前に済ませ、失敗しても
-        // 共有の重みで探索を続ける。失敗の理由は次の prepare_numa_networks (isready) で返す。
-        #[cfg(target_os = "linux")]
-        let numa_affinity = {
-            if let Some(message) = self.sync_numa_networks() {
-                self.add_numa_report(message);
-            }
-            match self.numa.as_ref().map(|numa| numa.plan.cpus_of_thread(0).to_vec()) {
-                Some(cpus) => match super::numa::AffinityGuard::pin(&cpus) {
-                    Ok(guard) => Some(guard),
-                    Err(reason) => {
-                        self.add_numa_report(format!("NumaPolicy=auto: {reason}"));
-                        None
-                    }
-                },
-                None => None,
-            }
-        };
 
         // workerは遅延初期化、再利用する
         let tt_clone = Arc::clone(&self.tt);
@@ -1443,32 +1135,20 @@ impl Search {
         let search_tune_params = self.search_tune_params;
         let draw_value_black = self.draw_value_black;
         let draw_value_white = self.draw_value_white;
-        let shared_histories = Arc::clone(&self.shared_histories);
         let worker = self.worker.get_or_insert_with(|| {
-            SearchWorker::new_with_shared(
-                tt_clone,
-                eval_hash_clone,
-                shared_histories,
-                max_moves,
-                0,
-                search_tune_params,
-            )
+            SearchWorker::new(tt_clone, eval_hash_clone, max_moves, 0, search_tune_params)
         });
-
-        #[cfg(target_os = "linux")]
-        if let Some(replicas) = self.numa.as_ref().and_then(|numa| numa.replicas.as_ref()) {
-            worker.set_numa_network(replicas.for_thread(0));
-        }
 
         // setoptionで変更された可能性があるため、最新値を反映
         worker.max_moves_to_draw = self.max_moves_to_draw;
         worker.search_tune_params = self.search_tune_params;
         worker.draw_value_black = self.draw_value_black;
         worker.draw_value_white = self.draw_value_white;
+        worker.bucket_eval_scale = self.bucket_eval_scale;
         worker.entering_king_rule = self.entering_king_rule;
 
         // 探索状態のリセット（履歴はクリアしない）
-        worker.prepare_search(&limits);
+        worker.prepare_search();
         worker.allow_tt_write = true;
 
         // 探索深さを決定
@@ -1482,53 +1162,10 @@ impl Search {
         let mut skill = Skill::from_options(&self.skill_options);
         let skill_enabled = skill.enabled();
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let game_mate_started = {
-            self.game_mate.reap();
-            let side = pos.side_to_move();
-            self.game_mate_config.is_some_and(|mut config| {
-                config.threads = config.threads.min(self.num_threads.saturating_sub(1));
-                if !helper_search_enabled
-                    || self.game_mate.busy_threads() != 0
-                    || config.threads == 0
-                    || skill_enabled
-                    || limits.ponder
-                    || limits.infinite
-                    || limits.analysis.is_some()
-                    || limits.nodes != 0
-                    || limits.depth != 0
-                    || limits.rtime != 0
-                    || limits.perft != 0
-                    || limits.multi_pv != 1
-                    || !limits.search_moves.is_empty()
-                    || (limits.movetime <= 0
-                        && limits.time_left(side) <= 0
-                        && limits.byoyomi_time(side) <= 0
-                        && limits.increment(side) <= 0)
-                    || self.entering_king_rule == EnteringKingRule::TryRule
-                    || pos.declaration_win(self.entering_king_rule) != Move::NONE
-                    || !crate::mate::dfpn::game::has_checking_move(pos)
-                {
-                    return false;
-                }
-                let Some(deadline) = time_manager.maximum_deadline() else {
-                    return false;
-                };
-                self.game_mate.start(
-                    config,
-                    pos,
-                    self.max_moves_to_draw,
-                    deadline,
-                    Arc::clone(&self.stop),
-                )
-            })
-        };
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            limits.reserved_game_mate_threads = self.game_mate.busy_threads();
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        let active_helpers = self.num_threads.saturating_sub(1 + limits.reserved_game_mate_threads);
+        // デバッグ用の helper 有効化制御
+        // go depth/go mate を含め helper を有効化する。
+        // 追加の切り分けは環境変数 RSHOGI_DISABLE_HELPER_SEARCH で行う。
+        let helper_search_enabled = self.num_threads > 1 && !helper_search_disabled();
 
         if helper_search_enabled {
             self.thread_pool.start_thinking(
@@ -1545,38 +1182,15 @@ impl Search {
         }
 
         // 探索実行（コールバックなしの場合はダミーを渡す）
-        let _effective_multi_pv = match on_info.as_mut() {
-            Some(callback) => {
-                // 検証は公開用コピーに限定し、内部 RootMoves/previous_pv を変えない。
-                let root_pos = pos.clone();
-                let rule = self.entering_king_rule;
-                #[cfg(test)]
-                let corrupt = self.corrupt_public_pv.clone();
-                self.search_with_callback(
-                    pos,
-                    &limits,
-                    &mut time_manager,
-                    max_depth,
-                    &mut |info: &SearchInfo| {
-                        #[cfg(feature = "allocation-stats")]
-                        let _allocation_scope = crate::allocation_stats::Scope::enter(
-                            crate::allocation_stats::Phase::Output,
-                        );
-                        let mut public_info = info.clone();
-                        #[cfg(test)]
-                        if let Some(pv) = corrupt.as_ref() {
-                            public_info.pv = pv.clone();
-                        }
-                        public_info.pv.truncate(legal_pv_prefix_len(
-                            &root_pos,
-                            &public_info.pv,
-                            rule,
-                        ));
-                        callback(&public_info);
-                    },
-                    skill_enabled,
-                )
-            }
+        let _effective_multi_pv = match on_info {
+            Some(callback) => self.search_with_callback(
+                pos,
+                &limits,
+                &mut time_manager,
+                max_depth,
+                callback,
+                skill_enabled,
+            ),
             None => {
                 let mut noop = |_info: &SearchInfo| {};
                 self.search_with_callback(
@@ -1590,17 +1204,13 @@ impl Search {
             }
         };
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let game_mate = self.game_mate.finish().filter(|_| game_mate_started);
-
         if helper_search_enabled {
             self.stop.store(true, Ordering::SeqCst);
             self.thread_pool.wait_for_search_finished();
         }
 
-        let use_best_thread = limits.analysis.is_none()
-            && self.num_threads > 1
-            && should_use_best_thread_selection(&limits, skill_enabled);
+        let use_best_thread =
+            self.num_threads > 1 && should_use_best_thread_selection(&limits, skill_enabled);
         let debug_best_thread = best_thread_debug_enabled();
 
         let best_thread_id = {
@@ -1608,14 +1218,7 @@ impl Search {
                 .worker
                 .as_ref()
                 .expect("worker should be initialized by search_with_callback");
-            get_best_thread_id(
-                worker,
-                &self.thread_pool,
-                use_best_thread,
-                debug_best_thread,
-                #[cfg(not(target_arch = "wasm32"))]
-                active_helpers,
-            )
+            get_best_thread_id(worker, &self.thread_pool, use_best_thread, debug_best_thread)
         };
 
         let best_result = if best_thread_id == 0 {
@@ -1623,24 +1226,16 @@ impl Search {
                 .worker
                 .as_ref()
                 .expect("worker should be initialized by search_with_callback");
-            collect_best_thread_result(worker, pos, &limits, skill_enabled, &mut skill)
+            collect_best_thread_result(worker, &limits, skill_enabled, &mut skill)
         } else {
-            // Native: Use helper_threads() to access Thread objects directly.
-            // Wasm without wasm-threads: helper_threads() is always empty, so this
-            // yields None and the main worker result below is used.
-            #[cfg(not(all(target_arch = "wasm32", feature = "wasm-threads")))]
+            // Native: Use helper_threads() to access Thread objects directly
+            #[cfg(not(target_arch = "wasm32"))]
             let result = {
                 let mut result = None;
                 for thread in self.thread_pool.helper_threads() {
                     if thread.id() == best_thread_id {
                         result = Some(thread.with_worker(|worker: &mut SearchWorker| {
-                            collect_best_thread_result(
-                                worker,
-                                pos,
-                                &limits,
-                                skill_enabled,
-                                &mut skill,
-                            )
+                            collect_best_thread_result(worker, &limits, skill_enabled, &mut skill)
                         }));
                         break;
                     }
@@ -1674,15 +1269,9 @@ impl Search {
                     };
                     BestThreadResult {
                         best_move,
+                        ponder_move: Move::NONE, // Cannot get ponder from helper in Wasm
                         score,
-                        // skill 有効時は MultiPV が 2 以上なので、中断した反復の結果は採用されず Exact になる。
-                        bound: if skill_enabled {
-                            Bound::Exact
-                        } else {
-                            r.best_bound
-                        },
                         completed_depth: r.completed_depth,
-                        sel_depth: self.worker.as_ref().map(|w| w.state.sel_depth).unwrap_or(0),
                         nodes: r.nodes,
                         // Use the actual best score (not skill-weakened) for time management
                         // and aspiration window initialization, matching native behavior.
@@ -1693,65 +1282,44 @@ impl Search {
                 })
             };
 
+            // Wasm without wasm-threads: Always use main thread
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+            let result: Option<BestThreadResult> = None;
+
             result.unwrap_or_else(|| {
                 let worker = self
                     .worker
                     .as_ref()
                     .expect("worker should be initialized by search_with_callback");
-                collect_best_thread_result(worker, pos, &limits, skill_enabled, &mut skill)
+                collect_best_thread_result(worker, &limits, skill_enabled, &mut skill)
             })
         };
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let best_result = if let Some(mate) = game_mate {
-            if best_result.best_move == Move::WIN {
-                best_result
-            } else {
-                log::info!("game mate verified: {} in {} plies", mate.first.to_usi(), mate.plies);
-                BestThreadResult {
-                    best_move: mate.first,
-                    score: Value::mate_in(i32::from(mate.plies)),
-                    bound: Bound::Lower,
-                    pv: vec![mate.first],
-                    ..best_result
-                }
-            }
-        } else {
-            best_result
-        };
         let BestThreadResult {
             best_move,
+            ponder_move,
             score,
-            bound,
             completed_depth,
-            sel_depth,
             nodes: _best_nodes,
             best_previous_score,
             best_previous_average_score,
-            mut pv,
+            pv,
         } = best_result;
-        // helper 採択と skill 選択で公開する手が変わるため、確定した後に検証する。
-        if pv.is_empty() && best_move != Move::NONE {
-            pv.push(best_move);
-        }
-        #[cfg(test)]
-        if let Some(corrupt) = self.corrupt_public_pv.as_ref() {
-            pv = corrupt.clone();
-        }
-        pv.truncate(legal_pv_prefix_len(pos, &pv, self.entering_king_rule));
-        let ponder_move = pv.get(1).copied().filter(|mv| !mv.is_win()).unwrap_or(Move::NONE);
+
+        // 防御的 mate-blunder check v3 (= `DefenseMateProbeNodes` > 0 のときのみ)。
+        // 劣勢時 (score ≤ -800) は depth 8、通常時は depth 6 の二段構えで
+        // 選んだ bestmove が相手の即詰みを許す場合、詰まされない別候補手へ差し替える。
+        let (best_move, ponder_move) = self.defense_mate_probe(pos, best_move, ponder_move, score);
+
         let total_nodes = {
             let main_nodes = self.worker.as_ref().map(|w| w.state.nodes).unwrap_or(0);
 
             // Native: Use helper_threads() to get node counts
             #[cfg(not(target_arch = "wasm32"))]
             let helper_nodes =
-                self.thread_pool.helper_threads().iter().take(active_helpers).fold(
-                    0u64,
-                    |acc, thread| {
-                        acc.saturating_add(thread.with_worker(|worker| worker.state.nodes))
-                    },
-                );
+                self.thread_pool.helper_threads().iter().fold(0u64, |acc, thread| {
+                    acc.saturating_add(thread.with_worker(|worker| worker.state.nodes))
+                });
 
             // Wasm with wasm-threads: Use helper_nodes() to get node counts
             #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
@@ -1764,37 +1332,6 @@ impl Search {
             main_nodes.saturating_add(helper_nodes)
         };
 
-        // Lazy SMPで採択したbestThreadのPVをbestmove直前の最終infoとして再出力する。
-        // 最後の info の pv 先頭を bestmove に揃えるため、採択ライン (multipv 1) を出す。
-        // score が番兵 (±INFINITE) のまま = depth 1 の初手完了前に中断した場合は
-        // 出さない。
-        // Wasm helper 採択で PV を取得できない場合も bestmove 1 手の PV で保証を保つ。
-        if let Some(callback) = on_info.as_mut()
-            && limits.analysis.is_none()
-            && best_move != Move::NONE
-            && root_score_is_initialized(score)
-        {
-            #[cfg(feature = "allocation-stats")]
-            let _allocation_scope =
-                crate::allocation_stats::Scope::enter(crate::allocation_stats::Phase::Output);
-            let final_pv = pv.clone();
-            let time_ms = time_manager.elapsed() as u64;
-            let nps = total_nodes.saturating_mul(1000) / time_ms.max(1);
-            let info = SearchInfo {
-                depth: completed_depth,
-                sel_depth,
-                score,
-                bound,
-                nodes: total_nodes,
-                time_ms,
-                nps,
-                hashfull: self.tt.hashfull(3) as u32,
-                pv: final_pv,
-                multi_pv: 1,
-            };
-            callback(&info);
-        }
-
         // 次の手番のために timeReduction を持ち回る
         self.previous_time_reduction = time_manager.previous_time_reduction();
 
@@ -1806,14 +1343,10 @@ impl Search {
         // 探索統計レポートを取得（search-stats feature有効時のみ内容あり）
         let stats_report = self.worker.as_ref().map(|w| w.get_stats_report()).unwrap_or_default();
 
-        #[cfg(target_os = "linux")]
-        drop(numa_affinity);
-
         SearchResult {
             best_move,
             ponder_move,
             score,
-            bound,
             depth: completed_depth,
             nodes: total_nodes,
             pv,
@@ -1847,7 +1380,6 @@ impl Search {
             ponderhit_flag: &self.ponderhit_flag,
             start_time: self.start_time.unwrap(),
             tt: &self.tt,
-            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             thread_pool: &self.thread_pool,
             increase_depth: self.increase_depth,
             search_again_counter: self.search_again_counter,
@@ -1860,13 +1392,6 @@ impl Search {
             increase_depth_shared: &self.increase_depth_shared,
         };
 
-        #[cfg(feature = "search-tree-sample")]
-        {
-            worker.state.tree_sampler = self.tree_sampler.take();
-            if let Some(sampler) = worker.state.tree_sampler.as_deref_mut() {
-                sampler.begin_search(pos.game_ply());
-            }
-        }
         let mut noop_progress = |_nodes: u64, _bmc: f64| {};
         let result = iterative_deepening(
             &mut worker,
@@ -1890,50 +1415,14 @@ impl Search {
         self.last_best_move_depth = main_state.last_best_move_depth;
         self.tot_best_move_changes = main_state.tot_best_move_changes;
 
-        #[cfg(feature = "search-tree-sample")]
-        {
-            self.tree_sampler = worker.state.tree_sampler.take();
-        }
-
         // workerを戻す
         self.worker = Some(worker);
 
         result
     }
-
-    /// 探索中の局面の書き出しを設定する。`None` で止める。累計とバッファは捨てる。
-    ///
-    /// 書き出すのは main thread の探索だけ。`config.probability` が 0..=1 の外なら panic する。
-    #[cfg(feature = "search-tree-sample")]
-    pub fn set_tree_sample(&mut self, config: Option<super::TreeSampleConfig>, seed: u64) {
-        self.tree_sampler =
-            config.map(|config| Box::new(super::tree_sample::TreeSampler::new(config, seed)));
-    }
-
-    /// 書き出しの乱数を `seed` から始め直す。設定が無ければ何もしない。
-    #[cfg(feature = "search-tree-sample")]
-    pub fn reseed_tree_sample(&mut self, seed: u64) {
-        if let Some(sampler) = self.tree_sampler.as_deref_mut() {
-            sampler.reseed(seed);
-        }
-    }
-
-    /// 積んだ標本を `out` の末尾へ移す。
-    #[cfg(feature = "search-tree-sample")]
-    pub fn drain_tree_samples(&mut self, out: &mut Vec<super::TreeSample>) {
-        if let Some(sampler) = self.tree_sampler.as_deref_mut() {
-            sampler.drain_into(out);
-        }
-    }
-
-    /// 設定してからの条件ごとの累計。
-    #[cfg(feature = "search-tree-sample")]
-    pub fn tree_sample_stats(&self) -> super::TreeSampleStats {
-        self.tree_sampler.as_deref().map(|sampler| sampler.stats()).unwrap_or_default()
-    }
 }
 
-/// メインスレッド固有の可変状態
+/// メインスレッド固有の可変状態（YO の SearchManager に対応）
 ///
 /// `search_with_callback` 呼び出し前に `Search` のフィールドから構築し、
 /// 戻った後に書き戻す。
@@ -1941,7 +1430,6 @@ struct MainThreadState<'a> {
     ponderhit_flag: &'a AtomicBool,
     start_time: Instant,
     tt: &'a TranspositionTable,
-    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     thread_pool: &'a ThreadPool,
     // owned (書き戻し対象)
     increase_depth: bool,
@@ -1965,11 +1453,6 @@ impl MainThreadState<'_> {
     ) -> (f64, f64, f64, usize) {
         let prev_avg_raw = self.best_previous_average_score.unwrap_or(Value::INFINITE).raw();
         let iter_val = self.iter_value[self.iter_idx];
-        log::trace!(
-            target: "rshogi_core::search::time",
-            "event=evaluation_reference depth={} previous_average_raw={} iteration_reference_raw={} best_raw={} last_best_depth={}",
-            completed_depth, prev_avg_raw, iter_val.raw(), best_value.raw(), self.last_best_move_depth,
-        );
         let falling_eval = calculate_falling_eval(prev_avg_raw, iter_val.raw(), best_value.raw());
         let time_reduction = calculate_time_reduction(completed_depth, self.last_best_move_depth);
         (falling_eval, time_reduction, tot_best_move_changes, thread_count)
@@ -1982,11 +1465,11 @@ impl MainThreadState<'_> {
     }
 }
 
-/// メインスレッドとワーカーで共用する反復深化ループ。
+/// YaneuraOu の iterative_deepening() に対応する統合反復深化ループ。
 ///
 /// メインスレッドでは `main_state = Some(...)` で呼び出し、
 /// ヘルパースレッドでは `main_state = None` で呼び出す。
-/// `main_state` がある場合だけメインスレッド用の処理を行う。
+/// YO の `if (mainThread)` パターンを `if let Some(ref mut ms) = main_state` で表現。
 fn iterative_deepening<FInfo, FProgress>(
     worker: &mut SearchWorker,
     pos: &mut Position,
@@ -2004,28 +1487,15 @@ where
     FProgress: FnMut(u64, f64),
 {
     let is_main = main_state.is_some();
-    #[cfg(feature = "allocation-stats")]
-    let _allocation_scope =
-        crate::allocation_stats::Scope::enter(crate::allocation_stats::Phase::Iteration);
-
-    // 毎 go の開始時に全スロットの cutoff_cnt をクリアする。孫スロット方式のクリア経路に
-    // 穴があっても go をまたぐ寿命比例の蓄積と i32 overflow を起こさないための防御で、
-    // go 内の蓄積は保持される。
-    for stack in &mut worker.state.stack {
-        stack.cutoff_cnt = 0;
-    }
 
     // ルート手を初期化
-    if worker.state.completed_depth == 0 {
-        worker.state.root_moves = super::RootMoves::from_legal_moves(pos, &limits.search_moves);
-    }
+    worker.state.root_moves = super::RootMoves::from_legal_moves(pos, &limits.search_moves);
 
-    // root の入玉宣言勝ちチェック
-    // 探索内の宣言勝ち判定は probe_transposition と qsearch で行う。
+    // 入玉宣言勝ちチェック（YO準拠: root のみ）
     let decl_move = pos.declaration_win(worker.entering_king_rule);
     if decl_move != Move::NONE {
         // 宣言勝ち可能: root_moves に追加してスコア MATE を設定
-        // searchmoves に関係なく追加する
+        // searchmoves に関係なく追加する（YO準拠）
         if worker.state.root_moves.find(decl_move).is_none() {
             worker.state.root_moves.push(super::RootMove::new(decl_move));
         }
@@ -2040,18 +1510,28 @@ where
             eprintln!("info string declaration win: {}", decl_move.to_usi());
         }
 
-        wait_for_search_release(worker.state.abort, limits, time_manager, main_state.as_deref());
+        // ponder/infinite 待機: bestmove を早出ししない（USI仕様準拠）
+        if let Some(ref ms) = main_state {
+            while !worker.state.abort
+                && !time_manager.stop_requested()
+                && (time_manager.is_pondering() || limits.infinite)
+            {
+                if ms.ponderhit_flag.swap(false, Ordering::Relaxed) {
+                    time_manager.on_ponderhit();
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
         return 0;
     }
 
     if worker.state.root_moves.is_empty() {
         worker.state.best_move = Move::NONE;
-        wait_for_search_release(worker.state.abort, limits, time_manager, main_state.as_deref());
         return 0;
     }
 
     // 合法手が1つの場合は500ms上限を適用
-    if limits.analysis.is_none() && worker.state.root_moves.len() == 1 {
+    if worker.state.root_moves.len() == 1 {
         time_manager.apply_single_move_limit();
     }
 
@@ -2061,12 +1541,10 @@ where
     }
     effective_multi_pv = effective_multi_pv.min(worker.state.root_moves.len());
 
-    // 中断したとき、MultiPV・skill の順位や確定値を求める呼出側の結果を完了した反復へ戻すために保存する。
-    let mut completed_root_moves = if worker.state.completed_depth > 0 {
-        worker.state.root_moves.clone()
-    } else {
-        super::RootMoves::new()
-    };
+    // 中断時にPVを巻き戻すための保持
+    let mut last_best_pv = vec![Move::NONE];
+    let mut last_best_score = Value::new(-Value::INFINITE.raw());
+    let mut last_best_move_depth = 0;
 
     // ヘルパー用のローカル search_again_counter
     let mut local_search_again_counter: i32 = 0;
@@ -2078,13 +1556,8 @@ where
     }
 
     // 反復深化ループ
-    for depth in (worker.state.completed_depth + 1)..=max_depth {
-        time_manager.publish_nodes(worker.state.nodes);
-        if worker.state.abort || time_manager.stop_requested() {
-            if is_main {
-                time_manager.trace_external_stop();
-            }
-            worker.state.abort = true;
+    for depth in 1..=max_depth {
+        if worker.state.abort {
             break;
         }
 
@@ -2123,24 +1596,25 @@ where
         {
             let best_value = worker.state.root_moves[0].score;
 
-            if proven_mate_depth_exceeded(best_value, depth) {
+            if limits.mate == 0 {
+                if proven_mate_depth_exceeded(best_value, depth) {
+                    break;
+                }
+            } else if mate_within_limit(
+                best_value,
+                worker.state.root_moves[0].score_lower_bound,
+                worker.state.root_moves[0].score_upper_bound,
+                limits.mate,
+            ) {
+                // メインのみ request_stop
+                if is_main {
+                    time_manager.request_stop();
+                }
                 break;
             }
         }
 
         // メインのみ: if (!mainThread) continue; に対応する部分はループ末尾で処理
-
-        let iteration_start = (is_main
-            && log::log_enabled!(target: "rshogi_core::search::time", log::Level::Trace))
-        .then(|| time_manager.elapsed());
-        if let Some(elapsed) = iteration_start {
-            log::trace!(
-                target: "rshogi_core::search::time",
-                "event=iteration_start depth={} elapsed_ms={} effective_elapsed_ms={} increase_depth={} deadline_ms={}",
-                depth, elapsed, time_manager.elapsed_from_ponderhit(), inc_depth,
-                time_manager.search_end(),
-            );
-        }
 
         let search_depth = depth;
         worker.state.root_depth = search_depth;
@@ -2154,7 +1628,6 @@ where
 
         // MultiPVループ
         let mut processed_pv = 0;
-        let mut depth_aborted = false;
         for pv_idx in 0..effective_multi_pv {
             if worker.state.abort {
                 break;
@@ -2167,16 +1640,12 @@ where
                 &worker.search_tune_params,
             );
             let mut failed_high_cnt = 0;
-            let mut pv_aborted = false;
 
             // Aspiration Windowループ
             loop {
                 let adjusted_depth =
                     (search_depth - failed_high_cnt - (3 * (search_again_counter + 1) / 4)).max(1);
 
-                // Aspiration retry ごとに node budget を測る。guard 自体は一度発火したら
-                // go の残り全体で有効にし、別 retry で同じ病的連鎖が再発するのを防ぐ。
-                worker.state.begin_depth_liveness_attempt();
                 let score = if pv_idx == 0 {
                     worker.search_root(pos, adjusted_depth, alpha, beta, limits, time_manager)
                 } else {
@@ -2198,17 +1667,11 @@ where
                 // abort フラグに加え、nodes 制限超過も直接チェックする
                 // （check_abort は頻度制御で呼び出されるため、abort フラグが
                 //   立っていないまま search_root が返ることがある）
-                time_manager.publish_nodes(worker.state.nodes);
                 if worker.state.abort
-                    || time_manager.node_limit_reached(limits, worker.state.nodes)
+                    || (limits.nodes > 0 && worker.state.nodes >= limits.nodes)
                     || time_manager.stop_requested()
                 {
-                    if is_main {
-                        time_manager.trace_external_stop();
-                    }
                     worker.state.abort = true;
-                    pv_aborted = true;
-                    depth_aborted = true;
                     break;
                 }
 
@@ -2241,36 +1704,19 @@ where
 
             // 安定ソート [pv_idx..]
             worker.state.root_moves.stable_sort_range(pv_idx, worker.state.root_moves.len());
-            // 探索済みのPVライン全体も安定ソートして順位を保つ
-            // abortしたdepthのinfoは出さない。最終infoは反復深化の後に決めた結果 (完了した反復、
-            // または根の先頭に別の手が残った中断反復) から作る。
-            // 完了済みラインの取りこぼしはMultiPV>1のみで許容し、探索状態の安定ソートは中断時も維持する。
+            // 📝 YaneuraOu行1539: 探索済みのPVライン全体も安定ソートして順位を保つ
             worker.state.root_moves.stable_sort_range(0, pv_idx + 1);
-            if !pv_aborted {
-                processed_pv = pv_idx + 1;
-            }
+            processed_pv = pv_idx + 1;
         }
 
-        // MultiPVループ完了後の最終ソート
+        // MultiPVループ完了後の最終ソート（YaneuraOu行1499）
         if !worker.state.abort && effective_multi_pv > 1 {
             worker.state.root_moves.stable_sort_range(0, effective_multi_pv);
         }
 
-        if let Some(start) = iteration_start {
-            let elapsed = time_manager.elapsed();
-            log::trace!(
-                target: "rshogi_core::search::time",
-                "event=iteration_end depth={} elapsed_ms={} effective_elapsed_ms={} iteration_ms={} aborted={} main_nodes={} best_move={} score_raw={}",
-                depth, elapsed, time_manager.elapsed_from_ponderhit(),
-                elapsed.saturating_sub(start), worker.state.abort, worker.state.nodes,
-                worker.state.root_moves[0].mv().to_usi(), worker.state.root_moves[0].score.raw(),
-            );
-        }
-
-        // メインのみ: info出力（GUI詰まり防止）
+        // メインのみ: info出力（GUI詰まり防止のYO仕様）
         if let Some(ref ms) = main_state
             && processed_pv > 0
-            && !depth_aborted
         {
             let elapsed = ms.start_time.elapsed();
             let time_ms = elapsed.as_millis() as u64;
@@ -2295,20 +1741,15 @@ where
             let nps = total_nodes.saturating_mul(1000).checked_div(time_ms).unwrap_or(0);
 
             for pv_idx in 0..processed_pv {
-                let root_move = &worker.state.root_moves[pv_idx];
-                if !root_score_is_initialized(root_move.score) {
-                    continue;
-                }
                 let info = SearchInfo {
                     depth,
-                    sel_depth: root_move.sel_depth,
-                    score: root_move.score,
-                    bound: root_move.score_bound(),
+                    sel_depth: worker.state.root_moves[pv_idx].sel_depth,
+                    score: worker.state.root_moves[pv_idx].score,
                     nodes: total_nodes,
                     time_ms,
                     nps,
                     hashfull: ms.tt.hashfull(3) as u32,
-                    pv: root_move.pv.clone(),
+                    pv: worker.state.root_moves[pv_idx].pv.clone(),
                     multi_pv: pv_idx + 1, // 1-indexed
                 };
                 on_info(&info);
@@ -2321,12 +1762,10 @@ where
             worker.state.best_move = worker.state.root_moves[0].mv();
 
             // previous_scoreを次のiterationのためにシード
-            // 前回のスコアを保存する。
+            // （YaneuraOu行1304-1305: rm.previousScore = rm.score）
             for rm in worker.state.root_moves.iter_mut() {
                 rm.previous_score = rm.score;
             }
-
-            completed_root_moves.clone_from(&worker.state.root_moves);
 
             let best_move_changes = worker.state.best_move_changes;
             worker.state.best_move_changes = 0.0;
@@ -2356,13 +1795,11 @@ where
                 // Native: Use helper_threads() to collect best_move_changes
                 #[cfg(not(target_arch = "wasm32"))]
                 let (changes_sum, thread_count) = {
-                    let helpers = ms.thread_pool.helper_threads();
-                    let helper_threads =
-                        &helpers[..helpers.len().saturating_sub(limits.reserved_game_mate_threads)];
+                    let helper_threads = ms.thread_pool.helper_threads();
                     let mut changes = Vec::with_capacity(helper_threads.len() + 1);
                     changes.push(best_move_changes);
                     for thread in helper_threads {
-                        changes.push(thread.take_best_move_changes());
+                        changes.push(thread.best_move_changes());
                     }
                     aggregate_best_move_changes(&changes)
                 };
@@ -2370,7 +1807,7 @@ where
                 // Wasm with wasm-threads: Use helper_best_move_changes() for realtime values
                 #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
                 let (changes_sum, thread_count) = {
-                    let helper_changes = ms.thread_pool.take_helper_best_move_changes();
+                    let helper_changes = ms.thread_pool.helper_best_move_changes();
                     let mut changes = Vec::with_capacity(helper_changes.len() + 1);
                     changes.push(best_move_changes);
                     changes.extend(helper_changes);
@@ -2430,6 +1867,15 @@ where
                 on_progress(worker.state.nodes, best_move_changes);
             }
 
+            // PVが変わったときのみ last_best_* を更新
+            if !worker.state.root_moves[0].pv.is_empty()
+                && worker.state.root_moves[0].pv[0] != last_best_pv[0]
+            {
+                last_best_pv = worker.state.root_moves[0].pv.clone();
+                last_best_score = worker.state.root_moves[0].score;
+                last_best_move_depth = depth;
+            }
+
             // 詰みスコアが見つかっていたら早期終了
             // ponder中は stop/ponderhit を待つ必要があるためスキップ（USI仕様準拠）
             if effective_multi_pv == 1
@@ -2439,93 +1885,63 @@ where
             {
                 let best_value = worker.state.root_moves[0].score;
 
-                if proven_mate_depth_exceeded(best_value, depth) {
+                if limits.mate == 0 {
+                    if proven_mate_depth_exceeded(best_value, depth) {
+                        break;
+                    }
+                } else if mate_within_limit(
+                    best_value,
+                    worker.state.root_moves[0].score_lower_bound,
+                    worker.state.root_moves[0].score_upper_bound,
+                    limits.mate,
+                ) {
+                    if is_main {
+                        time_manager.request_stop();
+                    }
                     break;
                 }
             }
         }
     }
 
-    // 反復深化が自然終了した場合も、終局分岐と同じ通知待機を通る。
-    wait_for_search_release(worker.state.abort, limits, time_manager, main_state.as_deref());
-
-    time_manager.publish_nodes(worker.state.nodes);
-    if worker.state.abort && !completed_root_moves.is_empty() {
-        // 中断した反復で根の先頭に完了した反復と別の手が残っていれば、その手・評価値・PV を返す。
-        // 評価値は窓の外の下界・上界のこともあり、bound として呼出側へ渡す。
-        // 先頭が同じ手なら、aspiration の再探索中に止まった bound と短い PV より完了した反復の値を返す。
-        // 番兵の値、未完了の探索から来た負け評価、MultiPV の順位、再開に使う解析の完了結果、
-        // 確定値だけを求める呼出側 (`return_completed_iteration`) は完了した反復の結果へ戻す。
-        let head = &worker.state.root_moves[0];
-        let keep_partial = limits.analysis.is_none()
-            && !limits.return_completed_iteration
-            && effective_multi_pv == 1
-            && head.mv() != completed_root_moves[0].mv()
-            && root_score_is_initialized(head.score)
-            && !head.score.is_loss();
-        if keep_partial {
-            worker.state.best_move = worker.state.root_moves[0].mv();
-        } else {
-            worker.state.root_moves = completed_root_moves;
-        }
-    }
-
-    effective_multi_pv
-}
-
-/// mainだけが終了通知を待つ。helperは待たずに呼出側へ戻る。
-fn wait_for_search_release(
-    aborted: bool,
-    limits: &LimitsType,
-    time_manager: &mut TimeManagement,
-    main_state: Option<&MainThreadState<'_>>,
-) {
-    if let Some(ms) = main_state {
-        while !aborted
+    // ponder中 / go infinite中はGUIからstop/ponderhitが来るまでbestmoveを出力してはならない（YaneuraOu準拠）
+    // 反復深化ループが自然に終了した場合（MAX_PLY到達や詰み確定）でもここで待機する
+    if let Some(ref ms) = main_state {
+        while !worker.state.abort
             && !time_manager.stop_requested()
             && (time_manager.is_pondering() || limits.infinite)
         {
             if ms.ponderhit_flag.swap(false, Ordering::Relaxed) {
                 time_manager.on_ponderhit();
             }
+            // YaneuraOu 同様、探索終了後の待機では短時間 sleep して busy wait を避ける。
             thread::sleep(Duration::from_millis(1));
         }
-        time_manager.trace_external_stop();
     }
-}
-/// 公開用 PV の合法な接頭列の長さ。元の局面と探索用 PV は変更しない。
-fn legal_pv_prefix_len(root: &Position, pv: &[Move], rule: EnteringKingRule) -> usize {
-    if pv.is_empty() {
-        return 0;
-    }
-    let mut pos = root.clone();
-    for (idx, &mv) in pv.iter().enumerate() {
-        if mv.is_win() {
-            return idx + usize::from(pos.declaration_win(rule) == Move::WIN);
-        }
-        // is_legal 単独には pseudo-legal 入力の前提があるため、全合法手と照合する。
-        let mut legal = MoveList::new();
-        generate_legal_all_with_pass(&pos, &mut legal);
-        if !legal.as_slice().contains(&mv) {
-            return idx;
-        }
-        if idx + 1 < pv.len() {
-            let check = pos.gives_check(mv);
-            pos.do_move(mv, check);
-        }
-    }
-    pv.len()
-}
 
-fn root_score_is_initialized(score: Value) -> bool {
-    let raw = score.raw();
-    -Value::INFINITE.raw() < raw && raw < Value::INFINITE.raw()
+    // 中断した探索で信頼できないPVになった場合のフォールバック
+    if worker.state.abort
+        && !worker.state.root_moves.is_empty()
+        && worker.state.root_moves[0].score.is_loss()
+    {
+        let head = last_best_pv.first().copied().unwrap_or(Move::NONE);
+        if head != Move::NONE
+            && let Some(idx) = worker.state.root_moves.find(head)
+        {
+            worker.state.root_moves.move_to_front(idx);
+            worker.state.root_moves[0].pv = last_best_pv;
+            worker.state.root_moves[0].score = last_best_score;
+            worker.state.completed_depth = last_best_move_depth;
+        }
+    }
+
+    effective_multi_pv
 }
 
 // search_helper_impl is a thin wrapper that calls iterative_deepening with main_state=None.
 // Only compiled for Native and Wasm with wasm-threads (single-threaded Wasm doesn't use helper threads).
 #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
-fn search_helper_impl<F>(
+fn search_helper_impl<F1, F2>(
     worker: &mut SearchWorker,
     pos: &mut Position,
     limits: &LimitsType,
@@ -2533,17 +1949,20 @@ fn search_helper_impl<F>(
     max_depth: Depth,
     skill_enabled: bool,
     increase_depth_shared: &AtomicBool,
-    mut on_depth_complete: F,
+    on_start: F1,
+    mut on_depth_complete: F2,
 ) -> usize
 where
-    F: FnMut(u64, f64),
+    F1: FnOnce(),
+    F2: FnMut(u64, f64),
 {
-    // 恒久修正評価のため、go depth を含め helper からのTT書き込みを有効にする。
+    // 恒久修正評価のため、go depth/go mate を含め helper からのTT書き込みを有効にする。
     worker.allow_tt_write = true;
 
-    let mut cumulative_changes = 0.0;
+    on_start();
+
     let mut noop_info = |_info: &SearchInfo| {};
-    let completed = iterative_deepening(
+    iterative_deepening(
         worker,
         pos,
         limits,
@@ -2553,13 +1972,8 @@ where
         increase_depth_shared,
         None,
         &mut noop_info,
-        &mut |nodes, changes| {
-            cumulative_changes += changes;
-            on_depth_complete(nodes, cumulative_changes);
-        },
-    );
-    on_depth_complete(worker.state.nodes, cumulative_changes + worker.state.best_move_changes);
-    completed
+        &mut on_depth_complete,
+    )
 }
 
 // Native version: takes progress parameter for tracking helper thread statistics.
@@ -2582,6 +1996,11 @@ pub(crate) fn search_helper(
         max_depth,
         skill_enabled,
         increase_depth_shared,
+        || {
+            if let Some(p) = progress {
+                p.reset();
+            }
+        },
         |nodes, bmc| {
             if let Some(p) = progress {
                 p.update(nodes, bmc);
@@ -2610,6 +2029,11 @@ pub(crate) fn search_helper(
         max_depth,
         skill_enabled,
         increase_depth_shared,
+        || {
+            if let Some(p) = progress {
+                p.reset();
+            }
+        },
         |nodes, bmc| {
             if let Some(p) = progress {
                 p.update(nodes, bmc);
@@ -2626,586 +2050,11 @@ pub(crate) fn search_helper(
 // =============================================================================
 
 #[cfg(test)]
-impl Search {
-    /// テスト専用: ponderhit flag の現在値を読み取る。
-    pub(crate) fn ponderhit_flag_for_test(&self) -> bool {
-        self.ponderhit_flag.load(Ordering::Relaxed)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
     /// SearchWorkerは大きなスタック領域を使うため、テストは別スレッドで実行
     const STACK_SIZE: usize = 64 * 1024 * 1024; // 64MB
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn changing_helper_count_does_not_signal_stop() {
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let mut search = Search::new_with_eval_hash(1, 1);
-                let stop = search.stop_flag();
-                for count in [2, 3, 1] {
-                    search.set_num_threads(count);
-                    assert!(!stop.load(Ordering::SeqCst), "Threads={count} requested stop");
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    /// main と helper は同じ表を参照し、共有表は倍率が変わるときだけ作り直す。
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn helpers_share_histories_with_main_worker() {
-        use crate::types::{Color, Piece, Square};
-
-        let _guard = crate::eval::material::test_support::lock_material();
-        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let mut search = Search::new_with_eval_hash(1, 1);
-                search.set_num_threads(2);
-                let params = SearchTuneParams {
-                    main_history_init: 512,
-                    pawn_history_init: -7,
-                    lmr_table_coeff: 3200,
-                    ..SearchTuneParams::default()
-                };
-                search.set_search_tune_params(params);
-                let reductions =
-                    crate::search::alpha_beta::build_reductions(params.lmr_table_coeff);
-                let check_worker = |worker: &mut SearchWorker| {
-                    let history = worker.history.get_mut();
-                    assert_eq!(
-                        history.main_history.get(Color::Black, Move::NONE),
-                        params.main_history_init as i16
-                    );
-                    assert_eq!(worker.reductions, reductions);
-                    assert_eq!(
-                        worker.shared_histories.pawn_history(0, Piece::B_PAWN, Square::SQ_55),
-                        params.pawn_history_init as i16
-                    );
-                };
-                for thread in search.thread_pool.helper_threads() {
-                    thread.with_worker(check_worker);
-                }
-                search.set_num_threads(1);
-                let mut pos = Position::new();
-                pos.set_hirate();
-                let limits = LimitsType {
-                    depth: 1,
-                    ..Default::default()
-                };
-                search.go(&mut pos, limits, None::<fn(&SearchInfo)>);
-                let mut previous = Arc::clone(&search.shared_histories);
-                for (count, rebuilt) in [(3, true), (4, false), (2, true)] {
-                    search.set_num_threads(count);
-                    let shared = Arc::clone(&search.shared_histories);
-                    assert_eq!(!Arc::ptr_eq(&previous, &shared), rebuilt, "Threads={count}");
-                    previous = Arc::clone(&shared);
-                    let main = search.worker.as_ref().unwrap();
-                    assert!(Arc::ptr_eq(&main.shared_histories, &shared));
-                    for thread in search.thread_pool.helper_threads() {
-                        thread.with_worker(|worker| {
-                            assert!(Arc::ptr_eq(&worker.shared_histories, &shared));
-                            check_worker(worker);
-                        });
-                    }
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn changing_threads_after_search_resets_histories_to_current_params() {
-        use crate::types::{Color, Piece, Square};
-
-        let _guard = crate::eval::material::test_support::lock_material();
-        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let mut search = Search::new_with_eval_hash(1, 1);
-                search.set_num_threads(3);
-                let mut pos = Position::new();
-                pos.set_hirate();
-                let limits = LimitsType {
-                    depth: 2,
-                    ..Default::default()
-                };
-                search.go(&mut pos, limits, None::<fn(&SearchInfo)>);
-
-                let shared = Arc::clone(&search.shared_histories);
-                shared.update_pawn_correction(0, Color::Black, 123);
-                let params = SearchTuneParams {
-                    pawn_history_init: -7,
-                    main_history_init: 512,
-                    ..SearchTuneParams::default()
-                };
-                search.set_search_tune_params(params);
-                search.set_num_threads(4);
-
-                let mut fresh = Search::new_with_eval_hash(1, 1);
-                fresh.set_search_tune_params(params);
-                fresh.set_num_threads(4);
-                fresh.clear_for_new_game();
-
-                let pawn_initial_value = |histories: &SharedHistories| {
-                    histories.pawn_history(0, Piece::B_PAWN, Square::SQ_55)
-                };
-                assert!(Arc::ptr_eq(&shared, &search.shared_histories));
-                assert_eq!(
-                    pawn_initial_value(&shared),
-                    pawn_initial_value(&fresh.shared_histories)
-                );
-                assert_eq!(
-                    shared.pawn_correction(0, Color::Black),
-                    fresh.shared_histories.pawn_correction(0, Color::Black)
-                );
-
-                let main_initial_value = |worker: &mut SearchWorker| {
-                    worker.history.get_mut().main_history.get(Color::Black, Move::NONE)
-                };
-                let expected =
-                    fresh.thread_pool.helper_threads()[0].with_worker(main_initial_value);
-                let main = search.worker.as_mut().unwrap();
-                assert!(Arc::ptr_eq(&main.shared_histories, &shared));
-                assert_eq!(main_initial_value(main), expected);
-                for thread in search.thread_pool.helper_threads() {
-                    thread.with_worker(|worker| {
-                        assert!(Arc::ptr_eq(&worker.shared_histories, &shared));
-                        assert_eq!(main_initial_value(worker), expected);
-                    });
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[test]
-    fn tuned_history_matches_after_new_game() {
-        let _guard = crate::eval::material::test_support::lock_material();
-        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let params = SearchTuneParams {
-                    main_history_init: 512,
-                    capture_history_init: -123,
-                    continuation_history_init: -1024,
-                    pawn_history_init: -7,
-                    low_ply_history_init: 256,
-                    lmr_table_coeff: 3200,
-                    ..SearchTuneParams::default()
-                };
-                let new_search = || {
-                    let mut search = Search::new_with_eval_hash(1, 1);
-                    search.set_search_tune_params(params);
-                    search
-                };
-                let run = |search: &mut Search, pos: &mut Position| {
-                    let limits = LimitsType {
-                        nodes: 8_000,
-                        ..Default::default()
-                    };
-                    let result = search.go(pos, limits, None::<fn(&SearchInfo)>);
-                    (result.nodes, result.best_move, result.score)
-                };
-
-                let mut target = Position::new();
-                target.set_hirate();
-                let expected = {
-                    let mut fresh = new_search();
-                    fresh.clear_for_new_game();
-                    run(&mut fresh, &mut target.clone())
-                };
-
-                let mut reused = new_search();
-                let mut other = Position::new();
-                other
-                    .set_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL w - 2")
-                    .unwrap();
-                run(&mut reused, &mut other);
-                reused.clear_tt();
-                reused.clear_eval_hash();
-                reused.clear_for_new_game();
-                assert_eq!(run(&mut reused, &mut target.clone()), expected);
-                drop(reused);
-                assert_eq!(run(&mut new_search(), &mut target), expected);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    /// reset_to_fresh_state の後と、usinewgame と同じ初期化の後の go は、前に何を探索していても
-    /// 新しい Search と同じ木になる。
-    #[test]
-    fn reset_to_fresh_state_matches_new_search() {
-        let _guard = crate::eval::material::test_support::lock_material();
-        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let sfens = [
-                    "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
-                    "lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL w - 2",
-                    "lnsgkgsnl/1r5b1/pppppp1pp/6p2/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL b - 3",
-                    "lnsgkg1nl/1r5s1/pppppp1pp/6p2/9/2P6/PP1PPPPPP/7R1/LNSGKGSNL b Bb 5",
-                ];
-                let run = |search: &mut Search, sfen: &str| {
-                    let mut pos = Position::new();
-                    pos.set_sfen(sfen).unwrap();
-                    let limits = LimitsType {
-                        depth: 7,
-                        ..Default::default()
-                    };
-                    let result = search.go(&mut pos, limits, None::<fn(&SearchInfo)>);
-                    (result.nodes, result.best_move, result.score)
-                };
-                let mut reused = Search::new_with_eval_hash(1, 1);
-                let mut new_game = Search::new_with_eval_hash(1, 1);
-                for &i in &[3, 0, 2, 1, 3, 2] {
-                    reused.reset_to_fresh_state();
-                    new_game.clear_tt();
-                    new_game.clear_eval_hash();
-                    new_game.clear_for_new_game();
-                    let fresh = run(&mut Search::new_with_eval_hash(1, 1), sfens[i]);
-                    assert_eq!(run(&mut reused, sfens[i]), fresh, "{}", sfens[i]);
-                    assert_eq!(run(&mut new_game, sfens[i]), fresh, "{}", sfens[i]);
-                }
-                assert_ne!(new_game.best_previous_score, Some(Value::INFINITE));
-                new_game.clear_for_new_game();
-                assert_eq!(new_game.best_previous_score, Some(Value::INFINITE));
-                assert_eq!(new_game.previous_time_reduction, 0.85);
-                // 浅い探索では漏れが結果に出にくいので、探索スタックが go ごとに新品に戻ることも
-                // 直接見る（解析の再開だけは持ち越す）。
-                let worker = reused.worker.as_mut().unwrap();
-                worker.state.stack.iter_mut().for_each(|e| {
-                    e.tt_pv = true;
-                    e.ply = -1;
-                    e.cont_history_ptr = std::ptr::NonNull::dangling();
-                });
-                let resume = LimitsType {
-                    analysis: Some(crate::search::analysis::AnalysisRun::resumed_for_test()),
-                    ..Default::default()
-                };
-                worker.prepare_search(&resume);
-                assert!(worker.state.stack.iter().all(|e| e.tt_pv && e.ply == -1));
-                worker.prepare_search(&LimitsType::default());
-                let (sentinel, correction_sentinel) =
-                    (worker.cont_history_sentinel, worker.cont_correction_sentinel);
-                assert!(worker.state.stack.iter().enumerate().all(|(i, e)| {
-                    !e.tt_pv
-                        && e.ply == i as i32
-                        && e.cont_history_ptr == sentinel
-                        && e.cont_correction_ptr == correction_sentinel
-                }));
-
-                // helper を使った探索の後も、次の go は深さ上限まで進む。
-                reused.set_num_threads(2);
-                run(&mut reused, sfens[0]);
-                reused.reset_to_fresh_state();
-                let mut pos = Position::new();
-                pos.set_sfen(sfens[0]).unwrap();
-                let limits = LimitsType {
-                    depth: 5,
-                    ..Default::default()
-                };
-                assert_eq!(reused.go(&mut pos, limits, None::<fn(&SearchInfo)>).depth, 5);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    /// callback の panic で所有された Search が破棄されても helper を終了できる。
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn callback_panic_joins_search_helpers() {
-        use std::io::{BufRead, BufReader};
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-        use std::process::{Command, Stdio};
-
-        const CHILD_ENV: &str = "RSHOGI_TEST_CALLBACK_PANIC_CHILD";
-        const CHILD_DONE: &str = "callback-panic-helpers-joined";
-        if std::env::var_os(CHILD_ENV).is_none() {
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "search::engine::tests::callback_panic_joins_search_helpers",
-                    "--nocapture",
-                ])
-                .env(CHILD_ENV, "1")
-                .env_remove("RSHOGI_DISABLE_HELPER_SEARCH")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let stdout = child.stdout.take().unwrap();
-            let output = std::thread::spawn(move || {
-                let mut completed = false;
-                for line in BufReader::new(stdout).lines() {
-                    completed |= line.unwrap().ends_with(CHILD_DONE);
-                }
-                completed
-            });
-            let deadline = Instant::now() + Duration::from_secs(20);
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    let completed = output.join().unwrap();
-                    assert!(status.success(), "callback panic child failed: {status}");
-                    assert!(completed, "child did not complete the helper shutdown assertions");
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    output.join().unwrap();
-                    panic!("callback panic left a helper running during Search destruction");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-
-        let guard = crate::eval::material::test_support::lock_material();
-        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let mut search = Search::new_with_eval_hash(1, 1);
-                search.set_num_threads(2);
-                search.reset_flags();
-                let stop = search.stop_flag();
-                let tt = Arc::downgrade(&search.tt);
-                let eval_hash = Arc::downgrade(&search.eval_hash);
-                let progress = search.thread_pool.helper_threads()[0].progress_for_test();
-                let helper_started = Arc::new(AtomicBool::new(false));
-                let started = Arc::clone(&helper_started);
-                let result = catch_unwind(AssertUnwindSafe(move || {
-                    // closure 内で所有し、panic の unwind 中に Search を破棄する。
-                    let mut search = search;
-                    let mut pos = Position::new();
-                    pos.set_hirate();
-                    search.go(
-                        &mut pos,
-                        LimitsType {
-                            infinite: true,
-                            ..LimitsType::default()
-                        },
-                        Some(|_info: &SearchInfo| {
-                            let deadline = Instant::now() + Duration::from_secs(5);
-                            while progress.nodes() == 0 {
-                                assert!(
-                                    Instant::now() < deadline,
-                                    "helper did not begin searching"
-                                );
-                                std::thread::yield_now();
-                            }
-                            started.store(true, Ordering::SeqCst);
-                            panic!("search info callback failure");
-                        }),
-                    );
-                }));
-                assert!(result.is_err(), "callback panic must propagate");
-                assert!(helper_started.load(Ordering::SeqCst));
-                assert!(stop.load(Ordering::SeqCst));
-                assert!(tt.upgrade().is_none(), "helper retained its TT after Search was dropped");
-                assert!(
-                    eval_hash.upgrade().is_none(),
-                    "helper retained its EvalHash after Search was dropped"
-                );
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-        drop(guard);
-        println!("{CHILD_DONE}");
-    }
-
-    #[test]
-    fn terminal_roots_wait_after_initialization() {
-        use std::sync::mpsc;
-        let mate = "4k4/9/9/9/9/9/4r4/4g4/4K4 b - 1";
-        let declaration = "KGG6/SS7/PPPPPP3/9/9/9/2pppppp1/1ss1gg1nl/4k2nl b 2R2B3p 1";
-        for (sfen, expected) in [(mate, Move::NONE), (declaration, Move::WIN)] {
-            for mode in 0..4 {
-                let (ready_tx, ready_rx) = mpsc::channel();
-                let (done_tx, done_rx) = mpsc::channel();
-                let thread = std::thread::Builder::new()
-                    .stack_size(STACK_SIZE)
-                    .spawn(move || {
-                        let mut search = Search::new_with_eval_hash(1, 1);
-                        let mut pos = Position::new();
-                        pos.set_sfen(sfen).unwrap();
-                        if expected == Move::NONE {
-                            assert!(pos.in_check());
-                            assert!(
-                                super::super::RootMoves::from_legal_moves(&pos, &[]).is_empty()
-                            );
-                        }
-                        let mut limits = LimitsType::new();
-                        limits.ponder = mode == 1 || mode == 2;
-                        limits.infinite = mode == 3;
-                        limits.set_start_time();
-                        search.start_time = limits.start_time;
-                        let mut tm = TimeManagement::new(
-                            Arc::clone(&search.stop),
-                            Arc::clone(&search.ponderhit_flag),
-                        );
-                        tm.init(&limits, pos.side_to_move(), pos.game_ply(), 256);
-                        let mut worker = SearchWorker::new(
-                            Arc::clone(&search.tt),
-                            Arc::clone(&search.eval_hash),
-                            256,
-                            0,
-                            SearchTuneParams::default(),
-                        );
-                        worker.entering_king_rule = EnteringKingRule::Point27;
-                        worker.prepare_search(&limits);
-                        search.worker = Some(worker);
-                        // F01のinit resetより後に同期し、通知消失と終局待機を分離する。
-                        ready_tx
-                            .send((Arc::clone(&search.stop), Arc::clone(&search.ponderhit_flag)))
-                            .unwrap();
-                        search.search_with_callback(
-                            &mut pos,
-                            &limits,
-                            &mut tm,
-                            1,
-                            |_info: &SearchInfo| {},
-                            false,
-                        );
-                        done_tx.send(search.worker.as_ref().unwrap().state.best_move).unwrap();
-                    })
-                    .unwrap();
-                let (stop, hit) = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                if mode != 0 {
-                    assert!(matches!(
-                        done_rx.recv_timeout(Duration::from_millis(100)),
-                        Err(mpsc::RecvTimeoutError::Timeout)
-                    ));
-                    if mode == 1 {
-                        hit.store(true, Ordering::Relaxed);
-                    } else {
-                        if mode == 3 {
-                            hit.store(true, Ordering::Relaxed);
-                            assert!(
-                                matches!(
-                                    done_rx.recv_timeout(Duration::from_millis(50)),
-                                    Err(mpsc::RecvTimeoutError::Timeout)
-                                ),
-                                "infiniteはhitだけで終了しない"
-                            );
-                        }
-                        stop.store(true, Ordering::Relaxed);
-                    }
-                }
-                let result = done_rx.recv_timeout(Duration::from_secs(2));
-                stop.store(true, Ordering::Relaxed);
-                thread.join().unwrap();
-                assert_eq!(result.unwrap(), expected, "mode={mode}");
-            }
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn helper_publishes_cumulative_changes_through_search_end() {
-        let _guard = crate::eval::material::test_support::lock_material();
-        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                for stop_after_first in [false, true] {
-                    let stop = Arc::new(AtomicBool::new(false));
-                    let hit = Arc::new(AtomicBool::new(false));
-                    let mut tm = TimeManagement::new(Arc::clone(&stop), hit);
-                    let mut pos = Position::new();
-                    pos.set_hirate();
-                    let limits = LimitsType {
-                        depth: 3,
-                        ..Default::default()
-                    };
-                    tm.init(&limits, pos.side_to_move(), pos.game_ply(), 100000);
-                    let mut worker = SearchWorker::new(
-                        Arc::new(TranspositionTable::new(1)),
-                        Arc::new(EvalHash::new(1)),
-                        100000,
-                        1,
-                        SearchTuneParams::default(),
-                    );
-                    worker.prepare_search(&limits);
-                    worker.state.best_move_changes = 3.0;
-                    let mut publications = Vec::new();
-                    let completed = search_helper_impl(
-                        &mut worker,
-                        &mut pos,
-                        &limits,
-                        &mut tm,
-                        3,
-                        false,
-                        &AtomicBool::new(true),
-                        |nodes, changes| {
-                            publications.push((nodes, changes));
-                            if stop_after_first {
-                                stop.store(true, Ordering::Relaxed);
-                            }
-                        },
-                    );
-                    assert_eq!(publications.len(), worker.state.completed_depth as usize + 1);
-                    assert_eq!(completed, 1);
-                    assert!(publications[0].1 >= 3.0);
-                    assert!(publications.windows(2).all(|p| p[0].1 <= p[1].1));
-                    assert_eq!(publications.last().unwrap().0, worker.state.nodes);
-                    let progress = SearchProgress::new();
-                    for (nodes, cumulative) in &publications {
-                        progress.update(*nodes, *cumulative);
-                    }
-                    assert_eq!(progress.best_move_changes(), publications.last().unwrap().1);
-                    assert_eq!(progress.best_move_changes(), publications.last().unwrap().1);
-                    assert_eq!(progress.take_best_move_changes(), publications.last().unwrap().1);
-                    assert_eq!(progress.take_best_move_changes(), 0.0);
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn clearing_helper_results_resets_unconsumed_progress() {
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let mut search = Search::new_with_eval_hash(1, 1);
-                search.set_num_threads(2);
-                let helper = &search.thread_pool.helper_threads()[0];
-                let progress = helper.progress_for_test();
-                progress.update(10, 4.0);
-                assert_eq!(helper.take_best_move_changes(), 4.0);
-                progress.update(20, 8.0);
-                search.thread_pool.clear_helper_results();
-                assert_eq!(helper.nodes(), 0);
-                assert_eq!(helper.take_best_move_changes(), 0.0);
-                progress.update(30, 2.0);
-                assert_eq!(helper.take_best_move_changes(), 2.0);
-                assert_eq!(helper.take_best_move_changes(), 0.0);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
 
     #[test]
     fn test_aggregate_best_move_changes_empty() {
@@ -3233,6 +2082,13 @@ mod tests {
         );
 
         limits.depth = 0;
+        limits.mate = 3;
+        assert!(
+            !should_use_best_thread_selection(&limits, false),
+            "go mate ではbest thread選抜を使わない"
+        );
+
+        limits.mate = 0;
         limits.multi_pv = 2;
         assert!(
             !should_use_best_thread_selection(&limits, false),
@@ -3254,7 +2110,6 @@ mod tests {
             ThreadSummary {
                 id: 0,
                 score: Value::new(30),
-                bound: Bound::Exact,
                 completed_depth: 10,
                 best_move: m_2g2f,
                 pv_len: 4,
@@ -3262,7 +2117,6 @@ mod tests {
             ThreadSummary {
                 id: 1,
                 score: Value::new(28),
-                bound: Bound::Exact,
                 completed_depth: 9,
                 best_move: m_2g2f,
                 pv_len: 4,
@@ -3270,7 +2124,6 @@ mod tests {
             ThreadSummary {
                 id: 2,
                 score: Value::new(90),
-                bound: Bound::Exact,
                 completed_depth: 1,
                 best_move: m_6i7h,
                 pv_len: 4,
@@ -3289,7 +2142,6 @@ mod tests {
             ThreadSummary {
                 id: 0,
                 score: Value::mate_in(7),
-                bound: Bound::Exact,
                 completed_depth: 12,
                 best_move: m_2g2f,
                 pv_len: 4,
@@ -3297,7 +2149,6 @@ mod tests {
             ThreadSummary {
                 id: 1,
                 score: Value::mate_in(5),
-                bound: Bound::Exact,
                 completed_depth: 8,
                 best_move: m_7g7f,
                 pv_len: 4,
@@ -3309,60 +2160,6 @@ mod tests {
     }
 
     #[test]
-    fn test_select_best_summary_index_keeps_proven_win_over_bounded_shorter_win() {
-        let m_2g2f = Move::from_usi("2g2f").expect("valid move");
-        let m_7g7f = Move::from_usi("7g7f").expect("valid move");
-        let summaries = vec![
-            ThreadSummary {
-                id: 0,
-                score: Value::mate_in(7),
-                bound: Bound::Exact,
-                completed_depth: 12,
-                best_move: m_2g2f,
-                pv_len: 4,
-            },
-            ThreadSummary {
-                id: 1,
-                score: Value::mate_in(5),
-                bound: Bound::Upper,
-                completed_depth: 8,
-                best_move: m_7g7f,
-                pv_len: 4,
-            },
-        ];
-
-        let idx = select_best_summary_index(&summaries);
-        assert_eq!(idx, 0);
-    }
-
-    #[test]
-    fn test_select_best_summary_index_does_not_treat_bounded_win_as_proven() {
-        let m_2g2f = Move::from_usi("2g2f").expect("valid move");
-        let m_7g7f = Move::from_usi("7g7f").expect("valid move");
-        let summaries = vec![
-            ThreadSummary {
-                id: 0,
-                score: Value::mate_in(5),
-                bound: Bound::Upper,
-                completed_depth: 12,
-                best_move: m_2g2f,
-                pv_len: 4,
-            },
-            ThreadSummary {
-                id: 1,
-                score: Value::mate_in(7),
-                bound: Bound::Exact,
-                completed_depth: 8,
-                best_move: m_7g7f,
-                pv_len: 4,
-            },
-        ];
-
-        let idx = select_best_summary_index(&summaries);
-        assert_eq!(idx, 1);
-    }
-
-    #[test]
     fn test_select_best_summary_index_rejects_single_helper_outlier_move() {
         let m_2g2f = Move::from_usi("2g2f").expect("valid move");
         let m_6i7h = Move::from_usi("6i7h").expect("valid move");
@@ -3371,7 +2168,6 @@ mod tests {
             ThreadSummary {
                 id: 0,
                 score: Value::new(35),
-                bound: Bound::Exact,
                 completed_depth: 8,
                 best_move: m_2g2f,
                 pv_len: 6,
@@ -3379,7 +2175,6 @@ mod tests {
             ThreadSummary {
                 id: 1,
                 score: Value::new(180),
-                bound: Bound::Exact,
                 completed_depth: 8,
                 best_move: m_6i7h,
                 pv_len: 6,
@@ -3387,7 +2182,6 @@ mod tests {
             ThreadSummary {
                 id: 2,
                 score: Value::new(34),
-                bound: Bound::Exact,
                 completed_depth: 8,
                 best_move: m_7g7f,
                 pv_len: 6,
@@ -3406,7 +2200,6 @@ mod tests {
             ThreadSummary {
                 id: 0,
                 score: Value::new(35),
-                bound: Bound::Exact,
                 completed_depth: 8,
                 best_move: m_2g2f,
                 pv_len: 6,
@@ -3414,7 +2207,6 @@ mod tests {
             ThreadSummary {
                 id: 1,
                 score: Value::new(120),
-                bound: Bound::Exact,
                 completed_depth: 8,
                 best_move: m_6i7h,
                 pv_len: 6,
@@ -3422,7 +2214,6 @@ mod tests {
             ThreadSummary {
                 id: 2,
                 score: Value::new(110),
-                bound: Bound::Exact,
                 completed_depth: 8,
                 best_move: m_6i7h,
                 pv_len: 6,
@@ -3523,11 +2314,51 @@ mod tests {
     }
 
     #[test]
-    fn test_search_with_callback_last_info_matches_best_move() {
-        // NNUE 未ロードでも探索できるよう material 評価を有効化 (guard が終了時に復元)
-        let guard = crate::eval::material::test_support::lock_material();
-        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
+    fn test_mate_within_limit_converts_moves_to_plies() {
+        // mate in 9 ply is within a 5-move limit (10 ply)
+        assert!(mate_within_limit(Value::mate_in(9), false, false, 5));
+        assert!(!mate_within_limit(Value::mate_in(11), false, false, 5));
+    }
 
+    #[test]
+    fn test_mate_within_limit_handles_mated_scores() {
+        // mated in 7 ply should still trigger when limit is 4 moves (8 ply)
+        assert!(mate_within_limit(Value::mated_in(7), false, false, 4));
+    }
+
+    #[test]
+    fn test_mate_within_limit_requires_exact_score() {
+        assert!(!mate_within_limit(Value::mate_in(7), true, false, 4));
+        assert!(!mate_within_limit(Value::mate_in(7), false, true, 4));
+    }
+
+    #[test]
+    fn test_search_basic() {
+        // スタックサイズを増やした別スレッドで実行
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let mut search = Search::new(16);
+                let mut pos = Position::new();
+                pos.set_hirate();
+
+                let limits = LimitsType {
+                    depth: 3,
+                    ..Default::default()
+                };
+
+                let result = search.go(&mut pos, limits, None::<fn(&SearchInfo)>);
+
+                assert_ne!(result.best_move, Move::NONE, "Should find a best move");
+                assert!(result.depth >= 1, "Should complete at least depth 1");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_search_with_callback() {
         // スタックサイズを増やした別スレッドで実行
         std::thread::Builder::new()
             .stack_size(STACK_SIZE)
@@ -3541,29 +2372,21 @@ mod tests {
                     ..Default::default()
                 };
 
-                let mut last_info_pv_head = Move::NONE;
+                let mut info_count = 0;
                 let result = search.go(
                     &mut pos,
                     limits,
-                    Some(|info: &SearchInfo| {
-                        if let Some(&mv) = info.pv.first() {
-                            last_info_pv_head = mv;
-                        }
+                    Some(|_info: &SearchInfo| {
+                        info_count += 1;
                     }),
                 );
 
-                assert!(result.depth >= 1);
                 assert_ne!(result.best_move, Move::NONE, "Should find a best move");
-                assert_eq!(
-                    last_info_pv_head, result.best_move,
-                    "Last info PV head should match the returned best move"
-                );
+                assert!(info_count >= 1, "Should have called info callback at least once");
             })
             .unwrap()
             .join()
             .unwrap();
-
-        drop(guard);
     }
 
     #[test]
@@ -3572,7 +2395,6 @@ mod tests {
             depth: 5,
             sel_depth: 7,
             score: Value::new(123),
-            bound: Bound::Exact,
             nodes: 10000,
             time_ms: 500,
             nps: 20000,
@@ -3596,7 +2418,6 @@ mod tests {
             depth: 9,
             sel_depth: 9,
             score: Value::mate_in(5),
-            bound: Bound::Exact,
             nodes: 42,
             time_ms: 10,
             nps: 4200,
@@ -3615,7 +2436,6 @@ mod tests {
             depth: 9,
             sel_depth: 9,
             score: Value::mated_in(4),
-            bound: Bound::Exact,
             nodes: 42,
             time_ms: 10,
             nps: 4200,
@@ -3627,139 +2447,4 @@ mod tests {
         let usi = info.to_usi_string();
         assert!(usi.contains("score mate -4"));
     }
-
-    #[test]
-    fn test_search_info_to_usi_marks_bound_after_score() {
-        let mut info = SearchInfo {
-            depth: 9,
-            sel_depth: 9,
-            score: Value::new(90),
-            bound: Bound::Lower,
-            nodes: 42,
-            time_ms: 10,
-            nps: 4200,
-            hashfull: 0,
-            pv: vec![],
-            multi_pv: 1,
-        };
-        assert!(info.to_usi_string().contains("score cp 100 lowerbound nodes"));
-        info.bound = Bound::Upper;
-        assert!(info.to_usi_string().contains("score cp 100 upperbound nodes"));
-    }
-
-    #[test]
-    fn root_score_is_initialized_rejects_infinite_sentinel() {
-        assert!(!root_score_is_initialized(Value::new(-Value::INFINITE.raw())));
-        assert!(!root_score_is_initialized(Value::INFINITE));
-        assert!(root_score_is_initialized(Value::new(0)));
-        assert!(root_score_is_initialized(Value::mate_in(1)));
-        assert!(root_score_is_initialized(Value::mated_in(1)));
-    }
-
-    #[test]
-    fn ponderhit_before_go_returns_bestmove_without_stop() {
-        let guard = crate::eval::material::test_support::lock_material();
-        crate::eval::set_material_level(crate::eval::MaterialLevel::Lv1);
-        let mut search = Search::new_with_eval_hash(1, 1);
-        search.reset_flags();
-        let stop = search.stop_flag();
-        let ponderhit = search.ponderhit_handle();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let search_barrier = Arc::clone(&barrier);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(move || {
-                let mut pos = Position::new();
-                pos.set_hirate();
-                search_barrier.wait();
-                let result = search.go(
-                    &mut pos,
-                    LimitsType {
-                        ponder: true,
-                        depth: 1,
-                        ..LimitsType::default()
-                    },
-                    None::<fn(&SearchInfo)>,
-                );
-                tx.send((result.best_move, search.ponderhit_flag_for_test())).unwrap();
-            })
-            .unwrap();
-        ponderhit.signal();
-        barrier.wait();
-        let result = rx.recv_timeout(Duration::from_secs(5));
-        // 回帰時にも探索スレッドを残さず、stop による返却を成功扱いしない。
-        if result.is_err() {
-            stop.store(true, Ordering::SeqCst);
-        }
-        worker.join().unwrap();
-        let (best_move, pending) = result.expect("ponderhit alone must release bestmove");
-        assert_ne!(best_move, Move::NONE);
-        assert!(!pending);
-        drop(guard);
-    }
-
-    #[test]
-    fn eval_hash_defaults_and_replacement_release_old_tables() {
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                for mut search in [Search::new(1), Search::new_with_eval_hash(1, 1)] {
-                    assert!(!search.eval_hash_large_pages);
-                    assert!(!search.eval_hash.uses_large_pages());
-                    assert!(!search.eval_hash.huge_page_hint_requested());
-                    search.set_num_threads(2);
-                    for large_pages in [true, false] {
-                        let old = Arc::downgrade(&search.eval_hash);
-                        search.set_eval_hash_large_pages(large_pages);
-                        assert!(old.upgrade().is_none());
-                        let old = Arc::downgrade(&search.eval_hash);
-                        search.resize_eval_hash(1);
-                        assert!(old.upgrade().is_none());
-                        search.eval_hash.store(1, 42);
-                        assert_eq!(search.eval_hash.probe(1), Some(42));
-                    }
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[test]
-    fn ponderhit_handle_signals_from_other_thread() {
-        let search = Search::new_with_eval_hash(1, 1);
-        let handle = search.ponderhit_handle();
-        std::thread::spawn(move || handle.signal()).join().unwrap();
-        assert!(search.ponderhit_flag_for_test());
-    }
-
-    #[test]
-    fn ponderhit_handle_outlives_search_drop() {
-        let handle = {
-            let search = Search::new_with_eval_hash(1, 1);
-            search.ponderhit_handle()
-        };
-        // Search drop 後でも panic しないことを確認する。
-        // flag の状態は観測できないため、panic 不在のみが検査対象。
-        handle.signal();
-    }
-
-    #[test]
-    fn ponderhit_handle_cleared_by_reset_flags() {
-        let search = Search::new_with_eval_hash(1, 1);
-        let handle = search.ponderhit_handle();
-        handle.signal();
-        assert!(search.ponderhit_flag_for_test());
-        search.reset_flags();
-        assert!(!search.ponderhit_flag_for_test());
-    }
 }
-
-#[cfg(test)]
-#[path = "tests/public_pv.rs"]
-mod public_pv_tests;
-
-#[cfg(all(test, target_os = "linux", feature = "halfkx-arch"))]
-#[path = "numa_search_tests.rs"]
-mod numa_search_tests;

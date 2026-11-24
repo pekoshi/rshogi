@@ -5,18 +5,18 @@
 use crate::types::Color;
 
 /// `#ILLEGAL_MOVE` が通知される際の補足事由。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IllegalReason {
     /// 非合法手（移動先・駒種の不整合）。
     Generic,
     /// 打ち歩詰。
     Uchifuzume,
-    /// `%KACHI` 宣言が入玉宣言ルールで不成立。
+    /// `%KACHI` 宣言が 24 点法で不成立。
     IllegalKachi,
 }
 
 /// 終局理由のモデル。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameResult {
     /// `%TORYO` → `#RESIGN`。
     Toryo {
@@ -35,7 +35,7 @@ pub enum GameResult {
         /// 反則の種別。
         reason: IllegalReason,
     },
-    /// `%KACHI` → `#JISHOGI`（入玉宣言成立）。
+    /// `%KACHI` → `#JISHOGI`（24 点法成立）。
     Kachi {
         /// 入玉宣言が成立した側（勝者）。
         winner: Color,

@@ -1,22 +1,19 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
-
-use tools::output_path::ensure_safe_output_path;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 const MODE_SEED: &str = "seed";
 const MODE_AGGREGATE: &str = "aggregate";
-const MODE_ASYNC: &str = "async";
 
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
-    about = "tools spsa の --stats-csv 出力 (--dispatch async の stats.csv、旧 v3 の stats_aggregate.csv を含む) を可視化向けCSVへ整形する"
+    about = "tools spsa の --stats-csv / --stats-aggregate-csv 出力を可視化向けCSVへ整形する"
 )]
 struct Cli {
     /// 入力CSV
@@ -35,8 +32,6 @@ struct Cli {
 enum Mode {
     Seed,
     Aggregate,
-    /// `spsa --dispatch async` の stats.csv。1 行 = 1 pair (2 局)。
-    Async,
 }
 
 #[derive(Clone, Debug)]
@@ -49,8 +44,8 @@ struct RowValues {
     draw_rate: f64,
     score_rate: f64,
     score_rate_std: f64,
-    grad_scale: String,
-    grad_scale_std: String,
+    grad_scale: f64,
+    grad_scale_std: f64,
     a_t: String,
     c_t: String,
     avg_abs_shift: String,
@@ -69,7 +64,6 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{}.plot.csv", cli.input_csv.display())));
 
-    ensure_safe_output_path(&output_csv, &cli.input_csv)?;
     let src = File::open(&cli.input_csv)
         .with_context(|| format!("failed to open {}", cli.input_csv.display()))?;
     let mut reader = BufReader::new(src);
@@ -91,15 +85,9 @@ fn main() -> Result<()> {
     let mode = detect_mode(&headers)?;
     let index = build_index(&headers);
 
-    let parent = output_csv
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut staged = tempfile::Builder::new()
-        .prefix(".spsa_plot_")
-        .tempfile_in(parent)
-        .with_context(|| format!("failed to stage {}", output_csv.display()))?;
-    let mut writer = BufWriter::new(staged.as_file_mut());
+    let dst = File::create(&output_csv)
+        .with_context(|| format!("failed to create {}", output_csv.display()))?;
+    let mut writer = BufWriter::new(dst);
     let output_headers = [
         "iteration",
         "mode",
@@ -151,24 +139,12 @@ fn main() -> Result<()> {
             index: &index,
         };
 
-        let (iteration, total_games) = match mode {
-            Mode::Async => {
-                let pairs = row.get("completed_pairs")?;
-                let games = pairs
-                    .parse::<u64>()
-                    .context("failed to parse integer column: completed_pairs")?
-                    * 2;
-                (pairs.to_owned(), games.to_string())
-            }
-            Mode::Seed | Mode::Aggregate => {
-                (row.get("iteration")?.to_owned(), row.get("total_games")?.to_owned())
-            }
-        };
+        let iteration = row.get("iteration")?;
+        let total_games = row.get("total_games")?;
 
         let values = match mode {
             Mode::Seed => row_values_seed(&row)?,
             Mode::Aggregate => row_values_aggregate(&row)?,
-            Mode::Async => row_values_async(&row)?,
         };
 
         cumulative_games += u64::try_from(values.games).context("games must be >= 0")?;
@@ -187,7 +163,7 @@ fn main() -> Result<()> {
         let rolling_score_rate = rolling_sum / rolling_scores.len() as f64;
 
         let record = vec![
-            iteration,
+            iteration.to_owned(),
             mode.as_str().to_owned(),
             values.seeds.to_string(),
             values.games_per_seed.to_string(),
@@ -199,24 +175,19 @@ fn main() -> Result<()> {
             values.score_rate_std.to_string(),
             cumulative_score_rate.to_string(),
             rolling_score_rate.to_string(),
-            values.grad_scale,
-            values.grad_scale_std,
+            values.grad_scale.to_string(),
+            values.grad_scale_std.to_string(),
             values.a_t,
             values.c_t,
             values.avg_abs_shift,
             values.avg_abs_update,
             values.max_abs_update,
-            total_games,
+            total_games.to_owned(),
         ];
         write_csv_row(&mut writer, &record)?;
     }
 
     writer.flush()?;
-    drop(writer);
-    ensure_safe_output_path(&output_csv, &cli.input_csv)?;
-    staged
-        .persist(&output_csv)
-        .with_context(|| format!("failed to publish {}", output_csv.display()))?;
     Ok(())
 }
 
@@ -225,7 +196,6 @@ impl Mode {
         match self {
             Self::Seed => MODE_SEED,
             Self::Aggregate => MODE_AGGREGATE,
-            Self::Async => MODE_ASYNC,
         }
     }
 }
@@ -313,24 +283,7 @@ fn detect_mode(headers: &[String]) -> Result<Mode> {
         return Ok(Mode::Seed);
     }
 
-    let async_required = [
-        "completed_pairs",
-        "pair_id",
-        "dispatch_k",
-        "result",
-        "g1_outcome",
-        "g2_outcome",
-        "avg_abs_shift",
-        "avg_abs_update",
-        "max_abs_update",
-    ];
-    if async_required.iter().all(|name| names.contains(name)) {
-        return Ok(Mode::Async);
-    }
-
-    bail!(
-        "input CSV format is not recognized. expected seed stats CSV, aggregate stats CSV or async stats CSV"
-    )
+    bail!("input CSV format is not recognized. expected seed stats CSV or aggregate stats CSV")
 }
 
 fn row_values_seed(row: &CsvRow<'_>) -> Result<RowValues> {
@@ -356,8 +309,8 @@ fn row_values_seed(row: &CsvRow<'_>) -> Result<RowValues> {
         draw_rate,
         score_rate,
         score_rate_std: 0.0,
-        grad_scale: grad_scale.to_string(),
-        grad_scale_std: 0.0.to_string(),
+        grad_scale,
+        grad_scale_std: 0.0,
         a_t: row.get("a_t")?.to_owned(),
         c_t: row.get("c_t")?.to_owned(),
         avg_abs_shift: row.get("avg_abs_shift")?.to_owned(),
@@ -401,8 +354,8 @@ fn row_values_aggregate(row: &CsvRow<'_>) -> Result<RowValues> {
         draw_rate,
         score_rate,
         score_rate_std,
-        grad_scale: grad_scale_mean.to_string(),
-        grad_scale_std: grad_scale_std.to_string(),
+        grad_scale: grad_scale_mean,
+        grad_scale_std,
         a_t: String::new(),
         c_t: String::new(),
         avg_abs_shift: String::new(),
@@ -411,39 +364,7 @@ fn row_values_aggregate(row: &CsvRow<'_>) -> Result<RowValues> {
     })
 }
 
-/// async の 1 pair。更新係数は param ごとに違うので、単一の a_t / c_t / grad_scale は空欄にする。
-fn row_values_async(row: &CsvRow<'_>) -> Result<RowValues> {
-    let mut wins = [0_i32; 3];
-    for key in ["g1_outcome", "g2_outcome"] {
-        let slot = match row.get(key)? {
-            "plus_win" => 0,
-            "minus_win" => 1,
-            "draw" => 2,
-            other => bail!("invalid {key}: {other}"),
-        };
-        wins[slot] += 1;
-    }
-    let result = row.parse_i32("result")?;
-    Ok(RowValues {
-        seeds: 1,
-        games_per_seed: 2,
-        games: 2,
-        plus_win_rate: f64::from(wins[0]) / 2.0,
-        minus_win_rate: f64::from(wins[1]) / 2.0,
-        draw_rate: f64::from(wins[2]) / 2.0,
-        score_rate: f64::from(result) / 2.0,
-        score_rate_std: 0.0,
-        grad_scale: String::new(),
-        grad_scale_std: String::new(),
-        a_t: String::new(),
-        c_t: String::new(),
-        avg_abs_shift: row.get("avg_abs_shift")?.to_owned(),
-        avg_abs_update: row.get("avg_abs_update")?.to_owned(),
-        max_abs_update: row.get("max_abs_update")?.to_owned(),
-    })
-}
-
-fn write_csv_row(writer: &mut impl Write, row: &[impl AsRef<str>]) -> Result<()> {
+fn write_csv_row(writer: &mut BufWriter<File>, row: &[impl AsRef<str>]) -> Result<()> {
     for (idx, value) in row.iter().enumerate() {
         if idx > 0 {
             writer.write_all(b",")?;
@@ -454,7 +375,7 @@ fn write_csv_row(writer: &mut impl Write, row: &[impl AsRef<str>]) -> Result<()>
     Ok(())
 }
 
-fn write_csv_value(writer: &mut impl Write, value: &str) -> Result<()> {
+fn write_csv_value(writer: &mut BufWriter<File>, value: &str) -> Result<()> {
     let needs_quote = value.contains(',') || value.contains('"') || value.contains('\n');
     if !needs_quote {
         writer.write_all(value.as_bytes())?;

@@ -69,7 +69,6 @@
 //! trait の contract と method 一覧は [`UsiEngineDriver`] の doc を参照。
 
 pub mod config;
-pub mod csa_writer;
 pub mod engine;
 pub mod event;
 pub mod events;
@@ -83,21 +82,17 @@ pub mod transport;
 // `use rshogi_csa_client::{CsaClientConfig, UsiEngine, ...}` で参照できる。
 // 型名は実装側に合わせており、別名は付与しない。
 pub use config::CsaClientConfig;
-pub use engine::{
-    BestMoveResult, SearchInfo, SearchOutcome, SpawnOptions, UsiEngine, UsiEngineDriver,
-};
+pub use engine::{BestMoveResult, SearchInfo, SearchOutcome, UsiEngine, UsiEngineDriver};
 pub use event::Event;
 pub use events::{
     BestMoveEvent, DisconnectReason, GameEndEvent, GameEndReason, MoveEvent, MovePlayer,
     NoopSessionEventSink, ReconnectState, SearchInfoEmitPolicy, SearchInfoSnapshot, SearchOrigin,
     SessionError, SessionEventSink, SessionOutcome, SessionProgress, Side, SinkError,
 };
-pub use protocol::{
-    CsaConnection, GameResult, GameSummary, compute_effective_retry_delay, extract_retry_after_sec,
-};
-pub use record::{GameRecord, RecordStatus, RecordedMove};
+pub use protocol::{CsaConnection, GameResult, GameSummary};
+pub use record::{GameRecord, RecordedMove};
 pub use session::{
-    RecordedSessionOutcome, run_game_session, run_game_session_with_events, run_resumed_session,
-    run_resumed_session_with_events, run_resumed_session_with_record,
+    run_game_session, run_game_session_with_events, run_resumed_session,
+    run_resumed_session_with_events,
 };
 pub use transport::{ConnectOpts, CsaTransport, TransportTarget};

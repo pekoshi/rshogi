@@ -1,0 +1,31 @@
+[package]
+name = "nnue-trainer-rs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cpu = []
+
+[dependencies]
+candle-core = { version = "0.8", default-features = false }
+candle-nn = { version = "0.8", default-features = false }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+
+[[bin]]
+name = "bench_forward"
+path = "src/bin/bench_forward.rs"
+
+[[bin]]
+name = "train"
+path = "src/bin/train.rs"
+
+[[bin]]
+name = "export_quantised"
+path = "src/bin/export_quantised.rs"
+
+[[bin]]
+name = "train_transformer"
+path = "src/bin/train_transformer.rs"

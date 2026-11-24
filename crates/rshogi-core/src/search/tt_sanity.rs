@@ -1,7 +1,7 @@
 //! TT読み取りの健全性チェック補助
 //!
 //! lock-free TT は読み取り競合で自己矛盾データを拾うことがあるため、
-//! 置換表から読んだ値が有効範囲内かを確認する。
+//! YaneuraOu の `is_valid(ttData.value)` 相当の防御を集約する。
 //!
 //! `tt-trace` feature 有効時は TT trace / helper TT write 制御が利用可能になる。
 //! 環境変数: `RSHOGI_DEBUG_TT_TRACE`, `RSHOGI_DEBUG_TT_SANITY`,
@@ -234,7 +234,7 @@ mod trace {
         if seq >= MAX_TRACE_LOGS {
             return;
         }
-        let guard = TRACE_LOCK.lock().ok();
+        let _guard = TRACE_LOCK.lock().ok();
         eprintln!(
             "[TT-TRACE] seq={} kind=probe stage={} tid={} ply={} root={} hit={} key=0x{:016x} depth={} bound={:?} move={} stored={} converted={} eval={}",
             seq,
@@ -251,7 +251,6 @@ mod trace {
             log.converted_value.raw(),
             log.eval.raw(),
         );
-        drop(guard);
     }
 
     pub(in crate::search) fn maybe_trace_tt_write(log: TtWriteTrace<'_>) {
@@ -262,7 +261,7 @@ mod trace {
         if seq >= MAX_TRACE_LOGS {
             return;
         }
-        let guard = TRACE_LOCK.lock().ok();
+        let _guard = TRACE_LOCK.lock().ok();
         eprintln!(
             "[TT-TRACE] seq={} kind=write stage={} tid={} ply={} root={} key=0x{:016x} depth={} bound={:?} pv={} move={} stored={} eval={}",
             seq,
@@ -278,7 +277,6 @@ mod trace {
             log.stored_value.raw(),
             log.eval.raw(),
         );
-        drop(guard);
     }
 
     pub(in crate::search) fn maybe_trace_tt_cutoff(log: TtCutoffTrace<'_>) {
@@ -289,7 +287,7 @@ mod trace {
         if seq >= MAX_TRACE_LOGS {
             return;
         }
-        let guard = TRACE_LOCK.lock().ok();
+        let _guard = TRACE_LOCK.lock().ok();
         eprintln!(
             "[TT-TRACE] seq={} kind=cutoff stage={} tid={} ply={} root={} key=0x{:016x} search_depth={} depth={} bound={:?} value={} beta={}",
             seq,
@@ -304,7 +302,6 @@ mod trace {
             log.value.raw(),
             log.beta.raw(),
         );
-        drop(guard);
     }
 }
 

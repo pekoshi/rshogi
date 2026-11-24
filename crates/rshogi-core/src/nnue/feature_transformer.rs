@@ -17,10 +17,10 @@ use std::io::{self, Read};
 /// FeatureTransformerのパラメータ
 #[repr(C, align(64))]
 pub struct FeatureTransformer {
-    /// バイアス `[half_dimensions]`
+    /// バイアス [half_dimensions]
     pub biases: Aligned<[i16; TRANSFORMED_FEATURE_DIMENSIONS]>,
 
-    /// 重み `[input_dimensions][half_dimensions]`
+    /// 重み [input_dimensions][half_dimensions]
     /// 64バイトアラインメントで確保（aligned load/store用）
     pub weights: AlignedBox<i16>,
 }
@@ -52,7 +52,7 @@ impl FeatureTransformer {
 
     /// 差分計算を使わずにAccumulatorを計算
     ///
-    /// トリガーごとにアキュムレータを計算する。
+    /// YaneuraOu の classic NNUE と同様に、トリガーごとにアキュムレータを計算する。
     /// 現在は NUM_REFRESH_TRIGGERS=1 なので trigger=0 のみ処理。
     pub fn refresh_accumulator(&self, pos: &Position, acc: &mut Accumulator) {
         // トリガーごとにループ（現在は trigger=0 のみ）
@@ -82,7 +82,7 @@ impl FeatureTransformer {
 
     /// 差分計算でAccumulatorを更新
     ///
-    /// 視点ごとに reset 判定を行う。
+    /// YaneuraOu classic と同様に、視点ごとに reset 判定を行う。
     /// reset が必要な視点は biases から再構築、それ以外は差分更新。
     pub fn update_accumulator(
         &self,
@@ -164,6 +164,8 @@ impl FeatureTransformer {
         };
 
         // 2. ソースのアキュムレータをコピー
+        // Note: clone() + copy_from_slice による二重コピーを避ける最適化を試みたが、
+        // NPSに改善が見られなかった。YaneuraOu の C++ 実装でも同様のパターンを使用。
         let source_acc = stack.entry_at(source_idx).accumulator.clone();
         {
             let current_acc = &mut stack.current_mut().accumulator;
@@ -236,7 +238,7 @@ impl FeatureTransformer {
     /// 重みを累積値に加算
     ///
     /// AVX2/SSE2/WASMのSIMD最適化版。256要素を一度に処理。
-    /// 非飽和演算を使用する。
+    /// YaneuraOu classic と同様に非飽和演算を使用する。
     /// weightsとaccumulationは64バイトアラインされている前提でaligned load/storeを使用。
     #[inline]
     fn add_weights(&self, accumulation: &mut [i16; TRANSFORMED_FEATURE_DIMENSIONS], index: usize) {
@@ -373,7 +375,7 @@ impl FeatureTransformer {
             return;
         }
 
-        // スカラーフォールバック（非飽和演算）
+        // スカラーフォールバック（非飽和演算 - YO classic と同等）
         #[allow(unreachable_code)]
         for (acc, &weight) in accumulation.iter_mut().zip(weights) {
             *acc = acc.wrapping_add(weight);
@@ -383,7 +385,7 @@ impl FeatureTransformer {
     /// 重みを累積値から減算
     ///
     /// AVX2/SSE2/WASMのSIMD最適化版。256要素を一度に処理。
-    /// 非飽和演算を使用する。
+    /// YaneuraOu classic と同様に非飽和演算を使用する。
     /// weightsとaccumulationは64バイトアラインされている前提でaligned load/storeを使用。
     #[inline]
     fn sub_weights(&self, accumulation: &mut [i16; TRANSFORMED_FEATURE_DIMENSIONS], index: usize) {
@@ -521,7 +523,7 @@ impl FeatureTransformer {
             return;
         }
 
-        // スカラーフォールバック（非飽和演算）
+        // スカラーフォールバック（非飽和演算 - YO classic と同等）
         #[allow(unreachable_code)]
         for (acc, &weight) in accumulation.iter_mut().zip(weights) {
             *acc = acc.wrapping_sub(weight);
@@ -531,7 +533,7 @@ impl FeatureTransformer {
     /// Accumulatorの値を変換して出力
     /// ClippedReLU(clamp(0, 127))を適用し、両視点を結合
     ///
-    /// トリガーごとの accumulation を合算して
+    /// YaneuraOu の classic NNUE と同様に、トリガーごとの accumulation を合算して
     /// ClippedReLU を適用する。現在は NUM_REFRESH_TRIGGERS=1 なので trigger=0 のみ使用。
     ///
     /// AVX2/SSE2/WASMのSIMD最適化版。

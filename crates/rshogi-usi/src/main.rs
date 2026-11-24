@@ -2,115 +2,104 @@
 //!
 //! 将棋GUIとの通信を行うUSIプロトコル実装。
 
-use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
-use rshogi_book::BookValueTieBreak;
+use anyhow::{Result, anyhow};
 use rshogi_core::eval::{
     DEFAULT_PASS_RIGHT_VALUE_EARLY, DEFAULT_PASS_RIGHT_VALUE_LATE, MaterialLevel, disable_material,
     is_material_enabled, set_eval_hash_enabled, set_material_level, set_pass_move_bonus,
     set_pass_right_value_phased,
 };
-use rshogi_core::mate::dfpn::{DfpnSolver, MateLimits, MateMode, MateResult, ShortestMode};
-use rshogi_core::movegen::{MoveList, generate_legal_all};
+use rshogi_core::nnue::dual_cross::{init_dual_cross_profile, print_dual_cross_profile};
 use rshogi_core::nnue::{
-    AccumulatorStackVariant, LayerStackBucketMode, LayerStackRoutingError, MAX_LAYER_STACK_BUCKETS,
-    NET_DELTA_OPTION_PREFIX, NetCoefficientId, NetDelta, NetDeltaReport, clear_nnue,
-    configure_layer_stack_routing, evaluate_dispatch, get_network, init_nnue_with_deltas,
-    load_progress_coeff_kpabs_from_bytes, parse_layer_stack_bucket_mode, parse_nnue_architecture,
-    print_nnue_stats, reset_layer_stack_progress_buckets, reset_layer_stack_progress_kpabs_weights,
-    set_fv_scale_override, set_layer_stack_progress_kpabs_weights, set_nnue_architecture_override,
-    validate_layer_stack_routing_with_coefficients,
+    AccumulatorStackVariant, LayerStackBucketMode, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, clear_nnue,
+    evaluate_dispatch, get_network, init_nnue, parse_layer_stack_bucket_mode,
+    parse_nnue_architecture, print_nnue_stats, reset_layer_stack_progress_kpabs_weights,
+    set_bucket_interp, set_fv_scale_override, set_layer_stack_bucket_mode,
+    set_layer_stack_progress_kpabs_weights, set_nnue_architecture_override,
 };
 use rshogi_core::position::Position;
 use rshogi_core::search::{
-    DEFAULT_DRAW_VALUE_BLACK, DEFAULT_DRAW_VALUE_WHITE, LimitsType, NumaPolicy, PonderhitHandle,
-    Search, SearchInfo, SearchResult, SearchTuneParams,
+    DEFAULT_DRAW_VALUE_BLACK, DEFAULT_DRAW_VALUE_WHITE, LimitsType, Search, SearchInfo,
+    SearchResult, SearchTuneParams,
 };
-use rshogi_core::types::{Color, EnteringKingRule, Move, PieceType};
+use rshogi_core::types::{EnteringKingRule, Move};
 use serde_json::json;
 
-#[cfg(feature = "allocation-stats")]
-mod allocation_stats;
-mod spsa_params;
+// ─── PUCT hybrid (puct-hybrid feature) ───
+//
+// 序中盤 PUCT + 終盤 αβ の hybrid 構成。 NNUE-B Transformer が未訓練のため
+// stub evaluator (value=0、 すべての局面で引き分け扱い) で pipeline 整備のみを行う。
+// 実 NNUE-B 統合は別 session (Phase B-3 NNUE-B Transformer 訓練後)。
+#[cfg(feature = "puct-hybrid")]
+use std::sync::atomic::AtomicI32;
+#[cfg(feature = "puct-hybrid")]
+use std::time::Instant;
 
-use spsa_params::parse_spsa_params;
+#[cfg(feature = "puct-hybrid")]
+use p2_nnue::evaluator::NnueEvaluator;
+#[cfg(feature = "puct-hybrid")]
+use p2_nnue::features::P2NnueInput;
+#[cfg(feature = "puct-hybrid")]
+use p2_search::puct::{PuctBackend, PuctLimits};
+#[cfg(feature = "puct-hybrid")]
+use p2_search::{PuctConfig, PuctEngine};
 
-#[cfg(all(feature = "mimalloc", feature = "allocation-stats"))]
-compile_error!(
-    "feature `mimalloc` と `allocation-stats` はどちらも global allocator を設定するため同時に指定できません"
-);
+use p2_search::mate_probe::{MateResult, mate_probe_1ply, mate_probe_3ply};
 
-#[cfg(all(feature = "mimalloc", not(feature = "allocation-stats")))]
-#[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+/// PUCT 用 stub evaluator
+///
+/// NNUE-B Transformer が未訓練のため、 すべての局面で value=0 (引き分け) を返す。
+/// PuctEngine は internally `value / VALUE_SCALE` で [-1.0, 1.0] winrate に変換するため
+/// 0 → 0.0 で安定。 strong play は期待しない、 pipeline 動作確認のみ。
+///
+/// 実 NNUE-B 統合は別 session で `NnueEvaluator` を本物の Transformer 推論に置き換える。
+#[cfg(feature = "puct-hybrid")]
+struct StubPuctEvaluator;
 
-/// エンジン名 (`id name`)。build 時に `RSHOGI_ENGINE_NAME` で変えられる (既定は `RAMU`、build.rs)。
-const ENGINE_NAME: &str = env!("RSHOGI_ENGINE_NAME");
+#[cfg(feature = "puct-hybrid")]
+impl NnueEvaluator for StubPuctEvaluator {
+    fn evaluate(&self, _input: &P2NnueInput) -> i32 {
+        // value=0 = winrate 0.0 (引き分け)。 一様な policy と組み合わせて UCB が機能する。
+        0
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "stub-puct"
+    }
+}
+
+/// エンジン名
+const ENGINE_NAME: &str = "Shogi Engine";
+/// エンジンバージョン
+const ENGINE_VERSION: &str = "0.1.0";
 /// エンジン作者
 const ENGINE_AUTHOR: &str = "sh11235";
-/// ビルド時に埋め込んだエンジンのソースの id (build.rs)。
-const SOURCE_ID: &str = env!("RSHOGI_SOURCE_ID");
 /// 探索スレッド用のスタックサイズ（SearchWorkerが大きいため増やす）
 const SEARCH_STACK_SIZE: usize = 64 * 1024 * 1024;
-/// build 時に `RSHOGI_EMBED_SPSA_PARAMS` で指定した `.params` の名前と値 (未指定なら空)。
-/// 値はテキストでなく数値として埋め込む。
-const EMBEDDED_SPSA_PARAMS: &[(&str, i32)] =
-    include!(concat!(env!("OUT_DIR"), "/embedded_spsa.rs"));
-/// isready で読む、オプションを固定するファイルの名前 (やねうら王と同じ)。
-const ENGINE_OPTIONS_FILE: &str = "engine_options.txt";
-/// engine_options.txt に相対パスで書いたとき、ファイルのあるフォルダを基準にするオプション。
-/// BookFile は BookDir からの相対なので含めない。
-const PATH_OPTIONS: &[&str] = &[
-    "EvalFile",
-    "LS_PROGRESS_COEFF",
-    "SPSAParamsFile",
-    "BookDir",
-    "BookExploreFile",
-];
-/// `go mate` の置換表サイズの既定値 (MB)
-const DEFAULT_MATE_HASH_MB: usize = 64;
 
-/// USI へ表示するハッシュ表の page 配置。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TtPageStatus {
-    /// Windows の明示的な Large Pages 確保に成功
-    LargePages,
-    /// Linux/Android の huge-page hint 要求に成功
-    HugePageHint,
-    /// 通常 page
-    Regular,
-}
-
-/// 直前に表示した配置から変わったときだけ、表示する文言を返す。
-/// 起動直後の通常 page は表示しない。表を取り直して通常 page へ戻った場合は、
-/// 以前の表示が残らないよう戻ったことを知らせる。
-fn page_status_message(reported: TtPageStatus, current: TtPageStatus) -> Option<&'static str> {
-    if reported == current {
-        return None;
+fn load_progress_coeff_kpabs(path: &str) -> Result<Box<[f32]>, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read LS_PROGRESS_COEFF '{path}': {e}"))?;
+    let expected = SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * size_of::<f64>();
+    if bytes.len() != expected {
+        return Err(format!(
+            "progress.bin size mismatch: got {} bytes, expected {}",
+            bytes.len(),
+            expected
+        ));
     }
-    Some(match current {
-        TtPageStatus::LargePages => "Large Pages are used.",
-        TtPageStatus::HugePageHint => {
-            "Huge-page hint requested; actual page backing is managed by the OS."
-        }
-        TtPageStatus::Regular => "The TT now uses regular pages.",
-    })
-}
 
-/// 探索 thread が panic した場合も探索中状態を解除する。
-struct SearchRunningGuard(Arc<AtomicBool>);
+    let weights: Vec<f32> = bytes
+        .chunks_exact(size_of::<f64>())
+        .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk size is checked")) as f32)
+        .collect();
 
-impl Drop for SearchRunningGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
+    Ok(weights.into_boxed_slice())
 }
 
 /// USIエンジンの状態
@@ -125,20 +114,16 @@ struct UsiEngine {
     eval_hash_size_mb: usize,
     /// EvalHash使用フラグ（UseEvalHashで変更）
     use_eval_hash: bool,
-    /// EvalHash の確保時に Large Pages を試みるか。
-    eval_hash_large_pages: bool,
     /// MultiPV値
     multi_pv: usize,
     /// Skill Level オプション
     skill_options: rshogi_core::search::SkillOptions,
     /// 探索スレッドのハンドル
     search_thread: Option<thread::JoinHandle<(Search, SearchResult)>>,
-    /// bestmove 出力前までの探索中状態（thread の終了とは区別する）。
-    search_running: Arc<AtomicBool>,
     /// 探索停止用のフラグ（探索スレッドと共有）
     stop_flag: Option<Arc<AtomicBool>>,
-    /// ponderhit通知ハンドル
-    ponderhit_handle: Option<PonderhitHandle>,
+    /// ponderhit通知フラグ
+    ponderhit_flag: Option<Arc<AtomicBool>>,
     /// bestmove出力抑制フラグ（cmd_go内部でcmd_stopする際に使用）
     suppress_bestmove: Arc<AtomicBool>,
     /// Stochastic_Ponder オプションのミラー
@@ -147,9 +132,6 @@ struct UsiEngine {
     last_position_cmd: Option<String>,
     /// 直近の go コマンド文字列（Stochastic_Ponder の再始動用）
     last_go_cmd: Option<String>,
-    /// 次の go の探索開始時刻。Stochastic_Ponder の ponderhit では受信時刻を入れ、
-    /// 先読みの停止と局面の再設定にかかった時間も消費時間に数える。
-    go_start_time_override: Option<Instant>,
     /// EvalFile の明示指定状態
     /// None: 未指定（eval/nn.bin 自動ロード対象）
     /// Some(true): 明示指定されロード成功
@@ -157,32 +139,12 @@ struct UsiEngine {
     eval_file_explicit: Option<bool>,
     /// 最後に指定された EvalFile パス（NNUE_ARCHITECTURE 変更時の再読込用）
     eval_file_path: Option<String>,
-    /// routing を内蔵しない LayerStacks ネット向けの mode。
-    ls_bucket_mode: Option<LayerStackBucketMode>,
-    /// progresskpabs の推論 bucket 数。0 は未指定として扱う。
-    ls_progress_buckets: Option<usize>,
-    /// LS_PROGRESS_COEFF の読み込みに成功しているか。
-    ls_progress_coeff_loaded: bool,
-    ls_progress_coeff_explicit: bool,
     /// SPSAParamsFile の明示指定パス（setoption で設定）
     spsa_params_file: Option<String>,
     /// SPSA params ファイルの読み込み済みフラグ
     spsa_params_loaded: bool,
-    /// SPSA の値を build に焼き込んだか。焼き込んだ build は探索定数を固定値として扱い、
-    /// 調整用の `SPSA_*` / `SPSA_NET_*` を `usi` で広告しない。
-    spsa_options_hidden: bool,
-    /// engine_options.txt で固定したオプション (小文字の名前 → 適用した値)。setoption では変えられない。
-    fixed_options: BTreeMap<String, String>,
-    /// 起動時 spec から広告する net delta option 名。
-    spsa_net_spec_names: Vec<String>,
-    /// 現在設定されている net delta。
-    net_deltas: BTreeMap<NetCoefficientId, i32>,
-    /// ロード済み net へ未反映の delta があるか。
-    net_deltas_dirty: bool,
-    /// 最後に表示した TT の page 配置。未表示のときは表示が不要な Regular。
-    reported_page_status: TtPageStatus,
-    /// 最後に表示した EvalHash の page 配置。
-    reported_eval_hash_page_status: TtPageStatus,
+    /// Large Pages使用メッセージの出力済みフラグ
+    large_pages_reported: bool,
     // --- 有限パス権（Finite Pass Rights）関連 ---
     /// パス権ルール有効化フラグ
     pass_rights_enabled: bool,
@@ -192,53 +154,58 @@ struct UsiEngine {
     pass_right_value_early: i32,
     /// パス権評価値（終盤）
     pass_right_value_late: i32,
-    // --- 定跡（opening book）関連 ---
-    /// probe パイプラインのオプション群（USI オプションのミラー）
-    book_options: rshogi_book::BookOptions,
-    /// BookFile（定跡ファイル名。`no_book` で無効）
-    book_file: String,
-    /// BookExploreFile（空なら無効。変更後の isready でロード）
-    book_explore_file: String,
-    book_explore: Option<rshogi_book::BookExploreList>,
-    /// BookDir（定跡ファイルのディレクトリ）
-    book_dir: String,
-    /// IgnoreBookPly（末尾手数を無視して検索するか。定跡ロード時のキー正規化に使う）
-    ignore_book_ply: bool,
-    /// BookOnTheFly（定跡を丸読みせず、probe のたびにファイルから引くか）
-    book_on_the_fly: bool,
-    /// ロード済み定跡（isready 時にロード。優先定跡があれば先頭ほど優先。BookFile=no_book なら空）
-    books: Vec<rshogi_book::Book>,
-    /// ロード済み定跡の識別子 `(解決済みパスの列, ignore_book_ply)`。丸読みの再ロード要否の判定に使う
-    book_loaded_sig: Option<(Vec<String>, bool)>,
-    /// 定跡手抽選用の乱数源
-    book_rng: rshogi_book::DefaultBookRng,
-    // --- 詰み探索（go mate）関連 ---
-    /// df-pn の置換表サイズ（MateHashMBで変更）
-    mate_hash_mb: usize,
-    /// df-pn の進め方（MateModeで変更）
-    mate_mode: MateMode,
-    /// df-pn で 1 局面を解くスレッド数（MateThreadsで変更）
-    mate_threads: usize,
-    #[cfg(not(target_arch = "wasm32"))]
-    game_mate_threads: usize,
-    /// 最短手順モード（MateShortestで変更。None は通常の詰み判定）
-    mate_shortest: Option<ShortestMode>,
-    /// df-pn ソルバー（置換表を持ち回る。最初の go mate で確保）
-    mate_solver: Option<DfpnSolver>,
-    /// go mate のスレッド（終了時にソルバーを返す。panic したら None）
-    mate_thread: Option<thread::JoinHandle<Option<DfpnSolver>>>,
-    /// go mate の停止フラグ
-    mate_stop: Arc<AtomicBool>,
+    // --- PUCT hybrid foundation (B-1、 観測層のみ。 search backend は αβ のまま) ---
+    /// 局面進行 phase 追跡 (序盤/中盤/終盤)
+    phase_tracker: p2_search::PhaseTracker,
+    /// 終盤検出器 (αβ vs PUCT のルーティング判定用、 PUCT 未統合時は info 出力のみ)
+    endgame_detector: p2_search::EndgameDetector,
+    // --- Midgame policy hook (αβ root move ordering を Transformer policy で補完) ---
+    /// Midgame policy 設定 (USI option `UseMidgamePolicy` 等で更新)
+    midgame_policy_config: p2_midgame_policy::MidgamePolicyConfig,
+    /// Midgame policy model のパス (`MidgamePolicyModel`)。 `isready` で load 試行。
+    midgame_policy_model_path: Option<String>,
+    /// Midgame policy hook 本体。 `isready` で初期化、 evaluator 未設定なら `is_active()` で false。
+    midgame_policy_hook: Option<p2_midgame_policy::MidgamePolicyHook>,
+    // --- Mate engine midgame integration (αβ engine 用、 USI option で制御) ---
+    /// Root mate search を有効化 (= cmd_go 冒頭で自詰み 3 ply 検索)
+    use_root_mate_search: bool,
+    /// Opponent mate check を有効化 (= 各 root move を do_move + mate_probe_1ply で頓死検知)
+    use_opponent_mate_check: bool,
+    /// Opponent mate check で試行する root move の上限 (= legal の最初 N moves のみ check、 overhead 抑制)
+    opponent_mate_max_moves: usize,
+    // --- MateSolverThread (= 別 thread dfpn、 main search 完全不変) ---
+    /// MateSolverThread を有効化 (= Threads >= 2 時のみ実起動)
+    use_mate_solver_thread: bool,
+    /// 現在の Threads option 値 (= MateSolverThread の gate 用)
+    num_threads: usize,
+    /// 現在走行中の MateSolverThread (= cmd_go で start、 cmd_stop で stop)
+    mate_solver_thread: Option<p2_search::mate_solver_thread::MateSolverThread>,
+    // --- PUCT hybrid engine (puct-hybrid feature、 default OFF) ---
+    /// PUCT hybrid 経路を使う (false なら既存 αβ 経路のみ)
+    #[cfg(feature = "puct-hybrid")]
+    use_puct: bool,
+    /// 終盤切替閾値 (endgame_score がこの cp 換算値以上なら αβ 経路、 未満なら PUCT)
+    /// 既存 EndgameDetector の `use_alpha_beta` 判定とは独立した USI 公開値。
+    /// 実装的には `endgame_score >= threshold/1000.0` で αβ 側にルート。
+    #[cfg(feature = "puct-hybrid")]
+    puct_endgame_threshold: i32,
+    /// NNUE-B ONNX model path (未訓練のため現状は受け取るだけ、 stub evaluator を使う)
+    #[cfg(feature = "puct-hybrid")]
+    puct_network_path: Option<String>,
+    /// 現在走行中の PUCT 探索の停止 flag (cmd_stop で立てる)
+    #[cfg(feature = "puct-hybrid")]
+    puct_stop_flag: Option<Arc<AtomicBool>>,
+    /// 現在走行中の PUCT 探索スレッド
+    #[cfg(feature = "puct-hybrid")]
+    puct_thread: Option<thread::JoinHandle<()>>,
+    /// PUCT 経路用 bestmove score (info 表示用、 cp 換算)
+    #[cfg(feature = "puct-hybrid")]
+    puct_last_score_cp: Arc<AtomicI32>,
 }
 
 impl UsiEngine {
     /// 新しいUSIエンジンを作成
-    #[cfg(test)]
     fn new() -> Self {
-        Self::new_with_spsa_net_spec(Vec::new())
-    }
-
-    fn new_with_spsa_net_spec(spsa_net_spec_names: Vec<String>) -> Self {
         let tt_size_mb = 256;
         let eval_hash_size_mb = 256;
         let use_eval_hash = true;
@@ -246,71 +213,58 @@ impl UsiEngine {
         // グローバルフラグをデフォルト値で初期化
         // （USI GUIがsetoptionを送らない場合に備える）
         set_eval_hash_enabled(use_eval_hash);
-        reset_layer_stack_progress_buckets();
 
-        let mut engine = Self {
-            // EvalHash は isready (無ければ最初の `go` 直前) まで遅延確保する。
+        Self {
+            // EvalHash は最初の `go` 直前まで遅延確保する。
             // selfplay のように起動直後に setoption でサイズを下げるケースで、
             // 先に既定 256MB を確保してしまう無駄を避ける。
-            search: Some(Search::new_with_eval_hash_large_pages(tt_size_mb, 0, true)),
+            search: Some(Search::new_with_eval_hash(tt_size_mb, 0)),
             position: Position::new(),
             tt_size_mb,
             eval_hash_size_mb,
             use_eval_hash,
-            eval_hash_large_pages: true,
             multi_pv: 1,
             skill_options: rshogi_core::search::SkillOptions::default(),
             search_thread: None,
-            search_running: Arc::new(AtomicBool::new(false)),
             stop_flag: None,
-            ponderhit_handle: None,
+            ponderhit_flag: None,
             suppress_bestmove: Arc::new(AtomicBool::new(false)),
             stochastic_ponder: false,
             last_position_cmd: None,
             last_go_cmd: None,
-            go_start_time_override: None,
             eval_file_explicit: None,
             eval_file_path: None,
-            ls_bucket_mode: None,
-            ls_progress_buckets: None,
-            ls_progress_coeff_loaded: false,
-            ls_progress_coeff_explicit: false,
             spsa_params_file: None,
             spsa_params_loaded: false,
-            spsa_options_hidden: false,
-            fixed_options: BTreeMap::new(),
-            spsa_net_spec_names,
-            net_deltas: BTreeMap::new(),
-            net_deltas_dirty: false,
-            reported_page_status: TtPageStatus::Regular,
-            reported_eval_hash_page_status: TtPageStatus::Regular,
+            large_pages_reported: false,
             pass_rights_enabled: false,
             initial_pass_count: 2,
             pass_right_value_early: DEFAULT_PASS_RIGHT_VALUE_EARLY,
             pass_right_value_late: DEFAULT_PASS_RIGHT_VALUE_LATE,
-            book_options: rshogi_book::BookOptions::default(),
-            // BookFile 既定は no_book(定跡オフ)。既存 SPRT/tournament の挙動を変えない。
-            book_file: "no_book".to_string(),
-            book_explore_file: String::new(),
-            book_explore: None,
-            book_dir: "book".to_string(),
-            ignore_book_ply: true,
-            book_on_the_fly: false,
-            books: Vec::new(),
-            book_loaded_sig: None,
-            book_rng: rshogi_book::DefaultBookRng::new(),
-            mate_hash_mb: DEFAULT_MATE_HASH_MB,
-            mate_mode: MateMode::default(),
-            mate_threads: 1,
-            #[cfg(not(target_arch = "wasm32"))]
-            game_mate_threads: 0,
-            mate_shortest: None,
-            mate_solver: None,
-            mate_thread: None,
-            mate_stop: Arc::new(AtomicBool::new(false)),
-        };
-        engine.apply_embedded_spsa_params(EMBEDDED_SPSA_PARAMS);
-        engine
+            phase_tracker: p2_search::PhaseTracker::new(),
+            endgame_detector: p2_search::EndgameDetector::new(),
+            midgame_policy_config: p2_midgame_policy::MidgamePolicyConfig::default(),
+            midgame_policy_model_path: None,
+            midgame_policy_hook: None,
+            use_root_mate_search: true,
+            use_opponent_mate_check: true,
+            opponent_mate_max_moves: 16,
+            use_mate_solver_thread: true,
+            num_threads: 1,
+            mate_solver_thread: None,
+            #[cfg(feature = "puct-hybrid")]
+            use_puct: false,
+            #[cfg(feature = "puct-hybrid")]
+            puct_endgame_threshold: 800,
+            #[cfg(feature = "puct-hybrid")]
+            puct_network_path: None,
+            #[cfg(feature = "puct-hybrid")]
+            puct_stop_flag: None,
+            #[cfg(feature = "puct-hybrid")]
+            puct_thread: None,
+            #[cfg(feature = "puct-hybrid")]
+            puct_last_score_cp: Arc::new(AtomicI32::new(0)),
+        }
     }
 
     /// USIコマンドを処理
@@ -325,32 +279,34 @@ impl UsiEngine {
                 self.cmd_usi();
             }
             "isready" => {
-                self.cmd_isready()?;
+                self.cmd_isready();
             }
             "setoption" => {
                 self.cmd_setoption(&tokens);
             }
             "usinewgame" => {
-                self.cmd_usinewgame()?;
+                self.cmd_usinewgame();
             }
-            "position" => match self.cmd_position(&tokens) {
-                Ok(()) => self.last_position_cmd = Some(line.to_string()),
-                Err(error) => eprintln!("info string Error parsing position: {error:#}"),
-            },
+            "position" => {
+                self.last_position_cmd = Some(line.to_string());
+                self.cmd_position(&tokens);
+            }
             "go" => {
                 self.last_go_cmd = Some(line.to_string());
-                self.cmd_go(&tokens)?;
+                self.cmd_go(&tokens);
             }
             "stop" => {
                 self.cmd_stop();
             }
             "ponderhit" => {
-                self.cmd_ponderhit()?;
+                self.cmd_ponderhit();
             }
             "quit" => {
                 self.cmd_stop();
                 // NNUE統計を出力（nnue-stats feature有効時のみ実際に出力）
                 print_nnue_stats();
+                // dual_cross profiling: DUAL_CROSS_PROFILE=1 時のみ stderr に出力
+                print_dual_cross_profile();
                 return Ok(false);
             }
             "gameover" => {
@@ -374,148 +330,152 @@ impl UsiEngine {
 
     /// usiコマンド: エンジン情報を出力
     fn cmd_usi(&self) {
-        println!("id name {ENGINE_NAME}");
+        println!("id name {ENGINE_NAME} {ENGINE_VERSION}");
         println!("id author {ENGINE_AUTHOR}");
         println!();
-        for line in self.advertised_option_lines() {
-            println!("{line}");
+        // オプション（将来的に追加）
+        println!("option name USI_Hash type spin default 256 min 1 max 4096");
+        println!("option name Threads type spin default 1 min 1 max 512");
+        println!("option name USI_Ponder type check default false");
+        println!("option name Stochastic_Ponder type check default false");
+        println!("option name MultiPV type spin default 1 min 1 max 500");
+        println!("option name NetworkDelay type spin default 120 min 0 max 10000");
+        println!("option name NetworkDelay2 type spin default 1120 min 0 max 10000");
+        println!("option name MinimumThinkingTime type spin default 2000 min 1000 max 100000");
+        println!("option name SlowMover type spin default 100 min 1 max 1000");
+        println!("option name MaxMovesToDraw type spin default 100000 min 0 max 100000");
+        println!(
+            "option name DrawValueBlack type spin default {DEFAULT_DRAW_VALUE_BLACK} min -30000 max 30000"
+        );
+        println!(
+            "option name DrawValueWhite type spin default {DEFAULT_DRAW_VALUE_WHITE} min -30000 max 30000"
+        );
+        println!("option name DefenseMateProbeNodes type spin default 0 min 0 max 10000000");
+        println!("option name EvalHash type spin default 256 min 0 max 4096");
+        println!("option name UseEvalHash type check default true");
+        println!("option name Skill Level type spin default 20 min 0 max 20");
+        println!("option name UCI_LimitStrength type check default false");
+        println!("option name UCI_Elo type spin default 0 min 0 max 4000");
+        println!(
+            "option name MaterialLevel type combo default none var none var 1 var 2 var 3 var 4 var 7 var 8 var 9"
+        );
+        println!("option name EvalFile type string default eval/nn.bin");
+        println!(
+            "option name EnteringKingRule type combo default CSARule27 var NoEnteringKing var CSARule24 var CSARule24H var CSARule27 var CSARule27H var TryRule"
+        );
+        // NNUEEvalScale option は v16 (shogi2344) 系 専用だったため 2026-05-12 削除。
+        // LayerStacks 系の eval scale 調整は FV_SCALE option を使用。
+        // FV_SCALE: 0=自動判定 (ckpt 値、 LayerStacks=24)、 1以上=指定値でオーバーライド。
+        // **default = 16** (Suisho5 / YaneuraOu HalfKP 同 scale で cp 表示を揃える、 2026-05-23)。
+        println!("option name FV_SCALE type spin default 16 min 0 max 100");
+        #[cfg(feature = "nnue-attack-relay-v2")]
+        println!("option name ARH_V2_OUTPUT_SCALE type spin default 4 min 0 max 256");
+        #[cfg(feature = "nnue-scalar-threat")]
+        println!("option name SCALAR_THREAT_OUTPUT_DIVISOR type spin default 8 min 1 max 256");
+        #[cfg(feature = "nnue-king-danger-psqt")]
+        println!("option name KING_DANGER_OUTPUT_SCALE type spin default 4 min 0 max 256");
+        #[cfg(feature = "nnue-king-danger-psqt")]
+        println!("option name KING_DANGER_ANALYTIC_COEF type spin default 0 min 0 max 200");
+        #[cfg(feature = "nnue-king-danger-psqt")]
+        println!("option name KING_DANGER_SLIDER_ANALYTIC_COEF type spin default 0 min 0 max 200");
+        #[cfg(feature = "nnue-king-danger-psqt")]
+        println!(
+            "option name KING_DANGER_SLIDER_DEF_ANALYTIC_COEF type spin default 0 min 0 max 200"
+        );
+        #[cfg(feature = "nnue-attack-dev-psqt")]
+        println!("option name ATTACK_DEV_OUTPUT_SCALE type spin default 4 min 0 max 256");
+        #[cfg(feature = "nnue-slider-xray-psqt")]
+        println!("option name SLIDER_XRAY_OUTPUT_SCALE type spin default 4 min 0 max 256");
+        #[cfg(feature = "nnue-kzt-psqt")]
+        println!("option name KZT_OUTPUT_SCALE type spin default 4 min 0 max 256");
+        #[cfg(feature = "nnue-kzt-psqt")]
+        println!("option name KZT_CLAMP_RAW type spin default 0 min 0 max 8192");
+        #[cfg(feature = "nnue-odh")]
+        println!("option name ODH_OUTPUT_SCALE type spin default 0 min 0 max 256");
+        #[cfg(feature = "nnue-odh")]
+        println!("option name ODH_THRESHOLD type spin default 100 min 0 max 3000");
+        #[cfg(feature = "nnue-odh")]
+        println!("option name ODH_CAP type spin default 800 min 0 max 30000");
+        #[cfg(feature = "nnue-eval-bias-corr")]
+        println!("option name EVAL_BIAS_CORR_SCALE type spin default 0 min 0 max 256");
+        #[cfg(feature = "nnue-eval-bias-corr")]
+        println!("option name EVAL_BIAS_CORR_CLAMP type spin default 300 min 0 max 30000");
+        #[cfg(feature = "nnue-eval-bias-corr")]
+        println!("option name EVAL_BIAS_CORR_FILE type string default <empty>");
+        #[cfg(feature = "nnue-king-mobility-psqt")]
+        println!("option name KING_MOBILITY_OUTPUT_SCALE type spin default 4 min 0 max 256");
+        #[cfg(feature = "nnue-drop-pressure-psqt")]
+        println!("option name DROP_PRESSURE_OUTPUT_SCALE type spin default 4 min 0 max 256");
+        println!(
+            "option name LS_BUCKET_MODE type combo default {} var progress8kpabs",
+            LayerStackBucketMode::Progress8KPAbs.as_str()
+        );
+        println!("option name LS_PROGRESS_COEFF type string default <empty>");
+        println!(
+            "option name LS_BUCKET_EVAL_SCALE type string default 100,100,100,100,100,100,100,100"
+        );
+        for i in 0..8 {
+            println!("option name LS_BUCKET_EVAL_SCALE_{i} type spin default 100 min 50 max 200");
+        }
+        println!("option name LS_BUCKET_INTERP type spin default 0 min 0 max 40");
+        println!(
+            "option name NNUE_ARCHITECTURE type combo default auto var auto var halfkp var halfka_hm var halfka var layerstacks var layerstacks-psqt"
+        );
+        // 有限パス権（Finite Pass Rights）オプション
+        println!("option name PassRights type check default false");
+        println!("option name InitialPassCount type spin default 2 min 0 max 10");
+        println!("option name PassMoveBonus type spin default 0 min -1000 max 1000");
+        println!(
+            "option name PassRightValueEarly type spin default {DEFAULT_PASS_RIGHT_VALUE_EARLY} min 0 max 500"
+        );
+        println!(
+            "option name PassRightValueLate type spin default {DEFAULT_PASS_RIGHT_VALUE_LATE} min 0 max 500"
+        );
+        println!("option name SPSAParamsFile type string default <auto>");
+        // --- Phase B-1 history coefficient sweep (2026-06-05) ---
+        println!("option name HistChCoeff type spin default 1 min 0 max 16");
+        println!("option name HistMainCoeff type spin default 2 min 0 max 16");
+        println!("option name HistPawnCoeff type spin default 2 min 0 max 16");
+        println!("option name HistLpCoeff type spin default 8 min 0 max 32");
+        // --- 敵玉 drop move-ordering bonus mode (2026-06-16, 害診断後の狭い版切替) ---
+        // 0=off / 1=line-only / 2=danger-gated(default) / 3=full(旧dropmo)
+        println!("option name KingDropBonusMode type spin default 2 min 0 max 3");
+        // mode2 の danger gate 閾値 (= 自軍駒が敵玉5x5内に何枚集まれば zone bonus 有効か)
+        println!("option name KingDropDangerMin type spin default 2 min 1 max 8");
+        // --- Midgame policy (αβ root ordering を Transformer policy で補完、 default OFF) ---
+        println!("option name UseMidgamePolicy type check default false");
+        println!("option name MidgamePolicyMinDepth type spin default 8 min 0 max 64");
+        println!("option name MidgamePolicyTopK type spin default 4 min 0 max 32");
+        println!("option name MidgamePolicyAlpha type spin default 32 min 0 max 1024");
+        println!("option name MidgamePolicyCacheEntries type spin default 1024 min 16 max 65536");
+        println!("option name MidgamePolicyModel type string default <empty>");
+        for spec in SearchTuneParams::option_specs() {
+            println!(
+                "option name {} type spin default {} min {} max {}",
+                spec.usi_name, spec.default, spec.min, spec.max
+            );
+        }
+        // --- PUCT hybrid engine (puct-hybrid feature 有効時のみ公開) ---
+        println!("option name UseRootMateSearch type check default true");
+        println!("option name UseOpponentMateCheck type check default true");
+        println!("option name OpponentMateMaxMoves type spin default 16 min 1 max 256");
+        // MateSolverThread (= 別 thread dfpn、 Threads >= 2 時のみ実起動、 main search 完全不変)
+        println!("option name UseMateSolverThread type check default true");
+        #[cfg(feature = "puct-hybrid")]
+        {
+            println!("option name UsePuct type check default false");
+            println!("option name PuctEndgameThreshold type spin default 800 min 0 max 5000");
+            println!("option name PuctNetworkPath type string default <empty>");
         }
         println!("usiok");
     }
 
-    /// `usi` で広告する行。SPSA の値を焼き込んだ build は、調整用の `SPSA_*` / `SPSA_NET_*` を除く。
-    fn advertised_option_lines(&self) -> Vec<String> {
-        let mut lines = self.usi_option_lines();
-        if self.spsa_options_hidden {
-            lines.retain(|line| !line.starts_with("option name SPSA_"));
-        }
-        lines
-    }
-
-    /// 受け付けるオプションの `option name ...` の行。engine_options.txt の名前と値の照合に使う
-    /// (広告しない `SPSA_*` / `SPSA_NET_*` も含む)。
-    fn usi_option_lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        lines.push("option name USI_Hash type spin default 256 min 1 max 4096".to_string());
-        lines.push("option name Threads type spin default 1 min 1 max 512".to_string());
-        lines.push("option name NumaPolicy type combo default none var none var auto".to_string());
-        lines.push("option name USI_Ponder type check default false".to_string());
-        lines.push("option name Stochastic_Ponder type check default false".to_string());
-        lines.push("option name MultiPV type spin default 1 min 1 max 500".to_string());
-        lines.push("option name NetworkDelay type spin default 120 min 0 max 10000".to_string());
-        lines.push("option name NetworkDelay2 type spin default 1120 min 0 max 10000".to_string());
-        // RoundUpToFullSecond=true のときはエンジン側で 1000 未満を 1000 に上げる
-        lines.push(
-            "option name MinimumThinkingTime type spin default 2000 min 0 max 100000".to_string(),
-        );
-        lines.push("option name RoundUpToFullSecond type check default true".to_string());
-        lines.push("option name SlowMover type spin default 100 min 1 max 1000".to_string());
-        lines.push(
-            "option name MaxMovesToDraw type spin default 100000 min 0 max 100000".to_string(),
-        );
-        lines.push(format!(
-            "option name DrawValueBlack type spin default {DEFAULT_DRAW_VALUE_BLACK} min -30000 max 30000"
-        ));
-        lines.push(format!(
-            "option name DrawValueWhite type spin default {DEFAULT_DRAW_VALUE_WHITE} min -30000 max 30000"
-        ));
-        lines.push("option name EvalHash type spin default 256 min 0 max 4096".to_string());
-        lines.push(format!(
-            "option name MateHashMB type spin default {DEFAULT_MATE_HASH_MB} min 1 max 4096"
-        ));
-        lines.push(format!(
-            "option name MateMode type combo default {} var Speed var Power",
-            MateMode::default().name()
-        ));
-        lines.push("option name MateThreads type spin default 1 min 1 max 512".to_string());
-        #[cfg(not(target_arch = "wasm32"))]
-        lines.push("option name GameMateThreads type spin default 0 min 0 max 512".to_string());
-        lines.push("option name MateShortest type combo default Off var Off var Tsume var All var Estimate".to_string());
-        lines.push("option name UseEvalHash type check default true".to_string());
-        lines.push("option name EvalHashLargePages type check default true".to_string());
-        lines.push("option name Skill Level type spin default 20 min 0 max 20".to_string());
-        lines.push("option name UCI_LimitStrength type check default false".to_string());
-        lines.push("option name UCI_Elo type spin default 0 min 0 max 4000".to_string());
-        lines.push("option name MaterialLevel type combo default none var none var 1 var 2 var 3 var 4 var 7 var 8 var 9".to_string());
-        lines.push("option name EvalFile type string default eval/nn.bin".to_string());
-        lines.push("option name EnteringKingRule type combo default CSARule27 var NoEnteringKing var CSARule24 var CSARule24H var CSARule27 var CSARule27H var TryRule".to_string());
-        // FV_SCALE: 0=自動判定、1以上=指定値でオーバーライド
-        // 水匠5等は24を使用する
-        lines.push("option name FV_SCALE type spin default 0 min 0 max 100".to_string());
-        lines.push("option name LS_BUCKET_MODE type combo default unset var unset var progresskpabs var progresskpabsq16 var kingrank9".to_string());
-        lines.push(format!(
-            "option name LS_PROGRESS_BUCKETS type spin default 0 min 0 max {MAX_LAYER_STACK_BUCKETS}"
-        ));
-        lines.push("option name LS_PROGRESS_COEFF type string default <empty>".to_string());
-        lines.push("option name NNUE_ARCHITECTURE type combo default auto var auto var halfkp var halfka_hm var halfka var layerstacks var layerstacks-psqt".to_string());
-        // 有限パス権（Finite Pass Rights）オプション
-        lines.push("option name PassRights type check default false".to_string());
-        lines.push("option name InitialPassCount type spin default 2 min 0 max 10".to_string());
-        lines.push("option name PassMoveBonus type spin default 0 min -1000 max 1000".to_string());
-        lines.push(format!(
-            "option name PassRightValueEarly type spin default {DEFAULT_PASS_RIGHT_VALUE_EARLY} min 0 max 500"
-        ));
-        lines.push(format!(
-            "option name PassRightValueLate type spin default {DEFAULT_PASS_RIGHT_VALUE_LATE} min 0 max 500"
-        ));
-        lines.push("option name SPSAParamsFile type string default <auto>".to_string());
-        // 定跡（opening book）オプション。既定は BookFile=no_book(オフ)、
-        // BookDepthLimit=0(無効)。
-        lines.push("option name USI_OwnBook type check default true".to_string());
-        lines.push("option name BookFile type string default no_book".to_string());
-        lines.push("option name BookExploreFile type string default <empty>".to_string());
-        lines.push("option name BookDir type string default book".to_string());
-        lines.push("option name BookMoves type spin default 16 min 0 max 10000".to_string());
-        lines.push("option name BookEvalDiff type spin default 30 min 0 max 30000".to_string());
-        lines.push(
-            "option name BookEvalBlackLimit type spin default 0 min -30000 max 30000".to_string(),
-        );
-        lines.push(
-            "option name BookEvalWhiteLimit type spin default -140 min -30000 max 30000"
-                .to_string(),
-        );
-        lines.push("option name BookDepthLimit type spin default 0 min 0 max 256".to_string());
-        // 先後別の値。-1 なら BookEvalDiff / BookDepthLimit を使う。
-        for name in BOOK_PER_SIDE_OPTIONS {
-            lines.push(format!("option name {name} type spin default -1 min -1 max 99999"));
-        }
-        lines.push("option name NarrowBook type check default false".to_string());
-        lines.push("option name BookSelectValue type check default false".to_string());
-        lines.push(
-            "option name BookValueTieBreak type combo default count var count var depth var random"
-                .to_string(),
-        );
-        lines.push("option name ConsiderBookMoveCount type check default false".to_string());
-        lines.push("option name IgnoreBookPly type check default true".to_string());
-        lines.push("option name FlippedBook type check default true".to_string());
-        lines.push("option name BookOnTheFly type check default false".to_string());
-        for spec in SearchTuneParams::option_specs() {
-            lines.push(format!(
-                "option name {} type spin default {} min {} max {}",
-                spec.usi_name, spec.default, spec.min, spec.max
-            ));
-        }
-        for name in &self.spsa_net_spec_names {
-            lines.push(format!("option name {name} type spin default 0 min -32768 max 32767"));
-        }
-        lines
-    }
-
     /// isreadyコマンド: 準備完了を通知
-    /// 探索中は探索を止めず即座に応答し、待機中だけTTをクリアする。
-    /// setoption 後は必ず isready が来るので、評価設定変更で陳腐化した EvalHash もここで捨てる。
-    fn cmd_isready(&mut self) -> Result<()> {
-        if self.search_thread.is_some() && self.search_running.load(Ordering::SeqCst) {
-            println!("readyok");
-            return Ok(());
-        }
-        self.wait_for_search();
+    /// YaneuraOu準拠: isready 受信時にTTをクリアする
+    fn cmd_isready(&mut self) {
         if let Some(search) = self.search.as_mut() {
             search.clear_tt();
-            search.clear_eval_hash();
         }
-        self.apply_engine_options_file();
-        self.maybe_load_spsa_params();
         // EvalFile の状態を確認し、必要なら NNUE をロード
         match self.eval_file_explicit {
             Some(false) => {
@@ -533,9 +493,8 @@ impl UsiEngine {
                 // EvalFile 未指定 + Material 未指定 + NNUE 未ロード → eval/nn.bin を自動ロード
                 const DEFAULT_EVAL_FILE: &str = "eval/nn.bin";
                 if std::path::Path::new(DEFAULT_EVAL_FILE).exists() {
-                    match self.load_nnue_with_current_deltas(Path::new(DEFAULT_EVAL_FILE)) {
-                        Ok(_) => {
-                            self.eval_file_path = Some(DEFAULT_EVAL_FILE.to_string());
+                    match init_nnue(DEFAULT_EVAL_FILE) {
+                        Ok(()) => {
                             let payload = json!({
                                 "type": "info",
                                 "message": format!("NNUE auto-loaded: {DEFAULT_EVAL_FILE}"),
@@ -558,167 +517,27 @@ impl UsiEngine {
                 // EvalFile 未指定だが Material 有効 or NNUE 既ロード → 何もしない
             }
         }
-        self.reload_net_deltas_if_dirty()?;
-        let network = get_network();
-        if let Some(spec) = network.as_deref().and_then(|net| net.layer_stack_bucket_spec()) {
-            if self.ls_bucket_mode.is_some()
-                || self.ls_progress_buckets.is_some()
-                || self.ls_progress_coeff_explicit
-            {
-                bail!(
-                    "NNUE ls_bucket routing conflicts with LS_BUCKET_MODE, LS_PROGRESS_BUCKETS or LS_PROGRESS_COEFF; leave these options unset"
-                );
-            }
-            eprintln!(
-                "info string NNUE LayerStack routing mode=spec buckets={}",
-                spec.num_buckets()
-            );
-        } else if let Some(stored_bucket_count) =
-            network.as_deref().and_then(|net| net.layer_stack_num_buckets())
-        {
-            if let Err(message) = validate_layer_stack_routing(
-                stored_bucket_count,
-                self.ls_bucket_mode,
-                self.ls_progress_buckets,
-                self.ls_progress_coeff_loaded,
-            ) {
-                panic!("Invalid LayerStacks routing configuration: {message}");
-            }
-            let mode = self.ls_bucket_mode.expect("validated above");
-            configure_layer_stack_routing(mode, stored_bucket_count, self.ls_progress_buckets)
-                .unwrap_or_else(|message| {
-                    panic!("Invalid LayerStacks routing configuration: {message}")
-                });
-            let routing_bucket_count = match mode {
-                LayerStackBucketMode::KingRank9 => 9,
-                LayerStackBucketMode::ProgressKPAbs | LayerStackBucketMode::ProgressKPAbsQ16 => {
-                    self.ls_progress_buckets.expect("validated above")
-                }
-                _ => unreachable!("validated above"),
+        // progress8kpabs モードで LS_PROGRESS_COEFF 未指定の場合はエラー
+        // NNUE が未ロード（Material 評価）または LayerStacks 以外のアーキ（v16 等）はスキップ
+        if let Some(net) = get_network() {
+            use rshogi_core::nnue::{
+                LayerStackBucketMode, get_layer_stack_bucket_mode,
+                get_layer_stack_progress_kpabs_weights,
             };
-            eprintln!(
-                "info string NNUE LayerStack routing mode={} stored_buckets={} routing_buckets={}",
-                mode.as_str(),
-                stored_bucket_count,
-                routing_bucket_count
-            );
-        }
-        // 確保と 0 埋めを持ち時間に入れないよう、setoption が出そろった readyok の前に済ませる。
-        if let Some(mut search) = self.search.take() {
-            self.prepare_eval_hash(&mut search);
-            // 評価関数の読み直しや Threads の変更の後でも、node ごとの写しを go の前に作り直しておく。
-            if let Some(message) = search.prepare_numa_networks() {
-                println!("info string {message}");
-            }
-            self.search = Some(search);
-        }
-        self.maybe_report_page_status();
-        self.maybe_load_book();
-        self.maybe_load_book_explore();
-        println!("readyok");
-        Ok(())
-    }
-
-    /// explore リストを設定変更後の isready で読み込む。読み込み失敗時は未ロードのままとし、次の isready で再試行する。
-    fn maybe_load_book_explore(&mut self) {
-        if self.book_explore_file.is_empty() || self.book_explore.is_some() {
-            return;
-        }
-        match std::fs::read_to_string(&self.book_explore_file) {
-            Ok(text) => {
-                self.book_explore = Some(rshogi_book::BookExploreList::parse(&text, |msg| {
-                    println!("info string {msg}");
-                }));
-            }
-            Err(e) => {
-                println!(
-                    "info string BookExploreFile {}: {e}; will retry on next isready",
-                    self.book_explore_file
+            if net.is_layer_stacks()
+                && get_layer_stack_bucket_mode() == LayerStackBucketMode::Progress8KPAbs
+                && get_layer_stack_progress_kpabs_weights().iter().all(|&w| w == 0.0)
+            {
+                panic!(
+                    "LS_BUCKET_MODE=progress8kpabs requires LS_PROGRESS_COEFF to be set. \
+                     All weights are zero (progress.bin not loaded). \
+                     Use 'setoption name LS_PROGRESS_COEFF value <path>' before isready."
                 );
-                println!("info string book explore loaded: 0 entries");
-                self.book_explore = None;
             }
         }
-    }
-
-    /// 定跡ファイルのロード（isready 時に実施）。
-    ///
-    /// BookFile=no_book なら何もしない。`user_book1-000.db` のような優先定跡があれば BookFile より
-    /// 先に引く順で並べて読む。ロードに失敗したファイルは info string でエラー出力して飛ばし、
-    /// 残りの定跡で継続する。丸読みは同一パス列・同一 IgnoreBookPly なら再ロードしない。
-    /// BookOnTheFly は開き直しが軽いので isready のたびに開き直し、差し替えたファイルを拾う。
-    fn maybe_load_book(&mut self) {
-        if self.book_file == "no_book" || self.book_file.is_empty() {
-            self.books.clear();
-            self.book_loaded_sig = None;
-            return;
-        }
-
-        // BookDir 配下に解決（BookFile が絶対パス/明示パスならそちらが優先される）。
-        // `.db` が無く同名の `.ybb` があればそちらを読む。
-        let requested = std::path::Path::new(&self.book_dir).join(&self.book_file);
-        let paths = rshogi_book::priority_book_paths(&requested, |msg| {
-            println!("info string {msg}");
-        });
-        if let Some(resolved) = paths.last().filter(|resolved| **resolved != requested) {
-            println!(
-                "info string book file fallback: {} -> {}",
-                requested.display(),
-                resolved.display()
-            );
-        }
-        let path_strs: Vec<String> =
-            paths.iter().map(|path| path.to_string_lossy().into_owned()).collect();
-
-        if self.book_on_the_fly {
-            // 開いていたハンドルを先に閉じる（Windows で差し替え先を開けるように）。
-            self.books.clear();
-            self.book_loaded_sig = None;
-            for (path, path_str) in paths.iter().zip(&path_strs) {
-                match rshogi_book::Book::open_on_the_fly(path, self.ignore_book_ply) {
-                    Ok(book) => {
-                        println!(
-                            "info string book opened on the fly: {path_str} ({} bytes)",
-                            book.on_the_fly_file_len().unwrap_or(0)
-                        );
-                        self.books.push(book);
-                    }
-                    Err(e) => {
-                        println!("info string Error opening book file {path_str}: {e}");
-                    }
-                }
-            }
-            return;
-        }
-
-        // 既ロード & 設定不変なら再ロード不要。
-        let sig = (path_strs, self.ignore_book_ply);
-        if !self.books.is_empty() && self.book_loaded_sig.as_ref() == Some(&sig) {
-            return;
-        }
-
-        self.books.clear();
-        self.book_loaded_sig = None;
-        let mut all_loaded = true;
-        for (path, path_str) in paths.iter().zip(&sig.0) {
-            match rshogi_book::Book::from_path(path, self.ignore_book_ply) {
-                Ok(book) => {
-                    println!(
-                        "info string book loaded: {path_str} ({} positions)",
-                        book.position_count().unwrap_or(0)
-                    );
-                    self.books.push(book);
-                }
-                Err(e) => {
-                    println!("info string Error loading book file {path_str}: {e}");
-                    all_loaded = false;
-                }
-            }
-        }
-        // 読めなかったファイルがあれば、次の isready で全部読み直す。
-        if all_loaded {
-            self.book_loaded_sig = Some(sig);
-        }
+        self.maybe_load_spsa_params();
+        self.maybe_report_large_pages();
+        println!("readyok");
     }
 
     /// SPSA params ファイルの自動/明示読み込み。
@@ -756,206 +575,82 @@ impl UsiEngine {
             }
         };
 
-        let report = self.apply_spsa_params(&parse_spsa_params(&content));
-        if report.applied > 0 {
-            eprintln!(
-                "info string SPSA params loaded: {} parameters from {} (clamped: {})",
-                report.applied,
-                path.display(),
-                report.clamped
-            );
-        }
-        report.warn_unknown(&path.display().to_string());
-    }
-
-    /// build に焼き込んだ SPSA の値を適用する。焼き込んだ build では調整用のオプションを広告しないので、
-    /// GUI が既定値を `setoption` で送り返して焼き込んだ値を上書きすることもない。
-    fn apply_embedded_spsa_params(&mut self, embedded: &[(&str, i32)]) {
-        if embedded.is_empty() {
-            return;
-        }
-        let entries: Vec<(String, i32)> =
-            embedded.iter().map(|&(name, value)| (name.to_string(), value)).collect();
-        let report = self.apply_spsa_params(&entries);
-        self.spsa_options_hidden = true;
-        eprintln!(
-            "info string SPSA params embedded: {} parameters (clamped: {})",
-            report.applied, report.clamped
-        );
-        report.warn_unknown("embedded SPSA params");
-    }
-
-    fn apply_spsa_params(&mut self, entries: &[(String, i32)]) -> SpsaApplyReport {
-        let mut report = SpsaApplyReport::default();
-        for (name, value) in entries {
-            // engine_options.txt で固定した値は .params でも変えない
-            if self.fixed_options.contains_key(&name.to_ascii_lowercase()) {
+        let mut applied = 0usize;
+        let mut clamped = 0usize;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            let applied = if name.starts_with(NET_DELTA_OPTION_PREFIX) {
-                // usi で広告する範囲 (i16) に収める
-                let clamped = (*value).clamp(i32::from(i16::MIN), i32::from(i16::MAX));
-                if clamped != *value {
-                    report.clamped += 1;
+            // .params format: name,type,value,min,max,c_end,r_end [// comment] [[[NOT USED]]]
+            let val_part = trimmed.split("//").next().unwrap_or(trimmed);
+            let val_part = val_part.replace("[[NOT USED]]", "");
+            let cols: Vec<&str> = val_part.split(',').map(str::trim).collect();
+            if cols.len() < 3 {
+                continue;
+            }
+            let name = cols[0];
+            let type_name = cols[1];
+            let value_str = cols[2];
+
+            let parsed = if type_name.eq_ignore_ascii_case("int") {
+                match value_str.parse::<f64>() {
+                    Ok(v) => v.round() as i32,
+                    Err(_) => continue,
                 }
-                self.set_net_delta_value(name, clamped).then_some(clamped)
-            } else if let Some(search) = self.search.as_mut()
-                && let Some(result) = search.set_search_tune_option(name, *value)
-            {
-                if result.clamped {
-                    report.clamped += 1;
-                }
-                Some(result.applied)
             } else {
-                None
+                match value_str.parse::<i32>() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                }
             };
-            match applied {
-                Some(_) => report.applied += 1,
-                None => report.unknown.push(name.clone()),
+
+            if let Some(search) = self.search.as_mut()
+                && let Some(result) = search.set_search_tune_option(name, parsed)
+            {
+                applied += 1;
+                if result.clamped {
+                    clamped += 1;
+                }
             }
         }
-        report
-    }
 
-    fn set_net_delta_value(&mut self, name: &str, value: i32) -> bool {
-        let Some(id) = NetCoefficientId::parse_usi_name(name) else {
-            eprintln!("info string Warning: invalid SPSA net option name '{name}'");
-            return false;
-        };
-        let previous = self.net_deltas.get(&id).copied().unwrap_or(0);
-        if previous != value {
-            self.net_deltas.insert(id, value);
-            self.net_deltas_dirty = true;
-        }
-        true
-    }
-
-    fn current_net_deltas(&self) -> Vec<NetDelta> {
-        self.net_deltas
-            .iter()
-            .filter(|(_, delta)| **delta != 0)
-            .map(|(id, delta)| NetDelta {
-                id: id.clone(),
-                delta: *delta,
-            })
-            .collect()
-    }
-
-    fn load_nnue_with_current_deltas(&mut self, path: &Path) -> io::Result<NetDeltaReport> {
-        let deltas = self.current_net_deltas();
-        let report = init_nnue_with_deltas(path, &deltas)?;
-        if let Some(storage) = get_network().and_then(|net| net.layer_stack_piece_ft_storage()) {
-            eprintln!("info string NNUE LayerStack piece FT storage={storage}");
-        }
-        if let Some(implementation) = get_network().and_then(|net| net.layer_stack_implementation())
-        {
-            eprintln!("info string NNUE LayerStack implementation={implementation}");
-        }
-        if !deltas.is_empty() || self.net_deltas_dirty {
+        if applied > 0 {
             eprintln!(
-                "info string net deltas applied: {} coefficients (clamped: {})",
-                report.applied, report.clamped
+                "info string SPSA params loaded: {} parameters from {} (clamped: {})",
+                applied,
+                path.display(),
+                clamped
             );
         }
-        self.net_deltas_dirty = false;
-        Ok(report)
     }
 
-    fn reload_net_deltas_if_dirty(&mut self) -> Result<()> {
-        if !self.net_deltas_dirty || get_network().is_none() {
-            return Ok(());
+    fn maybe_report_large_pages(&mut self) {
+        if self.large_pages_reported {
+            return;
         }
-        // 探索 worker は global Arc の生存を前提に raw pointer を持つため、差し替え前に join する。
-        self.wait_for_search();
-        let path = self
-            .eval_file_path
-            .as_ref()
-            .map(PathBuf::from)
-            .context("NNUE delta reload requested, but the loaded EvalFile path is unknown")?;
-        self.load_nnue_with_current_deltas(&path)
-            .with_context(|| format!("failed to reload NNUE file {}", path.display()))?;
-        // 旧 net の評価値を残さないよう表を手放し、次の isready か go の直前に確保し直す。
-        if let Some(search) = self.search.as_mut() {
-            search.clear_tt();
-            if search.eval_hash_size_mb() != 0 {
-                search.resize_eval_hash(0);
-            }
-        }
-        self.maybe_report_page_status();
-        Ok(())
-    }
 
-    fn maybe_report_page_status(&mut self) {
         let Some(search) = self.search.as_ref() else {
             return;
         };
-        let current = if search.tt_uses_large_pages() {
-            TtPageStatus::LargePages
-        } else if search.tt_huge_page_hint_requested() {
-            TtPageStatus::HugePageHint
-        } else {
-            TtPageStatus::Regular
-        };
-        let eval_hash = search.eval_hash();
-        self.report_eval_hash_page_status(&eval_hash);
-        let Some(message) = page_status_message(self.reported_page_status, current) else {
+        if !search.tt_uses_large_pages() {
             return;
-        };
+        }
 
+        // Windows: VirtualAlloc with MEM_LARGE_PAGES
+        // Linux: madvise(MADV_HUGEPAGE) によるhugepageヒント
         let payload = json!({
             "type": "info",
-            "message": message,
+            "message": "Large Pages are used.",
         });
         println!("info string {}", payload);
-        self.reported_page_status = current;
-    }
-
-    /// 実際に確保する EvalHash の大きさ。`UseEvalHash=false` では引かない表を持たない。
-    fn allocated_eval_hash_mb(&self) -> usize {
-        if self.use_eval_hash {
-            self.eval_hash_size_mb
-        } else {
-            0
-        }
-    }
-
-    /// isready と go の直前に、EvalHash を設定どおりの大きさにそろえる。setoption では確保しない。
-    fn prepare_eval_hash(&mut self, search: &mut Search) {
-        let allocated = self.allocated_eval_hash_mb();
-        if search.eval_hash_size_mb() != allocated {
-            search.resize_eval_hash(allocated);
-        }
-        self.report_eval_hash_page_status(&search.eval_hash());
-    }
-
-    fn report_eval_hash_page_status(&mut self, hash: &rshogi_core::eval::EvalHash) {
-        // 空の表は一時的に手放しただけのことがある。報告済みの状態を残し、
-        // 確保し直したときに前回の報告と比べて変化を伝える。
-        if hash.is_empty() {
-            return;
-        }
-        let current = if hash.uses_large_pages() {
-            TtPageStatus::LargePages
-        } else if hash.huge_page_hint_requested() {
-            TtPageStatus::HugePageHint
-        } else {
-            TtPageStatus::Regular
-        };
-        if let Some(message) = page_status_message(self.reported_eval_hash_page_status, current) {
-            let message = if current == TtPageStatus::Regular {
-                "Regular pages are used."
-            } else {
-                message
-            };
-            let payload = json!({"type": "info", "message": format!("EvalHash: {message}")});
-            println!("info string {}", payload);
-            self.reported_eval_hash_page_status = current;
-        }
+        self.large_pages_reported = true;
     }
 
     /// setoptionコマンド: オプション設定
     fn cmd_setoption(&mut self, tokens: &[&str]) {
-        self.stop_for_option_change();
+        // 探索中の設定変更は避ける
+        self.wait_for_search();
 
         // setoption name <name> value <value>
         let mut name = String::new();
@@ -989,29 +684,7 @@ impl UsiEngine {
             }
         }
 
-        if let Some(fixed) = self.fixed_options.get(&name.to_ascii_lowercase()) {
-            println!(
-                "info string {name} is fixed to '{fixed}' by {ENGINE_OPTIONS_FILE}; setoption ignored"
-            );
-            return;
-        }
-        self.set_option(name, value);
-    }
-
-    /// オプションを 1 つ適用する。setoption と engine_options.txt の両方から呼ぶ。
-    fn set_option(&mut self, name: String, value: String) {
-        if name.starts_with(NET_DELTA_OPTION_PREFIX) {
-            let parsed = match value.parse::<i32>() {
-                Ok(v) => v,
-                Err(_) => {
-                    eprintln!("info string Warning: invalid SPSA net value '{}'", value);
-                    return;
-                }
-            };
-            self.set_net_delta_value(&name, parsed);
-            return;
-        }
-
+        // オプションを適用
         if name.starts_with("SPSA_") {
             let parsed = match value.parse::<i32>() {
                 Ok(v) => v,
@@ -1049,26 +722,17 @@ impl UsiEngine {
                         search.resize_tt(size);
                         self.tt_size_mb = size;
                     }
-                    self.maybe_report_page_status();
+                    self.maybe_report_large_pages();
                 }
             }
             "Threads" => {
-                if let Ok(num) = value.parse::<usize>()
-                    && let Some(search) = self.search.as_mut()
-                {
-                    search.set_num_threads(num);
-                }
-            }
-            "NumaPolicy" => match NumaPolicy::from_usi(&value) {
-                Some(policy) => {
-                    if let Some(search) = self.search.as_mut()
-                        && let Some(message) = search.set_numa_policy(policy)
-                    {
-                        println!("info string {message}");
+                if let Ok(num) = value.parse::<usize>() {
+                    self.num_threads = num.max(1);
+                    if let Some(search) = self.search.as_mut() {
+                        search.set_num_threads(num);
                     }
                 }
-                None => println!("info string unknown NumaPolicy value: {value}"),
-            },
+            }
             "NetworkDelay" => {
                 if let Ok(v) = value.parse::<i64>()
                     && let Some(search) = self.search.as_mut()
@@ -1093,15 +757,6 @@ impl UsiEngine {
                 {
                     let mut opts = search.time_options();
                     opts.minimum_thinking_time = v;
-                    search.set_time_options(opts);
-                }
-            }
-            "RoundUpToFullSecond" => {
-                if let Ok(v) = value.parse::<bool>()
-                    && let Some(search) = self.search.as_mut()
-                {
-                    let mut opts = search.time_options();
-                    opts.round_up_to_full_second = v;
                     search.set_time_options(opts);
                 }
             }
@@ -1163,83 +818,18 @@ impl UsiEngine {
                     search.set_skill_options(opts);
                 }
             }
-            "MateHashMB" => {
-                if let Ok(size) = value.parse::<usize>()
-                    && size >= 1
-                {
-                    self.mate_hash_mb = size;
-                    // 次の go mate で新しいサイズで確保し直す
-                    self.mate_solver = None;
-                }
-            }
-            "MateMode" => {
-                if let Some(mode) = MateMode::from_name(&value) {
-                    self.mate_mode = mode;
-                    // 置換表の配分がモードで違うので、次の go mate で確保し直す
-                    self.mate_solver = None;
-                }
-            }
-            "MateThreads" => {
-                if let Ok(threads) = value.parse::<usize>()
-                    && threads >= 1
-                {
-                    self.mate_threads = threads.min(512);
-                }
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            "GameMateThreads" => {
-                if let Ok(threads) = value.parse::<usize>() {
-                    self.game_mate_threads = threads.min(512);
-                }
-            }
-            "MateShortest" => {
-                if value.eq_ignore_ascii_case("Off") {
-                    self.mate_shortest = None;
-                } else if let Some(mode) = ShortestMode::from_name(&value) {
-                    self.mate_shortest = Some(mode);
-                }
-            }
             "EvalHash" => {
-                // 確保は isready まで遅らせる。GUI は EvalHash を UseEvalHash より先に送るので、
-                // ここで確保すると UseEvalHash=false でも一度は表を確保して手放すことになる。
                 if let Ok(size) = value.parse::<usize>()
-                    && self.search.is_some()
+                    && let Some(search) = self.search.as_mut()
                 {
+                    search.resize_eval_hash(size);
                     self.eval_hash_size_mb = size;
-                    let allocated = self.allocated_eval_hash_mb();
-                    if let Some(search) = self.search.as_mut()
-                        && search.eval_hash_size_mb() != 0
-                        && search.eval_hash_size_mb() != allocated
-                    {
-                        search.resize_eval_hash(0);
-                    }
                 }
-                self.maybe_report_page_status();
-            }
-            "EvalHashLargePages" => {
-                let large_pages = value == "true" || value == "1";
-                self.eval_hash_large_pages = large_pages;
-                if let Some(search) = self.search.as_mut() {
-                    // ページ種別を替えるときも setoption では確保せず、表を手放してから切り替える。
-                    if search.eval_hash_size_mb() != 0 {
-                        search.resize_eval_hash(0);
-                    }
-                    search.set_eval_hash_large_pages(large_pages);
-                }
-                self.maybe_report_page_status();
             }
             "UseEvalHash" => {
                 let v = value == "true" || value == "1";
                 self.use_eval_hash = v;
                 set_eval_hash_enabled(v);
-                // 有効化時の確保は次の isready か go の直前まで遅らせ、無効化時はすぐ手放す。
-                if !v
-                    && let Some(search) = self.search.as_mut()
-                    && search.eval_hash_size_mb() != 0
-                {
-                    search.resize_eval_hash(0);
-                }
-                self.maybe_report_page_status();
             }
             "MaxMovesToDraw" => {
                 if let Ok(v) = value.parse::<i32>()
@@ -1254,9 +844,6 @@ impl UsiEngine {
                 {
                     search.set_draw_value_black(v);
                 }
-                if let Ok(v) = value.parse::<i32>() {
-                    self.book_options.draw_value_black = v.clamp(-30000, 30000);
-                }
             }
             "DrawValueWhite" => {
                 if let Ok(v) = value.parse::<i32>()
@@ -1264,8 +851,74 @@ impl UsiEngine {
                 {
                     search.set_draw_value_white(v);
                 }
-                if let Ok(v) = value.parse::<i32>() {
-                    self.book_options.draw_value_white = v.clamp(-30000, 30000);
+            }
+            "DefenseMateProbeNodes" => {
+                if let Ok(v) = value.parse::<u32>()
+                    && let Some(search) = self.search.as_mut()
+                {
+                    search.set_defense_mate_probe_nodes(v);
+                }
+            }
+            "LS_BUCKET_EVAL_SCALE" => {
+                // カンマ区切り8整数 (%)、各要素 1..=400 にclamp、不正入力は無視してdefault維持
+                let parts: Vec<&str> = value.split(',').collect();
+                if parts.len() == 8 {
+                    let parsed: Vec<Option<i32>> =
+                        parts.iter().map(|s| s.trim().parse::<i32>().ok()).collect();
+                    if parsed.iter().all(|v| v.is_some()) {
+                        let mut scale = [100i32; 8];
+                        for (i, v) in parsed.iter().enumerate() {
+                            scale[i] = v.unwrap().clamp(1, 400);
+                        }
+                        if let Some(search) = self.search.as_mut() {
+                            search.set_bucket_eval_scale(scale);
+                        }
+                    } else {
+                        eprintln!(
+                            "info string Warning: LS_BUCKET_EVAL_SCALE parse error for '{value}', ignored"
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "info string Warning: LS_BUCKET_EVAL_SCALE requires 8 comma-separated values, got '{value}', ignored"
+                    );
+                }
+            }
+            name if name.starts_with("LS_BUCKET_EVAL_SCALE_")
+                && name
+                    .strip_prefix("LS_BUCKET_EVAL_SCALE_")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .is_some_and(|idx| idx < 8) =>
+            {
+                // SPSA tune 用 per-bucket eval scale (%)、各 index 単独設定。
+                let idx = name
+                    .strip_prefix("LS_BUCKET_EVAL_SCALE_")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .expect("guard checked");
+                match value.trim().parse::<i32>() {
+                    Ok(v) => {
+                        if let Some(search) = self.search.as_mut() {
+                            search.set_bucket_eval_scale_index(idx, v);
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("info string Warning: {name} parse error for '{value}', ignored");
+                    }
+                }
+            }
+            "LS_BUCKET_INTERP" => {
+                // bucket 境界補間の遷移ゾーン幅 ε (%)、0..=40 にclamp、0 = OFF (bit-exact無変化)。
+                // global atomic を直接更新する (= FV_SCALE と同様、search 未生成でも反映)。
+                match value.trim().parse::<i32>() {
+                    Ok(v) => {
+                        set_bucket_interp(v.clamp(0, 40));
+                        eprintln!("info string LS_BUCKET_INTERP: {}", v.clamp(0, 40));
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "info string Warning: LS_BUCKET_INTERP parse error for '{value}', ignored"
+                        );
+                    }
                 }
             }
             "MultiPV" => {
@@ -1300,31 +953,19 @@ impl UsiEngine {
                 if value.is_empty() || value == "<empty>" {
                     // 空 → 明示指定を解除し isready の自動ロードに戻す
                     clear_nnue();
-                    reset_layer_stack_progress_buckets();
                     self.eval_file_explicit = None;
                     self.eval_file_path = None;
                 } else {
                     // パス指定: ロード試行し、結果を記録
                     self.eval_file_path = Some(value.to_string());
-                    match self.load_nnue_with_current_deltas(Path::new(&value)) {
-                        Ok(_) => {
-                            // 前 net 向けの routing 数を新 net に引き継がない。次の isready で
-                            // 再検証・再設定されるまで LayerStacks 評価は loud に失敗する。
-                            reset_layer_stack_progress_buckets();
+                    match init_nnue(&value) {
+                        Ok(()) => {
                             self.eval_file_explicit = Some(true);
                             let payload = json!({
                                 "type": "info",
                                 "message": format!("NNUE loaded: {value}"),
                             });
                             eprintln!("info string {payload}");
-                            // LayerStack ネットなら net に格納された bucket 数を出力
-                            // (file/option desync 検知用)。
-                            if let Some(n) = get_network()
-                                .as_deref()
-                                .and_then(|net| net.layer_stack_num_buckets())
-                            {
-                                eprintln!("info string NNUE LayerStack stored_bucket_count={n}");
-                            }
                         }
                         Err(e) => {
                             self.eval_file_explicit = Some(false);
@@ -1343,6 +984,174 @@ impl UsiEngine {
                     }
                 }
             }
+            #[cfg(feature = "nnue-attack-relay-v2")]
+            "ARH_V2_OUTPUT_SCALE" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::attack_relay_v2::set_output_scale(v);
+                    eprintln!("info string ARH_V2_OUTPUT_SCALE: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-scalar-threat")]
+            "SCALAR_THREAT_OUTPUT_DIVISOR" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    let v = v.clamp(1, 256);
+                    rshogi_core::nnue::scalar_threat::set_output_divisor(v);
+                    eprintln!("info string SCALAR_THREAT_OUTPUT_DIVISOR: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-king-danger-psqt")]
+            "KING_DANGER_OUTPUT_SCALE" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::king_danger::set_output_scale(v);
+                    eprintln!("info string KING_DANGER_OUTPUT_SCALE: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-king-danger-psqt")]
+            "KING_DANGER_ANALYTIC_COEF" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::king_danger::set_analytic_coef(v);
+                    eprintln!("info string KING_DANGER_ANALYTIC_COEF: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-king-danger-psqt")]
+            "KING_DANGER_SLIDER_ANALYTIC_COEF" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::king_danger::set_slider_analytic_coef(v);
+                    eprintln!("info string KING_DANGER_SLIDER_ANALYTIC_COEF: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-king-danger-psqt")]
+            "KING_DANGER_SLIDER_DEF_ANALYTIC_COEF" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::king_danger::set_slider_def_analytic_coef(v);
+                    eprintln!("info string KING_DANGER_SLIDER_DEF_ANALYTIC_COEF: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-attack-dev-psqt")]
+            "ATTACK_DEV_OUTPUT_SCALE" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::attack_dev::set_output_scale(v);
+                    eprintln!("info string ATTACK_DEV_OUTPUT_SCALE: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-slider-xray-psqt")]
+            "SLIDER_XRAY_OUTPUT_SCALE" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::slider_xray::set_output_scale(v);
+                    eprintln!("info string SLIDER_XRAY_OUTPUT_SCALE: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-kzt-psqt")]
+            "KZT_OUTPUT_SCALE" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::kzt::set_output_scale(v);
+                    eprintln!("info string KZT_OUTPUT_SCALE: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-odh")]
+            "ODH_OUTPUT_SCALE" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::odh::set_output_scale(v);
+                    eprintln!("info string ODH_OUTPUT_SCALE: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-odh")]
+            "ODH_THRESHOLD" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::odh::set_threshold(v);
+                    eprintln!("info string ODH_THRESHOLD: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-odh")]
+            "ODH_CAP" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::odh::set_cap(v);
+                    eprintln!("info string ODH_CAP: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-eval-bias-corr")]
+            "EVAL_BIAS_CORR_SCALE" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::eval_bias_corr::set_output_scale(v);
+                    eprintln!("info string EVAL_BIAS_CORR_SCALE: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-eval-bias-corr")]
+            "EVAL_BIAS_CORR_CLAMP" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::eval_bias_corr::set_clamp(v);
+                    eprintln!("info string EVAL_BIAS_CORR_CLAMP: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-eval-bias-corr")]
+            "EVAL_BIAS_CORR_FILE" => {
+                let path = value.trim();
+                if !path.is_empty() && path != "<empty>" {
+                    match rshogi_core::nnue::eval_bias_corr::load_from_file(path) {
+                        Ok(n) => {
+                            eprintln!("info string EVAL_BIAS_CORR_FILE: {n} 行ロード ({path})")
+                        }
+                        Err(e) => eprintln!("info string EVAL_BIAS_CORR_FILE エラー: {e}"),
+                    }
+                }
+            }
+            #[cfg(feature = "nnue-kzt-psqt")]
+            "KZT_CLAMP_RAW" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::kzt::set_clamp_raw(v);
+                    eprintln!("info string KZT_CLAMP_RAW: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-king-mobility-psqt")]
+            "KING_MOBILITY_OUTPUT_SCALE" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::king_mobility::set_output_scale(v);
+                    eprintln!("info string KING_MOBILITY_OUTPUT_SCALE: {v}");
+                }
+            }
+            #[cfg(feature = "nnue-drop-pressure-psqt")]
+            "DROP_PRESSURE_OUTPUT_SCALE" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::nnue::drop_pressure::set_output_scale(v);
+                    eprintln!("info string DROP_PRESSURE_OUTPUT_SCALE: {v}");
+                }
+            }
+            "HistChCoeff" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::search::set_hist_ch_coeff(v);
+                    eprintln!("info string HistChCoeff: {v}");
+                }
+            }
+            "HistMainCoeff" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::search::set_hist_main_coeff(v);
+                    eprintln!("info string HistMainCoeff: {v}");
+                }
+            }
+            "HistPawnCoeff" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::search::set_hist_pawn_coeff(v);
+                    eprintln!("info string HistPawnCoeff: {v}");
+                }
+            }
+            "HistLpCoeff" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::search::set_hist_lp_coeff(v);
+                    eprintln!("info string HistLpCoeff: {v}");
+                }
+            }
+            "KingDropBonusMode" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::search::set_king_drop_bonus_mode(v);
+                    eprintln!("info string KingDropBonusMode: {v}");
+                }
+            }
+            "KingDropDangerMin" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    rshogi_core::search::set_king_drop_danger_min(v);
+                    eprintln!("info string KingDropDangerMin: {v}");
+                }
+            }
             "NNUE_ARCHITECTURE" => match parse_nnue_architecture(&value) {
                 Some(mode) => {
                     set_nnue_architecture_override(mode);
@@ -1350,14 +1159,10 @@ impl UsiEngine {
                     // arch_str 不整合が原因でロード失敗していた場合、architecture override
                     // 変更後の再試行で成功する可能性がある。再試行しても失敗した場合は
                     // Some(false) のまま維持され、isready の panic 安全策は保持される。
-                    // auto-load した path を明示指定済みの状態へ昇格させないために限定する。
-                    if self.eval_file_explicit.is_some()
-                        && let Some(path) = self.eval_file_path.clone()
-                    {
+                    if let Some(ref path) = self.eval_file_path {
                         let was_loaded = get_network().is_some();
-                        match self.load_nnue_with_current_deltas(Path::new(&path)) {
-                            Ok(_) => {
-                                reset_layer_stack_progress_buckets();
+                        match init_nnue(path) {
+                            Ok(()) => {
                                 self.eval_file_explicit = Some(true);
                                 let action = if was_loaded {
                                     "reloaded"
@@ -1385,7 +1190,6 @@ impl UsiEngine {
                     } else if get_network().is_some() {
                         // EvalFile 未指定で自動ロード済み → クリアして isready に任せる
                         clear_nnue();
-                        reset_layer_stack_progress_buckets();
                         self.eval_file_explicit = None;
                         eprintln!(
                             "info string NNUE_ARCHITECTURE: {} (NNUE cleared, will reload on isready)",
@@ -1402,65 +1206,26 @@ impl UsiEngine {
                     );
                 }
             },
-            "LS_BUCKET_MODE" => {
-                if value.eq_ignore_ascii_case("unset") || value.is_empty() {
-                    self.ls_bucket_mode = None;
-                    eprintln!("info string LS_BUCKET_MODE: unset");
-                } else {
-                    match parse_layer_stack_bucket_mode(&value) {
-                        Some(mode) => {
-                            self.ls_bucket_mode = Some(mode);
-                            eprintln!("info string LS_BUCKET_MODE: {}", mode.as_str());
-                        }
-                        None => {
-                            // 設定済みの正しい mode を typo や旧名 (progress8kpabs) で
-                            // 上書き消去しない。isready の「未設定」エラーは誤診を招く。
-                            eprintln!(
-                                "info string Warning: invalid LS_BUCKET_MODE '{}' ignored, expected progresskpabs, progresskpabsq16 or kingrank9",
-                                value
-                            );
-                        }
-                    }
+            "LS_BUCKET_MODE" => match parse_layer_stack_bucket_mode(&value) {
+                Some(mode) => {
+                    set_layer_stack_bucket_mode(mode);
+                    eprintln!("info string LS_BUCKET_MODE: {}", mode.as_str());
                 }
-            }
-            "LS_PROGRESS_BUCKETS" => match value.parse::<usize>() {
-                Ok(0) => {
-                    self.ls_progress_buckets = None;
-                    eprintln!("info string LS_PROGRESS_BUCKETS: unset");
-                }
-                Ok(v @ 1..=MAX_LAYER_STACK_BUCKETS) => {
-                    self.ls_progress_buckets = Some(v);
-                    eprintln!("info string LS_PROGRESS_BUCKETS: {v}");
-                }
-                _ => {
-                    self.ls_progress_buckets = None;
+                None => {
                     eprintln!(
-                        "info string Warning: invalid LS_PROGRESS_BUCKETS '{}', expected 0..={MAX_LAYER_STACK_BUCKETS}",
-                        value,
+                        "info string Warning: invalid LS_BUCKET_MODE '{}', expected progress8kpabs",
+                        value
                     );
                 }
             },
             "LS_PROGRESS_COEFF" => {
-                self.ls_progress_coeff_explicit = !value.is_empty() && value != "<empty>";
-                if !self.ls_progress_coeff_explicit {
+                if value.is_empty() || value == "<empty>" {
                     reset_layer_stack_progress_kpabs_weights();
-                    rshogi_core::nnue::reset_layer_stack_progress_kpabs_q16_weights();
-                    self.ls_progress_coeff_loaded = false;
-                    eprintln!("info string LS_PROGRESS_COEFF: unset");
+                    eprintln!("info string LS_PROGRESS_COEFF: reset to built-in default");
                 } else {
-                    self.ls_progress_coeff_loaded = false;
-                    reset_layer_stack_progress_kpabs_weights();
-                    rshogi_core::nnue::reset_layer_stack_progress_kpabs_q16_weights();
-                    match std::fs::read(&value).map_err(|e| e.to_string()).and_then(|bytes| {
-                        let weights = load_progress_coeff_kpabs_from_bytes(&bytes)?;
-                        let q16 =
-                            rshogi_core::nnue::load_progress_coeff_kpabs_q16_from_bytes(&bytes)?;
-                        rshogi_core::nnue::set_layer_stack_progress_kpabs_q16_weights(q16)?;
-                        Ok(weights)
-                    }) {
+                    match load_progress_coeff_kpabs(&value) {
                         Ok(weights) => match set_layer_stack_progress_kpabs_weights(weights) {
                             Ok(()) => {
-                                self.ls_progress_coeff_loaded = true;
                                 eprintln!("info string LS_PROGRESS_COEFF loaded (kpabs): {value}");
                             }
                             Err(err) => {
@@ -1477,12 +1242,6 @@ impl UsiEngine {
                 let v = value == "true" || value == "1";
                 self.pass_rights_enabled = v;
                 eprintln!("info string PassRights: {}", if v { "enabled" } else { "disabled" });
-                #[cfg(not(feature = "search-pass-rules"))]
-                if v {
-                    eprintln!(
-                        "info string PassRights: this build does not evaluate pass rights in search (feature `search-pass-rules` is disabled)"
-                    );
-                }
             }
             "InitialPassCount" => {
                 if let Ok(v) = value.parse::<u8>() {
@@ -1517,110 +1276,132 @@ impl UsiEngine {
                     eprintln!("info string PassRightValueLate: {}", self.pass_right_value_late);
                 }
             }
-            // --- 定跡（opening book）オプション ---
-            "USI_OwnBook" => {
-                self.book_options.own_book = value == "true" || value == "1";
+            // ----------------------------------------------------------------
+            // Midgame policy hook (αβ root ordering を Transformer policy で補完)
+            // 詳細は docs/midgame_policy_design.md
+            // ----------------------------------------------------------------
+            "UseMidgamePolicy" => {
+                let enabled = matches!(value.to_ascii_lowercase().as_str(), "true" | "on" | "1");
+                self.midgame_policy_config.enabled = enabled;
+                self.refresh_midgame_policy_hook();
+                eprintln!("info string UseMidgamePolicy: {enabled}");
             }
-            "BookExploreFile" => {
-                let value = if value.is_empty() || value == "<empty>" {
-                    String::new()
-                } else {
-                    value
-                };
-                if self.book_explore_file != value {
-                    self.book_explore_file = value;
-                    self.book_explore = None;
-                }
-            }
-            "BookFile" => {
-                // 実ロードは isready 時。ここでは名前を保持するだけ。
-                self.book_file = if value.is_empty() {
-                    "no_book".to_string()
-                } else {
-                    value
-                };
-            }
-            "BookDir" => {
-                self.book_dir = if value.is_empty() {
-                    "book".to_string()
-                } else {
-                    value
-                };
-            }
-            "BookMoves" => {
+            "MidgamePolicyMinDepth" => {
                 if let Ok(v) = value.parse::<i32>() {
-                    self.book_options.book_moves = v;
-                }
-            }
-            "BookEvalDiff" => {
-                if let Ok(v) = value.parse::<i32>() {
-                    self.book_options.eval_diff = v;
-                }
-            }
-            "BookEvalBlackLimit" => {
-                if let Ok(v) = value.parse::<i32>() {
-                    self.book_options.eval_black_limit = v;
-                }
-            }
-            "BookEvalWhiteLimit" => {
-                if let Ok(v) = value.parse::<i32>() {
-                    self.book_options.eval_white_limit = v;
-                }
-            }
-            "BookDepthLimit" => {
-                if let Ok(v) = value.parse::<i32>() {
-                    self.book_options.depth_limit = v;
-                }
-            }
-            "BookEvalBlackDiff"
-            | "BookEvalWhiteDiff"
-            | "BookDepthBlackLimit"
-            | "BookDepthWhiteLimit" => match parse_book_per_side_value(&value) {
-                Some(v) => {
-                    let field = match name.as_str() {
-                        "BookEvalBlackDiff" => &mut self.book_options.eval_black_diff,
-                        "BookEvalWhiteDiff" => &mut self.book_options.eval_white_diff,
-                        "BookDepthBlackLimit" => &mut self.book_options.depth_black_limit,
-                        _ => &mut self.book_options.depth_white_limit,
-                    };
-                    *field = v;
-                }
-                None => eprintln!(
-                    "info string Warning: {name}: invalid value '{value}' (expected -1..=99999); unchanged"
-                ),
-            },
-            "NarrowBook" => {
-                self.book_options.narrow_book = value == "true" || value == "1";
-            }
-            "BookSelectValue" => {
-                self.book_options.select_value = value == "true" || value == "1";
-            }
-            "BookValueTieBreak" => {
-                let tie_break = match value.as_str() {
-                    "count" => Some(BookValueTieBreak::Count),
-                    "depth" => Some(BookValueTieBreak::Depth),
-                    "random" => Some(BookValueTieBreak::Random),
-                    _ => None,
-                };
-                if let Some(tie_break) = tie_break {
-                    self.book_options.value_tie_break = tie_break;
-                } else {
+                    self.midgame_policy_config.min_depth = v.clamp(0, 64);
+                    if let Some(h) = self.midgame_policy_hook.as_mut() {
+                        h.config_mut().min_depth = self.midgame_policy_config.min_depth;
+                    }
                     eprintln!(
-                        "info string Warning: BookValueTieBreak: invalid value '{value}' (expected count, depth or random); unchanged"
+                        "info string MidgamePolicyMinDepth: {}",
+                        self.midgame_policy_config.min_depth
                     );
                 }
             }
-            "ConsiderBookMoveCount" => {
-                self.book_options.consider_move_count = value == "true" || value == "1";
+            "MidgamePolicyTopK" => {
+                if let Ok(v) = value.parse::<usize>() {
+                    self.midgame_policy_config.top_k = v.min(32);
+                    if let Some(h) = self.midgame_policy_hook.as_mut() {
+                        h.config_mut().top_k = self.midgame_policy_config.top_k;
+                    }
+                    eprintln!(
+                        "info string MidgamePolicyTopK: {}",
+                        self.midgame_policy_config.top_k
+                    );
+                }
             }
-            "IgnoreBookPly" => {
-                self.ignore_book_ply = value == "true" || value == "1";
+            "MidgamePolicyAlpha" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    let clamped = v.clamp(0, 1024);
+                    self.midgame_policy_config.policy_alpha = clamped as f32;
+                    if let Some(h) = self.midgame_policy_hook.as_mut() {
+                        h.config_mut().policy_alpha = self.midgame_policy_config.policy_alpha;
+                    }
+                    eprintln!("info string MidgamePolicyAlpha: {clamped}");
+                }
             }
-            "FlippedBook" => {
-                self.book_options.flipped_book = value == "true" || value == "1";
+            "MidgamePolicyCacheEntries" => {
+                if let Ok(v) = value.parse::<usize>() {
+                    self.midgame_policy_config.cache_entries = v.clamp(16, 65536);
+                    // cache サイズ変更時は hook を再構築 (cache を作り直すため)。
+                    self.refresh_midgame_policy_hook();
+                    eprintln!(
+                        "info string MidgamePolicyCacheEntries: {}",
+                        self.midgame_policy_config.cache_entries
+                    );
+                }
             }
-            "BookOnTheFly" => {
-                self.book_on_the_fly = value == "true" || value == "1";
+            "MidgamePolicyModel" => {
+                if value == "<empty>" || value.is_empty() {
+                    self.midgame_policy_model_path = None;
+                } else {
+                    self.midgame_policy_model_path = Some(value.to_string());
+                }
+                // model 切替は重い候補 (candle load) のため、 evaluator 構築は
+                // isready 受信時または UseMidgamePolicy=true 時に試行する。
+                self.refresh_midgame_policy_hook();
+                eprintln!(
+                    "info string MidgamePolicyModel: {}",
+                    self.midgame_policy_model_path.as_deref().unwrap_or("<empty>")
+                );
+            }
+            // --- Mate engine 中盤統合 ---
+            "UseRootMateSearch" => {
+                let v = value == "true" || value == "1";
+                self.use_root_mate_search = v;
+                eprintln!(
+                    "info string UseRootMateSearch: {}",
+                    if v { "enabled" } else { "disabled" }
+                );
+            }
+            "UseOpponentMateCheck" => {
+                let v = value == "true" || value == "1";
+                self.use_opponent_mate_check = v;
+                eprintln!(
+                    "info string UseOpponentMateCheck: {}",
+                    if v { "enabled" } else { "disabled" }
+                );
+            }
+            "OpponentMateMaxMoves" => {
+                if let Ok(v) = value.parse::<usize>() {
+                    self.opponent_mate_max_moves = v.clamp(1, 256);
+                    eprintln!("info string OpponentMateMaxMoves: {}", self.opponent_mate_max_moves);
+                }
+            }
+            "UseMateSolverThread" => {
+                let v = value == "true" || value == "1";
+                self.use_mate_solver_thread = v;
+                eprintln!(
+                    "info string UseMateSolverThread: {}",
+                    if v { "enabled" } else { "disabled" }
+                );
+            }
+            // --- PUCT hybrid engine (puct-hybrid feature 有効時のみ受付) ---
+            #[cfg(feature = "puct-hybrid")]
+            "UsePuct" => {
+                let v = value == "true" || value == "1";
+                self.use_puct = v;
+                eprintln!("info string UsePuct: {}", if v { "enabled" } else { "disabled" });
+            }
+            #[cfg(feature = "puct-hybrid")]
+            "PuctEndgameThreshold" => {
+                if let Ok(v) = value.parse::<i32>() {
+                    self.puct_endgame_threshold = v.clamp(0, 5000);
+                    eprintln!("info string PuctEndgameThreshold: {}", self.puct_endgame_threshold);
+                }
+            }
+            #[cfg(feature = "puct-hybrid")]
+            "PuctNetworkPath" => {
+                if value.is_empty() || value == "<empty>" {
+                    self.puct_network_path = None;
+                } else {
+                    self.puct_network_path = Some(value.to_string());
+                }
+                // NNUE-B Transformer 未訓練のため現状は受け取るだけ。
+                eprintln!(
+                    "info string PuctNetworkPath: {} (stub evaluator 使用、 実 load は未実装)",
+                    self.puct_network_path.as_deref().unwrap_or("<empty>")
+                );
             }
             _ => {
                 // 未知のオプションは無視
@@ -1628,115 +1409,52 @@ impl UsiEngine {
         }
     }
 
-    /// オプションを変える前に探索と詰み探索を止める。
-    fn stop_for_option_change(&mut self) {
-        // 探索中の設定変更は避ける
-        self.wait_for_search();
-        // 未解決の go mate infinite は終わらないので、待つ前に止める (checkmate timeout を出す)
-        self.mate_stop.store(true, Ordering::SeqCst);
-        self.wait_for_mate();
-    }
-
-    /// 実行ファイルと同じフォルダの engine_options.txt を読み、書かれたオプションを適用して固定する。
-    /// isready のたびに読み、前回と値が同じ行は適用し直さない。やねうら王はカレントフォルダから読むが、
-    /// GUI ごとに違うカレントフォルダに左右されないよう、実行ファイルの隣だけを見る。
-    fn apply_engine_options_file(&mut self) {
-        let Some(path) = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join(ENGINE_OPTIONS_FILE)))
-            .filter(|path| path.is_file())
-        else {
-            return;
+    /// USI option 変更後に hook の状態を再構築する。
+    ///
+    /// - hook が未生成なら新規作成 (evaluator=None で deactivated)
+    /// - cache_entries が変わった場合は hook 全体を作り直す
+    /// - model 設定がある場合はここで evaluator load を試みる (後続セッションで
+    ///   実装。 現状は dummy evaluator を生成しない)
+    fn refresh_midgame_policy_hook(&mut self) {
+        // 既存の hook が同じ cache サイズなら config だけ更新で済む。
+        // 違う場合は再構築。
+        let need_rebuild = match &self.midgame_policy_hook {
+            None => true,
+            Some(h) => h.config().cache_entries != self.midgame_policy_config.cache_entries,
         };
-        self.apply_engine_options_from(&path);
-    }
-
-    fn apply_engine_options_from(&mut self, path: &Path) {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) => {
-                println!("info string Warning: failed to read {}: {e}", path.display());
-                return;
-            }
-        };
-        let base_dir = path.parent().unwrap_or(Path::new(""));
-        let known: Vec<(String, String)> = self
-            .usi_option_lines()
-            .into_iter()
-            .filter_map(|line| usi_option_line_name(&line).map(|name| (name, line)))
-            .collect();
-        // 同じ名前が複数行にあれば最後の行を使う
-        let mut latest: Vec<(String, String)> = Vec::new();
-        for (line_no, entry) in parse_engine_options(&text) {
-            let (name, value) = match entry {
-                Ok(entry) => entry,
-                Err(message) => {
-                    println!("info string Warning: {} line {line_no}: {message}", path.display());
-                    continue;
-                }
-            };
-            let Some((canonical, declaration)) =
-                known.iter().find(|(known, _)| known.eq_ignore_ascii_case(&name))
-            else {
-                println!(
-                    "info string Warning: {} line {line_no}: unknown option '{name}'",
-                    path.display()
-                );
-                continue;
-            };
-            if let Err(message) = validate_option_value(declaration, &value) {
-                println!("info string Warning: {} line {line_no}: {message}", path.display());
-                continue;
-            }
-            let value = resolve_option_path(canonical, &value, base_dir);
-            latest.retain(|(known, _)| known != canonical);
-            latest.push((canonical.clone(), value));
-        }
-        let changes: Vec<(String, String, String)> = latest
-            .into_iter()
-            .map(|(name, value)| {
-                let key = name.to_ascii_lowercase();
-                (name, key, value)
-            })
-            .filter(|(_, key, value)| self.fixed_options.get(key) != Some(value))
-            .collect();
-        if changes.is_empty() {
-            return;
-        }
-        println!("info string read engine options: {}", path.display());
-        self.stop_for_option_change();
-        for (name, key, value) in changes {
-            println!("info string engine option {name} = {value}");
-            self.set_option(name, value.clone());
-            self.fixed_options.insert(key, value);
+        if need_rebuild {
+            // 注: evaluator load は本タスクでは TODO (実 model 配置 + adapter
+            // feature の組み合わせで別 session に取り組む)。 hook 自体は OK。
+            self.midgame_policy_hook = Some(p2_midgame_policy::MidgamePolicyHook::new(
+                self.midgame_policy_config.clone(),
+                None,
+            ));
+        } else if let Some(h) = self.midgame_policy_hook.as_mut() {
+            *h.config_mut() = self.midgame_policy_config.clone();
         }
     }
 
     /// usinewgameコマンド: 新しい対局の開始
-    fn cmd_usinewgame(&mut self) -> Result<()> {
+    fn cmd_usinewgame(&mut self) {
         self.cmd_stop();
-        self.reload_net_deltas_if_dirty()?;
 
         if let Some(search) = self.search.as_mut() {
             search.clear_tt();
-            search.clear_eval_hash();
-            search.clear_for_new_game();
+            search.clear_histories(); // YaneuraOu準拠：履歴統計もクリア
         }
-        self.maybe_report_page_status();
         self.position = Position::new();
-        Ok(())
     }
 
     /// positionコマンド: 局面設定
     ///
     /// 拡張形式: `position [sfen <sfen> | startpos] [passrights <black> <white>] [moves <move1> ...]`
-    fn cmd_position(&mut self, tokens: &[&str]) -> Result<()> {
+    fn cmd_position(&mut self, tokens: &[&str]) {
         Self::apply_position_tokens(
             &mut self.position,
             tokens,
             self.pass_rights_enabled,
             self.initial_pass_count,
-        )
+        );
     }
 
     fn apply_position_tokens(
@@ -1744,93 +1462,107 @@ impl UsiEngine {
         tokens: &[&str],
         pass_rights_enabled: bool,
         initial_pass_count: u8,
-    ) -> Result<()> {
-        let mut candidate = Position::new();
+    ) {
+        // position [sfen <sfen> | startpos] [passrights <black> <white>] [moves <move1> <move2> ...]
         let mut idx = 1;
-        match tokens.get(idx).copied() {
-            Some("startpos") => {
-                candidate.set_hirate();
-                idx += 1;
-            }
-            Some("sfen") => {
-                idx += 1;
-                let start = idx;
-                while idx < tokens.len() && !matches!(tokens[idx], "moves" | "passrights") {
-                    idx += 1;
-                }
-                anyhow::ensure!(
-                    (3..=4).contains(&(idx - start)),
-                    "SFEN must contain a board, side, hand, and optional ply"
-                );
-                candidate.set_sfen(&tokens[start..idx].join(" "))?;
-                anyhow::ensure!(candidate.game_ply() > 0, "SFEN ply must be positive");
-            }
-            _ => bail!("Expected startpos or sfen"),
+        if idx >= tokens.len() {
+            return;
         }
-        for color in [Color::Black, Color::White] {
-            anyhow::ensure!(
-                candidate.pieces(color, PieceType::King).count() <= 1,
-                "SFEN must contain at most one king per side"
-            );
-        }
-        candidate.clear_checkers_without_king();
 
+        // 局面の設定
+        if tokens[idx] == "startpos" {
+            position.set_hirate();
+            idx += 1;
+        } else if tokens[idx] == "sfen" {
+            idx += 1;
+            // SFENを収集（movesまたはpassrightsの前まで）
+            let mut sfen_parts = Vec::new();
+            while idx < tokens.len() && tokens[idx] != "moves" && tokens[idx] != "passrights" {
+                sfen_parts.push(tokens[idx]);
+                idx += 1;
+            }
+            let sfen = sfen_parts.join(" ");
+            if let Err(e) = position.set_sfen(&sfen) {
+                eprintln!("info string Error parsing SFEN: {e}");
+                return;
+            }
+        }
+
+        // パス権の設定（passrights キーワード）
+        // 形式: passrights <black_count> <white_count>
         if idx < tokens.len() && tokens[idx] == "passrights" {
             idx += 1;
-            let black_pass = tokens.get(idx).context("Missing black passrights")?.parse::<u8>()?;
-            let white_pass =
-                tokens.get(idx + 1).context("Missing white passrights")?.parse::<u8>()?;
-            anyhow::ensure!(black_pass <= 15 && white_pass <= 15, "passrights must be 0..15");
-            idx += 2;
             if pass_rights_enabled {
-                candidate.enable_pass_rights(black_pass, white_pass);
+                // 先手のパス権数
+                let black_pass = if idx < tokens.len() {
+                    tokens[idx].parse::<u8>().unwrap_or(initial_pass_count)
+                } else {
+                    initial_pass_count
+                };
+                idx += 1;
+
+                // 後手のパス権数
+                let white_pass = if idx < tokens.len() {
+                    tokens[idx].parse::<u8>().unwrap_or(initial_pass_count)
+                } else {
+                    initial_pass_count
+                };
+                idx += 1;
+
+                // パス権を設定
+                position.enable_pass_rights(black_pass, white_pass);
+            } else {
+                // パス権が無効な場合は値を読み飛ばす
+                idx += 2;
             }
         } else if pass_rights_enabled {
-            candidate.enable_pass_rights(initial_pass_count, initial_pass_count);
+            // passrights キーワードがないがパス権が有効な場合、デフォルト値を設定
+            position.enable_pass_rights(initial_pass_count, initial_pass_count);
         }
 
-        if idx < tokens.len() {
-            anyhow::ensure!(tokens[idx] == "moves", "Expected moves, got {}", tokens[idx]);
+        // 指し手の適用
+        if idx < tokens.len() && tokens[idx] == "moves" {
             idx += 1;
-            for token in &tokens[idx..] {
-                let mv = Move::from_usi_strict(token)
-                    .with_context(|| format!("Invalid move token: {token}"))?;
-                anyhow::ensure!(
-                    Self::is_legal_position_move(&candidate, mv),
-                    "Illegal move: {token}"
-                );
-                anyhow::ensure!(candidate.game_ply() < i32::MAX, "ply overflow");
-                candidate.do_move_with_missing_kings(mv);
-                if mv.is_drop()
-                    && mv.drop_piece_type() == PieceType::Pawn
-                    && candidate.checkers().contains(mv.to())
-                {
-                    // 入力局面では既存の王手もあり得るため、歩以外の王手を残す応手は数えない。
-                    let mut replies = MoveList::new();
-                    generate_legal_all(&candidate, &mut replies);
-                    anyhow::ensure!(!replies.is_empty(), "Illegal pawn-drop mate: {token}");
+            while idx < tokens.len() {
+                if let Some(mv) = Move::from_usi(tokens[idx]) {
+                    // SEGV-FIX-20260531: 不正 move (= from に駒なし / 駒打ち先に駒あり 等)
+                    // を弾いて defensive に skip。 不正な position コマンドを
+                    // tournament 等が送りつけるケース (= USI 仕様外だが実害発生) で
+                    // do_move 内部の stale state aliasing → search 内 SEGV を防止する。
+                    if !mv.is_pass() && !mv.is_drop() && position.piece_on(mv.from()).is_none() {
+                        eprintln!(
+                            "info string Error: illegal move {token} (no piece at from square); aborting position moves",
+                            token = tokens[idx]
+                        );
+                        break;
+                    }
+                    if mv.is_drop() && position.piece_on(mv.to()).is_some() {
+                        eprintln!(
+                            "info string Error: illegal drop {token} (target square occupied); aborting position moves",
+                            token = tokens[idx]
+                        );
+                        break;
+                    }
+                    // PASS の場合は gives_check は false
+                    let gives_check = if mv.is_pass() {
+                        false
+                    } else {
+                        position.gives_check(mv)
+                    };
+                    position.do_move(mv, gives_check);
+                } else {
+                    eprintln!("info string Error parsing move: {token}", token = tokens[idx]);
+                    break;
                 }
+                idx += 1;
             }
+            // SEGV-FIX-20260531: do_move 中で NNUE モードは board_effects update を
+            // skip して dirty フラグを立てるが、 main thread の `detector` 経路で
+            // `board_effect()` が呼ばれた時に dirty=true だと panic / 不正値返却に
+            // なる。 position コマンド処理の末尾で 1 度だけ強制再計算して dirty を
+            // 解消する。 search 中の clone Position は別経路 (= dirty 維持で OK)。
+            position.recompute_board_effects();
         }
-        *position = candidate;
-        Ok(())
-    }
-
-    fn is_legal_position_move(position: &Position, mv: Move) -> bool {
-        if !position.pseudo_legal(mv) {
-            return false;
-        }
-        if mv.is_pass() || mv.is_drop() {
-            return true;
-        }
-
-        let us = position.side_to_move();
-        let captured = position.piece_on(mv.to());
-        if captured.is_some() && captured.piece_type() == PieceType::King {
-            return false;
-        }
-        // 自玉がなければ、仮の玉位置に対する玉移動・pin の制約は適用しない。
-        position.pieces(us, PieceType::King).is_empty() || position.is_legal(mv)
     }
 
     fn stochastic_ponder_position(&self) -> Option<Position> {
@@ -1840,11 +1572,12 @@ impl UsiEngine {
             return None;
         }
 
-        {
-            let moves_idx = owned.iter().position(|token| *token == "moves")?;
+        if let Some(moves_idx) = owned.iter().position(|token| *token == "moves") {
             if owned.len() > moves_idx + 1 {
                 owned.pop();
             }
+        } else {
+            return None;
         }
 
         let mut position = Position::new();
@@ -1853,75 +1586,225 @@ impl UsiEngine {
             &owned,
             self.pass_rights_enabled,
             self.initial_pass_count,
-        )
-        .ok()?;
+        );
         Some(position)
     }
 
     /// goコマンド: 探索開始
-    fn cmd_go(&mut self, tokens: &[&str]) -> Result<()> {
-        let start_time_override = self.go_start_time_override.take();
+    fn cmd_go(&mut self, tokens: &[&str]) {
         // 既存の探索を停止（bestmove出力を抑制する）
         // GUIがstopを送らずにposition+goを送ってきた場合、前のponder探索の
-        // bestmoveがstdoutに出力されるとGUIが混乱する
+        // bestmoveがstdoutに出力されるとGUIが混乱する（YaneuraOu準拠）
         self.stop_search_silently();
-        if tokens.get(1) == Some(&"mate") {
-            self.cmd_go_mate(tokens);
-            return Ok(());
+
+        // ★ PUCT hybrid foundation (観測層): phase + endgame 判定して info string で報告。
+        // puct-hybrid feature 有効 + UsePuct=true なら hybrid 経路で routing する。
+        let signal_score;
+        let signal_use_alpha_beta;
+        let game_phase;
+        {
+            let signal = self.endgame_detector.evaluate(&mut self.position);
+            let phase = p2_search::phase::determine_phase(signal.score, &mut self.phase_tracker);
+            println!(
+                "info string phase={:?} endgame_score={:.3} use_alpha_beta={} reason={:?}",
+                phase, signal.score, signal.use_alpha_beta, signal.reason
+            );
+            signal_score = signal.score;
+            signal_use_alpha_beta = signal.use_alpha_beta;
+            game_phase = phase;
+            // `DUAL_CROSS_USE_ENDGAME_DETECTOR=1` 経路で NNUE 側 gate が参照する thread-local
+            // override に position-based phase index を書き込む。 `GamePhase` 順
+            // (Opening=0 / Middlegame=1 / Endgame=2) を そのまま使う。 flag 無効時 (= default)
+            // でも overhead は cell 書き 1 回で negligible。
+            let phase_idx: u8 = match phase {
+                p2_search::phase::GamePhase::Opening => 0,
+                p2_search::phase::GamePhase::Middlegame => 1,
+                p2_search::phase::GamePhase::Endgame => 2,
+            };
+            rshogi_core::nnue::dual_cross::set_current_phase_idx(phase_idx);
         }
-        self.reload_net_deltas_if_dirty()?;
 
         // 制限を解析
         let mut limits = self.parse_go_options(tokens);
-        if let Some(start_time) = start_time_override {
-            limits.set_start_time_at(start_time);
+
+        // ─── Mate engine 中盤統合 (Plan B+C) ───
+        // - Opening phase は skip (= 序盤頓死は稀、 overhead 無駄)
+        // - budget = byoyomi の 2% × NPS 100k で max_nodes 制限
+        // - 3 ply mate は維持 (= 中盤詰み筋検知の本命)
+        let in_opening = matches!(game_phase, p2_search::phase::GamePhase::Opening);
+        let mut mate_excluded: Vec<rshogi_core::types::Move> = Vec::new();
+        if !in_opening && (self.use_root_mate_search || self.use_opponent_mate_check) {
+            // budget = byoyomi の 1%、 min 5ms max 30ms 程度
+            let stm_idx = self.position.side_to_move() as usize;
+            let byoyomi_ms = limits.byoyomi[stm_idx].max(500) as u32;
+            let budget_ms = (byoyomi_ms / 100).clamp(5, 30);
+            // NPS ~100k/s for mate_probe → budget_ms * 100 nodes
+            let budget_nodes = (budget_ms * 100).clamp(300, 3000);
+
+            let mut probe_pos = self.position.clone();
+            if self.use_root_mate_search {
+                let result = mate_probe_3ply(&mut probe_pos, budget_nodes);
+                if let MateResult::MateFound { best_move, ply, .. } = result {
+                    // 連続王手千日手ガード (= phantom mate 防止、 2026-06-25)
+                    // mate_probe_3ply は履歴を持たない clone 上で探索するため、
+                    // 「局所的には詰みに見えるが、 その王手で 4 回目の同一局面に達し
+                    //  連続王手の千日手で *攻め方が負け* る」筋を区別できない。
+                    // game3 (vs Suisho11) では root mate probe が phantom mate を返し続け、
+                    // 連続王手を継続して千日手規則で負けた。
+                    // ここで履歴付きの実局面 (self.position) 上で best_move を指し、
+                    // 千日手状態を確認する。 Lose / Draw なら詰みではないので採用しない。
+                    let mut hist_pos = self.position.clone();
+                    let gives_check = hist_pos.gives_check(best_move);
+                    let _ = hist_pos.do_move(best_move, gives_check);
+                    // best_move を指した後の手番は相手（受け手）。
+                    // この王手で連続王手の千日手が成立し攻め方（我々）が負ける場合、
+                    // 受け手手番から見た repetition_state は Win（受け手が勝ち）になる。
+                    // 通常の千日手（引き分け）は Draw。 どちらも「詰みではない」ので採用しない。
+                    let rep = hist_pos.repetition_state(1);
+                    if matches!(
+                        rep,
+                        rshogi_core::types::RepetitionState::Win
+                            | rshogi_core::types::RepetitionState::Draw
+                    ) {
+                        println!(
+                            "info string root mate rejected (repetition {:?}): best={}",
+                            rep,
+                            best_move.to_usi()
+                        );
+                    } else {
+                        println!(
+                            "info string root mate found: ply={} best={}",
+                            ply,
+                            best_move.to_usi()
+                        );
+                        println!("bestmove {}", best_move.to_usi());
+                        return;
+                    }
+                }
+            }
+            if self.use_opponent_mate_check {
+                let mut legal = rshogi_core::movegen::MoveList::new();
+                rshogi_core::movegen::generate_legal(&probe_pos, &mut legal);
+                let check_count = legal.len().min(self.opponent_mate_max_moves);
+                let _ = budget_nodes; // budget は root mate_search 専用
+                for i in 0..check_count {
+                    let mv = legal[i];
+                    let gives_check = probe_pos.gives_check(mv);
+                    let _ = probe_pos.do_move(mv, gives_check);
+                    // 1 ply mate (= 即詰、 v4 確定設定。 3 ply は v5 で NPS -9% overhead、 +70 Elo に劣化)
+                    let opp = mate_probe_1ply(&mut probe_pos);
+                    probe_pos.undo_move(mv);
+                    if matches!(opp, MateResult::MateFound { .. }) {
+                        mate_excluded.push(mv);
+                    }
+                }
+                if !mate_excluded.is_empty() {
+                    println!(
+                        "info string opponent mate detected: {} of {} moves excluded",
+                        mate_excluded.len(),
+                        legal.len()
+                    );
+                    if limits.search_moves.is_empty() {
+                        for i in 0..legal.len() {
+                            let mv = legal[i];
+                            if !mate_excluded.contains(&mv) {
+                                limits.search_moves.push(mv);
+                            }
+                        }
+                        if limits.search_moves.is_empty() {
+                            println!("info string all moves lead to mate, fallback to full search");
+                            for i in 0..legal.len() {
+                                limits.search_moves.push(legal[i]);
+                            }
+                        }
+                    } else {
+                        limits.search_moves.retain(|m| !mate_excluded.contains(m));
+                    }
+                }
+            }
         }
 
-        // 定跡 probe（探索の外・root で 1 回）。
-        // go infinite / go ponder では probe しない（Phase 1 の単純化、設計メモ §3）。
-        // book hit 時は探索スレッドを起こさず bestmove を直接出力する。
-        if !limits.infinite && !limits.ponder && self.try_book_probe() {
-            return Ok(());
+        // ─── PUCT hybrid 分岐 ───
+        //
+        // 序中盤 (endgame_score < threshold/1000.0) で UsePuct=true なら PUCT engine、
+        // それ以外は既存 αβ 経路。 EndgameDetector の `use_alpha_beta=true` (絶対終盤)
+        // も αβ にルート。
+        #[cfg(feature = "puct-hybrid")]
+        {
+            if self.use_puct && !signal_use_alpha_beta {
+                let threshold = self.puct_endgame_threshold as f32 / 1000.0;
+                if signal_score < threshold {
+                    self.cmd_go_puct(limits);
+                    return;
+                }
+                println!(
+                    "info string puct route skipped: endgame_score={:.3} >= threshold={:.3}",
+                    signal_score, threshold
+                );
+            }
+        }
+        #[cfg(not(feature = "puct-hybrid"))]
+        {
+            // signal_score / signal_use_alpha_beta は puct-hybrid 無効時は未使用なので
+            // warn を避けるため bind を消費する。
+            let _ = (signal_score, signal_use_alpha_beta);
         }
 
-        // Stochastic_Ponder では 1 手戻した局面から先読みする
+        // Stochastic_Ponder では 1 手戻した局面から先読みする（YaneuraOu 準拠）
         let mut pos = if self.stochastic_ponder && limits.ponder {
             self.stochastic_ponder_position().unwrap_or_else(|| self.position.clone())
         } else {
             self.position.clone()
         };
 
-        let mut search = self.search.take().unwrap_or_else(|| {
-            Search::new_with_eval_hash_large_pages(
-                self.tt_size_mb,
-                self.allocated_eval_hash_mb(),
-                self.eval_hash_large_pages,
-            )
-        });
-        self.prepare_eval_hash(&mut search);
+        // ─── MateSolverThread 起動 (= 別 thread dfpn、 main search 完全不変) ───
+        // Threads >= 2 + UseMateSolverThread=true + Opening 以外 + ponder 以外 で起動。
+        // Ponder 中は局面確定していないので skip (= 通常 go で根詰みを掘る)。
+        let (mate_found_arc, mate_move_arc) = if self.use_mate_solver_thread
+            && self.num_threads >= 2
+            && !in_opening
+            && !limits.ponder
+        {
+            // 既存 mate solver thread が残っていれば停止 (= 念のため)
+            if let Some(prev) = self.mate_solver_thread.take() {
+                prev.request_stop();
+                prev.join();
+            }
+            let probe_pos = self.position.clone();
+            let mate = p2_search::mate_solver_thread::MateSolverThread::start(
+                probe_pos,
+                p2_search::mate_solver_thread::DEFAULT_MATE_SOLVER_MAX_NODES,
+                p2_search::mate_solver_thread::DEFAULT_MATE_SOLVER_MAX_DEPTH,
+                p2_search::mate_solver_thread::DEFAULT_MATE_SOLVER_TT_MB,
+            );
+            let mf = mate.mate_found_flag();
+            let mm = mate.mate_move_flag();
+            self.mate_solver_thread = Some(mate);
+            (Some(mf), Some(mm))
+        } else {
+            (None, None)
+        };
+
+        let mut search = self
+            .search
+            .take()
+            .unwrap_or_else(|| Search::new_with_eval_hash(self.tt_size_mb, self.eval_hash_size_mb));
+        if search.eval_hash_size_mb() != self.eval_hash_size_mb {
+            search.resize_eval_hash(self.eval_hash_size_mb);
+        }
         search.set_skill_options(self.skill_options);
-        #[cfg(not(target_arch = "wasm32"))]
-        search.set_game_mate_options(self.game_mate_threads, self.mate_hash_mb, self.mate_mode);
         // stop/ponderhitフラグをリセット（スレッド生成前に行い、go()内での競合を防ぐ）
         search.reset_flags();
         let stop_flag = search.stop_flag();
+        let ponderhit_flag = search.ponderhit_flag();
         self.stop_flag = Some(stop_flag.clone());
-        self.ponderhit_handle = Some(search.ponderhit_handle());
+        self.ponderhit_flag = Some(ponderhit_flag.clone());
 
         let suppress_flag = Arc::clone(&self.suppress_bestmove);
-        let running_guard = SearchRunningGuard(Arc::clone(&self.search_running));
-        self.search_running.store(true, Ordering::SeqCst);
         let builder = thread::Builder::new().stack_size(SEARCH_STACK_SIZE);
         self.search_thread = Some(
             builder
                 .spawn(move || {
-                    let running_guard = running_guard;
-                    // panic 時は Search の helper 終了後に探索中状態を解除する。
-                    let mut search = search;
-                    #[cfg(feature = "allocation-stats")]
-                    let allocation_before = rshogi_core::allocation_stats::snapshot();
-                    #[cfg(feature = "tt-write-stats")]
-                    let tt_write_before = search.tt_write_stats();
                     let result = search.go(
                         &mut pos,
                         limits,
@@ -1929,15 +1812,6 @@ impl UsiEngine {
                             println!("{}", info.to_usi_string());
                             std::io::stdout().flush().ok();
                         }),
-                    );
-
-                    #[cfg(feature = "allocation-stats")]
-                    allocation_stats::report(allocation_before);
-
-                    #[cfg(feature = "tt-write-stats")]
-                    println!(
-                        "info string tt_write_events {}",
-                        search.tt_write_stats().since(tt_write_before)
                     );
 
                     // 探索統計レポートを出力（search-stats feature有効時のみ内容あり）
@@ -1948,18 +1822,33 @@ impl UsiEngine {
                         std::io::stdout().flush().ok();
                     }
 
-                    // bestmove を受信した側の isready は待機中の準備を行う。
-                    running_guard.0.store(false, Ordering::SeqCst);
                     // bestmove出力（suppress_bestmoveが立っていない場合のみ）
                     // cmd_goから内部的にstopされた場合は抑制される
                     if !suppress_flag.load(Ordering::SeqCst) {
-                        let best_usi = if result.best_move != Move::NONE {
-                            result.best_move.to_usi()
+                        // MateSolverThread が詰みを発見済なら bestmove を override する。
+                        // main search の result は変えない (= TT / 学習 side-effect 無し)、
+                        // あくまで出力 layer での swap のみ。
+                        let mate_override = if let (Some(mf), Some(mm)) =
+                            (&mate_found_arc, &mate_move_arc)
+                        {
+                            p2_search::mate_solver_thread::MateSolverThread::take_mate_from(mf, mm)
+                        } else {
+                            None
+                        };
+
+                        let best_move = mate_override.unwrap_or(result.best_move);
+                        if mate_override.is_some() {
+                            println!("info string mate solver found mate: {}", best_move.to_usi());
+                        }
+
+                        let best_usi = if best_move != Move::NONE {
+                            best_move.to_usi()
                         } else {
                             "resign".to_string()
                         };
 
-                        if result.ponder_move != Move::NONE {
+                        // mate override 時は ponder move を捨てる (= ponder 先が無意味になるため)
+                        if mate_override.is_none() && result.ponder_move != Move::NONE {
                             println!("bestmove {best_usi} ponder {}", result.ponder_move.to_usi());
                         } else {
                             println!("bestmove {best_usi}");
@@ -1971,122 +1860,92 @@ impl UsiEngine {
                 })
                 .expect("failed to spawn search thread"),
         );
-        Ok(())
     }
 
-    /// go mate コマンド: df-pn 詰み探索を別スレッドで走らせ、`checkmate` で応答する。
+    /// PUCT hybrid 経路の探索開始
     ///
-    /// `go mate <ミリ秒>` / `go mate infinite` / `go mate`（infinite と同じ）。手番側が詰ませる
-    /// 問題として解き、詰みなら `checkmate <手順>`、不詰なら `checkmate nomate`、時間切れ・stop なら
-    /// `checkmate timeout` を返す。局面以前の対局履歴（千日手の履歴）は見ない。
-    fn cmd_go_mate(&mut self, tokens: &[&str]) {
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(search) = self.search.as_mut() {
-            search.wait_for_game_mate();
-        }
-        let time_ms = parse_go_mate_time(tokens);
-        let mut pos = self.position.clone();
-        let mut solver = self
-            .mate_solver
-            .take()
-            .unwrap_or_else(|| DfpnSolver::with_mode(self.mate_hash_mb, self.mate_mode));
-        solver.set_threads(self.mate_threads);
-        solver.set_shortest(self.mate_shortest);
-        self.mate_stop.store(false, Ordering::SeqCst);
-        let stop = Arc::clone(&self.mate_stop);
+    /// 序中盤 PUCT engine で探索し、 bestmove を出力する。
+    /// 現状は stub evaluator (value=0) を使うため strong play は期待しない。
+    /// 本実装は pipeline 整備のみで、 NNUE-B Transformer 統合は別 session。
+    #[cfg(feature = "puct-hybrid")]
+    fn cmd_go_puct(&mut self, limits: LimitsType) {
+        let pos = self.position.clone();
+
+        // PuctConfig (default)。 phase-aware や hybrid は default off で素朴な PUCT 動作。
+        let config = PuctConfig::default();
+
+        // stub evaluator (value=0)
+        let evaluator: Arc<dyn NnueEvaluator + Send + Sync> = Arc::new(StubPuctEvaluator);
+
+        // PUCT 探索の時間/ノード上限を抽出。 limits.movetime / limits.nodes 優先。
+        // byoyomi / btime+binc の動的時間管理は本 stub では行わない (簡易固定上限)。
+        let max_time_ms: u64 = if limits.movetime > 0 {
+            limits.movetime as u64
+        } else if limits.byoyomi[0] > 0 {
+            limits.byoyomi[0] as u64
+        } else {
+            // 時間指定なし → 3 秒 default (USI proxy 経由 / `go infinite` 時の保険)
+            3_000
+        };
+        let max_nodes: u64 = if limits.nodes > 0 { limits.nodes } else { 0 };
+
+        let mut engine = PuctEngine::new_direct(config, evaluator);
+        let stop_flag = engine.stop_flag();
+        self.puct_stop_flag = Some(stop_flag.clone());
+
         let suppress_flag = Arc::clone(&self.suppress_bestmove);
-        // 詰み探索の再帰は手数に比例して深くなるので、通常探索と同じ大きさのスタックを使う
+        let score_cp_cell = Arc::clone(&self.puct_last_score_cp);
+
         let builder = thread::Builder::new().stack_size(SEARCH_STACK_SIZE);
-        self.mate_thread = Some(
-            builder
-                .spawn(move || {
-                    let limits = MateLimits { nodes: 0, time_ms };
-                    // panic しても GUI は checkmate を待ち続けるので、捕まえて timeout として応答する。
-                    // panic = "abort" のビルド (production プロファイル) ではプロセスごと終了する。
-                    let solved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let result = solver.solve(&mut pos, &limits, &stop, |progress| {
-                            let nps = progress.nodes * 1000 / progress.elapsed_ms.max(1);
-                            println!(
-                                "info time {} nodes {} nps {nps}",
-                                progress.elapsed_ms, progress.nodes
-                            );
-                            std::io::stdout().flush().ok();
-                        });
-                        (solver, result)
-                    }));
-                    let (solver, result) = match solved {
-                        Ok((solver, result)) => (Some(solver), result),
-                        Err(_) => {
-                            eprintln!("info string mate search panicked");
-                            (None, MateResult::Unknown)
-                        }
-                    };
-                    if !suppress_flag.load(Ordering::SeqCst) {
-                        println!("{}", checkmate_response(&result));
-                        std::io::stdout().flush().ok();
-                    }
-                    solver
-                })
-                .expect("failed to spawn mate search thread"),
-        );
-    }
+        let handle = builder
+            .spawn(move || {
+                let start = Instant::now();
+                let puct_limits = PuctLimits {
+                    max_nodes,
+                    max_time_ms,
+                    search_mode: p2_search::SearchMode::Normal,
+                    game_phase: None,
+                    endgame_score: 0.0,
+                };
 
-    /// 詰み探索スレッドの終了を待ち、ソルバーを取り戻す（panic していたら次の go mate で作り直す）
-    fn wait_for_mate(&mut self) {
-        if let Some(handle) = self.mate_thread.take() {
-            self.mate_solver = handle.join().ok().flatten();
-        }
-    }
+                let mut work_pos = pos;
+                let result = engine.search(&work_pos, &puct_limits);
+                let _ = &mut work_pos; // do_move/undo_move は engine 内部で完結
 
-    /// 現在局面を定跡で probe し、hit したら bestmove を直接出力して true を返す。
-    ///
-    /// USI_OwnBook=false / 定跡未ロード / miss の場合は何も出力せず false を返し、
-    /// 呼び出し側は通常探索へフォールバックする。
-    fn try_book_probe(&mut self) -> bool {
-        if !self.book_options.own_book {
-            return false;
-        }
-        if self.books.is_empty() {
-            return false;
-        }
-
-        // probe 中の info string 本文を集めてから出力する（borrow 競合回避）。
-        let mut infos: Vec<String> = Vec::new();
-        let result = rshogi_book::probe_with_explore(
-            &self.books,
-            &self.position,
-            &self.book_options,
-            &mut self.book_rng,
-            self.book_explore.as_mut(),
-            |msg| infos.push(msg.to_string()),
-        );
-
-        for msg in &infos {
-            println!("info string {msg}");
-        }
-
-        match result {
-            Some(r) => {
-                let best_usi = r.best_move.to_usi();
-                match r.ponder_move {
-                    Some(ponder) => {
-                        println!("bestmove {best_usi} ponder {}", ponder.to_usi());
-                    }
-                    None => {
-                        println!("bestmove {best_usi}");
-                    }
+                // info 出力 (cp 換算は winrate * 600 を粗近似)
+                let elapsed_ms = start.elapsed().as_millis().max(1) as u64;
+                // elapsed_ms は max(1) で保証されるが、 clippy の警告回避に checked_div を使う
+                let nps = (result.nodes * 1000).checked_div(elapsed_ms).unwrap_or(0);
+                let cp = (result.value * 600.0) as i32;
+                score_cp_cell.store(cp, Ordering::SeqCst);
+                println!(
+                    "info nodes {} time {} nps {} score cp {} string backend=puct value={:.4}",
+                    result.nodes, elapsed_ms, nps, cp, result.value
+                );
+                if !result.pv.is_empty() {
+                    let pv: Vec<String> = result.pv.iter().map(|m| m.to_usi()).collect();
+                    println!("info pv {}", pv.join(" "));
                 }
                 std::io::stdout().flush().ok();
-                true
-            }
-            None => false,
-        }
+
+                if !suppress_flag.load(Ordering::SeqCst) {
+                    let best_usi = if result.bestmove != Move::NONE {
+                        result.bestmove.to_usi()
+                    } else {
+                        "resign".to_string()
+                    };
+                    println!("bestmove {best_usi}");
+                    std::io::stdout().flush().ok();
+                }
+            })
+            .expect("failed to spawn puct search thread");
+        self.puct_thread = Some(handle);
     }
 
     /// goオプションを解析
     fn parse_go_options(&self, tokens: &[&str]) -> LimitsType {
         let mut limits = LimitsType::default();
-        // go受信時点で探索開始時刻を記録し、この時刻を基準に時間管理する
+        // YaneuraOu準拠: go受信時点で探索開始時刻を記録し、この時刻を基準に時間管理する
         limits.set_start_time();
         let mut idx = 1;
 
@@ -2115,6 +1974,18 @@ impl UsiEngine {
                     if idx < tokens.len() {
                         limits.movetime = tokens[idx].parse().unwrap_or(0);
                     }
+                }
+                "mate" => {
+                    idx += 1;
+                    // `go mate` without a value is treated as infinite (YaneuraOu互換)
+                    limits.mate = if idx < tokens.len() {
+                        match tokens[idx] {
+                            "infinite" => i32::MAX,
+                            v => v.parse().unwrap_or(0),
+                        }
+                    } else {
+                        i32::MAX
+                    };
                 }
                 "btime" => {
                     idx += 1;
@@ -2172,17 +2043,14 @@ impl UsiEngine {
                                 | "winc"
                                 | "byoyomi"
                                 | "rtime"
+                                | "mate"
                         ) {
                             idx -= 1; // 巻き戻して次のループで処理
                             break;
                         }
                         if let Some(mv) = Move::from_usi(tokens[idx]) {
                             if let Some(normalized) = self.position.to_move(mv) {
-                                if normalized.is_pass() && !self.position.can_pass() {
-                                    eprintln!("warning: invalid searchmoves: {}", tokens[idx]);
-                                } else {
-                                    limits.search_moves.push(normalized);
-                                }
+                                limits.search_moves.push(normalized);
                             } else {
                                 eprintln!("warning: invalid searchmoves: {}", tokens[idx]);
                             }
@@ -2206,48 +2074,55 @@ impl UsiEngine {
         if let Some(stop_flag) = &self.stop_flag {
             stop_flag.store(true, Ordering::SeqCst);
         }
+        #[cfg(feature = "puct-hybrid")]
+        if let Some(stop_flag) = &self.puct_stop_flag {
+            stop_flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(mate) = &self.mate_solver_thread {
+            mate.request_stop();
+        }
         self.wait_for_search();
-        // go mate 中なら打ち切り、探索スレッドが checkmate timeout（または直前に出た結論）を出力する
-        self.mate_stop.store(true, Ordering::SeqCst);
-        self.wait_for_mate();
     }
 
     /// 探索を停止するがbestmoveを出力しない（cmd_go内部で使用）
     ///
     /// GUIがstopを送らずにposition+goを送ってきた場合、前のponder探索の
-    /// bestmoveを出力するとGUIが混乱する
+    /// bestmoveを出力するとGUIが混乱する（YaneuraOu準拠）
     fn stop_search_silently(&mut self) {
         self.suppress_bestmove.store(true, Ordering::SeqCst);
         if let Some(stop_flag) = &self.stop_flag {
             stop_flag.store(true, Ordering::SeqCst);
         }
+        #[cfg(feature = "puct-hybrid")]
+        if let Some(stop_flag) = &self.puct_stop_flag {
+            stop_flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(mate) = &self.mate_solver_thread {
+            mate.request_stop();
+        }
         self.wait_for_search();
-        self.mate_stop.store(true, Ordering::SeqCst);
-        self.wait_for_mate();
         self.suppress_bestmove.store(false, Ordering::SeqCst);
     }
 
     /// ponderhitコマンド: 先読みヒットを通知
-    fn cmd_ponderhit(&mut self) -> Result<()> {
+    fn cmd_ponderhit(&mut self) {
         if self.stochastic_ponder {
-            self.restart_after_ponderhit()?;
-            return Ok(());
+            self.restart_after_ponderhit();
+            return;
         }
 
-        if let Some(handle) = &self.ponderhit_handle {
-            handle.signal();
+        if let Some(flag) = &self.ponderhit_flag {
+            flag.store(true, Ordering::SeqCst);
         }
-        Ok(())
     }
 
     /// Stochastic_Ponder の ponderhit 後に通常探索へ切り替える
-    fn restart_after_ponderhit(&mut self) -> Result<()> {
-        let received_at = Instant::now();
+    fn restart_after_ponderhit(&mut self) {
         self.stop_search_silently();
 
         if let Some(line) = self.last_position_cmd.clone() {
             let tokens: Vec<&str> = line.split_whitespace().collect();
-            self.cmd_position(&tokens)?;
+            self.cmd_position(&tokens);
         }
 
         if let Some(line) = self.last_go_cmd.clone() {
@@ -2258,15 +2133,9 @@ impl UsiEngine {
                 .collect();
             let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
             if !tokens.is_empty() {
-                println!(
-                    "info string stochastic ponderhit restart delay {}ms",
-                    received_at.elapsed().as_millis()
-                );
-                self.go_start_time_override = Some(received_at);
-                self.cmd_go(&tokens)?;
+                self.cmd_go(&tokens);
             }
         }
-        Ok(())
     }
 
     /// 探索スレッドの終了を待ち、Searchを取り戻す
@@ -2278,19 +2147,32 @@ impl UsiEngine {
                 }
                 Err(_) => {
                     eprintln!("info string search thread panicked, resetting Search");
-                    // EvalHash は直後に届き得る setoption を反映してから isready / go で確保する。
-                    let mut search = Search::new_with_eval_hash_large_pages(
-                        self.tt_size_mb,
-                        0,
-                        self.eval_hash_large_pages,
-                    );
+                    let mut search =
+                        Search::new_with_eval_hash(self.tt_size_mb, self.eval_hash_size_mb);
                     search.set_skill_options(self.skill_options);
                     self.search = Some(search);
                 }
             }
         }
         self.stop_flag = None;
-        self.ponderhit_handle = None;
+        self.ponderhit_flag = None;
+
+        // PUCT スレッドも join する (cmd_stop / stop_search_silently 経由)
+        #[cfg(feature = "puct-hybrid")]
+        {
+            if let Some(handle) = self.puct_thread.take()
+                && handle.join().is_err()
+            {
+                eprintln!("info string puct search thread panicked");
+            }
+            self.puct_stop_flag = None;
+        }
+
+        // MateSolverThread の join (= stop request 済の前提で blocking wait)
+        if let Some(mate) = self.mate_solver_thread.take() {
+            mate.request_stop();
+            mate.join();
+        }
     }
 
     /// displayコマンド: 現在の局面を表示（デバッグ用）
@@ -2303,7 +2185,7 @@ impl UsiEngine {
     /// evalコマンド: 現在の局面の静的評価値を表示（デバッグ用）
     ///
     /// `eval diag` で diagnostics 付き評価（PSQT 含む中間値をログ出力）
-    fn cmd_eval(&self, diagnostics: bool) {
+    fn cmd_eval(&mut self, diagnostics: bool) {
         let Some(network) = get_network() else {
             println!("info string Error: No NNUE network loaded");
             return;
@@ -2313,301 +2195,146 @@ impl UsiEngine {
         let mut stack = AccumulatorStackVariant::from_network(&network);
 
         if diagnostics {
-            #[cfg(all(feature = "diagnostics", feature = "layerstack-arch"))]
+            #[cfg(feature = "diagnostics")]
             {
-                use rshogi_core::nnue::NNUENetwork;
+                use rshogi_core::nnue::{LayerStacksNetwork, NNUENetwork};
+                // diagnostics モード: LayerStacks のみ対応
                 if let NNUENetwork::LayerStacks(ref net) = *network {
-                    let value = net.refresh_and_evaluate_with_diagnostics(&self.position);
-                    println!("info string Static eval (diagnostics): {}", value.raw());
+                    // L1 variant に dispatch し、refresh + evaluate_with_diagnostics を実行
+                    match net {
+                        #[cfg(feature = "layerstacks-1536x16x32")]
+                        LayerStacksNetwork::L1536x16x32(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1536>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-1536x32x32")]
+                        LayerStacksNetwork::L1536x32x32(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1536>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-1536x8x96")]
+                        LayerStacksNetwork::L1536x8x96(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1536>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-1536x16x96")]
+                        LayerStacksNetwork::L1536x16x96(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1536>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-1536x32x96")]
+                        LayerStacksNetwork::L1536x32x96(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1536>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-1536x48x96")]
+                        LayerStacksNetwork::L1536x48x96(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1536>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-1536x64x96")]
+                        LayerStacksNetwork::L1536x64x96(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1536>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-768x32x96")]
+                        LayerStacksNetwork::L768x32x96(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<768>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-1536x16x48")]
+                        LayerStacksNetwork::L1536x16x48(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1536>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-1024x16x48")]
+                        LayerStacksNetwork::L1024x16x48(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1024>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-1024x8x64")]
+                        LayerStacksNetwork::L1024x8x64(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<1024>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-768x16x32")]
+                        LayerStacksNetwork::L768x16x32(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<768>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-768x8x32")]
+                        LayerStacksNetwork::L768x8x32(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<768>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[cfg(feature = "layerstacks-512x16x32")]
+                        LayerStacksNetwork::L512x16x32(inner) => {
+                            let mut acc = rshogi_core::nnue::AccumulatorLayerStacks::<512>::new();
+                            inner.refresh_accumulator(&self.position, &mut acc);
+                            let value = inner.evaluate_with_diagnostics(&self.position, &acc);
+                            println!("info string Static eval (diagnostics): {}", value.raw());
+                        }
+                        #[allow(unreachable_patterns)]
+                        _ => println!(
+                            "info string Error: no matching LayerStacks L1 variant compiled"
+                        ),
+                    }
                 } else {
                     println!("info string Error: diagnostics is only supported for LayerStacks");
                 }
             }
-            #[cfg(all(feature = "diagnostics", not(feature = "layerstack-arch")))]
-            {
-                let _ = &network;
-                println!(
-                    "info string Error: 'eval diag' requires the `layerstack-arch` feature \
-                     (LayerStacks diagnostics)"
-                );
-            }
             #[cfg(not(feature = "diagnostics"))]
             {
-                let _ = &network;
                 println!("info string Error: build with --features diagnostics to use 'eval diag'");
             }
         } else {
-            let value = evaluate_dispatch(&self.position, &mut stack, &mut None);
+            // LOG_KINGRING_VALUE=1 環境変数有効時、 evaluate 1 回分の kingring scalar 情報を
+            // stdout に出力する thread-local request flag を guard で立てる (= drop で復元)。
+            // env 無効時は guard は no-op + overhead ゼロ。
+            let _kr_log_guard = rshogi_core::nnue::ablation::LogKingringRequestGuard::new();
+            let value = evaluate_dispatch(&mut self.position, &mut stack, &mut None);
             println!("info string Static eval: {}", value.raw());
         }
         println!("info string SFEN: {}", self.position.to_sfen());
     }
 }
 
-/// `go mate` の制限時間（ミリ秒）。`infinite`・省略・0 は無制限（0 を返す）。
-fn parse_go_mate_time(tokens: &[&str]) -> u64 {
-    match tokens.get(2) {
-        None | Some(&"infinite") => 0,
-        Some(value) => value.parse().unwrap_or_else(|_| {
-            eprintln!("info string Warning: invalid go mate time '{value}', treated as infinite");
-            0
-        }),
-    }
-}
-
-/// 詰み探索の結果を USI の `checkmate` 応答にする
-fn checkmate_response(result: &MateResult) -> String {
-    match result {
-        MateResult::Mate(pv) => {
-            let moves: Vec<String> = pv.iter().map(|m| m.to_usi()).collect();
-            format!("checkmate {}", moves.join(" "))
-        }
-        MateResult::NoMate => "checkmate nomate".to_string(),
-        MateResult::Unknown => "checkmate timeout".to_string(),
-        MateResult::Unsupported => "checkmate notimplemented".to_string(),
-    }
-}
-
-/// LayerStacks の格納 bucket 数と、明示された routing semantics の整合性を検証する。
-///
-/// NNUE version は binary layout の判別にだけ使い、この判断には使わない。
-fn validate_layer_stack_routing(
-    stored_bucket_count: usize,
-    mode: Option<LayerStackBucketMode>,
-    progress_buckets: Option<usize>,
-    progress_coeff_loaded: bool,
-) -> std::result::Result<(), String> {
-    let mode = mode.ok_or_else(|| "LS_BUCKET_MODE must be explicitly set to progresskpabs, progresskpabsq16 or kingrank9 before isready".to_string())?;
-    validate_layer_stack_routing_with_coefficients(
-        mode,
-        stored_bucket_count,
-        progress_buckets,
-        progress_coeff_loaded,
-    )
-    .map_err(|error| match error {
-        LayerStackRoutingError::Configuration(message) => message,
-        LayerStackRoutingError::MissingCoefficients => {
-            format!("LS_BUCKET_MODE={} requires LS_PROGRESS_COEFF to be loaded", mode.as_str())
-        }
-        LayerStackRoutingError::UnusedCoefficients => {
-            "LS_BUCKET_MODE=kingrank9 conflicts with LS_PROGRESS_COEFF; leave it unset".to_string()
-        }
-    })
-}
-
-/// 先後別の定跡オプション。`usi` ではこの順に出す。
-const BOOK_PER_SIDE_OPTIONS: [&str; 4] = [
-    "BookEvalBlackDiff",
-    "BookEvalWhiteDiff",
-    "BookDepthBlackLimit",
-    "BookDepthWhiteLimit",
-];
-
-/// 先後別の定跡オプションの値を読む。-1 は共通値の継承 (`Some(None)`)、範囲外や数でなければ `None`。
-fn parse_book_per_side_value(value: &str) -> Option<Option<i32>> {
-    match value.parse::<i32>().ok()? {
-        -1 => Some(None),
-        v @ 0..=99999 => Some(Some(v)),
-        _ => None,
-    }
-}
-
-fn parse_startup_args(args: impl IntoIterator<Item = String>) -> Result<Option<PathBuf>> {
-    let mut spec_path = None;
-    let mut args = args.into_iter();
-    while let Some(argument) = args.next() {
-        match argument.as_str() {
-            "--spsa-net-spec" => {
-                if spec_path.is_some() {
-                    bail!("--spsa-net-spec may only be specified once");
-                }
-                let path = args.next().context("--spsa-net-spec requires a path")?;
-                spec_path = Some(PathBuf::from(path));
-            }
-            _ => bail!("unknown argument: {argument}"),
-        }
-    }
-    Ok(spec_path)
-}
-
-fn parse_spsa_net_spec(content: &str) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    for (line_index, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let without_comment = trimmed.split("//").next().unwrap_or(trimmed);
-        let usable = without_comment.replace("[[NOT USED]]", "");
-        let usable = usable.trim();
-        if usable.is_empty() {
-            continue;
-        }
-        let name = usable.split(',').next().unwrap_or("").trim();
-        if NetCoefficientId::parse_usi_name(name).is_none() {
-            bail!("invalid SPSA net spec at line {}: '{name}'", line_index + 1);
-        }
-        names.push(name.to_string());
-    }
-    Ok(names)
-}
-
-/// SPSA の値を適用した結果。
-#[derive(Default)]
-struct SpsaApplyReport {
-    applied: usize,
-    clamped: usize,
-    unknown: Vec<String>,
-}
-
-impl SpsaApplyReport {
-    fn warn_unknown(&self, source: &str) {
-        if !self.unknown.is_empty() {
-            eprintln!(
-                "info string Warning: {} unknown SPSA parameters in {source}: {}",
-                self.unknown.len(),
-                self.unknown.join(", ")
-            );
-        }
-    }
-}
-
-/// engine_options.txt の 1 行: 名前と値、または読めなかった理由。
-type EngineOptionEntry = Result<(String, String), String>;
-
-/// engine_options.txt の各行を (行番号, 名前と値) にする。空行と `#`・`//` で始まる行は飛ばす。
-/// 書き方は `名前 値`、`名前=値`、`usi` の応答と同じ `option name 名前 type 型 default 値 ...` の 3 つ。
-/// `=` があれば最初の `=` で分けるので、`Skill Level=10` のように名前に空白を含められる。
-fn parse_engine_options(text: &str) -> Vec<(usize, EngineOptionEntry)> {
-    let mut entries = Vec::new();
-    for (index, raw) in text.lines().enumerate() {
-        let line = raw.trim_start_matches('\u{feff}').trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-            continue;
-        }
-        let entry = if line.starts_with("option ") {
-            parse_option_declaration(line)
-        } else if let Some((name, value)) = line.split_once('=') {
-            Ok((name.trim().to_string(), value.trim().to_string()))
-        } else {
-            match line.split_once(char::is_whitespace) {
-                Some((name, value)) => Ok((name.to_string(), value.trim().to_string())),
-                None => Ok((line.to_string(), String::new())),
-            }
-        };
-        let entry = entry.and_then(|(name, value)| {
-            if name.is_empty() {
-                Err(format!("missing option name: '{line}'"))
-            } else {
-                Ok((name, value))
-            }
-        });
-        entries.push((index + 1, entry));
-    }
-    entries
-}
-
-/// `option name 名前 type 型 default 値 [min ..] [max ..] [var ..]` から名前と default の値を取り出す。
-fn parse_option_declaration(line: &str) -> Result<(String, String), String> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.get(1) != Some(&"name") {
-        return Err(format!("invalid option declaration: '{line}'"));
-    }
-    let type_at = tokens
-        .iter()
-        .position(|t| *t == "type")
-        .ok_or_else(|| format!("invalid option declaration: '{line}'"))?;
-    let name = tokens[2..type_at].join(" ");
-    let default_at = tokens
-        .iter()
-        .position(|t| *t == "default")
-        .ok_or_else(|| format!("option declaration without default: '{line}'"))?;
-    let value: Vec<&str> = tokens[default_at + 1..]
-        .iter()
-        .take_while(|t| !matches!(**t, "min" | "max" | "var"))
-        .copied()
-        .collect();
-    Ok((name, value.join(" ")))
-}
-
-/// engine_options.txt の値が、`usi` で広告したオプションの型と範囲に合うかを確かめる。
-fn validate_option_value(declaration: &str, value: &str) -> Result<(), String> {
-    let tokens: Vec<&str> = declaration.split_whitespace().collect();
-    let after = |key: &str| tokens.iter().position(|t| *t == key).and_then(|i| tokens.get(i + 1));
-    match after("type").copied() {
-        Some("spin") => {
-            let v: i64 = value.parse().map_err(|_| format!("'{value}' is not an integer"))?;
-            let bound = |key| after(key).and_then(|t| t.parse::<i64>().ok());
-            if bound("min").is_some_and(|min| v < min) || bound("max").is_some_and(|max| v > max) {
-                return Err(format!("{value} is out of range: {declaration}"));
-            }
-            Ok(())
-        }
-        // 適用側は true/false だけを確実に読む (parse::<bool> の項目がある)
-        Some("check") if matches!(value, "true" | "false") => Ok(()),
-        Some("check") => Err(format!("'{value}' is not true or false")),
-        Some("combo") => {
-            let allowed = tokens.windows(2).any(|w| w[0] == "var" && w[1] == value);
-            if allowed {
-                Ok(())
-            } else {
-                Err(format!("'{value}' is not one of: {declaration}"))
-            }
-        }
-        _ => Ok(()),
-    }
-}
-
-/// `option name 名前 type ...` の行から名前を取り出す。
-fn usi_option_line_name(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("option name ")?;
-    let end = rest.find(" type ")?;
-    Some(rest[..end].to_string())
-}
-
-/// パスのオプションの相対パスを、engine_options.txt のあるフォルダからのパスにする。
-/// `<empty>` などの空を表す値はそのまま返す。
-fn resolve_option_path(name: &str, value: &str, base_dir: &Path) -> String {
-    let is_sentinel = value.is_empty() || value.starts_with('<');
-    if !PATH_OPTIONS.contains(&name) || is_sentinel || Path::new(value).is_absolute() {
-        return value.to_string();
-    }
-    base_dir.join(value).to_string_lossy().into_owned()
-}
-
-/// ソースの id に、結果を変えうる feature を `+` 以降に名前順で付ける。id が分からなければ `unknown`。
-fn source_version(id: &str, core_features: &str, usi_features: &str) -> String {
-    if id == "unknown" {
-        return id.to_owned();
-    }
-    let mut features: Vec<&str> = core_features
-        .split(',')
-        .chain(usi_features.split(','))
-        .filter(|f| !f.is_empty())
-        .collect();
-    features.sort_unstable();
-    features.dedup();
-    if features.is_empty() {
-        id.to_owned()
-    } else {
-        format!("{id}+{}", features.join(","))
-    }
-}
-
 fn main() -> Result<()> {
-    // USI の応答 (`id name` 等) は変えず、起動引数で問われたときだけ版を出して終わる。
-    if std::env::args().skip(1).eq(["--source-version".to_owned()]) {
-        let version = source_version(
-            SOURCE_ID,
-            rshogi_core::RESULT_FEATURES,
-            env!("RSHOGI_USI_RESULT_FEATURES"),
-        );
-        println!("source-version {version}");
-        return Ok(());
-    }
-    #[cfg(feature = "allocation-stats")]
-    allocation_stats::init()?;
+    thread::Builder::new()
+        .name("rshogi-usi-main".to_string())
+        .stack_size(SEARCH_STACK_SIZE)
+        .spawn(run_usi)?
+        .join()
+        .map_err(|_| anyhow!("USI main thread panicked"))?
+}
 
+fn run_usi() -> Result<()> {
     // ロガー初期化（標準エラー出力）
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Stderr)
@@ -2616,17 +2343,10 @@ fn main() -> Result<()> {
     // ビットボードテーブルの初期化（ホットパスでの OnceLock atomic check 回避）
     rshogi_core::bitboard::init_bitboard_tables();
 
-    let spec_path = parse_startup_args(std::env::args().skip(1))?;
-    let spec_names = match spec_path {
-        Some(path) => {
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("failed to read SPSA net spec {}", path.display()))?;
-            parse_spsa_net_spec(&content)
-                .with_context(|| format!("failed to parse SPSA net spec {}", path.display()))?
-        }
-        None => Vec::new(),
-    };
-    let mut engine = UsiEngine::new_with_spsa_net_spec(spec_names);
+    // dual_cross profiling 用の env flag を読み込み (default OFF、 ゼロオーバヘッド)
+    init_dual_cross_profile();
+
+    let mut engine = UsiEngine::new();
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -2646,602 +2366,22 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    #[test]
-    fn source_version_appends_sorted_features_from_both_crates() {
-        assert_eq!(source_version("abc", "", ""), "abc");
-        assert_eq!(
-            source_version("abc-dirty", "use-lazy-evaluate", ""),
-            "abc-dirty+use-lazy-evaluate"
-        );
-        assert_eq!(
-            source_version("abc", "use-lazy-evaluate,deep", "custom,deep"),
-            "abc+custom,deep,use-lazy-evaluate"
-        );
-        assert_eq!(source_version("unknown", "deep", "custom"), "unknown");
-    }
-
-    #[test]
-    fn parse_book_per_side_value_accepts_minus_one_to_99999() {
-        assert_eq!(parse_book_per_side_value("-1"), Some(None));
-        assert_eq!(parse_book_per_side_value("0"), Some(Some(0)));
-        assert_eq!(parse_book_per_side_value("99999"), Some(Some(99999)));
-        for invalid in ["-2", "100000", "abc", "", "1.5"] {
-            assert_eq!(parse_book_per_side_value(invalid), None, "{invalid:?}");
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn setoption_book_per_side_options_keep_values_across_shared_changes() {
-        let set = |engine: &mut UsiEngine, name: &str, value: &str| {
-            engine.cmd_setoption(&["setoption", "name", name, "value", value]);
-        };
-        let per_side = |engine: &UsiEngine| {
-            let o = &engine.book_options;
-            (o.eval_black_diff, o.eval_white_diff, o.depth_black_limit, o.depth_white_limit)
-        };
-
-        let mut engine = UsiEngine::new();
-        assert_eq!(per_side(&engine), (None, None, None, None));
-
-        // 共通値の前後どちらで送っても同じ。共通値を変えても個別値は残る。
-        let mut before = UsiEngine::new();
-        set(&mut before, "BookEvalBlackDiff", "10");
-        set(&mut before, "BookEvalDiff", "50");
-        set(&mut engine, "BookEvalDiff", "50");
-        set(&mut engine, "BookEvalBlackDiff", "10");
-        assert_eq!(per_side(&before), per_side(&engine));
-        assert_eq!(engine.book_options.eval_diff, 50);
-        assert_eq!(per_side(&engine), (Some(10), None, None, None));
-
-        set(&mut engine, "BookDepthWhiteLimit", "5");
-        set(&mut engine, "BookDepthLimit", "16");
-        assert_eq!(per_side(&engine), (Some(10), None, None, Some(5)));
-        assert_eq!(engine.book_options.depth_limit, 16);
-
-        // 不正値・範囲外は値を変えない。
-        for invalid in ["-2", "100000", "abc"] {
-            set(&mut engine, "BookEvalBlackDiff", invalid);
-            set(&mut engine, "BookDepthWhiteLimit", invalid);
-        }
-        assert_eq!(per_side(&engine), (Some(10), None, None, Some(5)));
-
-        set(&mut engine, "BookEvalWhiteDiff", "0");
-        set(&mut engine, "BookDepthBlackLimit", "99999");
-        assert_eq!(per_side(&engine), (Some(10), Some(0), Some(99999), Some(5)));
-
-        // -1 で共通値の継承に戻る。
-        for name in BOOK_PER_SIDE_OPTIONS {
-            set(&mut engine, name, "-1");
-        }
-        assert_eq!(per_side(&engine), (None, None, None, None));
-        assert_eq!(engine.book_options.eval_diff, 50);
-        assert_eq!(engine.book_options.depth_limit, 16);
-    }
-
-    #[test]
-    #[serial]
-    fn book_on_the_fly_reopens_on_isready_but_memory_book_does_not() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/book-on-the-fly-option-test.db");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let write_book = |mv: &str| {
-            let tmp = path.with_extension("db.tmp");
-            std::fs::write(
-                &tmp,
-                format!(
-                    "#YANEURAOU-DB2016 1.00\n\
-                     sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1\n\
-                     {mv} none 0 0 1\n"
-                ),
-            )
-            .unwrap();
-            std::fs::rename(&tmp, &path).unwrap();
-        };
-        let book_move = |engine: &UsiEngine| {
-            let mut position = Position::new();
-            position.set_hirate();
-            rshogi_book::probe(
-                &engine.books,
-                &position,
-                &engine.book_options,
-                &mut rshogi_book::DefaultBookRng::from_seed(0),
-                |_| {},
-            )
-            .unwrap()
-            .best_move
-            .to_usi()
-        };
-
-        for (on_the_fly, after_replace) in [("true", "2g2f"), ("false", "7g7f")] {
-            write_book("7g7f");
-            let mut engine = UsiEngine::new();
-            engine.cmd_setoption(&[
-                "setoption",
-                "name",
-                "BookFile",
-                "value",
-                path.to_str().unwrap(),
-            ]);
-            engine.cmd_setoption(&["setoption", "name", "BookOnTheFly", "value", on_the_fly]);
-            engine.maybe_load_book();
-            assert_eq!(book_move(&engine), "7g7f");
-            write_book("2g2f");
-            engine.maybe_load_book();
-            assert_eq!(book_move(&engine), after_replace, "BookOnTheFly={on_the_fly}");
-        }
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn book_file_db_falls_back_to_ybb_of_the_same_name() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
-        std::fs::create_dir_all(&dir).unwrap();
-        // 別プロセスで並行に流れても衝突しないよう、プロセスごとに名前を変える。
-        let db = dir.join(format!("book-ybb-fallback-test-{}.db", std::process::id()));
-        let ybb = db.with_extension("ybb");
-        std::fs::remove_file(&db).ok();
-        std::fs::write(&ybb, include_bytes!("../../rshogi-book/testdata/small.ybb")).unwrap();
-        for (book_file, on_the_fly) in [
-            (&db, "true"),
-            (&db, "false"),
-            (&ybb, "true"),
-            (&ybb, "false"),
-        ] {
-            let mut engine = UsiEngine::new();
-            engine.cmd_setoption(&[
-                "setoption",
-                "name",
-                "BookFile",
-                "value",
-                book_file.to_str().unwrap(),
-            ]);
-            engine.cmd_setoption(&["setoption", "name", "BookOnTheFly", "value", on_the_fly]);
-            engine.maybe_load_book();
-            assert_eq!(engine.books.len(), 1);
-            assert_eq!(engine.books[0].position_count(), Some(8));
-            let mut position = Position::new();
-            position.set_hirate();
-            let best = rshogi_book::probe(
-                &engine.books,
-                &position,
-                &engine.book_options,
-                &mut rshogi_book::DefaultBookRng::from_seed(0),
-                |_| {},
-            )
-            .unwrap()
-            .best_move
-            .to_usi();
-            assert!(["7g7f", "2g2f"].contains(&best.as_str()), "{best}");
-        }
-        std::fs::remove_file(ybb).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn book_explore_option_load_reload_disable_and_read_failure() {
-        let mut engine = UsiEngine::new();
-        assert!(engine.book_explore_file.is_empty());
-        assert!(engine.book_explore.is_none());
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/book-explore-option-test.txt");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            "sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1 7g7f\n",
-        )
-        .unwrap();
-        engine.cmd_setoption(&[
-            "setoption",
-            "name",
-            "BookExploreFile",
-            "value",
-            path.to_str().unwrap(),
-        ]);
-        assert!(engine.book_explore.is_none());
-        engine.maybe_load_book_explore();
-        assert_eq!(engine.book_explore.as_ref().unwrap().len(), 1);
-        std::fs::remove_file(&path).unwrap();
-        engine.maybe_load_book_explore();
-        assert_eq!(engine.book_explore.as_ref().unwrap().len(), 1);
-        engine.cmd_setoption(&["setoption", "name", "BookExploreFile", "value", ""]);
-        engine.maybe_load_book_explore();
-        assert!(engine.book_explore.is_none());
-        engine.cmd_setoption(&[
-            "setoption",
-            "name",
-            "BookExploreFile",
-            "value",
-            path.to_str().unwrap(),
-        ]);
-        engine.maybe_load_book_explore();
-        assert!(engine.book_explore.is_none());
-        std::fs::write(&path, "# empty\n").unwrap();
-        engine.maybe_load_book_explore();
-        assert!(engine.book_explore.as_ref().unwrap().is_empty());
-        std::fs::remove_file(path).unwrap();
-        engine.cmd_setoption(&["setoption", "name", "BookExploreFile", "value", "<empty>"]);
-        assert!(engine.book_explore_file.is_empty());
-        assert!(engine.book_explore.is_none());
-        engine.maybe_load_book_explore();
-        assert!(engine.book_explore.is_none());
-    }
-
-    #[test]
-    fn page_status_is_reported_only_when_it_changes() {
-        use TtPageStatus::{HugePageHint, LargePages, Regular};
-
-        assert_eq!(page_status_message(Regular, Regular), None);
-        assert_eq!(page_status_message(LargePages, LargePages), None);
-        assert_eq!(page_status_message(Regular, LargePages), Some("Large Pages are used."));
-        assert!(page_status_message(Regular, HugePageHint).is_some_and(|m| m.contains("hint")));
-        assert!(
-            page_status_message(LargePages, Regular).is_some_and(|m| m.contains("regular pages"))
-        );
-        assert!(
-            page_status_message(HugePageHint, Regular).is_some_and(|m| m.contains("regular pages"))
-        );
-    }
-
-    /// cmd_go が探索を始める直前の EvalHash の準備だけを行う。
-    fn prepare_for_go(engine: &mut UsiEngine) {
-        let mut search = engine.search.take().unwrap();
-        engine.prepare_eval_hash(&mut search);
-        engine.search = Some(search);
-    }
-
-    #[test]
-    #[serial]
-    fn use_eval_hash_false_keeps_eval_hash_unallocated() {
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let size = |engine: &UsiEngine| engine.search.as_ref().unwrap().eval_hash_size_mb();
-                let mut engine = UsiEngine::new();
-                // GUI が送る順 (EvalHash が先)。setoption の時点では確保しない。
-                engine.cmd_setoption(&["setoption", "name", "EvalHash", "value", "16"]);
-                assert_eq!(size(&engine), 0);
-                engine.cmd_setoption(&["setoption", "name", "UseEvalHash", "value", "false"]);
-                prepare_for_go(&mut engine);
-                assert_eq!(size(&engine), 0);
-                assert!(engine.search.as_ref().unwrap().eval_hash().is_empty());
-
-                engine.cmd_setoption(&["setoption", "name", "UseEvalHash", "value", "true"]);
-                assert_eq!(size(&engine), 0);
-                prepare_for_go(&mut engine);
-                assert_eq!(size(&engine), 16);
-
-                engine.cmd_setoption(&["setoption", "name", "UseEvalHash", "value", "false"]);
-                assert_eq!(size(&engine), 0);
-                engine.cmd_setoption(&["setoption", "name", "UseEvalHash", "value", "true"]);
-                engine.cmd_setoption(&["setoption", "name", "EvalHash", "value", "8"]);
-                prepare_for_go(&mut engine);
-                assert_eq!(size(&engine), 8);
-                // 大きさを変えると確保済みの表は手放し、次の go で確保し直す。
-                engine.cmd_setoption(&["setoption", "name", "EvalHash", "value", "4"]);
-                assert_eq!(size(&engine), 0);
-                prepare_for_go(&mut engine);
-                assert_eq!(size(&engine), 4);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn eval_hash_large_pages_option_survives_resize() {
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let mut engine = UsiEngine::new();
-                assert!(engine.eval_hash_large_pages);
-                assert_eq!(engine.eval_hash_size_mb, 256);
-                engine.eval_hash_size_mb = 0;
-                engine.reported_eval_hash_page_status = TtPageStatus::LargePages;
-                engine.report_eval_hash_page_status(&rshogi_core::eval::EvalHash::new(0));
-                assert_eq!(engine.reported_eval_hash_page_status, TtPageStatus::LargePages);
-                engine.report_eval_hash_page_status(&rshogi_core::eval::EvalHash::new(1));
-                assert_eq!(engine.reported_eval_hash_page_status, TtPageStatus::Regular);
-                engine.eval_hash_size_mb = 256;
-                engine.cmd_setoption(&[
-                    "setoption",
-                    "name",
-                    "EvalHashLargePages",
-                    "value",
-                    "false",
-                ]);
-                assert_eq!(engine.search.as_ref().unwrap().eval_hash_size_mb(), 0);
-                engine.cmd_setoption(&["setoption", "name", "EvalHash", "value", "1"]);
-                prepare_for_go(&mut engine);
-                let regular = engine.search.as_ref().unwrap().eval_hash();
-                assert!(!regular.uses_large_pages());
-                assert!(!regular.huge_page_hint_requested());
-                regular.store(1, 42);
-                engine.cmd_setoption(&["setoption", "name", "EvalHashLargePages", "value", "true"]);
-                assert_eq!(engine.search.as_ref().unwrap().eval_hash_size_mb(), 0);
-                prepare_for_go(&mut engine);
-                let allocated = engine.search.as_ref().unwrap().eval_hash();
-                assert!(!Arc::ptr_eq(&regular, &allocated));
-                assert_eq!(allocated.probe(1), None);
-                engine.cmd_setoption(&[
-                    "setoption",
-                    "name",
-                    "EvalHashLargePages",
-                    "value",
-                    "false",
-                ]);
-                engine.cmd_setoption(&["setoption", "name", "EvalHash", "value", "3"]);
-                prepare_for_go(&mut engine);
-                assert!(!engine.eval_hash_large_pages);
-                let resized = engine.search.as_ref().unwrap().eval_hash();
-                assert!(!resized.uses_large_pages());
-                assert!(!resized.huge_page_hint_requested());
-                resized.store(1, -42);
-                assert_eq!(resized.probe(1), Some(-42));
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn explicit_spsa_defaults_preserve_unconfigured_search() {
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let mut engine = UsiEngine::new();
-                let defaults = engine.search.as_ref().unwrap().search_tune_params();
-                assert_eq!(SearchTuneParams::option_specs().len(), 173);
-                for spec in SearchTuneParams::option_specs() {
-                    let value = spec.default.to_string();
-                    engine.cmd_setoption(&["setoption", "name", spec.usi_name, "value", &value]);
-                    assert_eq!(
-                        engine.search.as_ref().unwrap().search_tune_params(),
-                        defaults,
-                        "{}",
-                        spec.usi_name
-                    );
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn embedded_spsa_params_are_applied_without_advertising_spsa_options() {
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let spec = &SearchTuneParams::option_specs()[0];
-                let baked = if spec.default < spec.max {
-                    spec.default + 1
-                } else {
-                    spec.default - 1
-                };
-                let mut engine = UsiEngine::new_with_spsa_net_spec(vec![format!(
-                    "{NET_DELTA_OPTION_PREFIX}out_w_b0_0"
-                )]);
-                let advertises_spsa = |engine: &UsiEngine| {
-                    engine
-                        .advertised_option_lines()
-                        .iter()
-                        .any(|l| l.starts_with("option name SPSA_"))
-                };
-                assert!(advertises_spsa(&engine));
-                let defaults = engine.search.as_ref().unwrap().search_tune_params();
-                let mut expected = defaults;
-                expected.set_from_usi_name(spec.usi_name, baked).unwrap();
-
-                engine
-                    .apply_embedded_spsa_params(&[(spec.usi_name, baked), ("SPSA_NoSuchParam", 5)]);
-                assert_eq!(engine.search.as_ref().unwrap().search_tune_params(), expected);
-                assert!(
-                    !advertises_spsa(&engine),
-                    "焼き込んだ build は SPSA_* / SPSA_NET_* を広告しない"
-                );
-
-                // 広告しなくても setoption と engine_options.txt の固定は受け付ける
-                let default_value = spec.default.to_string();
-                engine.cmd_setoption(&[
-                    "setoption",
-                    "name",
-                    spec.usi_name,
-                    "value",
-                    &default_value,
-                ]);
-                assert_eq!(engine.search.as_ref().unwrap().search_tune_params(), defaults);
-
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join(ENGINE_OPTIONS_FILE);
-                std::fs::write(&path, format!("{} {baked}", spec.usi_name)).unwrap();
-                engine.apply_engine_options_from(&path);
-                assert_eq!(engine.search.as_ref().unwrap().search_tune_params(), expected);
-                engine.cmd_setoption(&[
-                    "setoption",
-                    "name",
-                    spec.usi_name,
-                    "value",
-                    &default_value,
-                ]);
-                assert_eq!(engine.search.as_ref().unwrap().search_tune_params(), expected);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn fixed_spsa_values_are_not_overwritten_by_params_and_net_deltas_are_clamped() {
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let spec = &SearchTuneParams::option_specs()[0];
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join(ENGINE_OPTIONS_FILE);
-                std::fs::write(&path, format!("{} {}\n", spec.usi_name, spec.min)).unwrap();
-                let mut engine = UsiEngine::new();
-                engine.apply_engine_options_from(&path);
-                let report = engine.apply_spsa_params(&[(spec.usi_name.to_string(), spec.max)]);
-                assert_eq!(report.applied, 0);
-
-                let net = format!("{NET_DELTA_OPTION_PREFIX}out_w_b0_0");
-                let report = engine.apply_spsa_params(&[(net, 40000)]);
-                assert_eq!((report.applied, report.clamped), (1, 1));
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[test]
-    fn validate_option_value_checks_type_and_range() {
-        let spin = "option name USI_Hash type spin default 256 min 1 max 4096";
-        assert!(validate_option_value(spin, "64").is_ok());
-        assert!(validate_option_value(spin, "0").is_err());
-        assert!(validate_option_value(spin, "abc").is_err());
-        let check = "option name UseEvalHash type check default true";
-        assert!(validate_option_value(check, "false").is_ok());
-        assert!(validate_option_value(check, "yes").is_err());
-        let combo = "option name MateMode type combo default Power var Speed var Power";
-        assert!(validate_option_value(combo, "Speed").is_ok());
-        assert!(validate_option_value(combo, "Fast").is_err());
-        let string = "option name EvalFile type string default eval/nn.bin";
-        assert!(validate_option_value(string, "any path").is_ok());
-    }
-
-    #[test]
-    fn parse_engine_options_accepts_three_forms() {
-        let text = "\u{feff}# comment\n// comment\n\nUSI_Hash 64\nSkill Level = 10\n\
-                    option name BookFile type string default user book.db\n\
-                    option name Threads type spin default 4 min 1 max 512\n\
-                    option name\n";
-        let entries = parse_engine_options(text);
-        let ok: Vec<_> = entries
-            .iter()
-            .filter_map(|(n, e)| e.as_ref().ok().map(|kv| (*n, kv.clone())))
-            .collect();
-        assert_eq!(
-            ok,
-            vec![
-                (4, ("USI_Hash".to_string(), "64".to_string())),
-                (5, ("Skill Level".to_string(), "10".to_string())),
-                (6, ("BookFile".to_string(), "user book.db".to_string())),
-                (7, ("Threads".to_string(), "4".to_string())),
-            ]
-        );
-        assert!(matches!(entries.last(), Some((8, Err(_)))));
-    }
-
-    #[test]
-    fn resolve_option_path_uses_file_dir_for_relative_paths_only() {
-        let base = Path::new("base");
-        assert_eq!(
-            resolve_option_path("EvalFile", "eval/nn.bin", base),
-            base.join("eval/nn.bin").to_string_lossy()
-        );
-        assert_eq!(resolve_option_path("BookFile", "user_book1.db", base), "user_book1.db");
-        assert_eq!(resolve_option_path("LS_PROGRESS_COEFF", "<empty>", base), "<empty>");
-        let absolute = std::env::current_dir().unwrap().join("nn.bin");
-        let absolute = absolute.to_string_lossy();
-        assert_eq!(resolve_option_path("EvalFile", &absolute, base), absolute);
-    }
-
-    #[test]
-    #[serial]
-    fn engine_options_file_fixes_options_against_setoption() {
-        std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn(|| {
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join(ENGINE_OPTIONS_FILE);
-                std::fs::write(&path, "usi_hash 64\nBookDir=mybook\nNoSuchOption 1\n").unwrap();
-                let mut engine = UsiEngine::new();
-                engine.apply_engine_options_from(&path);
-                assert_eq!(engine.tt_size_mb, 64);
-                assert_eq!(Path::new(&engine.book_dir), dir.path().join("mybook"));
-
-                engine.cmd_setoption(&["setoption", "name", "USI_Hash", "value", "128"]);
-                assert_eq!(engine.tt_size_mb, 64);
-                engine.cmd_setoption(&["setoption", "name", "BookFile", "value", "a.db"]);
-                assert_eq!(engine.book_file, "a.db");
-
-                // 同じ名前は最後の行、不正な値は適用も固定もしない
-                std::fs::write(&path, "USI_Hash 32\nUSI_Hash 64\nThreads abc\nBookDir=mybook\n")
-                    .unwrap();
-                engine.apply_engine_options_from(&path);
-                assert_eq!(engine.tt_size_mb, 64);
-                assert!(!engine.fixed_options.contains_key("threads"));
-                std::fs::write(&path, "USI_Hash 32\nBookDir=mybook\n").unwrap();
-                engine.apply_engine_options_from(&path);
-                assert_eq!(engine.tt_size_mb, 32);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
     // 履歴統計の初期化がスタックを大量に消費するため、別スレッドで実行
     // UsiEngine::new() が NNUE グローバル状態に依存するため、全テストを #[serial] で逐次実行
     const STACK_SIZE: usize = 64 * 1024 * 1024;
 
     #[test]
-    fn spsa_net_spec_accepts_names_and_params_rows() {
-        let content = r#"
-# comment
-SPSA_NET_out_w_b3_17
-SPSA_NET_out_b_b0_0,int,0,-10,10,1,0.1 // output bias
-SPSA_NET_ft_b_1023,int,0,-10,10,1,0.1 [[NOT USED]]
-// ignored
-"#;
-        assert_eq!(
-            parse_spsa_net_spec(content).expect("spec"),
-            [
-                "SPSA_NET_out_w_b3_17",
-                "SPSA_NET_out_b_b0_0",
-                "SPSA_NET_ft_b_1023"
-            ]
-        );
-    }
-
-    #[test]
-    fn spsa_net_spec_reports_invalid_line_and_name() {
-        let error = parse_spsa_net_spec("# ok\nSPSA_NET_out_w_17,int,0").expect_err("invalid name");
-        let message = error.to_string();
-        assert!(message.contains("line 2"), "{message}");
-        assert!(message.contains("SPSA_NET_out_w_17"), "{message}");
-    }
-
-    #[test]
     #[serial]
-    fn setoption_net_delta_saves_value_and_tracks_dirty_state() {
+    fn parse_go_mate_sets_limits() {
         std::thread::Builder::new()
             .stack_size(STACK_SIZE)
             .spawn(|| {
-                let mut engine = UsiEngine::new();
-                let name = "SPSA_NET_l2_w_b2_45";
-                let id = NetCoefficientId::parse_usi_name(name).expect("id");
+                let engine = UsiEngine::new();
+                let tokens = vec!["go", "mate", "5"];
 
-                engine.cmd_setoption(&["setoption", "name", name, "value", "12"]);
-                assert_eq!(engine.net_deltas.get(&id), Some(&12));
-                assert!(engine.net_deltas_dirty);
-
-                engine.net_deltas_dirty = false;
-                engine.cmd_setoption(&["setoption", "name", name, "value", "12"]);
-                assert!(!engine.net_deltas_dirty);
-
-                engine.cmd_setoption(&["setoption", "name", name, "value", "0"]);
-                assert_eq!(engine.net_deltas.get(&id), Some(&0));
-                assert!(engine.net_deltas_dirty);
-
-                engine.net_deltas_dirty = false;
-                engine.cmd_setoption(&["setoption", "name", "SPSA_NET_out_w_3", "value", "1"]);
-                assert!(!engine.net_deltas_dirty);
+                let limits = engine.parse_go_options(&tokens);
+                assert_eq!(limits.mate, 5);
+                assert!(!limits.use_time_management(), "mate search disables time management");
             })
             .unwrap()
             .join()
@@ -3250,664 +2390,36 @@ SPSA_NET_ft_b_1023,int,0,-10,10,1,0.1 [[NOT USED]]
 
     #[test]
     #[serial]
-    fn parse_go_searchmoves_special_values() {
+    fn parse_go_mate_without_value_defaults_to_infinite() {
         std::thread::Builder::new()
             .stack_size(STACK_SIZE)
             .spawn(|| {
-                let mut engine = UsiEngine::new();
-                let tokens = [
-                    "go",
-                    "searchmoves",
-                    "pass",
-                    "0000",
-                    "win",
-                    "5i4i",
-                    "depth",
-                    "1",
-                ];
-                for rank1 in ["4k4", "4k3p", "4k3P"] {
-                    engine.position.set_sfen(&format!("{rank1}/9/9/9/9/9/9/9/4K4 b - 1")).unwrap();
-                    let ordinary =
-                        engine.position.to_move(Move::from_usi("5i4i").unwrap()).unwrap();
-                    let limits = engine.parse_go_options(&tokens);
-                    assert_eq!(limits.search_moves, [ordinary]);
-                    engine.position.enable_pass_rights(1, 1);
-                    let limits = engine.parse_go_options(&tokens);
-                    assert_eq!(limits.search_moves, [Move::PASS, Move::PASS, ordinary]);
-                    assert_eq!(limits.depth, 1);
-                    let pass_only = engine.parse_go_options(&["go", "searchmoves", "pass"]);
-                    let roots = rshogi_core::search::RootMoves::from_legal_moves(
-                        &engine.position,
-                        &pass_only.search_moves,
-                    );
-                    assert_eq!(roots.len(), 1);
-                    assert!(roots.find(Move::PASS).is_some());
-                    engine.position.enable_pass_rights(0, 1);
-                    assert_eq!(engine.parse_go_options(&tokens).search_moves, [ordinary]);
-                }
-                engine.position.set_sfen("4k4/9/9/9/9/9/9/4r4/4K4 b - 1").unwrap();
-                engine.position.enable_pass_rights(1, 1);
-                assert!(engine.position.in_check());
-                assert!(
-                    engine
-                        .parse_go_options(&["go", "searchmoves", "pass", "0000", "win"])
-                        .search_moves
-                        .is_empty()
-                );
+                let engine = UsiEngine::new();
+                let tokens = vec!["go", "mate"];
+
+                let limits = engine.parse_go_options(&tokens);
+                assert_eq!(limits.mate, i32::MAX);
             })
             .unwrap()
             .join()
             .unwrap();
     }
-    #[test]
-    fn parse_go_mate_time_accepts_ms_and_infinite() {
-        assert_eq!(parse_go_mate_time(&["go", "mate", "1500"]), 1500);
-        assert_eq!(parse_go_mate_time(&["go", "mate"]), 0);
-        assert_eq!(parse_go_mate_time(&["go", "mate", "infinite"]), 0);
-        assert_eq!(parse_go_mate_time(&["go", "mate", "abc"]), 0);
-    }
 
     #[test]
-    fn checkmate_response_formats_each_outcome() {
-        let pv = vec![Move::from_usi("G*5b").unwrap()];
-        assert_eq!(checkmate_response(&MateResult::Mate(pv)), "checkmate G*5b");
-        assert_eq!(checkmate_response(&MateResult::NoMate), "checkmate nomate");
-        assert_eq!(checkmate_response(&MateResult::Unknown), "checkmate timeout");
-        assert_eq!(checkmate_response(&MateResult::Unsupported), "checkmate notimplemented");
-    }
+    #[serial]
+    fn parse_go_mate_infinite_defaults_to_max() {
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let engine = UsiEngine::new();
+                let tokens = vec!["go", "mate", "infinite"];
 
-    #[test]
-    fn position_commands_preserve_existing_enemy_check() {
-        let cases = [
-            (
-                "4k4/9/9/9/4R4/9/9/9/4K4 b G 1",
-                &[("G*1h", [2, 0]), ("5a4a", [2, 0]), ("5e4e", [4, 0])][..],
-            ),
-            (
-                "4k4/9/9/9/4R4/9/9/9/9 b G 1",
-                &[("G*1h", [2, 0]), ("5a4a", [2, 0]), ("5e4e", [4, 0])],
-            ),
-            (
-                "4k4/9/9/9/4r4/9/9/9/4K4 w g 1",
-                &[("G*1b", [0, 2]), ("5i4i", [0, 2]), ("5e4e", [0, 4])],
-            ),
-            (
-                "4k4/9/9/9/4R4/9/9/9/4K4 b G 1",
-                &[("G*1h", [2, 0]), ("5a4a", [2, 0]), ("5e5d", [0, 0])],
-            ),
-            ("4k4/9/9/9/4R4/9/9/9/4K4 b G 1", &[("G*5c", [0, 0])]),
-            (
-                "4k4/4p4/9/9/4R4/9/9/9/4K4 b - 1",
-                &[("5e5b+", [2, 0]), ("5a5b", [2, 0]), ("P*5e", [0, 0])],
-            ),
-        ];
-        let snapshot = |position: &Position| {
-            (
-                position.to_sfen(),
-                position.key(),
-                position.state().checkers,
-                position.state().continuous_check,
-                position.king_square(Color::Black),
-                position.king_square(Color::White),
-                position.state().last_move,
-            )
-        };
-        for (sfen, steps) in cases {
-            let mut position = Position::new();
-            let mut line = format!("position sfen {sfen} moves");
-            UsiEngine::apply_position_tokens(
-                &mut position,
-                &line.split_whitespace().collect::<Vec<_>>(),
-                false,
-                2,
-            )
+                let limits = engine.parse_go_options(&tokens);
+                assert_eq!(limits.mate, i32::MAX);
+            })
+            .unwrap()
+            .join()
             .unwrap();
-            let mut history = Vec::new();
-            for &(token, continuous_check) in steps {
-                history.push(snapshot(&position));
-                line.push(' ');
-                line.push_str(token);
-                UsiEngine::apply_position_tokens(
-                    &mut position,
-                    &line.split_whitespace().collect::<Vec<_>>(),
-                    false,
-                    2,
-                )
-                .unwrap_or_else(|err| panic!("{line}: {err}"));
-                let mut fresh = Position::new();
-                fresh.set_sfen(&position.to_sfen()).unwrap();
-                fresh.clear_checkers_without_king();
-                assert_eq!(position.state().checkers, fresh.state().checkers, "{line}");
-                assert_eq!(position.key(), fresh.key(), "{line}");
-                assert_eq!(position.state().continuous_check, continuous_check, "{line}");
-                assert_eq!(
-                    position.in_check(),
-                    continuous_check[(!position.side_to_move()).index()] != 0,
-                    "{line}"
-                );
-                let before = snapshot(&position);
-                let invalid = format!("{line} 1a1b");
-                assert!(
-                    UsiEngine::apply_position_tokens(
-                        &mut position,
-                        &invalid.split_whitespace().collect::<Vec<_>>(),
-                        false,
-                        2,
-                    )
-                    .is_err(),
-                    "{invalid}"
-                );
-                assert_eq!(snapshot(&position), before, "{invalid}");
-            }
-            for (&(token, _), before) in steps.iter().zip(history).rev() {
-                position.undo_move(Move::from_usi_strict(token).unwrap());
-                assert_eq!(snapshot(&position), before, "{sfen}: undo {token}");
-            }
-        }
-    }
-
-    #[test]
-    fn position_commands_existing_enemy_check_preserves_repetition() {
-        for sfen in [
-            "4k4/9/9/9/4R4/9/9/9/4K4 b G 1",
-            "4k4/9/9/9/4R4/9/9/9/9 b G 1",
-        ] {
-            let cycle = "5a4a 5e4e 4a5a 4e5e ";
-            let moves = format!("G*1h {}", cycle.repeat(3));
-            let line = format!("position sfen {sfen} moves {moves}");
-            let mut position = Position::new();
-            UsiEngine::apply_position_tokens(
-                &mut position,
-                &line.split_whitespace().collect::<Vec<_>>(),
-                false,
-                2,
-            )
-            .unwrap();
-            assert!(position.in_check());
-            assert_eq!(position.state().continuous_check, [14, 0]);
-            assert_eq!(position.game_ply(), 14);
-            assert_eq!(position.repetition_state(16), rshogi_core::types::RepetitionState::Win);
-            for token in moves.split_whitespace().rev() {
-                position.undo_move(Move::from_usi_strict(token).unwrap());
-                let mut fresh = Position::new();
-                fresh.set_sfen(&position.to_sfen()).unwrap();
-                fresh.clear_checkers_without_king();
-                assert_eq!(position.state().checkers, fresh.state().checkers);
-            }
-            assert_eq!(position.to_sfen(), sfen);
-            assert_eq!(position.state().continuous_check, [0, 0]);
-        }
-    }
-
-    #[test]
-    fn position_commands_reject_pawn_drop_mate_during_existing_check() {
-        let mut position = Position::new();
-        UsiEngine::apply_position_tokens(
-            &mut position,
-            &["position", "startpos", "moves", "7g7f", "3c3d"],
-            false,
-            2,
-        )
-        .unwrap();
-        let before = position.to_sfen();
-        let key = position.key();
-        for line in [
-            "position sfen 3pk3R/5g3/4G4/9/9/9/9/9/4K4 b P 1 moves P*5b",
-            "position sfen 3pk3R/5g3/4G4/9/9/9/9/9/9 b P 1 moves P*5b",
-            "position sfen 4k4/9/9/9/9/9/4g4/3G5/r3KP3 w p 1 moves P*5h",
-            "position sfen 9/9/9/9/9/9/4g4/3G5/r3KP3 w p 1 moves P*5h",
-        ] {
-            let error = UsiEngine::apply_position_tokens(
-                &mut position,
-                &line.split_whitespace().collect::<Vec<_>>(),
-                false,
-                2,
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("Illegal pawn-drop mate"), "{line}: {error}");
-            assert_eq!(position.to_sfen(), before, "{line}");
-            assert_eq!(position.key(), key, "{line}");
-        }
-        position.undo_move(Move::from_usi_strict("3c3d").unwrap());
-        position.undo_move(Move::from_usi_strict("7g7f").unwrap());
-        assert_eq!(position.to_sfen(), rshogi_core::position::SFEN_HIRATE);
-    }
-
-    #[test]
-    fn position_commands_accept_pawn_checks_with_legal_replies() {
-        for (sfen, moves, checker_count, expected) in [
-            (
-                "3pk3R/5g3/9/9/9/9/9/9/4K4 b P 1",
-                "P*5b 5a5b",
-                2,
-                "3p4R/4kg3/9/9/9/9/9/9/4K4 b p 3",
-            ),
-            (
-                "3pk3R/9/3G5/9/9/9/9/9/4K4 b P 1",
-                "P*5b 5a4b",
-                2,
-                "3p4R/4Pk3/3G5/9/9/9/9/9/4K4 b - 3",
-            ),
-            (
-                "3pk4/5g3/4G4/9/9/9/9/9/4K4 b P 1",
-                "P*5b 4b5b",
-                1,
-                "3pk4/4g4/4G4/9/9/9/9/9/4K4 b p 3",
-            ),
-            ("3pk3R/5g3/9/9/9/9/9/9/9 b P 1", "P*5b 5a5b", 2, "3p4R/4kg3/9/9/9/9/9/9/9 b p 3"),
-        ] {
-            let mut position = Position::new();
-            position.set_sfen(sfen).unwrap();
-            let root_key = position.key();
-            let line = format!("position sfen {sfen} moves {moves}");
-            UsiEngine::apply_position_tokens(
-                &mut position,
-                &line.split_whitespace().collect::<Vec<_>>(),
-                false,
-                2,
-            )
-            .unwrap_or_else(|error| panic!("{line}: {error}"));
-            assert_eq!(position.to_sfen(), expected, "{line}");
-            assert!(!position.in_check(), "{line}");
-            let mut parsed_moves =
-                moves.split_whitespace().map(|m| Move::from_usi_strict(m).unwrap());
-            let pawn_drop = parsed_moves.next().unwrap();
-            position.undo_move(parsed_moves.next().unwrap());
-            assert_eq!(position.checkers().count(), checker_count, "{line}");
-            assert!(position.checkers().contains(pawn_drop.to()), "{line}");
-            assert_eq!(position.state().continuous_check, [2, 0], "{line}");
-            assert_eq!(position.game_ply(), 2, "{line}");
-            let mut fresh = Position::new();
-            fresh.set_sfen(&position.to_sfen()).unwrap();
-            assert_eq!(position.key(), fresh.key(), "{line}");
-            assert_eq!(position.checkers(), fresh.checkers(), "{line}");
-            position.undo_move(pawn_drop);
-            assert_eq!(position.to_sfen(), sfen, "{line}");
-            assert_eq!(position.key(), root_key, "{line}");
-            assert_eq!(position.state().continuous_check, [0, 0], "{line}");
-        }
-    }
-
-    #[test]
-    fn position_commands_accept_nonchecking_pawn_drop_with_existing_mate() {
-        let sfen = "3pk3R/9/4G4/9/9/9/9/9/4K4 b P 1";
-        let line = format!("position sfen {sfen} moves P*1h");
-        let mut position = Position::new();
-        UsiEngine::apply_position_tokens(
-            &mut position,
-            &line.split_whitespace().collect::<Vec<_>>(),
-            false,
-            2,
-        )
-        .unwrap();
-        assert_eq!(position.to_sfen(), "3pk3R/9/4G4/9/9/9/9/8P/4K4 w - 2");
-        let pawn_drop = Move::from_usi_strict("P*1h").unwrap();
-        assert!(position.in_check());
-        assert!(!position.checkers().contains(pawn_drop.to()));
-        let mut replies = MoveList::new();
-        generate_legal_all(&position, &mut replies);
-        assert!(replies.is_empty());
-        assert_eq!(position.state().continuous_check, [2, 0]);
-        position.undo_move(pawn_drop);
-        assert_eq!(position.to_sfen(), sfen);
-    }
-
-    #[test]
-    fn position_commands_reject_duplicate_kings_atomically() {
-        let mut position = Position::new();
-        UsiEngine::apply_position_tokens(
-            &mut position,
-            &["position", "startpos", "moves", "7g7f", "3c3d"],
-            false,
-            2,
-        )
-        .unwrap();
-        let before = position.to_sfen();
-        let key = position.key();
-        for line in [
-            "position sfen 4K4/r8/9/9/9/9/9/9/4K4 b - 1 moves 5a5b",
-            "position sfen 4K4/r8/9/9/9/9/9/9/4K4 b - 1",
-            "position sfen 4k4/R8/9/9/9/9/9/9/4k4 w - 1 moves 5a5b",
-            "position sfen 4k4/R8/9/9/9/9/9/9/4k4 w - 1",
-        ] {
-            assert!(
-                UsiEngine::apply_position_tokens(
-                    &mut position,
-                    &line.split_whitespace().collect::<Vec<_>>(),
-                    false,
-                    2,
-                )
-                .is_err(),
-                "{line}"
-            );
-            assert_eq!(position.to_sfen(), before, "{line}");
-            assert_eq!(position.key(), key, "{line}");
-        }
-        position.undo_move(Move::from_usi_strict("3c3d").unwrap());
-        position.undo_move(Move::from_usi_strict("7g7f").unwrap());
-        assert_eq!(position.to_sfen(), rshogi_core::position::SFEN_HIRATE);
-    }
-
-    #[test]
-    fn position_commands_accept_moves_without_kings() {
-        let mut failures = Vec::new();
-        for (sfen, moves, expected) in [
-            ("4k4/9/9/9/9/9/9/9/8r b G 1", "", "4k4/9/9/9/9/9/9/9/8r b G 1"),
-            ("4k4/8g/4P4/9/9/9/9/9/9 b G 1", "G*5b", "4k4/4G3g/4P4/9/9/9/9/9/9 w - 2"),
-            ("4k4/9/9/9/9/9/9/9/8r b G 1", "G*5b", "4k4/4G4/9/9/9/9/9/9/8r w - 2"),
-            ("4k4/9/9/9/9/9/9/9/8r b G 1", "G*5b 5a5b", "9/4k4/9/9/9/9/9/9/8r b g 3"),
-            ("8G/7r1/9/9/9/9/9/9/4k4 b - 1", "1a1b", "9/7rG/9/9/9/9/9/9/4k4 w - 2"),
-            ("4k4/9/9/9/8G/9/9/9/8r b - 1", "1e2e", "4k4/9/9/9/7G1/9/9/9/8r w - 2"),
-            ("7pp/7p1/7G1/9/9/9/9/9/4K4 b P 1", "P*1b", "7pp/7pP/7G1/9/9/9/9/9/4K4 w - 2"),
-            ("9/9/9/9/9/9/9/9/4K3R w g 1", "G*5h", "9/9/9/9/9/9/9/4g4/4K3R b - 2"),
-            (
-                "4k4/9/4p4/4P4/9/9/9/9/9 b - 23",
-                "5d5c+ 5a4a P*5e",
-                "5k3/9/4+P4/9/4P4/9/9/9/9 w - 26",
-            ),
-        ] {
-            let mut position = Position::new();
-            let line = format!("position sfen {sfen} moves {moves}");
-            if let Err(err) = UsiEngine::apply_position_tokens(
-                &mut position,
-                &line.split_whitespace().collect::<Vec<_>>(),
-                false,
-                2,
-            ) {
-                failures.push(format!("{line}: {err}"));
-                continue;
-            }
-            assert_eq!(position.to_sfen(), expected, "{line}");
-            if position.pieces(position.side_to_move(), PieceType::King).is_empty() {
-                assert!(!position.in_check(), "{line}");
-            }
-            for token in moves.split_whitespace().rev() {
-                position.undo_move(Move::from_usi_strict(token).unwrap());
-                if position.pieces(position.side_to_move(), PieceType::King).is_empty() {
-                    assert!(!position.in_check(), "{line}");
-                }
-            }
-            assert_eq!(position.to_sfen(), sfen, "{line}");
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-    }
-
-    #[test]
-    fn position_commands_missing_kings_preserve_repetition_history() {
-        let sfen = "9/9/9/9/4G4/9/9/9/8r b - 1";
-        let cycle = "5e4e 1i1h 4e5e 1h1i ";
-        let line = format!("position sfen {sfen} moves {}", cycle.repeat(3));
-        let mut position = Position::new();
-        UsiEngine::apply_position_tokens(
-            &mut position,
-            &line.split_whitespace().collect::<Vec<_>>(),
-            false,
-            2,
-        )
-        .unwrap();
-        assert_eq!(position.to_sfen(), "9/9/9/9/4G4/9/9/9/8r b - 13");
-        assert!(!position.in_check());
-        assert_eq!(position.repetition_state(16), rshogi_core::types::RepetitionState::Draw);
-        assert_eq!(position.state().continuous_check, [0, 0]);
-        for token in cycle.repeat(3).split_whitespace().rev() {
-            position.undo_move(Move::from_usi_strict(token).unwrap());
-            assert!(!position.in_check());
-        }
-        assert_eq!(position.to_sfen(), sfen);
-    }
-
-    #[test]
-    fn position_commands_missing_king_pass_preserves_rights() {
-        use rshogi_core::types::Color;
-
-        let sfen = "9/9/9/9/9/9/9/9/8r b G 1";
-        let line = format!("position sfen {sfen} passrights 1 1 moves pass 0000");
-        let mut position = Position::new();
-        UsiEngine::apply_position_tokens(
-            &mut position,
-            &line.split_whitespace().collect::<Vec<_>>(),
-            true,
-            2,
-        )
-        .unwrap();
-        assert_eq!(position.to_sfen(), "9/9/9/9/9/9/9/9/8r b G 3");
-        assert_eq!(position.pass_rights(Color::Black), 0);
-        assert_eq!(position.pass_rights(Color::White), 0);
-        assert!(!position.in_check());
-        assert_eq!(position.state().continuous_check, [0, 0]);
-        let before = position.to_sfen();
-        let key = position.key();
-        for (enabled, moves) in [(false, "pass"), (true, "pass 0000 pass")] {
-            let line = format!("position sfen {sfen} passrights 1 1 moves {moves}");
-            assert!(
-                UsiEngine::apply_position_tokens(
-                    &mut position,
-                    &line.split_whitespace().collect::<Vec<_>>(),
-                    enabled,
-                    2,
-                )
-                .is_err(),
-                "{line}"
-            );
-            assert_eq!(position.to_sfen(), before);
-            assert_eq!(position.key(), key);
-        }
-        position.undo_move(Move::PASS);
-        position.undo_move(Move::PASS);
-        assert_eq!(position.to_sfen(), sfen);
-        assert_eq!(position.pass_rights(Color::Black), 1);
-        assert_eq!(position.pass_rights(Color::White), 1);
-        assert!(!position.in_check());
-
-        for sfen in [
-            "4k4/9/9/9/4R4/9/9/9/9 b - 1",
-            "4k4/9/9/9/4R4/9/9/9/4K4 b - 1",
-        ] {
-            let line = format!("position sfen {sfen} passrights 1 1 moves pass");
-            UsiEngine::apply_position_tokens(
-                &mut position,
-                &line.split_whitespace().collect::<Vec<_>>(),
-                true,
-                2,
-            )
-            .unwrap();
-            assert_eq!(position.side_to_move(), Color::White);
-            assert!(position.in_check());
-            assert!(!position.can_pass());
-            assert_eq!(position.state().continuous_check, [2, 0]);
-            let before = position.to_sfen();
-            let key = position.key();
-            let invalid = format!("{line} 0000");
-            assert!(
-                UsiEngine::apply_position_tokens(
-                    &mut position,
-                    &invalid.split_whitespace().collect::<Vec<_>>(),
-                    true,
-                    2,
-                )
-                .is_err()
-            );
-            assert_eq!(position.to_sfen(), before);
-            assert_eq!(position.key(), key);
-            assert_eq!(position.state().continuous_check, [2, 0]);
-            position.undo_move(Move::PASS);
-            assert_eq!(position.to_sfen(), sfen);
-            assert_eq!(position.pass_rights(Color::Black), 1);
-            assert_eq!(position.pass_rights(Color::White), 1);
-            assert_eq!(position.state().continuous_check, [0, 0]);
-        }
-    }
-
-    #[test]
-    fn position_commands_reject_invalid_input_atomically() {
-        let mut position = Position::new();
-        UsiEngine::apply_position_tokens(
-            &mut position,
-            &["position", "startpos", "moves", "7g7f", "3c3d"],
-            false,
-            2,
-        )
-        .unwrap();
-        let before = position.to_sfen();
-        let key = position.key();
-        for line in [
-            "position",
-            "position unknown",
-            "position startpos extra",
-            "position sfen invalid b - 1",
-            "position sfen 4k4/9/9/9/9/9/9/9/4K4 x - 1",
-            "position sfen 4k4/9/9/9/9/9/9/9/4K4 b 19P 1",
-            "position sfen 4k4/9/9/9/9/9/9/9/4K4 b - invalid",
-            "position sfen 4k4/9/9/9/9/9/9/9/4K4 b - 0",
-            "position sfen 4k4/9/9/9/9/9/9/9/4K4 b - -1",
-            "position sfen 4k4/9/9/9/9/9/9/9/4K4 b - 1073741824",
-            "position sfen 4k4/9/9/9/9/9/9/9/4K4 b - 1 extra",
-            "position sfen 4k4/9/9/9/9/9/9/9/4K4 b - 2147483647 moves 5i5h",
-            "position startpos moves 7g7e",
-            "position startpos moves 5e5d",
-            "position startpos moves 3c3d",
-            "position startpos moves 7g7f+",
-            "position startpos moves 6i6h+",
-            "position startpos moves P*5e",
-            "position startpos moves 7g7f 3c3d 5e5d",
-            "position startpos moves 7g7f 3c3d invalid",
-            "position startpos moves 7g7fextra",
-            "position startpos moves 7g7fあ",
-            "position startpos moves none",
-            "position startpos moves win",
-            "position startpos moves pass",
-            "position startpos moves 0000",
-            "position sfen 4r3k/9/9/9/9/9/9/4G4/4K4 b - 1 moves 5h4h",
-            "position sfen 8k/4P4/9/9/9/9/9/9/4K4 b - 1 moves 5b5a",
-            "position sfen 4k4/9/3GN1B2/4R4/9/9/9/9/4K4 b P 1 moves P*5b",
-            "position sfen 4k4/9/9/9/4P4/9/9/9/4K4 b P 1 moves P*5d",
-            "position sfen 4k4/9/9/9/9/9/4P4/9/9 b - 1 moves 5g5e",
-            "position sfen 4k4/9/9/9/9/9/4P4/9/9 b - 1 moves 5g5f+",
-            "position sfen 4k4/9/9/9/9/9/9/9/9 b - 1 moves 5e5d",
-            "position sfen 4k4/9/9/9/9/9/9/9/9 b - 1 moves 5a5b",
-            "position sfen 4k4/9/9/9/9/9/9/9/9 b - 1 moves P*5e",
-            "position sfen 4k4/9/9/9/4P4/9/9/9/9 b P 1 moves P*5d",
-            "position sfen 4k4/9/9/9/9/9/9/9/9 b P 1 moves P*4a",
-            "position sfen 4k4/9/9/9/9/9/9/9/9 b L 1 moves L*4a",
-            "position sfen 4k4/9/9/9/9/9/9/9/9 b N 1 moves N*4b",
-            "position sfen 8k/4P4/9/9/9/9/9/9/9 b - 1 moves 5b5a",
-            "position sfen 8k/4G4/9/9/9/9/9/9/9 b - 1 moves 5b5a+",
-            "position sfen 4k4/4G4/9/9/9/9/9/9/9 b - 1 moves 5b5a",
-            "position sfen 4k4/9/3GN1B2/4R4/9/9/9/9/9 b P 1 moves P*5b",
-            "position sfen 4r4/9/9/9/9/9/9/4G4/4K4 b - 1 moves 5h4h",
-            "position sfen 4r4/9/9/9/9/9/9/9/4K4 b - 1 moves 5i5h",
-            "position sfen 4k4/9/9/9/9/9/9/9/8r b G 1 moves G*5b 5a5b 5e5d",
-        ] {
-            let tokens: Vec<_> = line.split_whitespace().collect();
-            assert!(
-                UsiEngine::apply_position_tokens(&mut position, &tokens, false, 2).is_err(),
-                "{line}"
-            );
-            assert_eq!(position.to_sfen(), before, "{line}");
-            assert_eq!(position.key(), key, "{line}");
-        }
-        position.undo_move(Move::from_usi_strict("3c3d").unwrap());
-        position.undo_move(Move::from_usi_strict("7g7f").unwrap());
-        assert_eq!(position.to_sfen(), rshogi_core::position::SFEN_HIRATE);
-    }
-
-    #[test]
-    fn position_commands_preserve_capture_drop_and_repetition_history() {
-        let mut position = Position::new();
-        let line = "position sfen 4k4/9/4p4/4P4/9/9/9/9/4K4 b - 23 moves 5d5c+ 5a4a P*5e";
-        UsiEngine::apply_position_tokens(
-            &mut position,
-            &line.split_whitespace().collect::<Vec<_>>(),
-            false,
-            2,
-        )
-        .unwrap();
-        assert_eq!(position.to_sfen(), "5k3/9/4+P4/9/4P4/9/9/9/4K4 w - 26");
-        for token in ["P*5e", "5a4a", "5d5c+"] {
-            position.undo_move(Move::from_usi_strict(token).unwrap());
-        }
-        assert_eq!(position.to_sfen(), "4k4/9/4p4/4P4/9/9/9/9/4K4 b - 23");
-
-        let cycle = "5i5h 5a5b 5h5i 5b5a ";
-        let line = format!("position sfen 4k4/9/9/9/9/9/9/9/4K4 b P 11 moves {}", cycle.repeat(3));
-        UsiEngine::apply_position_tokens(
-            &mut position,
-            &line.split_whitespace().collect::<Vec<_>>(),
-            false,
-            2,
-        )
-        .unwrap();
-        assert_eq!(position.game_ply(), 23);
-        assert_eq!(position.repetition_state(16), rshogi_core::types::RepetitionState::Draw);
-        let before = position.to_sfen();
-        assert!(
-            UsiEngine::apply_position_tokens(
-                &mut position,
-                &["position", "startpos", "moves", "5e5d"],
-                false,
-                2,
-            )
-            .is_err()
-        );
-        assert_eq!(position.to_sfen(), before);
-        assert_eq!(position.repetition_state(16), rshogi_core::types::RepetitionState::Draw);
-    }
-
-    #[test]
-    fn position_commands_validate_pass_rights_and_pass_legality() {
-        use rshogi_core::types::Color;
-        let mut position = Position::new();
-        for (line, enabled, black, white) in [
-            ("position startpos moves pass 0000", true, 1, 1),
-            ("position startpos passrights 1 1 moves pass 0000", true, 0, 0),
-            ("position startpos passrights 15 15", true, 15, 15),
-            ("position startpos passrights 2 3", false, 0, 0),
-        ] {
-            UsiEngine::apply_position_tokens(
-                &mut position,
-                &line.split_whitespace().collect::<Vec<_>>(),
-                enabled,
-                2,
-            )
-            .unwrap();
-            assert_eq!(position.is_pass_rights_enabled(), enabled);
-            assert_eq!(position.pass_rights(Color::Black), black);
-            assert_eq!(position.pass_rights(Color::White), white);
-        }
-        let before = position.to_sfen();
-        let key = position.key();
-        for enabled in [false, true] {
-            for suffix in ["", "1", "x 1", "1 x", "16 1", "1 256", "1 1 extra"] {
-                let line = format!("position startpos passrights {suffix}");
-                assert!(
-                    UsiEngine::apply_position_tokens(
-                        &mut position,
-                        &line.split_whitespace().collect::<Vec<_>>(),
-                        enabled,
-                        2,
-                    )
-                    .is_err()
-                );
-                assert_eq!(position.to_sfen(), before);
-                assert_eq!(position.key(), key);
-            }
-        }
-        for line in [
-            "position startpos passrights 1 1 moves pass 0000 pass",
-            "position sfen 4r3k/9/9/9/9/9/9/9/4K4 b - 1 passrights 1 1 moves pass",
-        ] {
-            assert!(
-                UsiEngine::apply_position_tokens(
-                    &mut position,
-                    &line.split_whitespace().collect::<Vec<_>>(),
-                    true,
-                    2,
-                )
-                .is_err()
-            );
-            assert_eq!(position.to_sfen(), before);
-            assert_eq!(position.key(), key);
-        }
     }
 
     #[test]
@@ -3917,20 +2429,13 @@ SPSA_NET_ft_b_1023,int,0,-10,10,1,0.1 [[NOT USED]]
             .stack_size(STACK_SIZE)
             .spawn(|| {
                 let mut engine = UsiEngine::new();
-                let line = "position startpos moves 7g7f 3c3d";
-                engine.process_command(line).unwrap();
-                let before = engine.position.to_sfen();
-                engine.process_command("position startpos moves 7g7f 5e5d").unwrap();
-                assert_eq!(engine.last_position_cmd.as_deref(), Some(line));
-                assert_eq!(engine.position.to_sfen(), before);
+                engine.last_position_cmd = Some("position startpos moves 7g7f 3c3d".to_string());
 
                 let pos = engine.stochastic_ponder_position().expect("stochastic ponder position");
                 assert_eq!(
                     pos.to_sfen(),
                     "lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL w - 2"
                 );
-                engine.last_position_cmd = Some("position startpos moves 5e5d 3c3d".into());
-                assert!(engine.stochastic_ponder_position().is_none());
             })
             .unwrap()
             .join()
@@ -3950,12 +2455,6 @@ SPSA_NET_ft_b_1023,int,0,-10,10,1,0.1 [[NOT USED]]
                 let search = engine.search.as_ref().expect("search exists");
                 assert_eq!(search.draw_value_black(), 123);
                 assert_eq!(search.draw_value_white(), -456);
-                assert_eq!(engine.book_options.draw_value_black, 123);
-                assert_eq!(engine.book_options.draw_value_white, -456);
-                engine.cmd_setoption(&["setoption", "name", "DrawValueBlack", "value", "40000"]);
-                engine.cmd_setoption(&["setoption", "name", "DrawValueWhite", "value", "-40000"]);
-                assert_eq!(engine.book_options.draw_value_black, 30000);
-                assert_eq!(engine.book_options.draw_value_white, -30000);
             })
             .unwrap()
             .join()
@@ -3964,19 +2463,64 @@ SPSA_NET_ft_b_1023,int,0,-10,10,1,0.1 [[NOT USED]]
 
     #[test]
     #[serial]
-    fn setoption_layerstack_bucket_updates_pending_configuration() {
+    fn setoption_defense_mate_probe_nodes_updates_search() {
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let mut engine = UsiEngine::new();
+
+                // default は 0 (= 機能 OFF)。
+                assert_eq!(
+                    engine.search.as_ref().expect("search exists").defense_mate_probe_nodes(),
+                    0
+                );
+
+                // setoption で値が Search に反映されること。
+                engine.cmd_setoption(&[
+                    "setoption",
+                    "name",
+                    "DefenseMateProbeNodes",
+                    "value",
+                    "50000",
+                ]);
+                assert_eq!(
+                    engine.search.as_ref().expect("search exists").defense_mate_probe_nodes(),
+                    50000
+                );
+
+                // max を超える値は clamp されること。
+                engine.cmd_setoption(&[
+                    "setoption",
+                    "name",
+                    "DefenseMateProbeNodes",
+                    "value",
+                    "99999999",
+                ]);
+                assert_eq!(
+                    engine.search.as_ref().expect("search exists").defense_mate_probe_nodes(),
+                    10_000_000
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn setoption_layerstack_bucket_updates_globals() {
         std::thread::Builder::new()
             .stack_size(STACK_SIZE)
             .spawn(|| {
                 use rshogi_core::nnue::{
                     LayerStackBucketMode, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
-                    get_layer_stack_progress_buckets, get_layer_stack_progress_kpabs_weights,
-                    reset_layer_stack_progress_buckets, reset_layer_stack_progress_kpabs_weights,
+                    get_layer_stack_bucket_mode, get_layer_stack_progress_kpabs_weights,
+                    reset_layer_stack_progress_kpabs_weights, set_layer_stack_bucket_mode,
                 };
 
                 // テスト開始時に既定値へ戻す
+                set_layer_stack_bucket_mode(LayerStackBucketMode::Progress8KPAbs);
                 reset_layer_stack_progress_kpabs_weights();
-                rshogi_core::nnue::reset_layer_stack_progress_kpabs_q16_weights();
 
                 let mut engine = UsiEngine::new();
                 engine.cmd_setoption(&[
@@ -3984,22 +2528,9 @@ SPSA_NET_ft_b_1023,int,0,-10,10,1,0.1 [[NOT USED]]
                     "name",
                     "LS_BUCKET_MODE",
                     "value",
-                    "progresskpabs",
+                    "progress8kpabs",
                 ]);
-                assert_eq!(engine.ls_bucket_mode, Some(LayerStackBucketMode::ProgressKPAbs));
-
-                engine.cmd_setoption(&["setoption", "name", "LS_PROGRESS_BUCKETS", "value", "8"]);
-                assert_eq!(engine.ls_progress_buckets, Some(8));
-                assert_eq!(get_layer_stack_progress_buckets(), None);
-
-                engine.cmd_setoption(&[
-                    "setoption",
-                    "name",
-                    "LS_BUCKET_MODE",
-                    "value",
-                    "kingrank9",
-                ]);
-                assert_eq!(engine.ls_bucket_mode, Some(LayerStackBucketMode::KingRank9));
+                assert_eq!(get_layer_stack_bucket_mode(), LayerStackBucketMode::Progress8KPAbs);
 
                 let tmp_path_bin =
                     std::env::temp_dir().join("rshogi_progress_coeff_kpabs_test.bin");
@@ -4028,13 +2559,11 @@ SPSA_NET_ft_b_1023,int,0,-10,10,1,0.1 [[NOT USED]]
                 assert_eq!(kpabs.len(), SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS);
                 assert_eq!(kpabs[0], 1.25);
                 assert_eq!(kpabs[SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS - 1], -0.75);
-                assert!(engine.ls_progress_coeff_loaded);
                 let _ = std::fs::remove_file(tmp_path_bin);
 
                 // 他テストへの影響を避けるため復元
-                reset_layer_stack_progress_buckets();
+                set_layer_stack_bucket_mode(LayerStackBucketMode::Progress8KPAbs);
                 reset_layer_stack_progress_kpabs_weights();
-                rshogi_core::nnue::reset_layer_stack_progress_kpabs_q16_weights();
             })
             .unwrap()
             .join()
@@ -4042,25 +2571,121 @@ SPSA_NET_ft_b_1023,int,0,-10,10,1,0.1 [[NOT USED]]
     }
 
     #[test]
-    fn validate_layer_stack_routing_matrix() {
-        use LayerStackBucketMode::{KingRank9, ProgressKPAbs};
+    #[serial]
+    fn setoption_bucket_eval_scale_updates_search() {
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let mut engine = UsiEngine::new();
 
-        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(8), true).is_ok());
-        assert!(validate_layer_stack_routing(8, Some(ProgressKPAbs), Some(8), true).is_ok());
-        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(9), true).is_ok());
-        assert!(validate_layer_stack_routing(9, Some(KingRank9), None, false).is_ok());
-        // 1 は常に bucket 0 を選ぶ no-op routing (格納 1 bucket net の唯一の設定経路)。
-        // 係数を参照しないため LS_PROGRESS_COEFF 未ロードでも通る (ロード済みも可)。
-        assert!(validate_layer_stack_routing(1, Some(ProgressKPAbs), Some(1), false).is_ok());
-        assert!(validate_layer_stack_routing(1, Some(ProgressKPAbs), Some(1), true).is_ok());
-        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(1), false).is_ok());
+                // 正常系: 8要素カンマ区切り
+                engine.cmd_setoption(&[
+                    "setoption",
+                    "name",
+                    "LS_BUCKET_EVAL_SCALE",
+                    "value",
+                    "80,90,100,110,120,130,140,150",
+                ]);
+                let search = engine.search.as_ref().expect("search exists");
+                let scale = search.bucket_eval_scale();
+                assert_eq!(scale, [80, 90, 100, 110, 120, 130, 140, 150]);
 
-        assert!(validate_layer_stack_routing(9, None, None, false).is_err());
-        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), None, true).is_err());
-        assert!(validate_layer_stack_routing(8, Some(ProgressKPAbs), Some(9), true).is_err());
-        assert!(validate_layer_stack_routing(9, Some(ProgressKPAbs), Some(8), false).is_err());
-        assert!(validate_layer_stack_routing(8, Some(KingRank9), None, false).is_err());
-        assert!(validate_layer_stack_routing(9, Some(KingRank9), Some(8), false).is_err());
-        assert!(validate_layer_stack_routing(9, Some(KingRank9), None, true).is_err());
+                // clamp 確認: 0 → 1, 500 → 400
+                engine.cmd_setoption(&[
+                    "setoption",
+                    "name",
+                    "LS_BUCKET_EVAL_SCALE",
+                    "value",
+                    "0,500,100,100,100,100,100,100",
+                ]);
+                let search = engine.search.as_ref().expect("search exists");
+                let scale = search.bucket_eval_scale();
+                assert_eq!(scale[0], 1);
+                assert_eq!(scale[1], 400);
+
+                // 不正入力は無視して前回値維持
+                engine.cmd_setoption(&[
+                    "setoption",
+                    "name",
+                    "LS_BUCKET_EVAL_SCALE",
+                    "value",
+                    "bad,input",
+                ]);
+                let search = engine.search.as_ref().expect("search exists");
+                let scale_after = search.bucket_eval_scale();
+                // 前回値 (0→1 clamp, 500→400 clamp) が維持されていること
+                assert_eq!(scale_after[0], 1);
+                assert_eq!(scale_after[1], 400);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn setoption_bucket_eval_scale_index_updates_search() {
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                let mut engine = UsiEngine::new();
+
+                // 単一 index のみ更新、他は default 100 のまま
+                engine.cmd_setoption(&[
+                    "setoption",
+                    "name",
+                    "LS_BUCKET_EVAL_SCALE_3",
+                    "value",
+                    "120",
+                ]);
+                let search = engine.search.as_ref().expect("search exists");
+                let scale = search.bucket_eval_scale();
+                assert_eq!(scale[3], 120);
+                for (i, &v) in scale.iter().enumerate() {
+                    if i != 3 {
+                        assert_eq!(v, 100, "index {i} should stay 100");
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn setoption_bucket_interp_updates_global() {
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                use rshogi_core::nnue::{get_bucket_interp, set_bucket_interp};
+
+                // テスト開始時に既定値 (OFF) へ戻す
+                set_bucket_interp(0);
+
+                let mut engine = UsiEngine::new();
+
+                // 正常系: 20 を設定
+                engine.cmd_setoption(&["setoption", "name", "LS_BUCKET_INTERP", "value", "20"]);
+                assert_eq!(get_bucket_interp(), 20);
+
+                // clamp 確認: 100 → 40
+                engine.cmd_setoption(&["setoption", "name", "LS_BUCKET_INTERP", "value", "100"]);
+                assert_eq!(get_bucket_interp(), 40);
+
+                // 0 で OFF
+                engine.cmd_setoption(&["setoption", "name", "LS_BUCKET_INTERP", "value", "0"]);
+                assert_eq!(get_bucket_interp(), 0);
+
+                // 不正入力は無視して前回値 (0) 維持
+                engine.cmd_setoption(&["setoption", "name", "LS_BUCKET_INTERP", "value", "bad"]);
+                assert_eq!(get_bucket_interp(), 0);
+
+                // 他テストへの影響を避けるため復元
+                set_bucket_interp(0);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

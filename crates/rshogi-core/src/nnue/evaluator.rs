@@ -11,9 +11,6 @@
 //!
 //! // ネットワークを読み込み
 //! let network = Arc::new(NNUENetwork::load("model.nnue")?);
-//! // LayerStacks の場合は評価器を作る前に、学習時の routing mode / bucket 数と
-//! // progress 係数を明示し、network.layer_stack_num_buckets() との整合性を
-//! // configure_layer_stack_routing(...) で検証する。HalfKX 系では不要。
 //!
 //! // 評価器を作成（局面を指定して初期化）
 //! let mut evaluator = NNUEEvaluator::new_with_position(network, &position);
@@ -33,11 +30,10 @@
 use std::sync::Arc;
 
 use super::accumulator::{AccumulatorCacheGeneric, DirtyPiece};
-#[cfg(feature = "layerstack-arch")]
 use super::accumulator_layer_stacks::LayerStacksAccCache;
 use super::accumulator_stack_variant::AccumulatorStackVariant;
-use super::halfka_hm_merged::HalfKaHmMergedStack;
-use super::halfka_split::HalfKaSplitStack;
+use super::halfka::HalfKAStack;
+use super::halfka_hm::HalfKA_hmStack;
 use super::halfkp::HalfKPStack;
 use super::network::NNUENetwork;
 use super::spec::ArchitectureSpec;
@@ -64,10 +60,9 @@ pub struct NNUEEvaluator {
     stack: AccumulatorStackVariant,
     /// LayerStacks 用 AccumulatorCaches（Finny Tables）
     /// LayerStacks アーキテクチャ以外では None
-    #[cfg(feature = "layerstack-arch")]
     acc_cache: Option<LayerStacksAccCache>,
     /// 非LayerStacks用 AccumulatorCaches（Finny Tables）
-    /// HalfKP/HalfKaSplit/HalfKaHmMerged で使用。LayerStacks では None
+    /// HalfKP/HalfKA/HalfKA_hm で使用。LayerStacks では None
     acc_cache_generic: Option<AccumulatorCacheGeneric>,
 }
 
@@ -84,17 +79,19 @@ impl NNUEEvaluator {
     /// ```
     pub fn new_with_position(net: Arc<NNUENetwork>, pos: &Position) -> Self {
         let stack = AccumulatorStackVariant::from_network(&net);
-        #[cfg(feature = "layerstack-arch")]
         let acc_cache = if let NNUENetwork::LayerStacks(ls_net) = &*net {
             Some(ls_net.new_acc_cache())
         } else {
             None
         };
-        let acc_cache_generic = Self::new_generic_cache(&net);
+        let acc_cache_generic = if !matches!(*net, NNUENetwork::LayerStacks(_)) {
+            Some(AccumulatorCacheGeneric::new(net.l1_size()))
+        } else {
+            None
+        };
         let mut evaluator = Self {
             net,
             stack,
-            #[cfg(feature = "layerstack-arch")]
             acc_cache,
             acc_cache_generic,
         };
@@ -112,17 +109,19 @@ impl NNUEEvaluator {
     ///
     /// - `pos`: 初期化する局面
     pub fn clone_for_thread(&self, pos: &Position) -> Self {
-        #[cfg(feature = "layerstack-arch")]
         let acc_cache = if let NNUENetwork::LayerStacks(ls_net) = &*self.net {
             Some(ls_net.new_acc_cache())
         } else {
             None
         };
-        let acc_cache_generic = Self::new_generic_cache(&self.net);
+        let acc_cache_generic = if !matches!(*self.net, NNUENetwork::LayerStacks(_)) {
+            Some(AccumulatorCacheGeneric::new(self.net.l1_size()))
+        } else {
+            None
+        };
         let mut evaluator = Self {
             net: Arc::clone(&self.net),
             stack: AccumulatorStackVariant::from_network(&self.net),
-            #[cfg(feature = "layerstack-arch")]
             acc_cache,
             acc_cache_generic,
         };
@@ -137,7 +136,6 @@ impl NNUEEvaluator {
     /// スタックをリセット（探索開始時に呼び出す）
     ///
     /// ルート局面でアキュムレータをフル再計算する。
-    /// LayerStacks の f32 progresskpabs 係数も、この時点の設定へ更新する。
     ///
     /// # 引数
     ///
@@ -179,9 +177,9 @@ impl NNUEEvaluator {
     ///
     /// 局面の評価値（手番側から見た評価値）
     #[inline(always)]
-    pub fn evaluate(&mut self, pos: &Position) -> Value {
+    pub fn evaluate(&mut self, pos: &mut Position) -> Value {
         // アキュムレータを更新（必要に応じて差分更新 or フル再計算）
-        self.ensure_accumulator_computed(pos);
+        self.ensure_accumulator_computed(&*pos);
 
         // 評価
         self.evaluate_only(pos)
@@ -204,6 +202,9 @@ impl NNUEEvaluator {
     /// アキュムレータが計算済みであることが前提。
     /// ベンチマークで評価部分のみを測定したい場合に使用。
     ///
+    /// 2026-06-06: activity_risk accumulator の cached path 採用のため `&mut self` 化
+    /// (= stack mut ref 必要)。
+    ///
     /// # 引数
     ///
     /// - `pos`: 評価対象の局面
@@ -217,35 +218,23 @@ impl NNUEEvaluator {
     /// アキュムレータが未計算の場合、不正な評価値が返る。
     /// 通常は `evaluate()` を使用すること。
     #[inline(always)]
-    pub fn evaluate_only(&self, pos: &Position) -> Value {
-        match (&*self.net, &self.stack) {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            (
-                NNUENetwork::DynamicLayerStacks(net),
-                AccumulatorStackVariant::DynamicLayerStacks(st),
-            ) => net.evaluate(pos, &mut st.borrow_mut()),
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            (NNUENetwork::DynamicHalfKx(net), AccumulatorStackVariant::DynamicHalfKx(st)) => {
-                net.evaluate(pos, &mut st.borrow_mut())
+    pub fn evaluate_only(&mut self, pos: &mut Position) -> Value {
+        // LayerStacks variant のみ activity_risk cached path 採用のため stack を &mut で取る。
+        // 他 variant は既存 &self.stack で OK だが、 borrow checker のため
+        // 同 match で &mut self.stack を取り、 immutable use する。
+        match (&*self.net, &mut self.stack) {
+            (NNUENetwork::HalfKA(net), AccumulatorStackVariant::HalfKA(st)) => {
+                net.evaluate(&*pos, &*st)
             }
-            (NNUENetwork::HalfKaSplit(net), AccumulatorStackVariant::HalfKaSplit(st)) => {
-                net.evaluate(pos, st)
-            }
-            (NNUENetwork::HalfKaHmMerged(net), AccumulatorStackVariant::HalfKaHmMerged(st)) => {
-                net.evaluate(pos, st)
-            }
-            (NNUENetwork::HalfKaMerged(net), AccumulatorStackVariant::HalfKaMerged(st)) => {
-                net.evaluate(pos, st)
-            }
-            (NNUENetwork::HalfKaHmSplit(net), AccumulatorStackVariant::HalfKaHmSplit(st)) => {
-                net.evaluate(pos, st)
+            (NNUENetwork::HalfKA_hm(net), AccumulatorStackVariant::HalfKA_hm(st)) => {
+                net.evaluate(&*pos, &*st)
             }
             (NNUENetwork::HalfKP(net), AccumulatorStackVariant::HalfKP(st)) => {
-                net.evaluate(pos, st)
+                net.evaluate(&*pos, &*st)
             }
-            #[cfg(feature = "layerstack-arch")]
             (NNUENetwork::LayerStacks(net), AccumulatorStackVariant::LayerStacks(st)) => {
-                net.evaluate(pos, st)
+                // 2026-06-06: activity_risk cached path 経由で評価 (= &mut stack 必須)。
+                net.evaluate_mut(pos, st)
             }
             _ => unreachable!("Network/Stack type mismatch"),
         }
@@ -256,7 +245,7 @@ impl NNUEEvaluator {
     // =========================================================================
 
     /// アーキテクチャ名を取得
-    pub fn architecture_name(&self) -> String {
+    pub fn architecture_name(&self) -> &'static str {
         self.net.architecture_name()
     }
 
@@ -279,52 +268,17 @@ impl NNUEEvaluator {
     // 内部実装
     // =========================================================================
 
-    fn new_generic_cache(net: &NNUENetwork) -> Option<AccumulatorCacheGeneric> {
-        #[cfg(feature = "nnue-runtime-dimensions")]
-        if matches!(net, NNUENetwork::DynamicHalfKx(_)) {
-            return None;
-        }
-        if net.is_layer_stacks() {
-            None
-        } else {
-            Some(AccumulatorCacheGeneric::new(net.l1_size()))
-        }
-    }
-
     /// アキュムレータをフル再計算
     fn refresh_accumulator(&mut self, pos: &Position) {
         match (&*self.net, &mut self.stack) {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            (
-                NNUENetwork::DynamicLayerStacks(net),
-                AccumulatorStackVariant::DynamicLayerStacks(st),
-            ) => net.refresh(pos, st.get_mut()),
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            (NNUENetwork::DynamicHalfKx(net), AccumulatorStackVariant::DynamicHalfKx(st)) => {
-                net.refresh(pos, st.get_mut());
-            }
-            (NNUENetwork::HalfKaSplit(net), AccumulatorStackVariant::HalfKaSplit(st)) => {
+            (NNUENetwork::HalfKA(net), AccumulatorStackVariant::HalfKA(st)) => {
                 if let Some(cache) = &mut self.acc_cache_generic {
                     net.refresh_accumulator_with_cache(pos, st, cache);
                 } else {
                     net.refresh_accumulator(pos, st);
                 }
             }
-            (NNUENetwork::HalfKaHmMerged(net), AccumulatorStackVariant::HalfKaHmMerged(st)) => {
-                if let Some(cache) = &mut self.acc_cache_generic {
-                    net.refresh_accumulator_with_cache(pos, st, cache);
-                } else {
-                    net.refresh_accumulator(pos, st);
-                }
-            }
-            (NNUENetwork::HalfKaMerged(net), AccumulatorStackVariant::HalfKaMerged(st)) => {
-                if let Some(cache) = &mut self.acc_cache_generic {
-                    net.refresh_accumulator_with_cache(pos, st, cache);
-                } else {
-                    net.refresh_accumulator(pos, st);
-                }
-            }
-            (NNUENetwork::HalfKaHmSplit(net), AccumulatorStackVariant::HalfKaHmSplit(st)) => {
+            (NNUENetwork::HalfKA_hm(net), AccumulatorStackVariant::HalfKA_hm(st)) => {
                 if let Some(cache) = &mut self.acc_cache_generic {
                     net.refresh_accumulator_with_cache(pos, st, cache);
                 } else {
@@ -338,7 +292,6 @@ impl NNUEEvaluator {
                     net.refresh_accumulator(pos, st);
                 }
             }
-            #[cfg(feature = "layerstack-arch")]
             (NNUENetwork::LayerStacks(net), AccumulatorStackVariant::LayerStacks(st)) => {
                 net.update_accumulator(pos, st, &mut self.acc_cache);
             }
@@ -349,31 +302,15 @@ impl NNUEEvaluator {
     /// アキュムレータが計算済みか確認し、必要に応じて更新
     fn ensure_accumulator_computed(&mut self, pos: &Position) {
         match (&*self.net, &mut self.stack) {
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            (
-                NNUENetwork::DynamicLayerStacks(net),
-                AccumulatorStackVariant::DynamicLayerStacks(st),
-            ) => net.ensure(pos, st.get_mut()),
-            #[cfg(feature = "nnue-runtime-dimensions")]
-            (NNUENetwork::DynamicHalfKx(net), AccumulatorStackVariant::DynamicHalfKx(st)) => {
-                net.ensure(pos, st.get_mut());
-            }
-            (NNUENetwork::HalfKaSplit(net), AccumulatorStackVariant::HalfKaSplit(st)) => {
+            (NNUENetwork::HalfKA(net), AccumulatorStackVariant::HalfKA(st)) => {
                 Self::update_halfka_accumulator(net, pos, st, &mut self.acc_cache_generic);
             }
-            (NNUENetwork::HalfKaHmMerged(net), AccumulatorStackVariant::HalfKaHmMerged(st)) => {
+            (NNUENetwork::HalfKA_hm(net), AccumulatorStackVariant::HalfKA_hm(st)) => {
                 Self::update_halfka_hm_accumulator(net, pos, st, &mut self.acc_cache_generic);
-            }
-            (NNUENetwork::HalfKaMerged(net), AccumulatorStackVariant::HalfKaMerged(st)) => {
-                Self::update_halfka_merged_accumulator(net, pos, st, &mut self.acc_cache_generic);
-            }
-            (NNUENetwork::HalfKaHmSplit(net), AccumulatorStackVariant::HalfKaHmSplit(st)) => {
-                Self::update_halfka_hm_split_accumulator(net, pos, st, &mut self.acc_cache_generic);
             }
             (NNUENetwork::HalfKP(net), AccumulatorStackVariant::HalfKP(st)) => {
                 Self::update_halfkp_accumulator(net, pos, st, &mut self.acc_cache_generic);
             }
-            #[cfg(feature = "layerstack-arch")]
             (NNUENetwork::LayerStacks(net), AccumulatorStackVariant::LayerStacks(st)) => {
                 net.update_accumulator(pos, st, &mut self.acc_cache);
             }
@@ -381,12 +318,12 @@ impl NNUEEvaluator {
         }
     }
 
-    /// HalfKaSplit アキュムレータを更新
+    /// HalfKA アキュムレータを更新
     #[inline]
     fn update_halfka_accumulator(
-        net: &super::halfka_split::HalfKaSplitNetwork,
+        net: &super::halfka::HalfKANetwork,
         pos: &Position,
-        stack: &mut HalfKaSplitStack,
+        stack: &mut HalfKAStack,
         cache: &mut Option<AccumulatorCacheGeneric>,
     ) {
         if stack.is_current_computed() {
@@ -421,12 +358,12 @@ impl NNUEEvaluator {
         }
     }
 
-    /// HalfKaHmMerged アキュムレータを更新
+    /// HalfKA_hm アキュムレータを更新
     #[inline]
     fn update_halfka_hm_accumulator(
-        net: &super::halfka_hm_merged::HalfKaHmMergedNetwork,
+        net: &super::halfka_hm::HalfKA_hmNetwork,
         pos: &Position,
-        stack: &mut HalfKaHmMergedStack,
+        stack: &mut HalfKA_hmStack,
         cache: &mut Option<AccumulatorCacheGeneric>,
     ) {
         if stack.is_current_computed() {
@@ -451,82 +388,6 @@ impl NNUEEvaluator {
         }
 
         // 失敗なら全計算
-        if !updated {
-            if let Some(c) = cache {
-                net.refresh_accumulator_with_cache(pos, stack, c);
-            } else {
-                net.refresh_accumulator(pos, stack);
-            }
-            count_refresh!();
-        }
-    }
-
-    /// HalfKaMerged アキュムレータを更新
-    #[inline]
-    fn update_halfka_merged_accumulator(
-        net: &super::halfka_merged::HalfKaMergedNetwork,
-        pos: &Position,
-        stack: &mut super::halfka_merged::HalfKaMergedStack,
-        cache: &mut Option<AccumulatorCacheGeneric>,
-    ) {
-        if stack.is_current_computed() {
-            count_already_computed!();
-            return;
-        }
-
-        let mut updated = false;
-
-        if let Some(prev_idx) = stack.current_previous()
-            && stack.is_entry_computed(prev_idx)
-        {
-            let dirty = stack.current_dirty_piece();
-            if let Some(c) = cache {
-                net.update_accumulator_with_cache(pos, &dirty, stack, prev_idx, c);
-            } else {
-                net.update_accumulator(pos, &dirty, stack, prev_idx);
-            }
-            count_update!();
-            updated = true;
-        }
-
-        if !updated {
-            if let Some(c) = cache {
-                net.refresh_accumulator_with_cache(pos, stack, c);
-            } else {
-                net.refresh_accumulator(pos, stack);
-            }
-            count_refresh!();
-        }
-    }
-
-    /// HalfKaHmSplit アキュムレータを更新
-    #[inline]
-    fn update_halfka_hm_split_accumulator(
-        net: &super::halfka_hm_split::HalfKaHmSplitNetwork,
-        pos: &Position,
-        stack: &mut super::halfka_hm_split::HalfKaHmSplitStack,
-        cache: &mut Option<AccumulatorCacheGeneric>,
-    ) {
-        if stack.is_current_computed() {
-            count_already_computed!();
-            return;
-        }
-
-        let mut updated = false;
-
-        if let Some(prev_idx) = stack.current_previous()
-            && stack.is_entry_computed(prev_idx)
-        {
-            let dirty = stack.current_dirty_piece();
-            if let Some(c) = cache {
-                net.update_accumulator_with_cache(pos, &dirty, stack, prev_idx, c);
-            } else {
-                net.update_accumulator(pos, &dirty, stack, prev_idx);
-            }
-            count_update!();
-            updated = true;
-        }
-
         if !updated {
             if let Some(c) = cache {
                 net.refresh_accumulator_with_cache(pos, stack, c);
@@ -582,76 +443,106 @@ impl NNUEEvaluator {
 mod tests {
     use super::*;
 
-    #[cfg(all(
-        feature = "layerstack-arch",
-        feature = "ft-halfka_hm_merged",
-        not(feature = "nnue-effect-bucket"),
-        any(feature = "layerstacks-1536x16x32", feature = "layerstacks-512x16x32")
-    ))]
+    /// NNUEEvaluator の基本的な構築テスト
+    ///
+    /// ネットワークなしでのテスト（構造確認のみ）
     #[test]
-    fn fixed_layer_stacks_progress_weights_snapshot_changes_on_evaluator_reset() {
-        use crate::nnue::constants::HALFKA_HM_DIMENSIONS;
-        use crate::nnue::net_delta::test_utils::build_synthetic_layer_stacks;
-        use crate::nnue::network::{
-            LayerStackBucketMode, SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, configure_layer_stack_routing,
-            layer_stack_routing_test_guard, reset_layer_stack_progress_buckets,
-            reset_layer_stack_progress_kpabs_weights, set_layer_stack_progress_kpabs_weights,
-        };
-        use crate::nnue::network_layer_stacks::LayerStacksNetwork;
-        use std::io::Cursor;
+    fn test_evaluator_construction() {
+        // デフォルトの AccumulatorStackVariant と同様の構造確認
+        let stack = AccumulatorStackVariant::new_default();
+        assert!(stack.is_halfkp());
+    }
 
-        let _guard = layer_stack_routing_test_guard();
-        configure_layer_stack_routing(LayerStackBucketMode::ProgressKPAbs, 4, Some(4)).unwrap();
-        let mut pos = Position::new();
-        pos.set_sfen(crate::position::SFEN_HIRATE).unwrap();
-        for l1 in [
-            #[cfg(feature = "layerstacks-1536x16x32")]
-            1536,
-            #[cfg(feature = "layerstacks-512x16x32")]
-            512,
-        ] {
-            let mut model =
-                build_synthetic_layer_stacks("HalfKaHmMerged", HALFKA_HM_DIMENSIONS, l1, 16, 32, 4);
-            for (index, bucket) in model.buckets.iter().enumerate() {
-                model.bytes[bucket.output_bias..bucket.output_bias + 4]
-                    .copy_from_slice(&(index as i32 * 8192).to_le_bytes());
-                model.bytes[bucket.output_weights..bucket.output_weights + 32].fill(0);
-            }
-            let net = LayerStacksNetwork::read_with_options(
-                &mut Cursor::new(&model.bytes),
-                l1,
-                16,
-                32,
-                None,
-            )
-            .unwrap();
-            let network = Arc::new(NNUENetwork::LayerStacks(Arc::new(net)));
-            set_layer_stack_progress_kpabs_weights(
-                vec![-0.125; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS].into_boxed_slice(),
-            )
-            .unwrap();
-            let mut evaluator = NNUEEvaluator::new_with_position(Arc::clone(&network), &pos);
-            let original = evaluator.evaluate(&pos);
-            set_layer_stack_progress_kpabs_weights(
-                vec![0.125; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS].into_boxed_slice(),
-            )
-            .unwrap();
-            let replacement = NNUEEvaluator::new_with_position(network, &pos).evaluate(&pos);
-            assert_ne!(original, replacement, "L1={l1}");
-            assert_eq!(evaluator.evaluate_only(&pos), original, "L1={l1}");
-            assert_eq!(evaluator.evaluate(&pos), original, "L1={l1}");
-            evaluator.refresh(&pos);
-            assert_eq!(evaluator.evaluate_only(&pos), original, "L1={l1}");
-            evaluator.reset(&pos);
-            assert_eq!(evaluator.evaluate(&pos), replacement, "L1={l1}");
-            reset_layer_stack_progress_kpabs_weights();
-            assert_eq!(evaluator.evaluate_only(&pos), replacement, "L1={l1}");
-            evaluator.reset(&pos);
-            let zero = evaluator.evaluate(&pos);
-            assert_ne!(zero, original, "L1={l1}");
-            assert_ne!(zero, replacement, "L1={l1}");
-        }
-        reset_layer_stack_progress_buckets();
+    /// push/pop の対称性テスト
+    #[test]
+    fn test_stack_push_pop() {
+        let mut stack = AccumulatorStackVariant::new_default();
+        let dirty = DirtyPiece::default();
+
+        stack.reset();
+        stack.push(dirty);
+        stack.push(dirty);
+        stack.pop();
+        stack.pop();
+        // パニックしなければ成功
+    }
+
+    /// NNUEEvaluator のサイズテスト
+    #[test]
+    fn test_evaluator_size() {
+        use std::mem::size_of;
+
+        let evaluator_size = size_of::<NNUEEvaluator>();
+        let arc_size = size_of::<Arc<NNUENetwork>>();
+        let stack_size = size_of::<AccumulatorStackVariant>();
+
+        eprintln!("NNUEEvaluator size: {evaluator_size} bytes");
+        eprintln!("Arc<NNUENetwork> size: {arc_size} bytes");
+        eprintln!("AccumulatorStackVariant size: {stack_size} bytes");
+
+        // Evaluator は Arc + Stack のサイズ程度
+        assert!(evaluator_size > 0);
+    }
+
+    /// AccumulatorStackVariant::matches_network のテスト
+    #[test]
+    fn test_stack_variant_type_checking() {
+        use crate::nnue::network_halfka::AccumulatorStackHalfKA;
+        use crate::nnue::network_halfka_hm::AccumulatorStackHalfKA_hm;
+        use crate::nnue::network_halfkp::AccumulatorStackHalfKP;
+
+        // HalfKA スタックの各 L1 サイズ
+        let halfka_nm_l256 = AccumulatorStackVariant::HalfKA(HalfKAStack::L256(
+            AccumulatorStackHalfKA::<256>::new(),
+        ));
+        let halfka_nm_l512 = AccumulatorStackVariant::HalfKA(HalfKAStack::L512(
+            AccumulatorStackHalfKA::<512>::new(),
+        ));
+        let halfka_nm_l1024 = AccumulatorStackVariant::HalfKA(HalfKAStack::L1024(
+            AccumulatorStackHalfKA::<1024>::new(),
+        ));
+
+        // HalfKA_hm スタックの各 L1 サイズ
+        let halfka_hm_l256 =
+            AccumulatorStackVariant::HalfKA_hm(HalfKA_hmStack::L256(AccumulatorStackHalfKA_hm::<
+                256,
+            >::new()));
+        let halfka_hm_l512 =
+            AccumulatorStackVariant::HalfKA_hm(HalfKA_hmStack::L512(AccumulatorStackHalfKA_hm::<
+                512,
+            >::new()));
+        let halfka_hm_l1024 =
+            AccumulatorStackVariant::HalfKA_hm(HalfKA_hmStack::L1024(AccumulatorStackHalfKA_hm::<
+                1024,
+            >::new()));
+
+        // HalfKP スタックの各 L1 サイズ
+        let halfkp_l256 = AccumulatorStackVariant::HalfKP(HalfKPStack::L256(
+            AccumulatorStackHalfKP::<256>::new(),
+        ));
+        let halfkp_l512 = AccumulatorStackVariant::HalfKP(HalfKPStack::L512(
+            AccumulatorStackHalfKP::<512>::new(),
+        ));
+
+        // 型の確認
+        assert!(matches!(halfka_nm_l256, AccumulatorStackVariant::HalfKA(_)));
+        assert!(matches!(halfka_nm_l512, AccumulatorStackVariant::HalfKA(_)));
+        assert!(matches!(halfka_nm_l1024, AccumulatorStackVariant::HalfKA(_)));
+        assert!(matches!(halfka_hm_l256, AccumulatorStackVariant::HalfKA_hm(_)));
+        assert!(matches!(halfka_hm_l512, AccumulatorStackVariant::HalfKA_hm(_)));
+        assert!(matches!(halfka_hm_l1024, AccumulatorStackVariant::HalfKA_hm(_)));
+        assert!(matches!(halfkp_l256, AccumulatorStackVariant::HalfKP(_)));
+        assert!(matches!(halfkp_l512, AccumulatorStackVariant::HalfKP(_)));
+
+        // is_halfkp() の確認
+        assert!(!halfka_nm_l256.is_halfkp());
+        assert!(!halfka_nm_l512.is_halfkp());
+        assert!(!halfka_nm_l1024.is_halfkp());
+        assert!(!halfka_hm_l256.is_halfkp());
+        assert!(!halfka_hm_l512.is_halfkp());
+        assert!(!halfka_hm_l1024.is_halfkp());
+        assert!(halfkp_l256.is_halfkp());
+        assert!(halfkp_l512.is_halfkp());
     }
 
     /// 各バリアントの push/pop インデックス一貫性テスト
@@ -662,15 +553,15 @@ mod tests {
     /// 実行され、LayerStacks variant を実質テストしない silent no-op 状態だった。
     #[test]
     fn test_all_variants_push_pop_consistency() {
-        use crate::nnue::network_halfka_hm_merged::AccumulatorStackHalfKaHmMerged;
-        use crate::nnue::network_halfka_split::AccumulatorStackHalfKaSplit;
+        use crate::nnue::network_halfka::AccumulatorStackHalfKA;
+        use crate::nnue::network_halfka_hm::AccumulatorStackHalfKA_hm;
         use crate::nnue::network_halfkp::AccumulatorStackHalfKP;
 
         let dirty = DirtyPiece::default();
 
-        // HalfKaSplit L512
-        let mut stack = AccumulatorStackVariant::HalfKaSplit(HalfKaSplitStack::L512(
-            AccumulatorStackHalfKaSplit::<512>::new(),
+        // HalfKA L512
+        let mut stack = AccumulatorStackVariant::HalfKA(HalfKAStack::L512(
+            AccumulatorStackHalfKA::<512>::new(),
         ));
         stack.reset();
         stack.push(dirty);
@@ -679,10 +570,11 @@ mod tests {
         stack.pop();
         // パニックしなければ成功
 
-        // HalfKaHmMerged L512
-        let mut stack = AccumulatorStackVariant::HalfKaHmMerged(HalfKaHmMergedStack::L512(
-            AccumulatorStackHalfKaHmMerged::<512>::new(),
-        ));
+        // HalfKA_hm L512
+        let mut stack =
+            AccumulatorStackVariant::HalfKA_hm(HalfKA_hmStack::L512(AccumulatorStackHalfKA_hm::<
+                512,
+            >::new()));
         stack.reset();
         stack.push(dirty);
         stack.push(dirty);
@@ -704,21 +596,12 @@ mod tests {
         // LayerStacks 各 L1 バリアント（有効 feature のみ検証）。
         // 外側の `any(...)` でいずれかの variant が有効なときだけ import が使われる
         // ようにして unused-import 警告を抑える。
-        #[cfg(all(
-            feature = "layerstack-arch",
-            any(
-                feature = "layerstacks-1536x16x32",
-                feature = "layerstacks-1536x32x32",
-                feature = "layerstacks-768x16x32",
-                feature = "layerstacks-768x8x32",
-                feature = "layerstacks-512x16x32",
-                feature = "layerstacks-1024x16x32",
-                feature = "layerstacks-3072x16x32",
-                feature = "layerstacks-1024x16x64",
-                feature = "layerstacks-2304x16x64",
-                feature = "layerstacks-3072x16x64",
-                feature = "layerstacks-1536x16x64"
-            )
+        #[cfg(any(
+            feature = "layerstacks-1536x16x32",
+            feature = "layerstacks-1536x32x32",
+            feature = "layerstacks-768x16x32",
+            feature = "layerstacks-768x8x32",
+            feature = "layerstacks-512x16x32"
         ))]
         {
             use crate::nnue::accumulator_layer_stacks::{
@@ -784,74 +667,78 @@ mod tests {
                 stack.pop();
                 stack.pop();
             }
+        }
+    }
 
-            #[cfg(feature = "layerstacks-1024x16x32")]
-            {
-                let mut stack = AccumulatorStackVariant::LayerStacks(
-                    LayerStacksAccStack::L1024x16x32(AccumulatorStackLayerStacks::<1024>::new()),
-                );
-                stack.reset();
+    /// 深い探索木での push/pop テスト
+    #[test]
+    fn test_deep_search_simulation() {
+        let mut stack = AccumulatorStackVariant::new_default();
+        let dirty = DirtyPiece::default();
+
+        stack.reset();
+
+        // 典型的な探索深さ (30手程度)
+        const MAX_DEPTH: usize = 30;
+
+        // 複数回の探索をシミュレート
+        for _ in 0..5 {
+            // 探索開始
+            for _ in 0..MAX_DEPTH {
                 stack.push(dirty);
-                stack.push(dirty);
-                stack.pop();
-                stack.pop();
             }
 
-            #[cfg(feature = "layerstacks-3072x16x32")]
-            {
-                let mut stack = AccumulatorStackVariant::LayerStacks(
-                    LayerStacksAccStack::L3072x16x32(AccumulatorStackLayerStacks::<3072>::new()),
-                );
-                stack.reset();
-                stack.push(dirty);
-                stack.push(dirty);
-                stack.pop();
+            // 探索終了
+            for _ in 0..MAX_DEPTH {
                 stack.pop();
             }
-            #[cfg(feature = "layerstacks-1024x16x64")]
-            {
-                let mut stack = AccumulatorStackVariant::LayerStacks(
-                    LayerStacksAccStack::L1024x16x64(AccumulatorStackLayerStacks::<1024>::new()),
-                );
-                stack.reset();
-                stack.push(dirty);
-                stack.push(dirty);
-                stack.pop();
-                stack.pop();
-            }
-            #[cfg(feature = "layerstacks-2304x16x64")]
-            {
-                let mut stack = AccumulatorStackVariant::LayerStacks(
-                    LayerStacksAccStack::L2304x16x64(AccumulatorStackLayerStacks::<2304>::new()),
-                );
-                stack.reset();
-                stack.push(dirty);
-                stack.push(dirty);
-                stack.pop();
-                stack.pop();
-            }
-            #[cfg(feature = "layerstacks-3072x16x64")]
-            {
-                let mut stack = AccumulatorStackVariant::LayerStacks(
-                    LayerStacksAccStack::L3072x16x64(AccumulatorStackLayerStacks::<3072>::new()),
-                );
-                stack.reset();
-                stack.push(dirty);
-                stack.push(dirty);
-                stack.pop();
-                stack.pop();
-            }
-            #[cfg(feature = "layerstacks-1536x16x64")]
-            {
-                let mut stack = AccumulatorStackVariant::LayerStacks(
-                    LayerStacksAccStack::L1536x16x64(AccumulatorStackLayerStacks::<1536>::new()),
-                );
-                stack.reset();
-                stack.push(dirty);
-                stack.push(dirty);
-                stack.pop();
-                stack.pop();
-            }
+        }
+
+        // パニックしなければ成功
+    }
+
+    /// network.rs の NNUENetwork enum が全アーキテクチャをカバーしていることの確認
+    #[test]
+    fn test_network_enum_coverage() {
+        use crate::nnue::halfka::HalfKANetwork;
+        use crate::nnue::halfka_hm::HalfKA_hmNetwork;
+        use crate::nnue::halfkp::HalfKPNetwork;
+
+        // HalfKA サポートアーキテクチャ数
+        let halfka_specs = HalfKANetwork::supported_specs();
+        assert_eq!(halfka_specs.len(), 8); // 256:1 + 512:3 + 768:1 + 1024:3
+
+        // HalfKA_hm サポートアーキテクチャ数
+        let halfka_hm_specs = HalfKA_hmNetwork::supported_specs();
+        assert_eq!(halfka_hm_specs.len(), 8); // 256:1 + 512:3 + 768:1 + 1024:3
+
+        // HalfKP サポートアーキテクチャ数
+        let halfkp_specs = HalfKPNetwork::supported_specs();
+        assert_eq!(halfkp_specs.len(), 7); // 256:1 + 512:3 + 768:1 + 1024:2
+
+        // 全アーキテクチャで feature_set が正しいことを確認
+        for spec in &halfka_specs {
+            assert_eq!(
+                spec.feature_set,
+                crate::nnue::spec::FeatureSet::HalfKA,
+                "HalfKA spec has wrong feature_set: {spec:?}"
+            );
+        }
+
+        for spec in &halfka_hm_specs {
+            assert_eq!(
+                spec.feature_set,
+                crate::nnue::spec::FeatureSet::HalfKA_hm,
+                "HalfKA_hm spec has wrong feature_set: {spec:?}"
+            );
+        }
+
+        for spec in &halfkp_specs {
+            assert_eq!(
+                spec.feature_set,
+                crate::nnue::spec::FeatureSet::HalfKP,
+                "HalfKP spec has wrong feature_set: {spec:?}"
+            );
         }
     }
 }

@@ -47,6 +47,9 @@ pub struct SearchStats {
     pub probcut_cutoff: u64,
     /// Singular Extension適用回数
     pub singular_extension: u64,
+    /// capture move での double/triple extension 抑止回数
+    /// （SPSA_SKIP_CAPTURE_DOUBLE_TRIPLE_SE 有効時のみ計上）
+    pub singular_capture_double_triple_skipped: u64,
     /// Multi-Cut発動回数
     pub multi_cut: u64,
     /// TT（置換表）カットオフ回数
@@ -83,6 +86,12 @@ pub struct SearchStats {
     pub cutoff_by_depth: [u64; STATS_MAX_DEPTH],
     /// 深度別のカットオフ時move_count合計（平均計算用）
     pub move_count_sum_by_depth: [u64; STATS_MAX_DEPTH],
+    /// Phase A: stage 別 cutoff 回数 (= どの stage の手で beta cut 起きたか)
+    /// index = stage_to_idx() で 0=MainTT, 1=GoodCapture, 2=GoodQuiet, 3=BadCapture,
+    /// 4=BadQuiet, 5=Evasion(系), 6=Other
+    pub cutoff_by_stage: [u64; 7],
+    /// Phase A: stage 別 first move cutoff 回数 (= move_count==1 で cut)
+    pub first_cutoff_by_stage: [u64; 7],
     /// LMR削減量（r/1024）のヒストグラム（0-15+）
     pub lmr_reduction_histogram: [u64; 16],
     /// LMR適用後の新深度別ノード数
@@ -99,10 +108,8 @@ pub struct SearchStats {
     pub qs_tt_cutoff: u64,
     /// stand pat（静的評価で即時 beta カット）回数
     pub qs_stand_pat_cutoff: u64,
-    /// MovePicker が返した手の総数（beta カットで打ち切った分は含まない）
-    pub qs_moves_picked: u64,
-    /// 指し手生成ステージへ到達せずに打ち切ったノード数
-    pub qs_movegen_skipped: u64,
+    /// 生成された手の総数
+    pub qs_moves_generated: u64,
     /// 実際に探索された手の数
     pub qs_moves_searched: u64,
     /// SEE による枝刈り数（capture && !see_ge(0)）
@@ -150,6 +157,7 @@ impl Default for SearchStats {
             probcut_attempted: 0,
             probcut_cutoff: 0,
             singular_extension: 0,
+            singular_capture_double_triple_skipped: 0,
             multi_cut: 0,
             tt_cutoff: 0,
             nodes_by_depth: [0; STATS_MAX_DEPTH],
@@ -168,6 +176,8 @@ impl Default for SearchStats {
             first_move_cutoff_by_depth: [0; STATS_MAX_DEPTH],
             cutoff_by_depth: [0; STATS_MAX_DEPTH],
             move_count_sum_by_depth: [0; STATS_MAX_DEPTH],
+            cutoff_by_stage: [0; 7],
+            first_cutoff_by_stage: [0; 7],
             lmr_reduction_histogram: [0; 16],
             lmr_new_depth_histogram: [0; STATS_MAX_DEPTH],
             // qsearch 統計
@@ -175,8 +185,7 @@ impl Default for SearchStats {
             qs_tt_hit: 0,
             qs_tt_cutoff: 0,
             qs_stand_pat_cutoff: 0,
-            qs_moves_picked: 0,
-            qs_movegen_skipped: 0,
+            qs_moves_generated: 0,
             qs_moves_searched: 0,
             qs_see_pruned: 0,
             qs_futility_pruned: 0,
@@ -229,6 +238,10 @@ impl SearchStats {
         report.push_str(&format!("LMR re-search:       {:>12}\n", self.lmr_research));
         report.push_str("--- Extensions ---\n");
         report.push_str(&format!("Singular extension:  {:>12}\n", self.singular_extension));
+        report.push_str(&format!(
+            "SE capture skip:     {:>12}\n",
+            self.singular_capture_double_triple_skipped
+        ));
         report.push_str(&format!("Multi-cut:           {:>12}\n", self.multi_cut));
         // 深度別ノード数（ノード数が0より大きい深度のみ表示）
         report.push_str("--- Nodes by Depth ---\n");
@@ -301,6 +314,50 @@ impl SearchStats {
                     d, razoring, futility, nmp, nodes
                 ));
             }
+        }
+        // Move Ordering 全体 summary 1 line (= SPRT log grep 容易化、 mo_first_cut_rate / mo_avg_cut_idx)
+        {
+            let total_first: u64 = self.first_move_cutoff_by_depth.iter().sum();
+            let total_cut: u64 = self.cutoff_by_depth.iter().sum();
+            let total_move_sum: u64 = self.move_count_sum_by_depth.iter().sum();
+            let rate = if total_cut > 0 {
+                100.0 * total_first as f64 / total_cut as f64
+            } else {
+                0.0
+            };
+            let avg_idx = if total_cut > 0 {
+                total_move_sum as f64 / total_cut as f64
+            } else {
+                0.0
+            };
+            report.push_str(&format!(
+                "MO_SUMMARY mo_first_cut_rate={:.3} mo_avg_cut_idx={:.3} mo_cutoffs={}\n",
+                rate, avg_idx, total_cut
+            ));
+        }
+        // Phase A: stage 別 first_cut_rate 1 line (= bottleneck identify)
+        {
+            let names = [
+                "TT",
+                "GoodCap",
+                "GoodQuiet",
+                "BadCap",
+                "BadQuiet",
+                "Evasion",
+                "Other",
+            ];
+            let mut parts = String::new();
+            for i in 0..7 {
+                let cut = self.cutoff_by_stage[i];
+                let first = self.first_cutoff_by_stage[i];
+                if cut > 0 {
+                    let r = 100.0 * first as f64 / cut as f64;
+                    let pct =
+                        100.0 * cut as f64 / self.cutoff_by_stage.iter().sum::<u64>().max(1) as f64;
+                    parts.push_str(&format!(" {}={:.1}%/{:.1}%c({})", names[i], r, pct, cut));
+                }
+            }
+            report.push_str(&format!("MO_STAGE{}\n", parts));
         }
         // Move Ordering品質統計（depth別）
         report.push_str("--- Move Ordering Quality (First Move Cutoff Rate) ---\n");
@@ -387,14 +444,9 @@ impl SearchStats {
                 self.qs_stand_pat_cutoff as f64 / qs_nodes * 100.0
             ));
             report.push_str(&format!(
-                "  Moves picked:      {:>12} ({:.1} avg/node)\n",
-                self.qs_moves_picked,
-                self.qs_moves_picked as f64 / qs_nodes
-            ));
-            report.push_str(&format!(
-                "  Movegen skipped:   {:>12} ({:.1}%)\n",
-                self.qs_movegen_skipped,
-                self.qs_movegen_skipped as f64 / qs_nodes * 100.0
+                "  Moves generated:   {:>12} ({:.1} avg/node)\n",
+                self.qs_moves_generated,
+                self.qs_moves_generated as f64 / qs_nodes
             ));
             report.push_str(&format!(
                 "  Moves searched:    {:>12} ({:.1} avg/node)\n",

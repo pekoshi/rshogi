@@ -66,36 +66,16 @@ pub fn games_index_key(ended_at_ms: u64, game_id: &str) -> Result<String, Storag
     Ok(format!("{KEY_PREFIX}{inv:014}-{validated}.json"))
 }
 
-/// `key` が `game_id` の games-index key (`games-index/<inv 14 桁>-<game_id>.json`) か。
-///
-/// key の先頭は終了時刻由来なので、`game_id` から前方一致では引けない。終了時刻が
-/// 分からない対局の index を探すときに、list した key をこの関数でふるい分ける。
-/// `<game_id>` 部分は完全一致で比べる (別の対局の ID が同じ文字列で終わっていても拾わない)。
-pub fn is_games_index_key_of(key: &str, game_id: &str) -> bool {
-    const INV_DIGITS: usize = 14;
-    let Some(rest) = key.strip_prefix(KEY_PREFIX) else {
-        return false;
-    };
-    let bytes = rest.as_bytes();
-    bytes.len() > INV_DIGITS
-        && bytes[..INV_DIGITS].iter().all(u8::is_ascii_digit)
-        && bytes[INV_DIGITS] == b'-'
-        && rest[INV_DIGITS + 1..].strip_suffix(".json") == Some(game_id)
-}
-
 /// games-index に書き込む 1 entry の wire format。
 ///
-/// API contract A (https://github.com/SH11235/rshogi/issues/542 issuecomment-4338125621) に準拠し、`result_kind` /
+/// API contract A (Issue #542 issuecomment-4338125621) に準拠し、`result_kind` /
 /// `end_reason` を **2 フィールドに分離** する。client 側 (ramu-shogi viewer)
 /// は両者を合わせて UI 表示用の構造化結果に変換する。
 ///
-/// `source` は `"kifu"` / `"floodgate"` / `"wdoor"` / `"upload"` の 4 値。
-/// `"floodgate"` は「Floodgate gating が opt-in された worker
-/// (`ALLOW_FLOODGATE_FEATURES` 立ち + `FLOODGATE_HISTORY_BUCKET` binding 解決可)
-/// で起きた終局」を意味し、`floodgate-history/` への put 成否は反映しない。
-/// `"wdoor"` / `"upload"` は管理 API で取り込んだ外部棋譜
-/// ([`SOURCE_WDOOR`] / [`SOURCE_UPLOAD`]) で、player ID を持たず、内部
-/// レーティング集計の対象外になる。
+/// `source` は `"kifu"` / `"floodgate"` の 2 値 enum。`"floodgate"` は
+/// 「Floodgate gating が opt-in された worker (`ALLOW_FLOODGATE_FEATURES`
+/// 立ち + `FLOODGATE_HISTORY_BUCKET` binding 解決可) で起きた終局」を意味し、
+/// `floodgate-history/` への put 成否は反映しない。
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct GamesIndexEntry<'a> {
     pub game_id: &'a str,
@@ -103,40 +83,11 @@ pub struct GamesIndexEntry<'a> {
     pub ended_at_ms: u64,
     pub black_handle: &'a str,
     pub white_handle: &'a str,
-    /// LOGIN credential から導出した公開用 opaque ID。旧 meta では省略される。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub black_player_id: Option<&'a str>,
-    /// LOGIN credential から導出した公開用 opaque ID。旧 meta では省略される。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub white_player_id: Option<&'a str>,
     pub result_kind: &'static str,
     pub end_reason: &'static str,
     pub moves_count: u32,
-    /// 外部棋譜で持ち時間を判定できないときだけ省略する。自前サーバーの対局は常に `Some`。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub clock: Option<ClockSpec<'a>>,
+    pub clock: ClockSpec<'a>,
     pub source: &'static str,
-    /// `wdoor` はゲーム名 (例 `floodgate-300-10F`)、`upload` は取り込み時に指定した大会名など。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event: Option<&'a str>,
-    /// `wdoor` から参照取り込みした棋譜の元 URL。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin_url: Option<&'a str>,
-}
-
-/// wdoor の Floodgate から取り込んだ対局の `source` 値。
-pub const SOURCE_WDOOR: &str = "wdoor";
-
-/// 管理者がアップロードした棋譜の `source` 値。
-pub const SOURCE_UPLOAD: &str = "upload";
-
-/// 外部棋譜 (`wdoor` / `upload`) を除外する SQL 条件。レーティング集計と
-/// プレイヤー詳細の対局一覧で共有する。
-pub const NOT_EXTERNAL_SOURCE_SQL: &str = "source NOT IN ('wdoor','upload')";
-
-/// 外部から取り込んだ棋譜の `source` かどうか。
-pub fn is_external_source(source: &str) -> bool {
-    source == SOURCE_WDOOR || source == SOURCE_UPLOAD
 }
 
 /// `clock` field の wire 形状。`kind` は `wrangler.toml::CLOCK_KIND` と同一の
@@ -144,21 +95,8 @@ pub fn is_external_source(source: &str) -> bool {
 ///
 /// 各時計方式で意味のある field は限定されるため、未使用 field は `None` で省略する
 /// (serde の `skip_serializing_if`)。
-/// `black_total_*` / `white_total_*` は先後別の上書きで、省略時は対応する `total_*` を使う。
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct ClockSpec<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub black_total_sec: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub white_total_sec: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub black_total_ms: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub white_total_ms: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub black_total_min: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub white_total_min: Option<u32>,
     pub kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_sec: Option<u32>,
@@ -184,15 +122,7 @@ impl<'a> ClockSpec<'a> {
             rshogi_csa_server::ClockSpec::Countdown {
                 total_time_sec,
                 byoyomi_sec,
-                black_total_time_sec,
-                white_total_time_sec,
             } => Self {
-                black_total_sec: *black_total_time_sec,
-                white_total_sec: *white_total_time_sec,
-                black_total_ms: None,
-                white_total_ms: None,
-                black_total_min: None,
-                white_total_min: None,
                 kind: "countdown",
                 total_sec: Some(*total_time_sec),
                 byoyomi_sec: Some(*byoyomi_sec),
@@ -205,15 +135,7 @@ impl<'a> ClockSpec<'a> {
             rshogi_csa_server::ClockSpec::CountdownMsec {
                 total_time_ms,
                 byoyomi_ms,
-                black_total_time_ms,
-                white_total_time_ms,
             } => Self {
-                black_total_sec: None,
-                white_total_sec: None,
-                black_total_ms: *black_total_time_ms,
-                white_total_ms: *white_total_time_ms,
-                black_total_min: None,
-                white_total_min: None,
                 kind: "countdown_msec",
                 total_sec: None,
                 byoyomi_sec: None,
@@ -226,15 +148,7 @@ impl<'a> ClockSpec<'a> {
             rshogi_csa_server::ClockSpec::Fischer {
                 total_time_sec,
                 increment_sec,
-                black_total_time_sec,
-                white_total_time_sec,
             } => Self {
-                black_total_sec: *black_total_time_sec,
-                white_total_sec: *white_total_time_sec,
-                black_total_ms: None,
-                white_total_ms: None,
-                black_total_min: None,
-                white_total_min: None,
                 kind: "fischer",
                 total_sec: Some(*total_time_sec),
                 byoyomi_sec: None,
@@ -247,15 +161,7 @@ impl<'a> ClockSpec<'a> {
             rshogi_csa_server::ClockSpec::StopWatch {
                 total_time_min,
                 byoyomi_min,
-                black_total_time_min,
-                white_total_time_min,
             } => Self {
-                black_total_sec: None,
-                white_total_sec: None,
-                black_total_ms: None,
-                white_total_ms: None,
-                black_total_min: *black_total_time_min,
-                white_total_min: *white_total_time_min,
                 kind: "stopwatch",
                 total_sec: None,
                 byoyomi_sec: None,
@@ -383,7 +289,7 @@ mod tests {
 
     #[test]
     fn games_index_key_inv_ms_zero_pads_for_recent_timestamp() {
-        // epoch ms (13 桁) でも inv は 14 桁ゼロパディングで揃う。
+        // 2026-04-29 頃の epoch ms (13 桁) でも inv は 14 桁ゼロパディングで揃う。
         let ended = 1_777_392_877_244_u64;
         let key = games_index_key(ended, "lobby-cross-fischer-1777391025209").unwrap();
         // INV_BASE - 1_777_392_877_244 = 98_222_607_122_755 (14 桁)
@@ -408,6 +314,25 @@ mod tests {
     #[test]
     fn games_index_key_rejects_overflowing_ended_at() {
         let err = games_index_key(INV_BASE + 1, "g1").unwrap_err();
+        assert!(matches!(err, StorageError::Malformed(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn games_index_key_rejects_game_id_with_slash() {
+        // `/` は R2 の階層区切り。validate_key_component 経由で弾かれる。
+        let err = games_index_key(1_000, "g1/evil").unwrap_err();
+        assert!(matches!(err, StorageError::Malformed(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn games_index_key_rejects_empty_game_id() {
+        let err = games_index_key(1_000, "").unwrap_err();
+        assert!(matches!(err, StorageError::Malformed(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn games_index_key_rejects_non_ascii_game_id() {
+        let err = games_index_key(1_000, "g\u{3042}").unwrap_err();
         assert!(matches!(err, StorageError::Malformed(_)), "got: {err:?}");
     }
 
@@ -505,8 +430,6 @@ mod tests {
         let spec = rshogi_csa_server::ClockSpec::Countdown {
             total_time_sec: 600,
             byoyomi_sec: 10,
-            black_total_time_sec: None,
-            white_total_time_sec: None,
         };
         let wire = ClockSpec::from_server(&spec);
         assert_eq!(wire.kind, "countdown");
@@ -521,8 +444,6 @@ mod tests {
         let spec = rshogi_csa_server::ClockSpec::Fischer {
             total_time_sec: 300,
             increment_sec: 5,
-            black_total_time_sec: None,
-            white_total_time_sec: None,
         };
         let wire = ClockSpec::from_server(&spec);
         assert_eq!(wire.kind, "fischer");
@@ -536,8 +457,6 @@ mod tests {
         let spec = rshogi_csa_server::ClockSpec::CountdownMsec {
             total_time_ms: 60_000,
             byoyomi_ms: 100,
-            black_total_time_ms: None,
-            white_total_time_ms: None,
         };
         let wire = ClockSpec::from_server(&spec);
         assert_eq!(wire.kind, "countdown_msec");
@@ -552,8 +471,6 @@ mod tests {
         let spec = rshogi_csa_server::ClockSpec::StopWatch {
             total_time_min: 15,
             byoyomi_min: 2,
-            black_total_time_min: None,
-            white_total_time_min: None,
         };
         let wire = ClockSpec::from_server(&spec);
         assert_eq!(wire.kind, "stopwatch");
@@ -601,18 +518,10 @@ mod tests {
             ended_at_ms: 1_777_392_877_244,
             black_handle: "alice",
             white_handle: "bob",
-            black_player_id: Some("p_alice"),
-            white_player_id: Some("p_bob"),
             result_kind: "WIN_BLACK",
             end_reason: "RESIGN",
             moves_count: 142,
-            clock: Some(ClockSpec {
-                black_total_sec: None,
-                white_total_sec: None,
-                black_total_ms: None,
-                white_total_ms: None,
-                black_total_min: None,
-                white_total_min: None,
+            clock: ClockSpec {
                 kind: "fischer",
                 total_sec: Some(300),
                 byoyomi_sec: None,
@@ -621,118 +530,16 @@ mod tests {
                 total_ms: None,
                 total_min: None,
                 byoyomi_min: None,
-            }),
+            },
             source: "kifu",
-            event: None,
-            origin_url: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
-        // 自前サーバーの対局では外部棋譜用の任意 field を出さない (既存 wire を変えない)。
-        assert!(!json.contains("event"), "json={json}");
-        assert!(!json.contains("origin_url"), "json={json}");
         // result_kind / end_reason が独立 field として直列化されることを固定。
         assert!(json.contains("\"result_kind\":\"WIN_BLACK\""), "json={json}");
         assert!(json.contains("\"end_reason\":\"RESIGN\""), "json={json}");
-        assert!(json.contains("\"black_player_id\":\"p_alice\""), "json={json}");
         assert!(json.contains("\"source\":\"kifu\""), "json={json}");
         // 未使用 clock field は省略される。
         assert!(!json.contains("byoyomi_sec"), "json={json}");
         assert!(!json.contains("total_ms"), "json={json}");
-    }
-
-    #[test]
-    fn external_entry_omits_player_ids_and_unknown_clock() {
-        let entry = GamesIndexEntry {
-            game_id: "wdoor-20261009000001-0123456789",
-            started_at_ms: 1,
-            ended_at_ms: 2,
-            black_handle: "RAMU",
-            white_handle: "Panda",
-            black_player_id: None,
-            white_player_id: None,
-            result_kind: "WIN_BLACK",
-            end_reason: "RESIGN",
-            moves_count: 113,
-            clock: None,
-            source: SOURCE_WDOOR,
-            event: Some("floodgate-300-10F"),
-            origin_url: Some("https://example.com/a.csa"),
-        };
-        let value = serde_json::to_value(&entry).unwrap();
-        let object = value.as_object().unwrap();
-        for absent in ["black_player_id", "white_player_id", "clock"] {
-            assert!(!object.contains_key(absent), "{absent} must be omitted: {value}");
-        }
-        assert_eq!(value["source"], "wdoor");
-        assert_eq!(value["event"], "floodgate-300-10F");
-        assert_eq!(value["origin_url"], "https://example.com/a.csa");
-    }
-
-    #[test]
-    fn external_source_predicate_matches_only_imported_sources() {
-        assert!(is_external_source("wdoor"));
-        assert!(is_external_source("upload"));
-        assert!(!is_external_source("kifu"));
-        assert!(!is_external_source("floodgate"));
-        for source in [SOURCE_WDOOR, SOURCE_UPLOAD] {
-            assert!(NOT_EXTERNAL_SOURCE_SQL.contains(&format!("'{source}'")));
-        }
-    }
-
-    #[test]
-    fn games_index_key_ownership_matches_only_the_exact_game_id() {
-        let game_id = "wdoor-20261009000001-93ef4d36a6";
-        for ended_at_ms in [0, 1, 1_777_392_877_244, INV_BASE] {
-            let key = games_index_key(ended_at_ms, game_id).unwrap();
-            assert!(is_games_index_key_of(&key, game_id), "key={key}");
-        }
-        let key = games_index_key(1_777_392_877_244, game_id).unwrap();
-        for other in [
-            "20261009000001-93ef4d36a6",
-            "93ef4d36a6",
-            "x-wdoor-20261009000001-93ef4d36a6",
-            "wdoor-20261009000001-93ef4d36a",
-            "",
-        ] {
-            assert!(!is_games_index_key_of(&key, other), "other={other:?}");
-        }
-        // 別の対局の ID が同じ文字列で終わっていても拾わない。
-        let longer = games_index_key(1, "prefix-wdoor-20261009000001-93ef4d36a6").unwrap();
-        assert!(!is_games_index_key_of(&longer, game_id));
-        for malformed in [
-            "games-index/",
-            "games-index/123-g.json",
-            "games-index/1234567890123x-g.json",
-            "games-index/12345678901234_g.json",
-            "games-index/12345678901234-g",
-            "live-games-index/12345678901234-g.json",
-            "kifu-by-id/g.meta.json",
-        ] {
-            assert!(!is_games_index_key_of(malformed, "g"), "key={malformed}");
-        }
-        assert!(is_games_index_key_of("games-index/12345678901234-g.json", "g"));
-    }
-
-    #[test]
-    fn index_key_rejects_invalid_game_id() {
-        for id in ["", "g1/evil", "gあ"] {
-            assert!(matches!(games_index_key(1000, id), Err(StorageError::Malformed(_))));
-        }
-    }
-
-    #[test]
-    fn color_totals_are_recorded_in_index() {
-        for (kind, unit, extra) in [
-            ("countdown", "sec", "byoyomi_sec"),
-            ("fischer", "sec", "increment_sec"),
-            ("countdown_msec", "ms", "byoyomi_ms"),
-            ("stopwatch", "min", "byoyomi_min"),
-        ] {
-            let input = serde_json::json!({"kind": kind, format!("total_time_{unit}"): 10, format!("black_total_time_{unit}"): 3, format!("white_total_time_{unit}"): 8, extra: 2});
-            let clock: rshogi_csa_server::ClockSpec = serde_json::from_value(input).unwrap();
-            let wire = serde_json::to_value(ClockSpec::from_server(&clock)).unwrap();
-            assert_eq!(wire[format!("black_total_{unit}")], 3);
-            assert_eq!(wire[format!("white_total_{unit}")], 8);
-        }
     }
 }

@@ -15,12 +15,7 @@
 //! - 対局開始 → R2 put までの数百 ms ～ 数秒は live に出てこない
 //! - 終局 → R2 delete までは live に残る (viewer の click 時に既に終局済 cfg)
 //! - DO crash で put 済だが delete されない orphan が残るリスクあり
-//!   (orphan sweep は https://github.com/SH11235/rshogi/issues/551 で扱う backfill ジョブに統合する)
-//! - https://github.com/SH11235/rshogi/issues/636: viewer API (`/api/v1/games/live`) は `caches.default` で
-//!   60 秒 TTL の per-URL cache を被せる。R2 put / delete の反映に追加で
-//!   **最大 60 秒** の cache stale が乗る。具体的には:
-//!     - 対局開始 → live list に現れるまで: 上記 R2 put 反映 + 60 秒
-//!     - 終局 → live list から消えるまで: 上記 R2 delete 反映 + 60 秒
+//!   (orphan sweep は Issue #551 で扱う backfill ジョブに統合する)
 //!
 //! pagination 中に entry が追加・削除されうるため、同じ cursor で 2 回 list を
 //! 呼んでも結果集合が一致しない。viewer 側は live entry を **発見手段** として
@@ -83,7 +78,7 @@ mod tests {
 
     #[test]
     fn live_games_index_key_inv_ms_zero_pads_for_recent_timestamp() {
-        // epoch ms (13 桁) でも inv は 14 桁ゼロパディングで揃う。
+        // 2026-04-29 頃の epoch ms (13 桁) でも inv は 14 桁ゼロパディングで揃う。
         let started = 1_777_391_025_209_u64;
         let key = live_games_index_key(started, "lobby-cross-fischer-1777391025209").unwrap();
         // INV_BASE - 1_777_391_025_209 = 98_222_608_974_790 (14 桁)
@@ -108,6 +103,19 @@ mod tests {
     #[test]
     fn live_games_index_key_rejects_overflowing_started_at() {
         let err = live_games_index_key(INV_BASE + 1, "g1").unwrap_err();
+        assert!(matches!(err, StorageError::Malformed(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn live_games_index_key_rejects_game_id_with_slash() {
+        // `/` は R2 の階層区切り。validate_key_component 経由で弾かれる。
+        let err = live_games_index_key(1_000, "g1/evil").unwrap_err();
+        assert!(matches!(err, StorageError::Malformed(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn live_games_index_key_rejects_empty_game_id() {
+        let err = live_games_index_key(1_000, "").unwrap_err();
         assert!(matches!(err, StorageError::Malformed(_)), "got: {err:?}");
     }
 
@@ -137,12 +145,6 @@ mod tests {
             black_handle: "alice",
             white_handle: "bob",
             clock: ClockSpec {
-                black_total_sec: None,
-                white_total_sec: None,
-                black_total_ms: None,
-                white_total_ms: None,
-                black_total_min: None,
-                white_total_min: None,
                 kind: "fischer",
                 total_sec: Some(300),
                 byoyomi_sec: None,
@@ -169,15 +171,14 @@ mod tests {
         assert!(!json.contains("moves_count"), "json={json}");
     }
 
+    #[test]
+    fn live_key_prefix_matches_expected_string() {
+        // viewer_api ハンドラと R2 list でしか参照されない契約値を固定。
+        assert_eq!(LIVE_KEY_PREFIX, "live-games-index/");
+    }
+
     // `source` の env 切替判定は `games_index::resolve_index_source` (wasm32
     // 限定) に集約済み。ホスト target からは純粋関数
     // `games_index::classify_index_source_from_inputs` のテスト
     // (`games_index::tests`) で網羅する。
-
-    #[test]
-    fn index_key_rejects_invalid_game_id() {
-        for id in ["", "g1/evil", "gあ"] {
-            assert!(matches!(live_games_index_key(1000, id), Err(StorageError::Malformed(_))));
-        }
-    }
 }

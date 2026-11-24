@@ -30,10 +30,7 @@ use std::{
 };
 
 use clap::Parser;
-use tools::common::dedup::{
-    PSV_SIZE, SFEN_SIZE, check_output_not_in_inputs, collect_input_paths, validate_psv_file_sizes,
-};
-use tools::common::memory::available_memory_bytes;
+use tools::common::dedup::{PSV_SIZE, SFEN_SIZE, check_output_not_in_inputs, collect_input_paths};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -182,6 +179,20 @@ fn hash_pair(sfen: &[u8; SFEN_SIZE]) -> (u64, u64) {
     (h1, h2 | 1)
 }
 
+/// /proc/meminfo から MemAvailable をバイト単位で取得する。
+/// 取得できない環境（非 Linux）では None を返す。
+fn get_mem_available() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb_str = rest.trim().strip_suffix("kB")?.trim();
+            let kb: u64 = kb_str.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
 fn format_gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
@@ -208,7 +219,15 @@ fn count_records(label: &str, paths: &[PathBuf]) -> io::Result<u64> {
     eprintln!("[{label}]");
     for p in paths {
         let sz = std::fs::metadata(p)?.len();
-        let n = validate_psv_file_sizes(std::slice::from_ref(p))?;
+        let n = sz / PSV_SIZE as u64;
+        if sz % PSV_SIZE as u64 != 0 {
+            eprintln!(
+                "Warning: {} のサイズが {} の倍数ではありません (残余 {} bytes)",
+                p.display(),
+                PSV_SIZE,
+                sz % PSV_SIZE as u64,
+            );
+        }
         total += n;
         eprintln!("  {}: {n} records ({:.2} GB)", p.display(), sz as f64 / 1e9);
     }
@@ -218,7 +237,7 @@ fn count_records(label: &str, paths: &[PathBuf]) -> io::Result<u64> {
 fn main() -> io::Result<()> {
     let args = Args::parse();
 
-    if !(args.fpr > 0.0 && args.fpr < 1.0) {
+    if args.fpr <= 0.0 || args.fpr >= 1.0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "--fpr は 0.0〜1.0 の間で指定してください",
@@ -288,7 +307,7 @@ fn main() -> io::Result<()> {
     );
 
     // メモリ充足チェック
-    if let Some(mem_available) = available_memory_bytes() {
+    if let Some(mem_available) = get_mem_available() {
         let threshold = (mem_available as f64 * 0.8) as u64;
         eprintln!(
             "  required: {} / available: {} (80% threshold: {})",
@@ -311,16 +330,11 @@ fn main() -> io::Result<()> {
                 )));
             }
         }
-    } else if args.force {
+    } else {
         eprintln!(
-            "  required: {} (利用可能メモリの取得不可、--force によりチェックをスキップ)",
+            "  required: {} (MemAvailable の取得不可、メモリチェックをスキップ)",
             format_gib(params.size_bytes),
         );
-    } else {
-        return Err(io::Error::other(
-            "利用可能メモリを取得できません。安全のため処理を停止します。\n\
-             続行する場合は --force を指定してください",
-        ));
     }
 
     // ブルームフィルタ確保

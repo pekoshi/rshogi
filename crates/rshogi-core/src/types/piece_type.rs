@@ -119,7 +119,7 @@ impl PieceType {
     }
 }
 
-/// 駒種の集合（複数の駒種を表すビットマスク）
+/// 駒種の集合（やねうら王の合成駒種に対応するビットマスク）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct PieceTypeSet(u16);
 

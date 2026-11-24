@@ -4,8 +4,7 @@ use super::{Piece, PieceType, Square};
 
 /// 指し手（32bit）
 ///
-/// 下位16bitは外部形式（PSV など）の Move16 と同じ配置で固定する。変更すると読み書きが壊れる。
-///
+/// 下位16bit（YaneuraOu互換）:
 /// - bit 0-6:  移動先 (to)
 /// - bit 7-13: 移動元 (from) / 駒打ちの場合はPieceType
 /// - bit 14:   駒打ちフラグ
@@ -33,7 +32,7 @@ impl Move {
     /// - PASS(0xC000)と同じ DROP+PROMOTE 同時立ちだが、to=1 で区別
     pub const WIN: Move = Move(0xC001);
 
-    // 外部形式の Move16 の配置を保つため、下位16bitのマスクは固定する。
+    // 下位16bitのマスク（YaneuraOu互換）
     const TO_MASK: u32 = 0x007F; // bit 0-6
     const FROM_MASK: u32 = 0x3F80; // bit 7-13
     const FROM_SHIFT: u32 = 7;
@@ -92,50 +91,44 @@ impl Move {
         Move(m)
     }
 
-    // to / from / drop_piece_type は探索の最内ループで通るため、release では符号化を検査しない
-    // (理由は `Index<Square> for [T]` と同じ)。呼ぶのは手生成が作った手か、`from_u16_checked` /
-    // `Position::to_move` で検証した手だけ。置換表から読んだ生の move16 は `Position::to_move` を通してから使う。
-
     /// 移動先を取得
     ///
-    /// `NONE` / `NULL` の符号化に含まれる升も取得できる。
-    /// `PASS` / `WIN` や、移動先が盤外の符号化 (検証していない `from_u16` の値) に対して呼ばないこと。
+    /// # 注意
+    /// - PASSに対して呼ぶと不正な値が返る
+    /// - NULLはNMPで使用されるため従来通り許可
+    ///
+    /// # Safety
+    /// - release ビルドでは PASS チェックが無効化される（`debug_assert!`）
+    /// - 呼び出し側で PASS でないことを保証する必要がある
     #[inline]
     pub const fn to(self) -> Square {
         debug_assert!(!self.is_pass() && !self.is_win(), "to() called on PASS/WIN move");
-        // SAFETY: 検証済みの手の to は 0..=80。
+        // SAFETY: to は 0-80 の範囲（7bit）
         unsafe { Square::from_u8_unchecked((self.0 & Self::TO_MASK) as u8) }
     }
 
-    /// 移動元を取得
+    /// 移動元を取得（駒打ちの場合は無効）
     ///
-    /// `PASS` / `WIN` / 駒打ちや、移動元が盤外の符号化に対して呼ばないこと。
+    /// 【注意】PASSや駒打ちに対して呼ぶと不正な値が返る
     #[inline]
     pub const fn from(self) -> Square {
         debug_assert!(
             !self.is_pass() && !self.is_win() && !self.is_drop(),
             "from() called on invalid move (PASS/WIN or drop)"
         );
-        // SAFETY: 検証済みの駒移動の from は 0..=80。
+        // SAFETY: from は 0-80 の範囲（7bit）
         unsafe { Square::from_u8_unchecked(((self.0 & Self::FROM_MASK) >> Self::FROM_SHIFT) as u8) }
     }
 
-    /// 打つ駒種を取得
-    ///
-    /// 駒打ちでない手や、打つ駒種が手駒の7種類でない符号化に対して呼ばないこと。
+    /// 打つ駒種を取得（駒打ちでない場合は無効）
     #[inline]
     pub const fn drop_piece_type(self) -> PieceType {
-        debug_assert!(self.is_drop(), "drop_piece_type() called on a non-drop move");
-        let piece = ((self.0 & Self::FROM_MASK) >> Self::FROM_SHIFT) as u8;
-        debug_assert!(
-            piece >= 1 && piece <= PieceType::Gold as u8,
-            "drop piece must be a hand piece"
-        );
-        // SAFETY: 検証済みの駒打ちの駒種は 1..=7 (Pawn..=Gold)。
-        unsafe { std::mem::transmute(piece) }
+        debug_assert!(self.is_drop());
+        // SAFETY: PieceType は 1-7 の範囲（手駒のみ）
+        unsafe { std::mem::transmute(((self.0 & Self::FROM_MASK) >> Self::FROM_SHIFT) as u8) }
     }
 
-    /// 移動後の駒を取得
+    /// 移動後の駒を取得（YaneuraOu互換）
     /// 成りの場合は成った後の駒、駒打ちの場合は打った駒を返す
     /// 駒情報が設定されていない場合はPiece::NONEを返す
     #[inline]
@@ -215,9 +208,9 @@ impl Move {
 
     /// History用インデックス
     ///
-    /// `m.raw()` (下位16bit) をそのまま使用。
+    /// YaneuraOu準拠: `m.raw()` (下位16bit) をそのまま使用。
     /// bit 0-6: to, bit 7-13: from/駒種, bit 14: 打ちフラグ, bit 15: 成りフラグ
-    /// 成り/不成りで別エントリになる。
+    /// 成り/不成りで別エントリになる（YO互換）。
     #[inline]
     pub const fn history_index(self) -> usize {
         (self.0 & Self::LOWER_16BIT_MASK) as usize
@@ -229,7 +222,7 @@ impl Move {
         self.is_promote()
     }
 
-    /// 内部値を取得（下位16bitのみ）
+    /// 内部値を取得（下位16bitのみ、YaneuraOu互換）
     #[inline]
     pub const fn raw(self) -> u16 {
         (self.0 & Self::LOWER_16BIT_MASK) as u16
@@ -242,9 +235,6 @@ impl Move {
     }
 
     /// u16からMoveを生成（駒情報なし）
-    ///
-    /// 符号化は検証しない。外部入力の検証には `from_u16_checked()` を使う。
-    /// 盤外の升や不正な駒種を含む値に `to()` / `from()` / `drop_piece_type()` を呼んではならない。
     #[inline]
     pub const fn from_u16(value: u16) -> Move {
         Move(value as u32)
@@ -325,21 +315,7 @@ impl Move {
         }
     }
 
-    /// USIの指し手トークン全体を検証して変換する（合法性は判定しない）。
-    ///
-    /// 通常手は4文字、成りは末尾 `+` を含む5文字、打ちは4文字に限る。
-    /// `none` / `pass` / `0000` は従来の特殊値として受理し、`win` は受理しない。
-    /// 余分な文字・空白を含む入力はNone。行全体は呼出側でトークンに分割する。
-    pub fn from_usi_strict(s: &str) -> Option<Move> {
-        match s.len() {
-            4 => Self::from_usi(s),
-            5 if s.as_bytes()[1] != b'*' && s.ends_with('+') => Self::from_usi(s),
-            _ => None,
-        }
-    }
     /// USI形式の文字列からMoveに変換（パス対応）
-    ///
-    /// 互換性のため通常手・打ちの末尾を許容する。全体の字句検証には `from_usi_strict()` を使う。
     ///
     /// # パス手の形式
     /// - `"pass"`: 独自形式
@@ -404,26 +380,6 @@ impl Default for Move {
 mod tests {
     use super::*;
     use crate::types::{File, Rank};
-
-    #[test]
-    fn raw_move_accessors_preserve_valid_fields() {
-        for index in 0..Square::NUM as u8 {
-            let square = Square::from_u8(index).unwrap();
-            let mv = Move::new_move(square, square, false);
-            let restored = Move::from_u16(mv.to_u16());
-            assert_eq!(restored.from(), square);
-            assert_eq!(restored.to(), square);
-            for piece in PieceType::HAND_PIECES {
-                let mv = Move::new_drop(piece, square);
-                let restored = Move::from_u16(mv.to_u16());
-                assert_eq!(restored.to(), square);
-                assert_eq!(restored.drop_piece_type(), piece);
-            }
-        }
-        for mv in [Move::NONE, Move::NULL] {
-            assert_eq!(mv.from(), mv.to());
-        }
-    }
 
     #[test]
     fn test_move_new_move() {
@@ -530,42 +486,6 @@ mod tests {
     }
 
     #[test]
-    fn test_strict_usi_move_token_boundaries() {
-        for token in [
-            "7g7f", "2c2b+", "P*5e", "L*5e", "N*5e", "S*5e", "G*5e", "B*5e", "R*5e", "none",
-            "pass", "0000",
-        ] {
-            assert_eq!(Move::from_usi_strict(token), Move::from_usi(token), "{token}");
-            assert!(Move::from_usi_strict(token).is_some());
-        }
-        for token in [
-            "",
-            "7g7",
-            "7g7fgarbage",
-            "7g7f+garbage",
-            "7g7fx",
-            "7g7f++",
-            "P*5e+",
-            "P*5egarbage",
-            "7g7f ",
-            "7g7f\n",
-            "7g7f\0",
-            "7g7f歩",
-            "７g7f",
-            "pass+",
-            "passgarbage",
-            "0000+",
-            "none+",
-            "win",
-        ] {
-            assert_eq!(Move::from_usi_strict(token), None, "{token:?}");
-        }
-        // 寛容な既存APIを使う正規化経路の互換性は維持する。
-        assert_eq!(Move::from_usi("7g7fgarbage"), Move::from_usi("7g7f"));
-        assert_eq!(Move::from_usi("7g7f++"), Move::from_usi("7g7f+"));
-        assert_eq!(Move::from_usi("P*5e+"), Move::from_usi("P*5e"));
-    }
-    #[test]
     fn test_move_from_usi() {
         // 通常移動
         let m = Move::from_usi("7g7f").unwrap();
@@ -596,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_move_history_index() {
-        // history_index = m.raw() (下位16bit)
+        // YaneuraOu準拠: history_index = m.raw() (下位16bit)
         let from = Square::new(File::File7, Rank::Rank7);
         let to = Square::new(File::File7, Rank::Rank6);
 
@@ -636,22 +556,25 @@ mod tests {
     // =========================================
 
     #[test]
-    fn test_special_move_encodings() {
-        for (mv, raw, usi, parsed) in [
-            (Move::PASS, 0xC000, "pass", Some(Move::PASS)),
-            (Move::WIN, 0xC001, "win", None),
-        ] {
-            assert_eq!(mv.to_u16(), raw);
-            assert_eq!(Move::from_u16_checked(raw), Some(mv));
-            assert_eq!(mv.to_usi(), usi);
-            assert_eq!(Move::from_usi(usi), parsed);
-            assert!(!mv.is_drop());
-            assert!(!mv.is_promote());
-        }
-        for mv in [Move::NONE, Move::NULL, Move::PASS, Move::WIN] {
-            assert_eq!(mv.is_pass(), mv == Move::PASS);
-            assert_eq!(mv.is_win(), mv == Move::WIN);
-        }
+    fn test_move_pass_encoding() {
+        // PASS は bit14=1, bit15=1 (0xC000)
+        assert_eq!(Move::PASS.0, 0xC000);
+        assert!(Move::PASS.is_pass());
+        assert!(!Move::NONE.is_pass());
+        assert!(!Move::NULL.is_pass());
+        assert!(!Move::WIN.is_pass());
+    }
+
+    #[test]
+    fn test_move_pass_not_drop() {
+        // PASSは bit14=1 だが is_drop() は false
+        assert!(!Move::PASS.is_drop());
+    }
+
+    #[test]
+    fn test_move_pass_not_promote() {
+        // PASSは bit15=1 だが is_promote() は false
+        assert!(!Move::PASS.is_promote());
     }
 
     #[test]
@@ -690,6 +613,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_move_usi_pass() {
+        assert_eq!(Move::PASS.to_usi(), "pass");
+        assert_eq!(Move::from_usi("pass"), Some(Move::PASS));
+    }
+
     // 【注意】以下のテストは debug_assert! なので debug ビルドでのみ動作
     // cargo test で実行（release ビルドでは panic しない）
 
@@ -710,6 +639,37 @@ mod tests {
     // =========================================
     // 入玉宣言勝ち（WIN）関連のテスト
     // =========================================
+
+    #[test]
+    fn test_move_win_encoding() {
+        assert_eq!(Move::WIN.0, 0xC001);
+        assert!(Move::WIN.is_win());
+        assert!(!Move::NONE.is_win());
+        assert!(!Move::NULL.is_win());
+        assert!(!Move::PASS.is_win());
+    }
+
+    #[test]
+    fn test_move_win_not_drop_not_promote() {
+        assert!(!Move::WIN.is_drop());
+        assert!(!Move::WIN.is_promote());
+    }
+
+    #[test]
+    fn test_move_win_usi() {
+        assert_eq!(Move::WIN.to_usi(), "win");
+        // from_usi("win") は受理しない（position moves 経路での誤用防止）
+        assert_eq!(Move::from_usi("win"), None);
+    }
+
+    #[test]
+    fn test_move_win_from_u16_checked() {
+        let win_u16 = Move::WIN.to_u16();
+        assert_eq!(win_u16, 0xC001);
+        let restored = Move::from_u16_checked(win_u16);
+        assert_eq!(restored, Some(Move::WIN));
+        assert!(restored.unwrap().is_win());
+    }
 
     #[test]
     #[cfg(debug_assertions)]

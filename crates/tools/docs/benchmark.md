@@ -1,8 +1,6 @@
 ## 将棋エンジンベンチマークツール
 
-LayerStacks の bucket mode（`progresskpabsq16` を含む）と進行度係数は [routing 対応表](nnue-routing.md) を参照してください。
-
-指定した局面を探索し、処理時間・探索ノード数・NPS を測定します。
+YaneuraOu の `bench` コマンド相当の標準ベンチマーク機能を提供します。
 
 ### 機能
 
@@ -16,12 +14,8 @@ LayerStacks の bucket mode（`progresskpabsq16` を含む）と進行度係数�
 #### 内部APIモード（自作エンジン）
 
 ```bash
-cargo run -p tools --bin benchmark --release -- \
-  --internal --usi-option MaterialLevel=1 \
-  --limit-type nodes --limit 10000 --tt-mb 16 --eval-hash-mb 16
+cargo run -p tools --bin benchmark --release -- --internal
 ```
-
-評価関数なしの短い動作確認例です。NNUE の性能を測るときは `--nnue-file` と必要な routing を指定します。
 
 #### USIモード（外部エンジン）
 
@@ -36,10 +30,8 @@ cargo run -p tools --bin benchmark --release -- \
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
 | `--threads` | 測定するスレッド数（カンマ区切り） | 1 |
-| `--eval-hash-mb` | 評価ハッシュ容量（MB）。USI では `EvalHash` | 256 |
-| `--use-eval-hash true/false` | 評価ハッシュ使用。USI では `UseEvalHash` | true |
 | `--tt-mb` | 置換表サイズ（MB） | 1024 |
-| `--limit-type` | 制限タイプ (depth/nodes/movetime)。nodes は全スレッドの合計で打ち切る | movetime |
+| `--limit-type` | 制限タイプ (depth/nodes/movetime) | movetime |
 | `--limit` | 制限値 | 15000 |
 | `--sfens` | カスタム局面ファイル | デフォルト4局面 |
 | `--iterations` | 反復回数 | 1 |
@@ -47,14 +39,8 @@ cargo run -p tools --bin benchmark --release -- \
 | `-v, --verbose` | 詳細なinfo行を表示 | false |
 | `--engine` | エンジンバイナリパス | なし（内部API） |
 | `--internal` | 内部API直接呼び出しモード | false |
-| `--nnue-file` | NNUE ファイル | なし |
-| `--usi-option Name=Value` | 評価設定（複数指定可） | なし |
 | `--reuse-search` | Searchインスタンス再利用モード | false |
 | `--warmup` | ウォームアップ回数 | 0 |
-
-内部APIで LayerStacks を使う場合も routing は明示します。progresskpabs なら
-`--usi-option LS_BUCKET_MODE=progresskpabs --usi-option LS_PROGRESS_BUCKETS=8
---usi-option LS_PROGRESS_COEFF=/path/to/progress.bin` を指定します。
 
 ### カスタム局面ファイル
 
@@ -68,9 +54,6 @@ cargo run -p tools --bin benchmark --release -- \
 # 区切り文字がない場合は、SFEN文字列のみ
 lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1
 ```
-
-先頭の `sfen ` は名前付き・名前なしのどちらの行でも省略できます。名前なしの行は
-`position_<行番号>` という名前になります。
 
 ### 出力形式
 
@@ -94,7 +77,7 @@ Threads    Total Nodes     Total Time      Avg NPS         Efficiency
 #### JSON出力
 
 結果は `benchmark_results/` に自動保存されます：
-- ファイル名形式: `YYYYMMDDhhmmss_enginename_threads.json`。エンジン名はファイル名に使える文字へ置換し、UTF-8 の文字境界を保って最大 100 byte に短縮します。
+- ファイル名形式: `YYYYMMDDhhmmss_enginename_threads.json`
 - システム情報、エンジン情報、全測定結果を含む
 
 ### ライブラリとしての使用
@@ -165,11 +148,3 @@ Position-by-position breakdown:
 - `--iterations` を増やして平均を取る
 - システムの他のプロセスを停止
 - CPU の省電力機能を無効化
-
-### USI 設定と受信期限
-
-USI モードは `EvalHash` / `UseEvalHash` をエンジンへ送信します。これらの名前を実装するエンジンが対象です。専用フラグの後に `--usi-option Name=Value` を指定順で送るため、同名の追加設定が最後に適用されます。
-
-探索の受信期限は movetime なら指定時間の 2 倍 + 5 秒、depth / nodes なら 300 秒です。`info` 行を受け取っても延長しません。期限後は `stop` を送り、最大 10 秒応答を回収します。回収した `bestmove` は正常測定として採用せず、タイムアウトで終了します。探索途中の値を成功した測定結果に含めません。
-
-起動時の bucket 数・係数の組合せと入力エラー時の扱いは、[native routing の設定条件](nnue-routing.md#起動時の設定条件)を参照してください。

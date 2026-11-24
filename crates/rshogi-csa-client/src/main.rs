@@ -13,40 +13,34 @@
 //! cargo run -p rshogi-csa-client -- config.toml --id my_engine --ponder
 //! ```
 
-mod options_reload;
-
-use options_reload::OptionsReloader;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{Parser, ValueEnum};
 
 use rshogi_csa_client::config::CsaClientConfig;
-use rshogi_csa_client::engine::{SpawnOptions, UsiEngine};
-use rshogi_csa_client::events::SessionOutcome;
-use rshogi_csa_client::jsonl::write_game_jsonl_with_status;
-use rshogi_csa_client::protocol::{CsaConnection, GameResult, compute_effective_retry_delay};
-use rshogi_csa_client::record::{RecordStatus, save_record_with_status};
-use rshogi_csa_client::session::{run_game_session, run_resumed_session_with_record};
+use rshogi_csa_client::engine::UsiEngine;
+use rshogi_csa_client::jsonl::write_game_jsonl;
+use rshogi_csa_client::protocol::{CsaConnection, GameResult};
+use rshogi_csa_client::record::save_record;
+use rshogi_csa_client::session::{run_game_session, run_resumed_session};
 use rshogi_csa_client::transport::{ConnectOpts, TransportTarget};
 
-/// `--target` プリセット。本リポ単一 Cloudflare アカウントの staging / production
-/// Worker（カスタムドメイン経由）への 1 コマンド接続を提供する。別アカウント /
-/// 自前 Worker に接続する場合は `--target` を使わず TOML / `--host` で URL を直接指定する。
+/// `--target` プリセット。本リポ単一 Cloudflare アカウント (`sh11235.workers.dev`) の
+/// staging / production Worker への 1 コマンド接続を提供する。別アカウントの Worker に
+/// 接続する場合は `--target` を使わず TOML / `--host` で URL を直接指定する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum TargetPreset {
-    /// staging Worker (`stg.rshogi-csa-server.sh11235.com`)。
-    /// allowlist (`WS_ALLOWED_ORIGINS`) に登録された `https://csa-client-local` を
-    /// `Origin` として送る。
+    /// staging Worker (`rshogi-csa-server-workers-staging.sh11235.workers.dev`)。
+    /// `WS_ALLOWED_ORIGINS = "https://csa-client-local"` allowlist 通過のため
+    /// `Origin: https://csa-client-local` を送る。
     Staging,
-    /// production Worker (`rshogi-csa-server.sh11235.com`)。
-    /// ネイティブ経路として Origin を送らない (=`ws_origin = None`)。production の
-    /// `WS_ALLOWED_ORIGINS` は非空だが、Origin 欠落リクエストは allowlist の内容に
-    /// 関わらず通過する。
+    /// production Worker (`rshogi-csa-server-workers.sh11235.workers.dev`)。
+    /// `WS_ALLOWED_ORIGINS = ""` (空) の運用前提でネイティブ経路として Origin を
+    /// 送らない (=`ws_origin = None`)。
     Production,
 }
 
@@ -84,9 +78,8 @@ struct Cli {
     #[arg(long)]
     room_id: Option<String>,
 
-    /// `--target` 利用時のログインハンドル。CSA LOGIN ID は
-    /// `<handle>+<game_name>+<color>` 形式で組み立てる（Workers GameRoom 要求）。
-    /// `<game_name>` は `--game-name` の値（`--target` 利用時は必須）。
+    /// `--target` 利用時のログインハンドル。CSA LOGIN ID は `<handle>+<room_id>+<color>`
+    /// 形式で組み立てる（Workers GameRoom が要求するフォーマット）。
     #[arg(long)]
     handle: Option<String>,
 
@@ -100,11 +93,8 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     lobby: bool,
 
-    /// LOGIN handle の `<game_name>` 部分。`--target {staging,production}` 利用時は
-    /// 両 Worker が `CLOCK_PRESETS` strict mode のため**必須**で、登録済み preset 名
-    /// (例: `byoyomi-msec-10-100` / `byoyomi-120-5` / `floodgate-600-10`) を指定して
-    /// clock を選ぶ。`--lobby` 利用時はマッチング pool 名としても用いる
-    /// (同 game_name 同士でしかマッチングしない)。`[A-Za-z0-9_-]` / 1〜32 文字制限。
+    /// `--lobby` 利用時のマッチング pool 名 (`<game_name>` 部分)。同 game_name 同士
+    /// でしかマッチングしない。`[A-Za-z0-9_-]` / 1〜32 文字制限。
     #[arg(long)]
     game_name: Option<String>,
 
@@ -165,102 +155,15 @@ struct Cli {
     #[arg(long)]
     record_dir: Option<PathBuf>,
 
-    /// analyze_selfplay 互換 JSONL の出力先上書き（未指定時は `record.dir/jsonl/`）。
-    /// 出力を止めるには TOML で `record.save_jsonl = false` を指定する。
+    /// JSONL 出力ディレクトリ。指定すると対局完了ごとに analyze_selfplay 互換の
+    /// JSONL ファイルを `<datetime>_<sente>_vs_<gote>.jsonl` として書き出す。
+    /// 未指定時は JSONL を出力しない（既定 OFF）。TOML の `record.jsonl_out` でも指定可。
     #[arg(long)]
     jsonl_out: Option<PathBuf>,
 
     /// USIエンジンオプション (K=V,K=V,...)
     #[arg(long)]
     options: Option<String>,
-
-    /// engine stderr を csa_client log に多重化する (`log::info!("[engine stderr] ...")`).
-    /// debug / 初期セットアップ用。default は false (既存の ring buffer 末尾捕捉のみ)。
-    /// TOML の `engine.stderr_passthrough` でも指定可。
-    ///
-    /// `--engine-stderr-passthrough` / `--no-engine-stderr-passthrough` のペアで指定する。
-    /// 両方指定された場合は clap の `overrides_with` により最後に指定された方が勝つ。
-    /// 旧形式 `--engine-stderr-passthrough=false` は廃止 (`--no-engine-stderr-passthrough` を使用)。
-    #[arg(
-        long = "engine-stderr-passthrough",
-        action = ArgAction::SetTrue,
-        overrides_with = "no_engine_stderr_passthrough_flag"
-    )]
-    engine_stderr_passthrough_flag: bool,
-
-    /// `--engine-stderr-passthrough` を打ち消す。TOML 値を CLI から明示的に false 上書きする
-    /// 用途で使用する。両方指定された場合は最後に指定された方が勝つ。
-    #[arg(
-        long = "no-engine-stderr-passthrough",
-        action = ArgAction::SetTrue,
-        overrides_with = "engine_stderr_passthrough_flag"
-    )]
-    no_engine_stderr_passthrough_flag: bool,
-}
-
-/// `delay` が経過するか `shutdown` が立つまで待機する。`shutdown` 検出時は早期に
-/// `false` を返し、呼び出し側はループを抜けるべき (= サーバ指定の長い `retry_after`
-/// を honor する間に Ctrl-C しても即座に終了できる)。
-///
-/// 単純な `std::thread::sleep(delay)` は signal を観測できないため、`SHUTDOWN_POLL`
-/// 刻みで分割 sleep して shutdown を polling する。粒度は「Ctrl-C から終了までの
-/// 体感遅延」と「polling overhead」のトレードオフで 200ms 固定 (#682 follow-up)。
-const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
-
-fn sleep_with_shutdown(delay: Duration, shutdown: &AtomicBool) -> bool {
-    let deadline = Instant::now().checked_add(delay);
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return false;
-        }
-        let sleep_for = match deadline {
-            Some(deadline) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return true;
-                }
-                remaining.min(SHUTDOWN_POLL)
-            }
-            // overflow (例: `retry_after=u64::MAX`): deadline を計算できないので
-            // shutdown が立つまで SHUTDOWN_POLL 刻みで polling し続ける。実害は
-            // 低い (server が `u64::MAX` を返す事は無く、shutdown は必ずいずれ立つ)。
-            None => SHUTDOWN_POLL,
-        };
-        std::thread::sleep(sleep_for);
-    }
-}
-
-/// retry sleep の log 出力 + `sleep_with_shutdown` の組合わせを 1 か所に集約する。
-/// `acquire_lobby_match` / `run_one_game` の Err arm がそれぞれ同じブロックを
-/// 持つと将来の log フォーマット変更で片方の修正が漏れるため、helper 化している。
-///
-/// 戻り値は `sleep_with_shutdown` をそのまま転送し、`false` のとき呼び出し側は
-/// 連続対局ループを抜けるべき。
-fn sleep_retry(effective: Duration, backoff: Duration, shutdown: &AtomicBool) -> bool {
-    if effective > backoff {
-        log::warn!(
-            "サーバから retry_after を受信。{}秒後にリトライ (バックオフ {}秒を上書き)...",
-            effective.as_secs(),
-            backoff.as_secs()
-        );
-    } else {
-        log::info!("{}秒後にリトライ...", effective.as_secs());
-    }
-    sleep_with_shutdown(effective, shutdown)
-}
-
-/// CLI で `--engine-stderr-passthrough` / `--no-engine-stderr-passthrough` のいずれかが
-/// 明示指定された場合のみ `Some(bool)` を返す。未指定時は `None` を返し、TOML/環境変数の
-/// 値をそのまま温存する。`overrides_with` のため両方指定後に最後に勝った方の flag のみ
-/// true になる前提。
-fn cli_engine_stderr_passthrough(cli: &Cli) -> Option<bool> {
-    match (cli.engine_stderr_passthrough_flag, cli.no_engine_stderr_passthrough_flag) {
-        (true, false) => Some(true),
-        (false, true) => Some(false),
-        // (false, false): 未指定 / (true, true): clap の overrides_with の挙動上ありえないが
-        // 念のため None で TOML 値を温存する。
-        _ => None,
-    }
 }
 
 fn main() -> Result<()> {
@@ -268,12 +171,9 @@ fn main() -> Result<()> {
     // 明示的に登録されていないと panic する。aws-lc-rs より導入が軽い `ring` を選択し、
     // 起動時に 1 度だけ install する。`set_default` は同 process で既に install されて
     // いれば `Err` を返すので無視する。
-    #[cfg(feature = "websocket")]
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
-
-    let mut options_reloader = cli.config.as_deref().map(OptionsReloader::new).transpose()?;
 
     // 設定ファイル読み込み
     let mut config = if let Some(ref path) = cli.config {
@@ -311,7 +211,7 @@ fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {
-        log::info!("終了シグナル受信。待機・対局を中止して終了します...");
+        log::info!("終了シグナル受信。対局完了後に終了します...");
         shutdown_clone.store(true, Ordering::SeqCst);
     })?;
 
@@ -335,39 +235,6 @@ fn main() -> Result<()> {
             break;
         }
 
-        if let Some(reloader) = options_reloader.as_mut() {
-            match reloader.prepare(&config.engine.options, &cli) {
-                Ok(Some(update)) => {
-                    if !update.changed.is_empty()
-                        && let Err(error) = engine.update_options(
-                            &update.changed,
-                            config.game.ponder,
-                            Duration::from_secs(config.engine.startup_timeout_sec),
-                        )
-                    {
-                        log::warn!(
-                            "[USI] オプション更新・準備完了待ちの失敗。旧設定で再起動: {error:#}"
-                        );
-                        engine.quit();
-                        engine = spawn_engine(&config)?;
-                    } else {
-                        if !update.changed.is_empty() {
-                            log::info!(
-                                "[USI] 設定ファイルから {} 個のオプションを更新",
-                                update.changed.len()
-                            );
-                        }
-                        config.engine.options = update.options.clone();
-                        reloader.accept(update);
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    log::warn!("[USI] 設定ファイルの再読込を見送り、旧設定を維持: {error:#}")
-                }
-            }
-        }
-
         // `--lobby` モードは対局直前に LobbyDO へ問い合わせて room_id を取得する。
         let lobby_room_assignment = if cli.lobby {
             match acquire_lobby_match(&config, &cli, &shutdown) {
@@ -378,10 +245,8 @@ fn main() -> Result<()> {
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
-                    let effective = compute_effective_retry_delay(&e.to_string(), retry_delay);
-                    if !sleep_retry(effective, retry_delay, &shutdown) {
-                        break;
-                    }
+                    log::info!("{}秒後にリトライ...", retry_delay.as_secs());
+                    std::thread::sleep(retry_delay);
                     retry_delay =
                         (retry_delay * 2).min(Duration::from_secs(config.retry.max_delay_sec));
                     continue;
@@ -397,21 +262,15 @@ fn main() -> Result<()> {
         };
 
         match run_one_game(&game_config, &mut engine, &shutdown, games_played) {
-            Ok((result, record, record_status)) => {
+            Ok((result, record)) => {
                 // 棋譜保存
-                if let Err(e) = save_record_with_status(&record, &config.record, &record_status) {
+                if let Err(e) = save_record(&record, &config.record) {
                     log::error!("棋譜保存エラー: {e}");
                 }
 
-                // analyze_selfplay 互換 JSONL（ON/OFF と出力先は RecordConfig::jsonl_dir）
-                if let Some(jsonl_dir) = config.record.jsonl_dir() {
-                    match write_game_jsonl_with_status(
-                        &jsonl_dir,
-                        &record,
-                        &config,
-                        &result,
-                        &record_status,
-                    ) {
+                // JSONL 出力（opt-in、--jsonl-out / record.jsonl_out 指定時のみ）
+                if let Some(ref jsonl_dir) = config.record.jsonl_out {
+                    match write_game_jsonl(jsonl_dir, &record, &config, &result) {
                         Ok(path) => log::info!("[REC] JSONL 保存: {}", path.display()),
                         Err(e) => log::error!("JSONL 保存エラー: {e}"),
                     }
@@ -445,10 +304,8 @@ fn main() -> Result<()> {
                 }
                 // エラー後はエンジンを再起動（不整合な状態の可能性）
                 engine.quit();
-                let effective = compute_effective_retry_delay(&e.to_string(), retry_delay);
-                if !sleep_retry(effective, retry_delay, &shutdown) {
-                    break;
-                }
+                log::info!("{}秒後にリトライ...", retry_delay.as_secs());
+                std::thread::sleep(retry_delay);
                 retry_delay =
                     (retry_delay * 2).min(Duration::from_secs(config.retry.max_delay_sec));
                 engine = spawn_engine(&config)?;
@@ -465,11 +322,8 @@ fn spawn_engine(config: &CsaClientConfig) -> Result<UsiEngine> {
     UsiEngine::spawn(
         &config.engine.path,
         &config.engine.options,
-        SpawnOptions {
-            ponder: config.game.ponder,
-            startup_timeout: Duration::from_secs(config.engine.startup_timeout_sec),
-            stderr_passthrough: config.engine.stderr_passthrough,
-        },
+        config.game.ponder,
+        Duration::from_secs(config.engine.startup_timeout_sec),
     )
 }
 
@@ -486,7 +340,7 @@ fn run_one_game(
     engine: &mut UsiEngine,
     shutdown: &AtomicBool,
     games_played: u32,
-) -> Result<(GameResult, rshogi_csa_client::record::GameRecord, RecordStatus)> {
+) -> Result<(GameResult, rshogi_csa_client::record::GameRecord)> {
     let game_seq_str = games_played.to_string();
     let host = config.server.host.replace("{game_seq}", &game_seq_str);
     let id = config.server.id.replace("{game_seq}", &game_seq_str);
@@ -496,7 +350,6 @@ fn run_one_game(
     let target = TransportTarget::from_host_port(&host, config.server.port)?;
     let opts = ConnectOpts {
         tcp_keepalive: config.server.keepalive.tcp,
-        unacked_timeout: config.server.keepalive.unacked_timeout(),
         ws_origin: config.server.ws_origin.clone(),
     };
     let mut conn = CsaConnection::connect_with_target(&target, &opts)?;
@@ -508,18 +361,19 @@ fn run_one_game(
     // 中断 (= サーバ切断) でかつ Reconnect_Token を保持している場合は 1 度だけ
     // 再接続を試みる。Workers の `RECONNECT_GRACE_SECONDS` 内に到達できれば
     // 同一対局を継続できる。reconnect 試行前に元 conn は drop / logout する。
-    //
-    // 判定ロジック自体は `should_attempt_reconnect` pure helper に切り出して
-    // unit test で pin している。token=None (production の grace=0 構成等) の
-    // 場合は reconnect 試行自体を skip するため、https://github.com/SH11235/rshogi/issues/591 の
-    // `LOGIN:incorrect reconnect_rejected` 経路に到達しない。
     let reconnect_request = match session_result.as_ref() {
-        Ok(outcome) => should_attempt_reconnect(outcome, shutdown.load(Ordering::SeqCst))
-            .map(|(game_id, token)| (game_id, token, outcome.record.clone())),
-        Err(_) => None,
+        Ok(outcome)
+            if outcome.result == GameResult::Interrupted
+                && outcome.summary.as_ref().is_some_and(|s| s.reconnect_token.is_some())
+                && !shutdown.load(Ordering::SeqCst) =>
+        {
+            let summary = outcome.summary.as_ref().unwrap();
+            Some((summary.game_id.clone(), summary.reconnect_token.clone().unwrap()))
+        }
+        _ => None,
     };
 
-    if let Some((game_id, token, retained_record)) = reconnect_request {
+    if let Some((game_id, token)) = reconnect_request {
         log::warn!(
             "[CSA] サーバ切断を検出。Reconnect_Token を持つので grace 内に再接続を試みます: game_id={}",
             game_id
@@ -532,18 +386,10 @@ fn run_one_game(
             game_id: &game_id,
             token: &token,
         };
-        match attempt_reconnect(
-            &target,
-            &opts,
-            &credentials,
-            engine,
-            config,
-            shutdown,
-            retained_record,
-        ) {
-            Ok((reconnect_result, reconnect_record, record_status)) => {
+        match attempt_reconnect(&target, &opts, &credentials, engine, config, shutdown) {
+            Ok((reconnect_result, reconnect_record)) => {
                 log::info!("[CSA] 再接続成功: 対局を継続して終局: {:?}", reconnect_result);
-                return Ok((reconnect_result, reconnect_record, record_status));
+                return Ok((reconnect_result, reconnect_record));
             }
             Err(e) => {
                 // engine は元 disconnect 経路で `gameover("lose")` 発射済み。
@@ -554,7 +400,7 @@ fn run_one_game(
                 log::warn!("[CSA] 再接続失敗: {e}。元の Interrupted 結果で終了します。");
                 let _ = engine.stop_and_wait();
                 return session_result
-                    .map(|outcome| (outcome.result, outcome.record, RecordStatus::Complete))
+                    .map(|outcome| (outcome.result, outcome.record))
                     .map_err(|e| anyhow::anyhow!("{}", e));
             }
         }
@@ -570,30 +416,8 @@ fn run_one_game(
 
     let _ = conn.logout();
     session_result
-        .map(|outcome| (outcome.result, outcome.record, RecordStatus::Complete))
+        .map(|outcome| (outcome.result, outcome.record))
         .map_err(|e| anyhow::anyhow!("{}", e))
-}
-
-/// セッション結果から再接続を試みるべきかどうかを判定する pure helper。
-///
-/// 戻り値の `(game_id, token)` 順は [`ReconnectCredentials`] の `game_id` /
-/// `token` フィールド順と一致させる。順序を逆転させると `attempt_reconnect`
-/// が不正な認証情報を server に送るので unit test で pin する。
-///
-/// 戻り値:
-/// - `Some((game_id, token))`: reconnect を試みるべき (中断 + token あり + 非 shutdown)
-/// - `None`: reconnect を skip すべき (shutdown 中 / 通常終局 / token 未配布)
-///
-/// production の grace=0 構成では server から `Reconnect_Token:` 拡張行が出ないため
-/// `outcome.summary.reconnect_token` が常に `None` で、本関数は `None` を返し、
-/// https://github.com/SH11235/rshogi/issues/591 の `LOGIN:incorrect reconnect_rejected` 経路には到達しない。
-fn should_attempt_reconnect(outcome: &SessionOutcome, shutdown: bool) -> Option<(String, String)> {
-    if shutdown || outcome.result != GameResult::Interrupted {
-        return None;
-    }
-    let summary = outcome.summary.as_ref()?;
-    let token = summary.reconnect_token.as_ref()?.clone();
-    Some((summary.game_id.clone(), token))
 }
 
 /// 切断検出後の再接続に必要な認証情報。多引数化を避けるためまとめる。
@@ -613,15 +437,13 @@ fn attempt_reconnect(
     engine: &mut UsiEngine,
     config: &CsaClientConfig,
     shutdown: &AtomicBool,
-    retained_record: rshogi_csa_client::record::GameRecord,
-) -> Result<(GameResult, rshogi_csa_client::record::GameRecord, RecordStatus)> {
+) -> Result<(GameResult, rshogi_csa_client::record::GameRecord)> {
     let mut conn = CsaConnection::connect_with_target(target, opts)?;
     conn.login_reconnect(creds.id, creds.password, creds.game_id, creds.token)?;
-    let outcome =
-        run_resumed_session_with_record(&mut conn, engine, config, shutdown, retained_record)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let outcome = run_resumed_session(&mut conn, engine, config, shutdown)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let _ = conn.logout();
-    Ok((outcome.outcome.result, outcome.outcome.record, outcome.status))
+    Ok((outcome.result, outcome.record))
 }
 
 /// `--lobby` モードで成立したマッチ。`run_one_game` 直前に config を差し替えるための
@@ -666,7 +488,6 @@ fn acquire_lobby_match(
     let target = TransportTarget::from_host_port(&config.server.host, config.server.port)?;
     let opts = ConnectOpts {
         tcp_keepalive: config.server.keepalive.tcp,
-        unacked_timeout: config.server.keepalive.unacked_timeout(),
         ws_origin: config.server.ws_origin.clone(),
     };
     let mut conn = CsaConnection::connect_with_target(&target, &opts)?;
@@ -689,15 +510,12 @@ fn acquire_lobby_match(
     // LOGIN_LOBBY:OK → MATCHED <room_id> <color> の順で受信。途中 shutdown が立ったら
     // logout して None を返す。
     loop {
-        let line = match conn
-            .recv_lobby_line_while(config.server.keepalive.ping_interval_sec, || {
-                !shutdown.load(Ordering::SeqCst)
-            }) {
-            Ok(Some(line)) => line,
-            Ok(None) => {
-                let _ = conn.send_raw_line("LOGOUT_LOBBY");
-                return Ok(None);
-            }
+        if shutdown.load(Ordering::SeqCst) {
+            let _ = conn.send_raw_line("LOGOUT_LOBBY");
+            return Ok(None);
+        }
+        let line = match conn.recv_line_blocking_pub(Duration::from_secs(60)) {
+            Ok(l) => l,
             Err(e) => {
                 bail!("[Lobby] 受信エラー: {e}");
             }
@@ -792,32 +610,27 @@ fn apply_target_preset(config: &mut CsaClientConfig, cli: &Cli) -> Result<()> {
     })?;
 
     let (subdomain, ws_origin) = match target {
-        TargetPreset::Staging => {
-            ("stg.rshogi-csa-server.sh11235.com", Some("https://csa-client-local".to_owned()))
-        }
-        TargetPreset::Production => ("rshogi-csa-server.sh11235.com", None),
+        TargetPreset::Staging => (
+            "rshogi-csa-server-workers-staging.sh11235.workers.dev",
+            // staging Worker は `WS_ALLOWED_ORIGINS = "https://csa-client-local"` で
+            // この値を allowlist に登録済み。Origin を送ってブラウザ経路相当でも
+            // ネイティブ経路相当でも通電できるが、明示しておく方が allowlist 経路の
+            // 動作確認に資する。
+            Some("https://csa-client-local".to_owned()),
+        ),
+        TargetPreset::Production => (
+            "rshogi-csa-server-workers.sh11235.workers.dev",
+            // production Worker の `WS_ALLOWED_ORIGINS` は空 (空 allowlist 運用)。
+            // Origin 欠落 = ネイティブ経路として素通し、Origin 付きは 403 になる。
+            // web client 化したいときは wrangler.production.toml の allowlist に値を追加
+            // してから CLI で `--ws-origin <url>` を渡す運用に切り替える。
+            None,
+        ),
     };
     config.server.host = format!("wss://{subdomain}/ws/{room_id}");
     // `wss://` 経路では port 値は無視されるが、TOML schema 互換のため 0 を入れておく。
     config.server.port = 0;
-    // `--target {staging,production}` は両 Worker が `CLOCK_PRESETS` を非空で持つ
-    // strict mode 前提なので、LOGIN id の `<game_name>` 部分には登録済み preset 名
-    // (例: `byoyomi-msec-10-100` / `floodgate-600-10`) を必ず明示してもらう。
-    // 省略すると非 lobby 経路は LOGIN OK 後に GameRoom 側 preset 解決で失敗し
-    // Game_Summary まで進めない (lobby 経路は LOGIN 段で UnknownGameName)。
-    // `CLOCK_PRESETS = "[]"` の自前 Worker に `--target` で繋ぎたい場合は
-    // `--target` を使わず TOML / `--host` で URL 直指定するルートに切り替える。
-    let game_name_for_id = cli
-        .game_name
-        .as_deref()
-        .filter(|g| !g.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "--target {{staging,production}} を指定する場合は --game-name <preset> も指定してください \
-                 (両 Worker は CLOCK_PRESETS strict mode のため未登録名は LOGIN/preset 解決で拒否されます)"
-            )
-        })?;
-    config.server.id = format!("{handle}+{game_name_for_id}+{}", color.as_str());
+    config.server.id = format!("{handle}+{room_id}+{}", color.as_str());
     if config.server.password.is_empty() {
         config.server.password = PRESET_FALLBACK_PASSWORD.to_owned();
     }
@@ -874,9 +687,6 @@ fn apply_cli_overrides(config: &mut CsaClientConfig, cli: &Cli) {
     }
     if let Some(ref dir) = cli.jsonl_out {
         config.record.jsonl_out = Some(dir.clone());
-    }
-    if let Some(passthrough) = cli_engine_stderr_passthrough(cli) {
-        config.engine.stderr_passthrough = passthrough;
     }
     if let Some(ref opts) = cli.options {
         for kv in opts.split(',') {
@@ -992,8 +802,6 @@ mod tests {
             record_dir: None,
             jsonl_out: None,
             options: None,
-            engine_stderr_passthrough_flag: false,
-            no_engine_stderr_passthrough_flag: false,
         }
     }
 
@@ -1034,37 +842,18 @@ mod tests {
     }
 
     #[test]
-    fn target_preset_requires_game_name() {
-        // staging/production の両 Worker は CLOCK_PRESETS strict mode のため、
-        // `--target` 利用時に `--game-name` が空だと LOGIN/preset 解決で必ず弾かれる。
-        // クライアント側で先に分かりやすく Err 化することで silent 失敗を防ぐ。
-        let mut config = CsaClientConfig::default();
-        let mut cli = cli_with(Some(TargetPreset::Staging));
-        cli.room_id = Some("r".to_owned());
-        cli.handle = Some("h".to_owned());
-        cli.color = Some(CliColor::Black);
-        let err = apply_target_preset(&mut config, &cli).unwrap_err();
-        assert!(err.to_string().contains("--game-name"));
-
-        let mut cli = cli_with(Some(TargetPreset::Production));
-        cli.room_id = Some("r".to_owned());
-        cli.handle = Some("h".to_owned());
-        cli.color = Some(CliColor::White);
-        let err = apply_target_preset(&mut config, &cli).unwrap_err();
-        assert!(err.to_string().contains("--game-name"));
-    }
-
-    #[test]
     fn target_preset_staging_fills_host_and_id() {
         let mut config = CsaClientConfig::default();
         let mut cli = cli_with(Some(TargetPreset::Staging));
         cli.room_id = Some("e2e-1".to_owned());
         cli.handle = Some("alice".to_owned());
         cli.color = Some(CliColor::Black);
-        cli.game_name = Some("byoyomi-msec-10-100".to_owned());
         apply_target_preset(&mut config, &cli).unwrap();
-        assert_eq!(config.server.host, "wss://stg.rshogi-csa-server.sh11235.com/ws/e2e-1");
-        assert_eq!(config.server.id, "alice+byoyomi-msec-10-100+black");
+        assert_eq!(
+            config.server.host,
+            "wss://rshogi-csa-server-workers-staging.sh11235.workers.dev/ws/e2e-1"
+        );
+        assert_eq!(config.server.id, "alice+e2e-1+black");
         assert_eq!(config.server.ws_origin.as_deref(), Some("https://csa-client-local"));
         assert!(!config.server.password.is_empty());
         assert!(config.server.floodgate);
@@ -1077,10 +866,12 @@ mod tests {
         cli.room_id = Some("game42".to_owned());
         cli.handle = Some("bob".to_owned());
         cli.color = Some(CliColor::White);
-        cli.game_name = Some("floodgate-600-10".to_owned());
         apply_target_preset(&mut config, &cli).unwrap();
-        assert_eq!(config.server.host, "wss://rshogi-csa-server.sh11235.com/ws/game42");
-        assert_eq!(config.server.id, "bob+floodgate-600-10+white");
+        assert_eq!(
+            config.server.host,
+            "wss://rshogi-csa-server-workers.sh11235.workers.dev/ws/game42"
+        );
+        assert_eq!(config.server.id, "bob+game42+white");
         assert!(config.server.ws_origin.is_none());
     }
 
@@ -1092,7 +883,6 @@ mod tests {
         cli.room_id = Some("r".to_owned());
         cli.handle = Some("h".to_owned());
         cli.color = Some(CliColor::Black);
-        cli.game_name = Some("byoyomi-msec-10-100".to_owned());
         apply_target_preset(&mut config, &cli).unwrap();
         assert_eq!(config.server.password, "user-supplied");
     }
@@ -1106,218 +896,11 @@ mod tests {
         cli.room_id = Some("r".to_owned());
         cli.handle = Some("h".to_owned());
         cli.color = Some(CliColor::Black);
-        cli.game_name = Some("byoyomi-msec-10-100".to_owned());
         cli.host = Some("wss://custom.example/ws/x".to_owned());
         cli.id = Some("override-id".to_owned());
         apply_target_preset(&mut config, &cli).unwrap();
         apply_cli_overrides(&mut config, &cli);
         assert_eq!(config.server.host, "wss://custom.example/ws/x");
         assert_eq!(config.server.id, "override-id");
-    }
-
-    /// `should_attempt_reconnect` の fixture を作る helper。token / shutdown / result を
-    /// 引数で切り替えて全分岐を網羅する。`GameRecord` 等の重量フィールドはダミー値で OK。
-    fn session_outcome_with(result: GameResult, reconnect_token: Option<String>) -> SessionOutcome {
-        use rshogi_csa::{Color as CsaColor, Position};
-        use rshogi_csa_client::protocol::{GameSummary, TimeConfig};
-        use rshogi_csa_client::record::GameRecord;
-
-        let summary = GameSummary {
-            game_id: "room-1-test-id".to_owned(),
-            my_color: CsaColor::Black,
-            sente_name: "alice".to_owned(),
-            gote_name: "bob".to_owned(),
-            position: Position::default(),
-            initial_moves: vec![],
-            black_time: TimeConfig {
-                time_unit_ms: 1000,
-                total_time_ms: 60_000,
-                byoyomi_ms: 1_000,
-                increment_ms: 0,
-            },
-            white_time: TimeConfig {
-                time_unit_ms: 1000,
-                total_time_ms: 60_000,
-                byoyomi_ms: 1_000,
-                increment_ms: 0,
-            },
-            reconnect_token,
-            entering_king_rule: None,
-        };
-        SessionOutcome {
-            result,
-            record: GameRecord {
-                game_id: summary.game_id.clone(),
-                sente_name: summary.sente_name.clone(),
-                gote_name: summary.gote_name.clone(),
-                black_time: summary.black_time.clone(),
-                white_time: summary.white_time.clone(),
-                initial_position: Position::default(),
-                moves: vec![],
-                result: String::new(),
-                winner: None,
-                start_time: chrono::Local::now(),
-                end_time: None,
-                rejected_move: None,
-                my_color: CsaColor::Black,
-                jsonl_moves: vec![],
-            },
-            summary: Some(summary),
-        }
-    }
-
-    /// `Reconnect_Token:` が配布された + 中断 + 非 shutdown なら reconnect を試みる。
-    /// 戻り値の `(game_id, token)` 順を pin する (順序を逆転させると `ReconnectCredentials`
-    /// の `id`/`password`/`game_id`/`token` 配線で server 側に不正な認証を送ってしまう)。
-    #[test]
-    fn should_attempt_reconnect_returns_some_when_token_present_and_interrupted() {
-        let outcome = session_outcome_with(GameResult::Interrupted, Some("a".repeat(32)));
-        let actual = should_attempt_reconnect(&outcome, false);
-        let (game_id, token) = actual.expect("token あり + 中断 + 非 shutdown で Some");
-        assert_eq!(game_id, "room-1-test-id");
-        assert_eq!(token, "a".repeat(32));
-    }
-
-    /// production の保守的既定 (`grace=0`) で `Reconnect_Token:` 拡張行が出ない場合、
-    /// `summary.reconnect_token == None` なので reconnect 試行を skip する。
-    /// 本 case が https://github.com/SH11235/rshogi/issues/591 hotfix の client 側保証 (= `LOGIN:incorrect reconnect_rejected`
-    /// 経路に到達しない) を pin する唯一の test。
-    #[test]
-    fn should_attempt_reconnect_returns_none_when_token_absent() {
-        let outcome = session_outcome_with(GameResult::Interrupted, None);
-        assert!(should_attempt_reconnect(&outcome, false).is_none());
-    }
-
-    /// shutdown フラグが立っていれば、token があっても reconnect を試みない。
-    /// session を畳む経路で再接続要求を送ると server に二重ログイン扱いされる
-    /// 可能性があるため、shutdown 検知を最優先する契約を pin する。
-    #[test]
-    fn should_attempt_reconnect_returns_none_when_shutdown_set() {
-        let outcome = session_outcome_with(GameResult::Interrupted, Some("a".repeat(32)));
-        assert!(should_attempt_reconnect(&outcome, true).is_none());
-    }
-
-    /// 通常終局 (`Win` / `Lose` / `Draw` 等の `Interrupted` 以外) では reconnect を
-    /// 試みない。`run_one_game` 側で対局が完走したことが確定しているため、
-    /// 再接続経路に進むのは契約違反。
-    #[test]
-    fn should_attempt_reconnect_returns_none_when_result_is_not_interrupted() {
-        let outcome = session_outcome_with(GameResult::Win, Some("a".repeat(32)));
-        assert!(should_attempt_reconnect(&outcome, false).is_none());
-    }
-
-    // ───────────────────────────────────────────────
-    // `--engine-stderr-passthrough` / `--no-engine-stderr-passthrough` の clap
-    // パース挙動を pin する。`overrides_with` ペアで「未指定 = None」「肯定 / 否定 =
-    // Some(bool)」「両指定 = 最後勝ち」を表現するため、helper の判定が clap の
-    // 振る舞いと整合することを確認する。
-    // ───────────────────────────────────────────────
-
-    /// 引数解析用の minimal arg 列を組み立てる。Cli は `argv[0]` (= 実行ファイル名) と
-    /// その後に flag を取るため、binary 名 placeholder + 任意の追加引数で組み立てる。
-    fn parse_cli(extra: &[&str]) -> Cli {
-        let mut argv: Vec<&str> = vec!["rshogi-csa-client"];
-        argv.extend_from_slice(extra);
-        Cli::try_parse_from(argv).expect("clap parse")
-    }
-
-    #[test]
-    fn cli_engine_stderr_passthrough_unset_returns_none() {
-        let cli = parse_cli(&[]);
-        assert_eq!(cli_engine_stderr_passthrough(&cli), None);
-    }
-
-    #[test]
-    fn cli_engine_stderr_passthrough_flag_only_returns_some_true() {
-        let cli = parse_cli(&["--engine-stderr-passthrough"]);
-        assert_eq!(cli_engine_stderr_passthrough(&cli), Some(true));
-    }
-
-    #[test]
-    fn cli_engine_stderr_passthrough_no_flag_only_returns_some_false() {
-        let cli = parse_cli(&["--no-engine-stderr-passthrough"]);
-        assert_eq!(cli_engine_stderr_passthrough(&cli), Some(false));
-    }
-
-    // ───────────────────────────────────────────────
-    // `sleep_with_shutdown` の挙動を pin する。retry_after で長時間 sleep する間も
-    // Ctrl-C (= shutdown 立ち) を即座に観測して loop を抜けられる契約 (#682 follow-up)。
-    // `compute_effective_retry_delay` の test は protocol.rs 側に集約。
-    // ───────────────────────────────────────────────
-
-    #[test]
-    fn sleep_with_shutdown_completes_when_shutdown_remains_clear() {
-        // shutdown が立たないまま delay が経過したら true を返す。
-        let shutdown = AtomicBool::new(false);
-        let start = Instant::now();
-        let completed = sleep_with_shutdown(Duration::from_millis(120), &shutdown);
-        let elapsed = start.elapsed();
-        assert!(completed, "delay 経過時は true を返すべき");
-        assert!(
-            elapsed >= Duration::from_millis(120),
-            "delay 未満で帰ってはいけない: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn sleep_with_shutdown_handles_huge_delay_when_shutdown_already_set() {
-        // server が異常に大きい retry_after を返しても Instant 加算 overflow で
-        // panic せず、shutdown が立っていれば即座に抜ける。
-        let shutdown = AtomicBool::new(true);
-        let start = Instant::now();
-        let completed = sleep_with_shutdown(Duration::from_secs(u64::MAX), &shutdown);
-        let elapsed = start.elapsed();
-        assert!(!completed);
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "巨大 delay でも事前 shutdown は即座に return すべき: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn sleep_with_shutdown_returns_false_when_shutdown_set_during_sleep() {
-        // 別スレッドから sleep 中に shutdown を立てると、SHUTDOWN_POLL の粒度で
-        // 即座に抜けられること。`retry_after=900` 等の長時間 sleep でも 200ms 程度で
-        // 終了する契約を pin する。
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
-        let signal = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            shutdown_clone.store(true, Ordering::SeqCst);
-        });
-
-        let start = Instant::now();
-        let completed = sleep_with_shutdown(Duration::from_secs(60), &shutdown);
-        let elapsed = start.elapsed();
-        signal.join().expect("signal thread");
-
-        assert!(!completed, "shutdown 検出時は false を返すべき");
-        // 200ms poll + 50ms 起床遅延 + 余裕で 1s 以内に return すること。
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "shutdown 検出後は SHUTDOWN_POLL 粒度で抜けるべき: {elapsed:?}"
-        );
-    }
-
-    /// `--engine-stderr-passthrough --no-engine-stderr-passthrough` の順で指定された場合は
-    /// `overrides_with` により後勝ちで `Some(false)` になる。
-    #[test]
-    fn cli_engine_stderr_passthrough_flag_then_no_flag_returns_some_false() {
-        let cli = parse_cli(&[
-            "--engine-stderr-passthrough",
-            "--no-engine-stderr-passthrough",
-        ]);
-        assert_eq!(cli_engine_stderr_passthrough(&cli), Some(false));
-    }
-
-    /// `--no-engine-stderr-passthrough --engine-stderr-passthrough` の順で指定された場合は
-    /// `overrides_with` により後勝ちで `Some(true)` になる。
-    #[test]
-    fn cli_engine_stderr_passthrough_no_flag_then_flag_returns_some_true() {
-        let cli = parse_cli(&[
-            "--no-engine-stderr-passthrough",
-            "--engine-stderr-passthrough",
-        ]);
-        assert_eq!(cli_engine_stderr_passthrough(&cli), Some(true));
     }
 }

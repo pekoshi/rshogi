@@ -5,23 +5,19 @@
 /// 特徴量セット
 ///
 /// NNUEネットワークの入力特徴量の種類を表す。
-/// 命名規則: `HalfKa{Hm?}{Merged|Split}` で mirror 有無 + plane 種別を明示する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FeatureSet {
     /// HalfKP (classic NNUE)
     HalfKP,
-    /// Half-Mirror + MergedPlane
-    HalfKaHmMerged,
-    /// 非ミラー + SplitPlane
-    HalfKaSplit,
-    /// 非ミラー + MergedPlane
-    HalfKaMerged,
-    /// Half-Mirror + SplitPlane
-    HalfKaHmSplit,
-    /// Half-Mirror + MergedPlane with EffectBucket modifier
-    HalfKaHmMergedEffectBucket,
+    /// HalfKA_hm^ (Half-Mirror + Factorization)
+    #[allow(non_camel_case_types)]
+    HalfKA_hm,
+    /// HalfKA (非ミラー)
+    HalfKA,
     /// LayerStacks (実験的)
     LayerStacks,
+    /// Shogi2344 Mirrored (v16: 384x2-8-96 + 32-bucket + INT8)
+    Shogi2344,
 }
 
 impl FeatureSet {
@@ -29,12 +25,10 @@ impl FeatureSet {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::HalfKP => "HalfKP",
-            Self::HalfKaHmMerged => "HalfKaHmMerged",
-            Self::HalfKaSplit => "HalfKaSplit",
-            Self::HalfKaMerged => "HalfKaMerged",
-            Self::HalfKaHmSplit => "HalfKaHmSplit",
-            Self::HalfKaHmMergedEffectBucket => "HalfKaHmMergedEffectBucket",
+            Self::HalfKA_hm => "HalfKA_hm",
+            Self::HalfKA => "HalfKA",
             Self::LayerStacks => "LayerStacks",
+            Self::Shogi2344 => "Shogi2344",
         }
     }
 }
@@ -138,7 +132,7 @@ impl ArchitectureSpec {
 
     /// アーキテクチャ名を生成
     ///
-    /// 例: "HalfKaHmMerged-512-8-96-CReLU"
+    /// 例: "HalfKA_hm-512-8-96-CReLU"
     pub fn name(&self) -> String {
         format!("{}-{}-{}-{}-{}", self.feature_set, self.l1, self.l2, self.l3, self.activation)
     }
@@ -171,219 +165,39 @@ pub fn parse_feature_input_dimensions(arch_str: &str) -> Option<usize> {
     num_str.parse::<usize>().ok()
 }
 
-/// `Features=` キーの直後にある特徴量セット名トークンを切り出す
-///
-/// 戻り値は `Features=` の後ろから区切り文字 (`(`, `[`, `^`, `,`, 空白) の直前まで。
-/// 区切り文字が無い場合は文字列末尾まで。
-///
-/// 部分文字列 (`contains`) 判定を排し、`==` での厳密な keyword 一致を行うために使う。
-pub(crate) fn parse_feature_set_keyword(arch_str: &str) -> Option<&str> {
-    let features_key = "Features=";
-    let start = arch_str.find(features_key)?;
-    let after_key = &arch_str[start + features_key.len()..];
-    let end = after_key
-        .find(|c: char| matches!(c, '(' | '[' | '^' | ',') || c.is_whitespace())
-        .unwrap_or(after_key.len());
-    Some(&after_key[..end])
-}
-
-/// LayerStacks ヘッダーの `Features=` keyword から内部 FT を厳密に判定する。
-///
-/// family 判定では混在活性化や `Threat=` を優先して `LayerStacks` を返す必要があるが、
-/// 実際の入力特徴量はこの keyword から別途判定する。tatara の PascalCase 表記と
-/// bullet-shogi 系の underscore 表記を同じ FT に解決する。
-pub(crate) fn parse_layer_stacks_feature_set_keyword(
-    arch_str: &str,
-) -> Result<Option<FeatureSet>, String> {
-    use super::constants::{
-        HALFKA_DIMENSIONS, HALFKA_HM_DIMENSIONS, HALFKA_HM_SPLIT_DIMENSIONS,
-        HALFKA_MERGED_DIMENSIONS,
-    };
-
-    let Some(name) = parse_feature_set_keyword(arch_str) else {
-        return Ok(None);
-    };
-    let feature = match name {
-        "HalfKP" => FeatureSet::HalfKP,
-        "HalfKA_merged" | "HalfKaMerged" => FeatureSet::HalfKaMerged,
-        "HalfKA_hm_split" | "HalfKaHmSplit" => FeatureSet::HalfKaHmSplit,
-        "HalfKA_hm" | "HalfKaHmMerged" => FeatureSet::HalfKaHmMerged,
-        "HalfKaSplit" => FeatureSet::HalfKaSplit,
-        "HalfKaHmMergedEffectBucket" => FeatureSet::HalfKaHmMergedEffectBucket,
-        "HalfKA" => {
-            let reported_dim = parse_feature_input_dimensions(arch_str).ok_or_else(|| {
-                "HalfKA architecture is missing input dimensions in arch string.".to_string()
-            })?;
-            let threat_dim = arch_str
-                .split(',')
-                .find_map(|part| part.strip_prefix("Threat="))
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            let resolve = |input_dim| match input_dim {
-                HALFKA_HM_DIMENSIONS => Some(FeatureSet::HalfKaHmMerged),
-                HALFKA_DIMENSIONS => Some(FeatureSet::HalfKaSplit),
-                HALFKA_MERGED_DIMENSIONS => Some(FeatureSet::HalfKaMerged),
-                HALFKA_HM_SPLIT_DIMENSIONS => Some(FeatureSet::HalfKaHmSplit),
-                _ => None,
-            };
-            resolve(reported_dim)
-                .or_else(|| reported_dim.checked_sub(threat_dim).and_then(resolve))
-                .ok_or_else(|| format!("Unknown HalfKA input dimensions: {reported_dim}"))?
-        }
-        "" => return Ok(None),
-        other => return Err(format!("Unknown feature set keyword: {other}")),
-    };
-    Ok(Some(feature))
-}
-
-/// LayerStacks reader が使う実際の FT feature を判定する。
-///
-/// family 判定より EffectBucket の alias と `Features=` keyword を優先する。
-pub(crate) fn detect_layer_stacks_feature(arch_str: &str) -> Result<FeatureSet, String> {
-    if arch_str.contains("EffectBucket=") || arch_str.contains("E4=") {
-        return Ok(FeatureSet::HalfKaHmMergedEffectBucket);
-    }
-    if let Some(feature) = parse_layer_stacks_feature_set_keyword(arch_str)? {
-        return Ok(feature);
-    }
-    if let Ok(feature) = parse_feature_set_from_arch(arch_str)
-        && feature != FeatureSet::LayerStacks
-    {
-        return Ok(feature);
-    }
-    for (token, feature) in [
-        ("HalfKP", FeatureSet::HalfKP),
-        ("HalfKaSplit", FeatureSet::HalfKaSplit),
-        ("HalfKaMerged", FeatureSet::HalfKaMerged),
-        ("HalfKaHmSplit", FeatureSet::HalfKaHmSplit),
-        ("HalfKaHmMerged", FeatureSet::HalfKaHmMerged),
-    ] {
-        if arch_str.contains(token) {
-            return Ok(feature);
-        }
-    }
-    Err("unknown LayerStacks FT".to_string())
-}
-
-/// LayerStacks header の EffectBucket token と旧 alias を同じ設定へ解決する。
-pub(crate) fn parse_effect_bucket_config(
-    arch_str: &str,
-) -> Option<super::bona_piece_effect_bucket::EffectBucketConfig> {
-    use super::bona_piece_effect_bucket::EffectBucketConfig;
-
-    let token = arch_str
-        .split(',')
-        .find_map(|part| part.strip_prefix("EffectBucket=").or_else(|| part.strip_prefix("E4=")))?;
-    match token {
-        "2x2fixed" | "4xfixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
-        "2x2bucketed" | "4xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
-        "3x3fixed" | "9xfixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
-        "3x3bucketed" | "9xbucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
-        _ => None,
-    }
-}
-
-/// LayerStacks loader が共通で要求する header 条件を検証する。
-pub(crate) fn validate_layer_stacks_architecture_header(
-    arch_str: &str,
-) -> Result<Option<usize>, String> {
-    if arch_str.contains("Factorizer") {
-        return Err(format!(
-            "Unsupported model format: factorized (non-coalesced) model detected. \
-             This engine only supports coalesced models. \
-             To fix: re-export with nnue-pytorch serialize.py (python serialize.py model.ckpt output.nnue). \
-             Architecture string: {arch_str}"
-        ));
-    }
-
-    let Some(value) = arch_str.split(',').find_map(|part| part.strip_prefix("Threat=")) else {
-        return Ok(None);
-    };
-    let dimensions = value.parse::<usize>().map_err(|_| "malformed Threat token".to_owned())?;
-    if dimensions == 0 {
-        return Err("malformed Threat token".to_owned());
-    }
-    Ok(Some(dimensions))
-}
-
-/// ThreatWidth token を検証し、省略時は FT 全幅を返す。
-pub(crate) fn parse_threat_width(arch: &str, l1: usize) -> Result<usize, String> {
-    let mut tokens = arch.split(',').filter_map(|p| p.strip_prefix("ThreatWidth="));
-    let Some(token) = tokens.next() else {
-        return Ok(l1);
-    };
-    let width = token.parse::<usize>().map_err(|_| "malformed ThreatWidth token".to_owned())?;
-    if tokens.next().is_some()
-        || !arch.split(',').any(|p| p.starts_with("Threat="))
-        || width == 0
-        || width > l1
-        || !width.is_multiple_of(128)
-    {
-        return Err(
-            "ThreatWidth requires Threat and a width <= FT width divisible by 128".to_owned()
-        );
-    }
-    Ok(width)
-}
-
-pub(crate) fn validate_layer_stacks_dimensions(
-    l1: usize,
-    l2: usize,
-    l3: usize,
-) -> Result<(), String> {
-    const MAX_DIMENSION: usize = 16_384;
-
-    if l1 == 0 || !l1.is_multiple_of(2) || l2 < 2 || l3 == 0 {
-        return Err("invalid LayerStacks dimensions".to_owned());
-    }
-    for (name, value) in [("l1", l1), ("l2", l2), ("l3", l3)] {
-        if value > MAX_DIMENSION {
-            return Err(format!("invalid runtime LayerStacks {name} dimension: {value}"));
-        }
-    }
-    Ok(())
-}
-
 /// アーキテクチャ文字列から FeatureSet を判定
 pub fn parse_feature_set_from_arch(arch_str: &str) -> Result<FeatureSet, String> {
+    use super::constants::{HALFKA_DIMENSIONS, HALFKA_HM_DIMENSIONS};
+
     // 明示的な "LayerStacks" キーワードがあれば確定
     if arch_str.contains("LayerStacks") {
         return Ok(FeatureSet::LayerStacks);
     }
-    if arch_str.contains("EffectBucket=") {
-        return Ok(FeatureSet::HalfKaHmMergedEffectBucket);
-    }
-    // Threat= は LayerStacks 専用マーカ
-    if arch_str.contains("Threat=") {
+    // bullet-shogi LayerStacks 形式の判定:
+    // - Threat= を含むモデルは必ず LayerStacks
+    // - SqrClippedReLU を含むモデルは bullet-shogi LayerStacks（L2 活性化が SCReLU）
+    //   nnue-pytorch 単体モデルは ClippedReLU のみ使用
+    if arch_str.contains("Threat=") || arch_str.contains("SqrClippedReLU") {
         return Ok(FeatureSet::LayerStacks);
     }
-
-    // 活性化混在トークン: bucketed LayerStacks の構造的指紋。L1→L2 が SCReLU 系、
-    // L2→Out が CReLU 系で両者が混在する場合は LayerStacks として確定する。
-    // bucket 無しアーキは片方の活性化トークンしか出ない。
-    //
-    // `(ClippedReLU[` を開きカッコ付きで照合することで `(SqrClippedReLU[` 内部の
-    // `ClippedReLU[` 部分文字列を弾く。
-    //
-    // 注意: arch 文字列だけで「単一活性化 LayerStacks」と「bucket 無し」を区別する
-    // のは原理的に不可能なため、keyword (Features=HalfKA_hm 等) が存在する場合は
-    // keyword 側を優先する。LayerStacks の単一活性化バリアントは現状の engine
-    // network_layer_stacks 実装では存在せず、もし将来加わる場合は明示的に
-    // `LayerStacks` キーワードか `Threat=` マーカを arch 文字列に含めるものとする。
-    let has_mixed_activations =
-        arch_str.contains("(SqrClippedReLU[") && arch_str.contains("(ClippedReLU[");
-    if has_mixed_activations {
-        return Ok(FeatureSet::LayerStacks);
+    // HalfKP/HalfKA_hm/HalfKA のキーワードを先に判定（FT_OUT が LayerStacks と衝突するため）
+    if arch_str.contains("HalfKP") {
+        return Ok(FeatureSet::HalfKP);
     }
-
-    // Features= キーワードを切り出して `==` で完全一致判定する。
-    // underscore 表記 (`HalfKA_hm` 等) と PascalCase 表記 (`HalfKaHmMerged` 等) の両方を
-    // 同じ enum に解決して、両綴りで emit された .bin ヘッダを共通にロードできる。
-    if let Some(feature) = parse_layer_stacks_feature_set_keyword(arch_str)? {
-        return Ok(feature);
+    if arch_str.contains("HalfKA_hm") {
+        return Ok(FeatureSet::HalfKA_hm);
     }
-
-    // HalfKX キーワードを持たないネスト形式 LayerStacks: FT_OUT パターンで補完判定
+    if arch_str.contains("HalfKA") {
+        let input_dim = parse_feature_input_dimensions(arch_str).ok_or_else(|| {
+            "HalfKA architecture is missing input dimensions in arch string.".to_string()
+        })?;
+        return match input_dim {
+            HALFKA_HM_DIMENSIONS => Ok(FeatureSet::HalfKA_hm),
+            HALFKA_DIMENSIONS => Ok(FeatureSet::HalfKA),
+            _ => Err(format!("Unknown HalfKA input dimensions: {input_dim}")),
+        };
+    }
+    // キーワードが無い LayerStacks モデル（bullet-shogi 形式）: FT_OUT パターンで判定
     if arch_str.contains("->1536x2]")
         || arch_str.contains("->768x2]")
         || arch_str.contains("->512x2]")
@@ -422,15 +236,11 @@ pub fn parse_arch_dimensions(arch_str: &str) -> (usize, usize, usize) {
     // 例: AffineTransform[8<-1024] → L2=8
     //     AffineTransform[96<-8] → L3=96
     let mut layers: Vec<(usize, usize)> = Vec::new();
-    let pattern = "AffineTransform";
+    let pattern = "AffineTransform[";
 
     let mut search_start = 0;
     while let Some(start) = arch_str[search_start..].find(pattern) {
-        let after_name = search_start + start + pattern.len();
-        let Some(open_offset) = arch_str[after_name..].find('[') else {
-            break;
-        };
-        let abs_start = after_name + open_offset + 1;
+        let abs_start = search_start + start + pattern.len();
         if let Some(end) = arch_str[abs_start..].find(']') {
             let content = &arch_str[abs_start..abs_start + end];
             if let Some(arrow_idx) = content.find("<-") {
@@ -560,26 +370,6 @@ pub const fn network_payload_halfkp(l1: usize, l2: usize, l3: usize) -> u64 {
         as u64
 }
 
-/// HalfKP の network_payload を計算（PairwiseCReLU 版）
-///
-/// PairwiseCReLU は活性化で次元を半減させるため、L1 層の dense 入力は
-/// `pad32(l1)`（CReLU/SCReLU の `pad32(l1 * 2)` ではない）。
-pub const fn network_payload_halfkp_pairwise(l1: usize, l2: usize, l3: usize) -> u64 {
-    const HALFKP_DIMENSIONS: usize = 125388;
-
-    let ft_bias = l1 * 2;
-    let ft_weight = HALFKP_DIMENSIONS * l1 * 2;
-    let l1_bias = l2 * 4;
-    let l1_weight = pad32(l1) * l2;
-    let l2_bias = l3 * 4;
-    let l2_weight = pad32(l2) * l3;
-    let output_bias = 4;
-    let output_weight = l3;
-
-    (ft_bias + ft_weight + l1_bias + l1_weight + l2_bias + l2_weight + output_bias + output_weight)
-        as u64
-}
-
 /// HalfKA_hm の network_payload を計算
 pub const fn network_payload_halfka_hm(l1: usize, l2: usize, l3: usize) -> u64 {
     const HALFKA_HM_DIMENSIONS: usize = 73305;
@@ -588,23 +378,6 @@ pub const fn network_payload_halfka_hm(l1: usize, l2: usize, l3: usize) -> u64 {
     let ft_weight = HALFKA_HM_DIMENSIONS * l1 * 2;
     let l1_bias = l2 * 4;
     let l1_weight = pad32(l1 * 2) * l2;
-    let l2_bias = l3 * 4;
-    let l2_weight = pad32(l2) * l3;
-    let output_bias = 4;
-    let output_weight = l3;
-
-    (ft_bias + ft_weight + l1_bias + l1_weight + l2_bias + l2_weight + output_bias + output_weight)
-        as u64
-}
-
-/// HalfKA_hm の network_payload を計算（PairwiseCReLU 版）
-pub const fn network_payload_halfka_hm_pairwise(l1: usize, l2: usize, l3: usize) -> u64 {
-    const HALFKA_HM_DIMENSIONS: usize = 73305;
-
-    let ft_bias = l1 * 2;
-    let ft_weight = HALFKA_HM_DIMENSIONS * l1 * 2;
-    let l1_bias = l2 * 4;
-    let l1_weight = pad32(l1) * l2;
     let l2_bias = l3 * 4;
     let l2_weight = pad32(l2) * l3;
     let output_bias = 4;
@@ -631,91 +404,6 @@ pub const fn network_payload_halfka(l1: usize, l2: usize, l3: usize) -> u64 {
         as u64
 }
 
-/// HalfKA の network_payload を計算（PairwiseCReLU 版）
-pub const fn network_payload_halfka_pairwise(l1: usize, l2: usize, l3: usize) -> u64 {
-    const HALFKA_DIMENSIONS: usize = 138510;
-
-    let ft_bias = l1 * 2;
-    let ft_weight = HALFKA_DIMENSIONS * l1 * 2;
-    let l1_bias = l2 * 4;
-    let l1_weight = pad32(l1) * l2;
-    let l2_bias = l3 * 4;
-    let l2_weight = pad32(l2) * l3;
-    let output_bias = 4;
-    let output_weight = l3;
-
-    (ft_bias + ft_weight + l1_bias + l1_weight + l2_bias + l2_weight + output_bias + output_weight)
-        as u64
-}
-
-/// HalfKaMerged の network_payload を計算
-pub const fn network_payload_halfka_merged(l1: usize, l2: usize, l3: usize) -> u64 {
-    const HALFKA_MERGED_DIMENSIONS: usize = 131949;
-
-    let ft_bias = l1 * 2;
-    let ft_weight = HALFKA_MERGED_DIMENSIONS * l1 * 2;
-    let l1_bias = l2 * 4;
-    let l1_weight = pad32(l1 * 2) * l2;
-    let l2_bias = l3 * 4;
-    let l2_weight = pad32(l2) * l3;
-    let output_bias = 4;
-    let output_weight = l3;
-
-    (ft_bias + ft_weight + l1_bias + l1_weight + l2_bias + l2_weight + output_bias + output_weight)
-        as u64
-}
-
-/// HalfKaMerged の network_payload を計算（PairwiseCReLU 版）
-pub const fn network_payload_halfka_merged_pairwise(l1: usize, l2: usize, l3: usize) -> u64 {
-    const HALFKA_MERGED_DIMENSIONS: usize = 131949;
-
-    let ft_bias = l1 * 2;
-    let ft_weight = HALFKA_MERGED_DIMENSIONS * l1 * 2;
-    let l1_bias = l2 * 4;
-    let l1_weight = pad32(l1) * l2;
-    let l2_bias = l3 * 4;
-    let l2_weight = pad32(l2) * l3;
-    let output_bias = 4;
-    let output_weight = l3;
-
-    (ft_bias + ft_weight + l1_bias + l1_weight + l2_bias + l2_weight + output_bias + output_weight)
-        as u64
-}
-
-/// HalfKaHmSplit の network_payload を計算
-pub const fn network_payload_halfka_hm_split(l1: usize, l2: usize, l3: usize) -> u64 {
-    const HALFKA_HM_SPLIT_DIMENSIONS: usize = 76950;
-
-    let ft_bias = l1 * 2;
-    let ft_weight = HALFKA_HM_SPLIT_DIMENSIONS * l1 * 2;
-    let l1_bias = l2 * 4;
-    let l1_weight = pad32(l1 * 2) * l2;
-    let l2_bias = l3 * 4;
-    let l2_weight = pad32(l2) * l3;
-    let output_bias = 4;
-    let output_weight = l3;
-
-    (ft_bias + ft_weight + l1_bias + l1_weight + l2_bias + l2_weight + output_bias + output_weight)
-        as u64
-}
-
-/// HalfKaHmSplit の network_payload を計算（PairwiseCReLU 版）
-pub const fn network_payload_halfka_hm_split_pairwise(l1: usize, l2: usize, l3: usize) -> u64 {
-    const HALFKA_HM_SPLIT_DIMENSIONS: usize = 76950;
-
-    let ft_bias = l1 * 2;
-    let ft_weight = HALFKA_HM_SPLIT_DIMENSIONS * l1 * 2;
-    let l1_bias = l2 * 4;
-    let l1_weight = pad32(l1) * l2;
-    let l2_bias = l3 * 4;
-    let l2_weight = pad32(l2) * l3;
-    let output_bias = 4;
-    let output_weight = l3;
-
-    (ft_bias + ft_weight + l1_bias + l1_weight + l2_bias + l2_weight + output_bias + output_weight)
-        as u64
-}
-
 /// アーキテクチャ検出結果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchDetectionResult {
@@ -733,13 +421,10 @@ pub struct ArchDetectionResult {
 /// サポートされているアーキテクチャの network_payload テーブル
 ///
 /// (FeatureSet, L1, L2, L3, network_payload)
-/// CReLU/SCReLU は同一ファイルサイズ（活性化はスケール係数）なので 1 行で兼ねる。
-/// PairwiseCReLU は L1 層の dense 入力次元が半分になるためファイルサイズが異なり、
-/// 同じ (FeatureSet, L1, L2, L3) に対して別行を持つ。
-/// `detect_architecture_from_size` はサイズ一致でアーキを特定し、活性化は
-/// ヘッダーから別途判定するため、CReLU/Pairwise の 2 行併存で問題ない。
+/// 活性化関数はファイルサイズに影響しないため、ここでは CReLU を仮定。
+/// 実際の活性化関数はヘッダーから判定する。
 const KNOWN_PAYLOADS: &[(FeatureSet, usize, usize, usize, u64)] = &[
-    // HalfKP (CReLU/SCReLU)
+    // HalfKP
     (FeatureSet::HalfKP, 256, 32, 32, network_payload_halfkp(256, 32, 32)),
     (FeatureSet::HalfKP, 512, 8, 64, network_payload_halfkp(512, 8, 64)),
     (FeatureSet::HalfKP, 512, 8, 96, network_payload_halfkp(512, 8, 96)),
@@ -747,350 +432,24 @@ const KNOWN_PAYLOADS: &[(FeatureSet, usize, usize, usize, u64)] = &[
     (FeatureSet::HalfKP, 768, 16, 64, network_payload_halfkp(768, 16, 64)),
     (FeatureSet::HalfKP, 1024, 8, 32, network_payload_halfkp(1024, 8, 32)),
     (FeatureSet::HalfKP, 1024, 8, 64, network_payload_halfkp(1024, 8, 64)),
-    // HalfKP (PairwiseCReLU)
-    (FeatureSet::HalfKP, 256, 32, 32, network_payload_halfkp_pairwise(256, 32, 32)),
-    (FeatureSet::HalfKP, 512, 8, 64, network_payload_halfkp_pairwise(512, 8, 64)),
-    (FeatureSet::HalfKP, 512, 8, 96, network_payload_halfkp_pairwise(512, 8, 96)),
-    (FeatureSet::HalfKP, 512, 32, 32, network_payload_halfkp_pairwise(512, 32, 32)),
-    (FeatureSet::HalfKP, 768, 16, 64, network_payload_halfkp_pairwise(768, 16, 64)),
-    (FeatureSet::HalfKP, 1024, 8, 32, network_payload_halfkp_pairwise(1024, 8, 32)),
-    (FeatureSet::HalfKP, 1024, 8, 64, network_payload_halfkp_pairwise(1024, 8, 64)),
-    // HalfKA_hm (CReLU/SCReLU)
-    (FeatureSet::HalfKaHmMerged, 256, 32, 32, network_payload_halfka_hm(256, 32, 32)),
-    (FeatureSet::HalfKaHmMerged, 512, 8, 64, network_payload_halfka_hm(512, 8, 64)),
-    (FeatureSet::HalfKaHmMerged, 512, 8, 96, network_payload_halfka_hm(512, 8, 96)),
-    (FeatureSet::HalfKaHmMerged, 512, 32, 32, network_payload_halfka_hm(512, 32, 32)),
-    (FeatureSet::HalfKaHmMerged, 768, 16, 64, network_payload_halfka_hm(768, 16, 64)),
-    (FeatureSet::HalfKaHmMerged, 1024, 8, 32, network_payload_halfka_hm(1024, 8, 32)),
-    (FeatureSet::HalfKaHmMerged, 1024, 8, 64, network_payload_halfka_hm(1024, 8, 64)),
-    (FeatureSet::HalfKaHmMerged, 1024, 8, 96, network_payload_halfka_hm(1024, 8, 96)),
-    // HalfKA_hm (PairwiseCReLU)
-    (
-        FeatureSet::HalfKaHmMerged,
-        256,
-        32,
-        32,
-        network_payload_halfka_hm_pairwise(256, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaHmMerged,
-        512,
-        8,
-        64,
-        network_payload_halfka_hm_pairwise(512, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaHmMerged,
-        512,
-        8,
-        96,
-        network_payload_halfka_hm_pairwise(512, 8, 96),
-    ),
-    (
-        FeatureSet::HalfKaHmMerged,
-        512,
-        32,
-        32,
-        network_payload_halfka_hm_pairwise(512, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaHmMerged,
-        768,
-        16,
-        64,
-        network_payload_halfka_hm_pairwise(768, 16, 64),
-    ),
-    (
-        FeatureSet::HalfKaHmMerged,
-        1024,
-        8,
-        32,
-        network_payload_halfka_hm_pairwise(1024, 8, 32),
-    ),
-    (
-        FeatureSet::HalfKaHmMerged,
-        1024,
-        8,
-        64,
-        network_payload_halfka_hm_pairwise(1024, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaHmMerged,
-        1024,
-        8,
-        96,
-        network_payload_halfka_hm_pairwise(1024, 8, 96),
-    ),
-    // HalfKA (CReLU/SCReLU)
-    (FeatureSet::HalfKaSplit, 256, 32, 32, network_payload_halfka(256, 32, 32)),
-    (FeatureSet::HalfKaSplit, 512, 8, 64, network_payload_halfka(512, 8, 64)),
-    (FeatureSet::HalfKaSplit, 512, 8, 96, network_payload_halfka(512, 8, 96)),
-    (FeatureSet::HalfKaSplit, 512, 32, 32, network_payload_halfka(512, 32, 32)),
-    (FeatureSet::HalfKaSplit, 768, 16, 64, network_payload_halfka(768, 16, 64)),
-    (FeatureSet::HalfKaSplit, 1024, 8, 32, network_payload_halfka(1024, 8, 32)),
-    (FeatureSet::HalfKaSplit, 1024, 8, 64, network_payload_halfka(1024, 8, 64)),
-    (FeatureSet::HalfKaSplit, 1024, 8, 96, network_payload_halfka(1024, 8, 96)),
-    // HalfKA (PairwiseCReLU)
-    (
-        FeatureSet::HalfKaSplit,
-        256,
-        32,
-        32,
-        network_payload_halfka_pairwise(256, 32, 32),
-    ),
-    (FeatureSet::HalfKaSplit, 512, 8, 64, network_payload_halfka_pairwise(512, 8, 64)),
-    (FeatureSet::HalfKaSplit, 512, 8, 96, network_payload_halfka_pairwise(512, 8, 96)),
-    (
-        FeatureSet::HalfKaSplit,
-        512,
-        32,
-        32,
-        network_payload_halfka_pairwise(512, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaSplit,
-        768,
-        16,
-        64,
-        network_payload_halfka_pairwise(768, 16, 64),
-    ),
-    (
-        FeatureSet::HalfKaSplit,
-        1024,
-        8,
-        32,
-        network_payload_halfka_pairwise(1024, 8, 32),
-    ),
-    (
-        FeatureSet::HalfKaSplit,
-        1024,
-        8,
-        64,
-        network_payload_halfka_pairwise(1024, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaSplit,
-        1024,
-        8,
-        96,
-        network_payload_halfka_pairwise(1024, 8, 96),
-    ),
-    // HalfKaMerged (CReLU/SCReLU)
-    (
-        FeatureSet::HalfKaMerged,
-        256,
-        32,
-        32,
-        network_payload_halfka_merged(256, 32, 32),
-    ),
-    (FeatureSet::HalfKaMerged, 512, 8, 64, network_payload_halfka_merged(512, 8, 64)),
-    (FeatureSet::HalfKaMerged, 512, 8, 96, network_payload_halfka_merged(512, 8, 96)),
-    (
-        FeatureSet::HalfKaMerged,
-        512,
-        32,
-        32,
-        network_payload_halfka_merged(512, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        768,
-        16,
-        64,
-        network_payload_halfka_merged(768, 16, 64),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        1024,
-        8,
-        32,
-        network_payload_halfka_merged(1024, 8, 32),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        1024,
-        8,
-        64,
-        network_payload_halfka_merged(1024, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        1024,
-        8,
-        96,
-        network_payload_halfka_merged(1024, 8, 96),
-    ),
-    // HalfKaMerged (PairwiseCReLU)
-    (
-        FeatureSet::HalfKaMerged,
-        256,
-        32,
-        32,
-        network_payload_halfka_merged_pairwise(256, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        512,
-        8,
-        64,
-        network_payload_halfka_merged_pairwise(512, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        512,
-        8,
-        96,
-        network_payload_halfka_merged_pairwise(512, 8, 96),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        512,
-        32,
-        32,
-        network_payload_halfka_merged_pairwise(512, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        768,
-        16,
-        64,
-        network_payload_halfka_merged_pairwise(768, 16, 64),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        1024,
-        8,
-        32,
-        network_payload_halfka_merged_pairwise(1024, 8, 32),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        1024,
-        8,
-        64,
-        network_payload_halfka_merged_pairwise(1024, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaMerged,
-        1024,
-        8,
-        96,
-        network_payload_halfka_merged_pairwise(1024, 8, 96),
-    ),
-    // HalfKaHmSplit (CReLU/SCReLU)
-    (
-        FeatureSet::HalfKaHmSplit,
-        256,
-        32,
-        32,
-        network_payload_halfka_hm_split(256, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        512,
-        8,
-        64,
-        network_payload_halfka_hm_split(512, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        512,
-        8,
-        96,
-        network_payload_halfka_hm_split(512, 8, 96),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        512,
-        32,
-        32,
-        network_payload_halfka_hm_split(512, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        768,
-        16,
-        64,
-        network_payload_halfka_hm_split(768, 16, 64),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        1024,
-        8,
-        32,
-        network_payload_halfka_hm_split(1024, 8, 32),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        1024,
-        8,
-        64,
-        network_payload_halfka_hm_split(1024, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        1024,
-        8,
-        96,
-        network_payload_halfka_hm_split(1024, 8, 96),
-    ),
-    // HalfKaHmSplit (PairwiseCReLU)
-    (
-        FeatureSet::HalfKaHmSplit,
-        256,
-        32,
-        32,
-        network_payload_halfka_hm_split_pairwise(256, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        512,
-        8,
-        64,
-        network_payload_halfka_hm_split_pairwise(512, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        512,
-        8,
-        96,
-        network_payload_halfka_hm_split_pairwise(512, 8, 96),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        512,
-        32,
-        32,
-        network_payload_halfka_hm_split_pairwise(512, 32, 32),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        768,
-        16,
-        64,
-        network_payload_halfka_hm_split_pairwise(768, 16, 64),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        1024,
-        8,
-        32,
-        network_payload_halfka_hm_split_pairwise(1024, 8, 32),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        1024,
-        8,
-        64,
-        network_payload_halfka_hm_split_pairwise(1024, 8, 64),
-    ),
-    (
-        FeatureSet::HalfKaHmSplit,
-        1024,
-        8,
-        96,
-        network_payload_halfka_hm_split_pairwise(1024, 8, 96),
-    ),
+    // HalfKA_hm
+    (FeatureSet::HalfKA_hm, 256, 32, 32, network_payload_halfka_hm(256, 32, 32)),
+    (FeatureSet::HalfKA_hm, 512, 8, 64, network_payload_halfka_hm(512, 8, 64)),
+    (FeatureSet::HalfKA_hm, 512, 8, 96, network_payload_halfka_hm(512, 8, 96)),
+    (FeatureSet::HalfKA_hm, 512, 32, 32, network_payload_halfka_hm(512, 32, 32)),
+    (FeatureSet::HalfKA_hm, 768, 16, 64, network_payload_halfka_hm(768, 16, 64)),
+    (FeatureSet::HalfKA_hm, 1024, 8, 32, network_payload_halfka_hm(1024, 8, 32)),
+    (FeatureSet::HalfKA_hm, 1024, 8, 64, network_payload_halfka_hm(1024, 8, 64)),
+    (FeatureSet::HalfKA_hm, 1024, 8, 96, network_payload_halfka_hm(1024, 8, 96)),
+    // HalfKA
+    (FeatureSet::HalfKA, 256, 32, 32, network_payload_halfka(256, 32, 32)),
+    (FeatureSet::HalfKA, 512, 8, 64, network_payload_halfka(512, 8, 64)),
+    (FeatureSet::HalfKA, 512, 8, 96, network_payload_halfka(512, 8, 96)),
+    (FeatureSet::HalfKA, 512, 32, 32, network_payload_halfka(512, 32, 32)),
+    (FeatureSet::HalfKA, 768, 16, 64, network_payload_halfka(768, 16, 64)),
+    (FeatureSet::HalfKA, 1024, 8, 32, network_payload_halfka(1024, 8, 32)),
+    (FeatureSet::HalfKA, 1024, 8, 64, network_payload_halfka(1024, 8, 64)),
+    (FeatureSet::HalfKA, 1024, 8, 96, network_payload_halfka(1024, 8, 96)),
 ];
 
 /// ファイルサイズと arch_len からアーキテクチャを検出
@@ -1208,10 +567,8 @@ mod tests {
     #[test]
     fn test_feature_set_display() {
         assert_eq!(FeatureSet::HalfKP.as_str(), "HalfKP");
-        assert_eq!(FeatureSet::HalfKaHmMerged.as_str(), "HalfKaHmMerged");
-        assert_eq!(FeatureSet::HalfKaSplit.as_str(), "HalfKaSplit");
-        assert_eq!(FeatureSet::HalfKaMerged.as_str(), "HalfKaMerged");
-        assert_eq!(FeatureSet::HalfKaHmSplit.as_str(), "HalfKaHmSplit");
+        assert_eq!(FeatureSet::HalfKA_hm.as_str(), "HalfKA_hm");
+        assert_eq!(FeatureSet::HalfKA.as_str(), "HalfKA");
         assert_eq!(FeatureSet::LayerStacks.as_str(), "LayerStacks");
     }
 
@@ -1251,8 +608,8 @@ mod tests {
 
     #[test]
     fn test_architecture_spec_name() {
-        let spec = ArchitectureSpec::new(FeatureSet::HalfKaHmMerged, 512, 8, 96, Activation::CReLU);
-        assert_eq!(spec.name(), "HalfKaHmMerged-512-8-96-CReLU");
+        let spec = ArchitectureSpec::new(FeatureSet::HalfKA_hm, 512, 8, 96, Activation::CReLU);
+        assert_eq!(spec.name(), "HalfKA_hm-512-8-96-CReLU");
 
         let spec2 = ArchitectureSpec::new(FeatureSet::HalfKP, 256, 32, 32, Activation::SCReLU);
         assert_eq!(spec2.name(), "HalfKP-256-32-32-SCReLU");
@@ -1260,29 +617,26 @@ mod tests {
 
     #[test]
     fn test_parse_feature_set_from_arch() {
-        // keyword (HalfKA_hm) は LayerStacks/Threat=/混在トークンが無い限り優先。
-        // FT_OUT=512 は LayerStacks フォールバックパターンと被るが、keyword 優先で
-        // HalfKA_hm として返される（FT_OUT フォールバックは keyword 非該当時のみ）。
         assert_eq!(
             parse_feature_set_from_arch(
                 "Features=HalfKA_hm[73305->512x2],Network=AffineTransform[1<-96]"
             )
             .unwrap(),
-            FeatureSet::HalfKaHmMerged
+            FeatureSet::HalfKA_hm
         );
         assert_eq!(
             parse_feature_set_from_arch(
                 "Features=HalfKA[138510->512x2],Network=AffineTransform[1<-96]"
             )
             .unwrap(),
-            FeatureSet::HalfKaSplit
+            FeatureSet::HalfKA
         );
         assert_eq!(
             parse_feature_set_from_arch(
                 "Features=HalfKA[73305->512x2],Network=AffineTransform[1<-96]"
             )
             .unwrap(),
-            FeatureSet::HalfKaHmMerged
+            FeatureSet::HalfKA_hm
         );
         assert_eq!(
             parse_feature_set_from_arch("Features=HalfKP[125388->256x2]").unwrap(),
@@ -1298,238 +652,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_feature_set_keyword_extraction() {
-        // 区切り文字種別ごとの切り出し確認。
-        assert_eq!(parse_feature_set_keyword("Features=HalfKP[125388->256x2]"), Some("HalfKP"));
-        assert_eq!(
-            parse_feature_set_keyword("Features=HalfKA_hm(Friend)[73305->1536x2]"),
-            Some("HalfKA_hm")
-        );
-        assert_eq!(
-            parse_feature_set_keyword("Features=HalfKA_hm^[73305->512x2]-SCReLU"),
-            Some("HalfKA_hm")
-        );
-        assert_eq!(
-            parse_feature_set_keyword("Features=HalfKA,Network=AffineTransform[1<-96]"),
-            Some("HalfKA")
-        );
-        // PascalCase 表記の keyword
-        assert_eq!(
-            parse_feature_set_keyword("Features=HalfKaHmMerged[73305->1024x2]"),
-            Some("HalfKaHmMerged")
-        );
-        assert_eq!(
-            parse_feature_set_keyword("Features=HalfKaSplit[138510->512x2]"),
-            Some("HalfKaSplit")
-        );
-        // Features= 不在
-        assert_eq!(parse_feature_set_keyword("Threat=Foo"), None);
-    }
-
-    #[test]
-    fn test_parse_feature_set_underscore_aliases() {
-        // underscore 表記の keyword (HalfKA_hm / HalfKA_merged / HalfKA_hm_split) が
-        // 対応する enum 値に解決すること。
-        assert_eq!(
-            parse_feature_set_from_arch("Features=HalfKA_hm[73305->1024x2]").unwrap(),
-            FeatureSet::HalfKaHmMerged
-        );
-        assert_eq!(
-            parse_feature_set_from_arch("Features=HalfKA_merged[138510->512x2]").unwrap(),
-            FeatureSet::HalfKaMerged
-        );
-        assert_eq!(
-            parse_feature_set_from_arch("Features=HalfKA_hm_split[73305->512x2]").unwrap(),
-            FeatureSet::HalfKaHmSplit
-        );
-    }
-
-    #[test]
-    fn test_parse_feature_set_pascal_case_aliases() {
-        // PascalCase 表記の keyword (HalfKaHmMerged / HalfKaMerged / HalfKaHmSplit /
-        // HalfKaSplit) が対応する enum 値に解決すること。
-        assert_eq!(
-            parse_feature_set_from_arch("Features=HalfKaHmMerged[73305->1024x2]").unwrap(),
-            FeatureSet::HalfKaHmMerged
-        );
-        assert_eq!(
-            parse_feature_set_from_arch("Features=HalfKaMerged[138510->512x2]").unwrap(),
-            FeatureSet::HalfKaMerged
-        );
-        assert_eq!(
-            parse_feature_set_from_arch("Features=HalfKaHmSplit[73305->512x2]").unwrap(),
-            FeatureSet::HalfKaHmSplit
-        );
-        assert_eq!(
-            parse_feature_set_from_arch("Features=HalfKaSplit[138510->512x2]").unwrap(),
-            FeatureSet::HalfKaSplit
-        );
-        assert_eq!(
-            parse_feature_set_from_arch("Features=HalfKA[138510->512x2]").unwrap(),
-            FeatureSet::HalfKaSplit
-        );
-    }
-
-    #[test]
-    fn test_layer_stacks_internal_ft_accepts_both_header_styles() {
-        let cases: &[(&str, usize, FeatureSet)] = &[
-            ("HalfKP", 125_388, FeatureSet::HalfKP),
-            ("HalfKA", 138_510, FeatureSet::HalfKaSplit),
-            ("HalfKA_merged", 131_949, FeatureSet::HalfKaMerged),
-            ("HalfKA_hm_split", 76_950, FeatureSet::HalfKaHmSplit),
-            ("HalfKA_hm", 73_305, FeatureSet::HalfKaHmMerged),
-            ("HalfKaSplit", 138_510, FeatureSet::HalfKaSplit),
-            ("HalfKaMerged", 131_949, FeatureSet::HalfKaMerged),
-            ("HalfKaHmSplit", 76_950, FeatureSet::HalfKaHmSplit),
-            ("HalfKaHmMerged", 73_305, FeatureSet::HalfKaHmMerged),
-        ];
-        for &(keyword, input_dim, expected) in cases {
-            let arch = format!(
-                "Features={keyword}(Friend)[{input_dim}->1536x2],Network=AffineTransform[1<-32](ClippedReLU[32](SqrClippedReLU[30](AffineTransform[16<-3072])))"
-            );
-            assert_eq!(parse_feature_set_from_arch(&arch).unwrap(), FeatureSet::LayerStacks);
-            assert_eq!(
-                parse_layer_stacks_feature_set_keyword(&arch).unwrap(),
-                Some(expected),
-                "keyword={keyword}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_layer_stacks_internal_ft_rejects_unknown_keyword_substrings() {
-        let arch = "Features=UnknownHalfKaHmMerged(Friend)[73305->1536x2],Network=(ClippedReLU[32](SqrClippedReLU[30]))";
-        let err = parse_layer_stacks_feature_set_keyword(arch).unwrap_err();
-        assert!(err.contains("Unknown feature set keyword"));
-    }
-
-    #[test]
-    fn test_layer_stacks_implicit_halfka_accepts_combined_threat_dimensions() {
-        let arch = "Features=HalfKA(Friend)[355230->1536x2],Threat=216720,Network=(ClippedReLU[32](SqrClippedReLU[30]))";
-        assert_eq!(
-            parse_layer_stacks_feature_set_keyword(arch).unwrap(),
-            Some(FeatureSet::HalfKaSplit)
-        );
-    }
-
-    #[test]
-    fn test_parse_feature_set_real_model_arch_strings() {
-        // 実モデルの .bin ヘッダから抽出した arch 文字列で回帰防止する。
-        // simple-arch sweep (5 feature_set × CReLU/SCReLU/Pairwise) と bullet-shogi
-        // LayerStacks (bucketed) を網羅する。
-        let cases: &[(&str, FeatureSet)] = &[
-            // simple-arch CReLU (各 feature_set)
-            (
-                "Features=HalfKP(Friend)[125388->512x2],Network=AffineTransform[1<-64]\
-                 (ClippedReLU[64](AffineTransform[64<-8](ClippedReLU[8](\
-                 AffineTransformSparseInput[8<-1024](InputSlice[1024(0:1024)]))))),\
-                 fv_scale=28",
-                FeatureSet::HalfKP,
-            ),
-            (
-                "Features=HalfKA(Friend)[138510->512x2],Network=AffineTransform[1<-64]\
-                 (ClippedReLU[64](AffineTransform[64<-8](ClippedReLU[8](\
-                 AffineTransformSparseInput[8<-1024](InputSlice[1024(0:1024)]))))),\
-                 fv_scale=28",
-                FeatureSet::HalfKaSplit,
-            ),
-            (
-                "Features=HalfKA_merged(Friend)[131949->512x2],Network=AffineTransform\
-                 [1<-64](ClippedReLU[64](AffineTransform[64<-8](ClippedReLU[8](\
-                 AffineTransformSparseInput[8<-1024](InputSlice[1024(0:1024)]))))),\
-                 fv_scale=28",
-                FeatureSet::HalfKaMerged,
-            ),
-            (
-                "Features=HalfKA_hm_split(Friend)[76950->512x2],Network=AffineTransform\
-                 [1<-64](ClippedReLU[64](AffineTransform[64<-8](ClippedReLU[8](\
-                 AffineTransformSparseInput[8<-1024](InputSlice[1024(0:1024)]))))),\
-                 fv_scale=28",
-                FeatureSet::HalfKaHmSplit,
-            ),
-            (
-                "Features=HalfKA_hm(Friend)[73305->512x2],Network=AffineTransform[1<-64]\
-                 (ClippedReLU[64](AffineTransform[64<-8](ClippedReLU[8](\
-                 AffineTransformSparseInput[8<-1024](InputSlice[1024(0:1024)]))))),\
-                 fv_scale=28",
-                FeatureSet::HalfKaHmMerged,
-            ),
-            // simple-arch SCReLU (HalfKA_hm) — SqrClippedReLU 単独で keyword 経路へ
-            (
-                "Features=HalfKA_hm(Friend)[73305->512x2],Network=AffineTransform[1<-64]\
-                 (SqrClippedReLU[64](AffineTransform[64<-8](SqrClippedReLU[8](\
-                 AffineTransformSparseInput[8<-1024](InputSlice[1024(0:1024)]))))),\
-                 fv_scale=28",
-                FeatureSet::HalfKaHmMerged,
-            ),
-            // simple-arch Pairwise (HalfKA_hm 512/2)
-            (
-                "Features=HalfKA_hm(Friend)[73305->512/2x2]-Pairwise,Network=\
-                 AffineTransform[1<-64](ClippedReLU[64](AffineTransform[64<-8]\
-                 (ClippedReLU[8](AffineTransformSparseInput[8<-512]\
-                 (InputSlice[512(0:512)]))))),fv_scale=28",
-                FeatureSet::HalfKaHmMerged,
-            ),
-            // bullet-shogi LayerStacks bucketed (FT_OUT=1536, 混在活性化)
-            (
-                "Features=HalfKA_hm(Friend)[73305->1536x2],Network=AffineTransform[1<-32]\
-                 (ClippedReLU[32](AffineTransform[32<-30](SqrClippedReLU[30](\
-                 AffineTransform[16<-3072](InputSlice[3072(0:3072)]))))),fv_scale=28",
-                FeatureSet::LayerStacks,
-            ),
-            // bucketless SCReLU 1024x2 (bullet-shogi スタイルの `^` 付き keyword)
-            (
-                "Features=HalfKA_hm^[73305->1024x2]-SCReLU,fv_scale=16,l2=8,l3=96,qa=127,qb=64",
-                FeatureSet::HalfKaHmMerged,
-            ),
-        ];
-        for (arch, expected) in cases {
-            let got = parse_feature_set_from_arch(arch)
-                .unwrap_or_else(|e| panic!("parse failed for arch={arch}: {e}"));
-            assert_eq!(&got, expected, "arch={arch}");
-        }
-    }
-
-    #[test]
-    fn test_parse_feature_set_unknown_keyword_errors() {
-        // 既知 feature 名の prefix を持つ未知 keyword (例: "HalfKaFoo") は
-        // 曖昧マッチさせず、明示的なエラーで弾く。
-        let err = parse_feature_set_from_arch("Features=HalfKaFoo[73305->512x2]").unwrap_err();
-        assert!(err.contains("Unknown feature set keyword"));
-    }
-
-    #[test]
-    fn test_parse_feature_set_bucketless_screlu() {
-        // bucket 無し SCReLU: `(SqrClippedReLU[` トークンのみ。混在活性化トークン
-        // に該当しないため keyword から HalfKA_hm を返す。
-        let arch = "Features=HalfKA_hm(Friend)[73305->1024x2],Network=AffineTransform\
-                    [1<-64](SqrClippedReLU[64](AffineTransform[64<-8](SqrClippedReLU[8](\
-                    AffineTransformSparseInput[8<-2048](InputSlice[2048(0:2048)]))))),fv_scale=14";
-        assert_eq!(parse_feature_set_from_arch(arch).unwrap(), FeatureSet::HalfKaHmMerged);
-    }
-
-    #[test]
-    fn test_parse_feature_set_bucketless_crelu() {
-        // bucket 無し CReLU: `(ClippedReLU[` トークンのみ。混在トークンに該当せず
-        // → keyword で HalfKA_hm を返す。
-        let arch = "Features=HalfKA_hm(Friend)[73305->1024x2],Network=AffineTransform\
-                    [1<-64](ClippedReLU[64](AffineTransform[64<-8](ClippedReLU[8](\
-                    AffineTransformSparseInput[8<-2048](InputSlice[2048(0:2048)]))))),fv_scale=14";
-        assert_eq!(parse_feature_set_from_arch(arch).unwrap(), FeatureSet::HalfKaHmMerged);
-    }
-
-    #[test]
-    fn test_parse_feature_set_bucketless_512_preset() {
-        // bucket 無し 512x2 preset: FT_OUT が LayerStacks フォールバックパターンと
-        // 衝突するが、混在トークン非該当 + keyword 優先で HalfKA_hm を返す
-        // (FT_OUT フォールバックは keyword 非該当時のみ)。
-        let arch = "Features=HalfKA_hm(Friend)[73305->512x2],Network=AffineTransform\
-                    [1<-96](ClippedReLU[96](AffineTransform[96<-8](ClippedReLU[8](\
-                    AffineTransformSparseInput[8<-1024](InputSlice[1024(0:1024)]))))),fv_scale=14";
-        assert_eq!(parse_feature_set_from_arch(arch).unwrap(), FeatureSet::HalfKaHmMerged);
-    }
-
-    #[test]
     fn test_parse_arch_dimensions() {
         // nnue-pytorch 形式 (ネスト構造、出力→入力の順)
         // 実際のファイル例: "Network=AffineTransform[1<-96](ClippedReLU[96](AffineTransform[96<-8](...)))"
@@ -1539,10 +661,6 @@ mod tests {
         // nnue-pytorch 形式 (1024次元)
         let arch = "Features=HalfKA_hm[73305->1024x2],Network=AffineTransform[1<-96](ClippedReLU[96](AffineTransform[96<-8](ClippedReLU[8](AffineTransform[8<-2048](InputSlice[2048(0:2048)])))))";
         assert_eq!(parse_arch_dimensions(arch), (1024, 8, 96));
-
-        // sparse-input dense layer も AffineTransform と同じ次元表記を持つ
-        let arch = "Features=HalfKA_hm[73305->512x2],Network=AffineTransform[1<-96](ClippedReLU[96](AffineTransform[96<-8](ClippedReLU[8](AffineTransformSparseInput[8<-1024](InputSlice[1024(0:1024)])))))";
-        assert_eq!(parse_arch_dimensions(arch), (512, 8, 96));
 
         // bullet-shogi 形式 (l2=, l3= パターン)
         let arch = "Features=HalfKA_hm^[73305->512x2]-SCReLU,fv_scale=13,l2=8,l3=96,qa=127,qb=64";
@@ -1575,21 +693,6 @@ mod tests {
         // 何も取得できない場合
         assert_eq!(parse_arch_dimensions("unknown"), (0, 0, 0));
         assert_eq!(parse_arch_dimensions(""), (0, 0, 0));
-    }
-
-    #[test]
-    fn test_validate_layer_stacks_dimensions() {
-        assert!(validate_layer_stacks_dimensions(16_384, 16_384, 16_384).is_ok());
-        for dimensions in [(0, 2, 1), (3, 2, 1), (2, 1, 1), (2, 2, 0)] {
-            assert!(
-                validate_layer_stacks_dimensions(dimensions.0, dimensions.1, dimensions.2).is_err()
-            );
-        }
-        for dimensions in [(16_386, 2, 1), (2, 16_385, 1), (2, 2, 16_385)] {
-            assert!(
-                validate_layer_stacks_dimensions(dimensions.0, dimensions.1, dimensions.2).is_err()
-            );
-        }
     }
 
     // =============================================================================
@@ -1722,10 +825,10 @@ mod tests {
         // - outw: 96 (i8)
         // - padding: 63 (64バイトアライメント)
         // total = 141,847,232
-        let result = detect_architecture_from_size(141_847_232, 105, Some(FeatureSet::HalfKaSplit));
+        let result = detect_architecture_from_size(141_847_232, 105, Some(FeatureSet::HalfKA));
         assert!(result.is_some(), "bullet-shogi HalfKA 512-8-96 should be detected");
         let result = result.unwrap();
-        assert_eq!(result.spec.feature_set, FeatureSet::HalfKaSplit);
+        assert_eq!(result.spec.feature_set, FeatureSet::HalfKA);
         assert_eq!(result.spec.l1, 512);
         assert_eq!(result.spec.l2, 8);
         assert_eq!(result.spec.l3, 96);
@@ -1745,11 +848,8 @@ mod tests {
 
         // パディング 0 (hash有り、nnue-pytorch 形式)
         let file_size_no_padding = header_size + payload + 8;
-        let result = detect_architecture_from_size(
-            file_size_no_padding,
-            arch_len,
-            Some(FeatureSet::HalfKaSplit),
-        );
+        let result =
+            detect_architecture_from_size(file_size_no_padding, arch_len, Some(FeatureSet::HalfKA));
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(result.spec.l1, 512);
@@ -1761,7 +861,7 @@ mod tests {
             let result = detect_architecture_from_size(
                 file_size_with_padding,
                 arch_len,
-                Some(FeatureSet::HalfKaSplit),
+                Some(FeatureSet::HalfKA),
             );
             assert!(result.is_some(), "Should detect with padding={padding}");
             let result = result.unwrap();
@@ -1774,7 +874,7 @@ mod tests {
         let result = detect_architecture_from_size(
             file_size_too_much_padding,
             arch_len,
-            Some(FeatureSet::HalfKaSplit),
+            Some(FeatureSet::HalfKA),
         );
         assert!(result.is_none(), "padding=64 should not be detected");
     }

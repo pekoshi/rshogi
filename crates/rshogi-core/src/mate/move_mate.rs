@@ -1,6 +1,6 @@
 // 駒移動による1手詰め判定（近接王手のみを探索）
 //
-// 離し角・飛車による王手は未対応。
+// YaneuraOu mate1ply_without_effect.cpp の移植（離し角・飛車は未対応）
 
 use crate::bitboard::{
     Bitboard, bishop_effect, dragon_effect, gold_effect, horse_effect, king_effect, knight_effect,
@@ -197,8 +197,8 @@ pub fn check_move_mate(pos: &Position, us: Color) -> Option<Move> {
             } else {
                 // toに味方の利きがfrom以外にない場合はスキップ
                 // （toの駒が取られると王手が残らない）
-                let attackers_to_us =
-                    pos.attackers_to_color_occ(us, to, slide) ^ Bitboard::from_square(from);
+                let attackers_to_us = (pos.attackers_to_occ(to, slide) & pos.pieces_c(us))
+                    ^ Bitboard::from_square(from);
                 if attackers_to_us.is_empty() {
                     // toが味方利きで守られていない → LANCE_NO_PRO へ
                 } else if pos.discovered(from, to, our_king, our_pinned) {
@@ -224,8 +224,8 @@ pub fn check_move_mate(pos: &Position, us: Color) -> Option<Move> {
                 if !bb_skewer.contains(sq_king) {
                     continue;
                 }
-                let attackers_to_us =
-                    pos.attackers_to_color_occ(us, to, slide) ^ Bitboard::from_square(from);
+                let attackers_to_us = (pos.attackers_to_occ(to, slide) & pos.pieces_c(us))
+                    ^ Bitboard::from_square(from);
                 if attackers_to_us.is_empty() {
                     continue;
                 }
@@ -245,7 +245,11 @@ pub fn check_move_mate(pos: &Position, us: Color) -> Option<Move> {
     }
 
     // GOLD相当（Gold/ProPawn/ProLance/ProKnight/ProSilver）
-    let gold_like = pos.golds_c(us);
+    let gold_like = pos.pieces(us, PieceType::Gold)
+        | pos.pieces(us, PieceType::ProPawn)
+        | pos.pieces(us, PieceType::ProLance)
+        | pos.pieces(us, PieceType::ProKnight)
+        | pos.pieces(us, PieceType::ProSilver);
     let mut bb = check_cand_bb(us, PieceTypeCheck::Gold, sq_king) & gold_like;
     while bb.is_not_empty() {
         let from = bb.pop();
@@ -434,7 +438,7 @@ fn has_other_attacker(
     to: Square,
     slide: Bitboard,
 ) -> bool {
-    let attackers = pos.attackers_to_color_occ(us, to, slide);
+    let attackers = pos.attackers_to_occ(to, slide) & pos.pieces_c(us);
     let attackers_wo_from = attackers & !Bitboard::from_square(from);
     attackers_wo_from.is_not_empty()
 }
@@ -442,6 +446,11 @@ fn has_other_attacker(
 #[cfg(test)]
 mod tests {
     use crate::position::Position;
+
+    #[test]
+    fn test_move_mate_compile() {
+        let _ = std::mem::size_of::<Option<crate::types::Move>>();
+    }
 
     #[test]
     fn test_lance_promo_mate_6f6g() {

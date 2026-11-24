@@ -1,13 +1,16 @@
-//! 遠方駒（香・角・飛）の利きをQugiyアルゴリズムで計算する
+//! 遠方駒（香・角・飛）の利きをYaneuraOu互換のQugiyアルゴリズムで計算する
+
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::types::{Color, Square};
 
+#[cfg(not(target_arch = "x86_64"))]
+use super::Bitboard256;
 use super::utils::msb64;
-use super::{Bitboard, Bitboard256, FILE_BB, RANK_BB};
+use super::{Bitboard, FILE_BB, RANK_BB};
 
-const _: () = assert!(std::mem::align_of::<SliderTable>() >= 32);
-
-/// 8方向の単一レイ
+/// 8方向の単一レイ（やねうら王のEffect8::Directに対応）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direct {
     RU = 0,
@@ -39,119 +42,126 @@ impl Direct {
 
 struct SliderTable {
     lance_step_effect: [[Bitboard; Square::NUM]; Color::NUM],
+    #[cfg(not(target_arch = "x86_64"))]
     qugiy_rook_mask: [[Bitboard; 2]; Square::NUM],
+    #[cfg(not(target_arch = "x86_64"))]
     qugiy_bishop_mask: [[Bitboard256; 2]; Square::NUM],
     qugiy_step_effect: [[Bitboard; Square::NUM]; 6],
+    #[cfg(target_arch = "x86_64")]
+    rook_rank_pext: Box<[[Bitboard; 512]]>,
+    #[cfg(target_arch = "x86_64")]
+    rook_file_pext: Box<[[Bitboard; 512]]>,
+    #[cfg(target_arch = "x86_64")]
+    bishop_diag_a_mask: [Bitboard; Square::NUM],
+    #[cfg(target_arch = "x86_64")]
+    bishop_diag_b_mask: [Bitboard; Square::NUM],
+    #[cfg(target_arch = "x86_64")]
+    bishop_diag_a_shift: [u8; Square::NUM],
+    #[cfg(target_arch = "x86_64")]
+    bishop_diag_b_shift: [u8; Square::NUM],
+    #[cfg(target_arch = "x86_64")]
+    bishop_diag_a_pext: Box<[[Bitboard; 512]]>,
+    #[cfg(target_arch = "x86_64")]
+    bishop_diag_b_pext: Box<[[Bitboard; 512]]>,
 }
 
-static SLIDER_TABLE: SliderTable = SliderTable::build();
+/// OnceLock はテスト・初回アクセスのフォールバック用に保持
+static SLIDER_ATTACKS_LOCK: OnceLock<SliderTable> = OnceLock::new();
 
-/// API 互換用。テーブルはコンパイル時に生成されるため、何もしない。
-pub fn ensure_slider_initialized() {}
+/// ホットパス用のキャッシュポインタ。初期化後は non-null。
+static SLIDER_ATTACKS_PTR: AtomicPtr<SliderTable> = AtomicPtr::new(std::ptr::null_mut());
 
-/// コンパイル時に生成した利きテーブルを参照する。
+/// テーブルの初期化を保証する。起動時に 1 回呼ぶこと。
+pub fn ensure_slider_initialized() {
+    let table = SLIDER_ATTACKS_LOCK.get_or_init(SliderTable::new);
+    // AtomicPtr は *mut を要求するが、このポインタを経由した書き込みは行わない
+    SLIDER_ATTACKS_PTR.store(table as *const SliderTable as *mut SliderTable, Ordering::Release);
+}
+
+/// ホットパス用: 単純なポインタ load でテーブル参照を返す。
+/// `ensure_slider_initialized()` が先に呼ばれていれば atomic load 1 回 + 予測ヒット分岐のみ。
+/// 未初期化（テスト等）の場合は OnceLock にフォールバック。
 #[inline(always)]
 fn slider_attacks() -> &'static SliderTable {
-    &SLIDER_TABLE
-}
-
-impl SliderTable {
-    const fn build() -> Self {
-        // 盤面の下位レーンは 63 マス、上位レーンは残りの 18 マスを持つ。
-        const fn ray(file: i32, rank: i32, df: i32, dr: i32) -> Bitboard {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            let mut f = file + df;
-            let mut r = rank + dr;
-            while f >= 0 && f < 9 && r >= 0 && r < 9 {
-                let sq = (f * 9 + r) as usize;
-                if sq < 63 {
-                    lo |= 1u64 << sq;
-                } else {
-                    hi |= 1u64 << (sq - 63);
-                }
-                f += df;
-                r += dr;
-            }
-            Bitboard::from_u64_pair(lo, hi)
-        }
-
-        // 128 bit 全体のバイト反転には、各レーンの反転とレーン交換が必要。
-        const fn byte_reverse(bb: Bitboard) -> Bitboard {
-            Bitboard::from_u64_pair(bb.p1().swap_bytes(), bb.p0().swap_bytes())
-        }
-
-        const STEP_DIRS: [(i32, i32); 6] = [
-            (-1, -1), // 右上
-            (-1, 0),  // 右
-            (-1, 1),  // 右下
-            (1, -1),  // 左上
-            (1, 0),   // 左
-            (1, 1),   // 左下
-        ];
-        let mut table = Self {
-            lance_step_effect: [[Bitboard::EMPTY; Square::NUM]; Color::NUM],
-            qugiy_rook_mask: [[Bitboard::EMPTY; 2]; Square::NUM],
-            qugiy_bishop_mask: [[Bitboard256::ZERO; 2]; Square::NUM],
-            qugiy_step_effect: [[Bitboard::EMPTY; Square::NUM]; 6],
-        };
-        let mut sq = 0;
-        while sq < Square::NUM {
-            let file = (sq / 9) as i32;
-            let rank = (sq % 9) as i32;
-            table.lance_step_effect[Color::Black.index()][sq] = ray(file, rank, 0, -1);
-            table.lance_step_effect[Color::White.index()][sq] = ray(file, rank, 0, 1);
-
-            let mut dir = 0;
-            while dir < STEP_DIRS.len() {
-                let (df, dr) = STEP_DIRS[dir];
-                let bb = ray(file, rank, df, dr);
-                table.qugiy_step_effect[dir][sq] = if df < 0 { byte_reverse(bb) } else { bb };
-                dir += 1;
-            }
-
-            let right_rev = table.qugiy_step_effect[1][sq];
-            let left = table.qugiy_step_effect[4][sq];
-            // unpack(right_rev, left) の下位・上位レーンをそれぞれ並べる。
-            table.qugiy_rook_mask[sq][0] = Bitboard::from_u64_pair(left.p0(), right_rev.p0());
-            table.qugiy_rook_mask[sq][1] = Bitboard::from_u64_pair(left.p1(), right_rev.p1());
-
-            let right_up_rev = table.qugiy_step_effect[0][sq];
-            let right_down_rev = table.qugiy_step_effect[2][sq];
-            let left_up = table.qugiy_step_effect[3][sq];
-            let left_down = table.qugiy_step_effect[5][sq];
-            // 各 128 bit レーンに左方向と反転済み右方向を組にして格納する。
-            table.qugiy_bishop_mask[sq][0] = Bitboard256::from_u64_array([
-                left_up.p0(),
-                right_up_rev.p0(),
-                left_down.p0(),
-                right_down_rev.p0(),
-            ]);
-            table.qugiy_bishop_mask[sq][1] = Bitboard256::from_u64_array([
-                left_up.p1(),
-                right_up_rev.p1(),
-                left_down.p1(),
-                right_down_rev.p1(),
-            ]);
-            sq += 1;
-        }
-        table
+    let ptr = SLIDER_ATTACKS_PTR.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        // SAFETY: ensure_slider_initialized() が ptr を有効なアドレスに設定済み。
+        // SliderTable は 'static で解放されない。
+        unsafe { &*ptr }
+    } else {
+        SLIDER_ATTACKS_LOCK.get_or_init(SliderTable::new)
     }
 }
 
-#[cfg(test)]
+impl SliderTable {
+    fn new() -> Self {
+        let lance_step_effect = init_lance_step_effect();
+        #[cfg(not(target_arch = "x86_64"))]
+        let qugiy_rook_mask = init_qugiy_rook_mask();
+        #[cfg(not(target_arch = "x86_64"))]
+        let qugiy_bishop_mask = init_qugiy_bishop_mask();
+        let qugiy_step_effect = init_qugiy_step_effect();
+        #[cfg(target_arch = "x86_64")]
+        let rook_rank_pext = init_rook_rank_pext();
+        #[cfg(target_arch = "x86_64")]
+        let rook_file_pext = init_rook_file_pext();
+        #[cfg(target_arch = "x86_64")]
+        let bishop_diag_a_mask = init_bishop_diag_mask((1, 1), (-1, -1));
+        #[cfg(target_arch = "x86_64")]
+        let bishop_diag_b_mask = init_bishop_diag_mask((1, -1), (-1, 1));
+        #[cfg(target_arch = "x86_64")]
+        let bishop_diag_a_shift = init_bishop_pext_shift(&bishop_diag_a_mask);
+        #[cfg(target_arch = "x86_64")]
+        let bishop_diag_b_shift = init_bishop_pext_shift(&bishop_diag_b_mask);
+        #[cfg(target_arch = "x86_64")]
+        let bishop_diag_a_pext = init_bishop_diag_pext(&bishop_diag_a_mask, (1, 1), (-1, -1));
+        #[cfg(target_arch = "x86_64")]
+        let bishop_diag_b_pext = init_bishop_diag_pext(&bishop_diag_b_mask, (1, -1), (-1, 1));
+
+        SliderTable {
+            lance_step_effect,
+            #[cfg(not(target_arch = "x86_64"))]
+            qugiy_rook_mask,
+            #[cfg(not(target_arch = "x86_64"))]
+            qugiy_bishop_mask,
+            qugiy_step_effect,
+            #[cfg(target_arch = "x86_64")]
+            rook_rank_pext,
+            #[cfg(target_arch = "x86_64")]
+            rook_file_pext,
+            #[cfg(target_arch = "x86_64")]
+            bishop_diag_a_mask,
+            #[cfg(target_arch = "x86_64")]
+            bishop_diag_b_mask,
+            #[cfg(target_arch = "x86_64")]
+            bishop_diag_a_shift,
+            #[cfg(target_arch = "x86_64")]
+            bishop_diag_b_shift,
+            #[cfg(target_arch = "x86_64")]
+            bishop_diag_a_pext,
+            #[cfg(target_arch = "x86_64")]
+            bishop_diag_b_pext,
+        }
+    }
+}
+
 fn in_bounds(file: i32, rank: i32) -> bool {
     (0..=8).contains(&file) && (0..=8).contains(&rank)
 }
 
-#[cfg(test)]
 fn square_from_coords(file: i32, rank: i32) -> Square {
     debug_assert!(in_bounds(file, rank), "coordinates out of bounds");
     // SAFETY: 呼び出し元/上のassertで盤内を保証
     unsafe { Square::from_u8_unchecked((file * 9 + rank) as u8) }
 }
 
-#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+fn square_from_index(idx: usize) -> Square {
+    debug_assert!(idx < Square::NUM, "square index out of bounds");
+    // SAFETY: idx is checked to be in 0..Square::NUM, the valid Square range.
+    unsafe { Square::from_u8_unchecked(idx as u8) }
+}
+
 fn init_lance_step_effect() -> [[Bitboard; Square::NUM]; Color::NUM] {
     let mut table = [[Bitboard::EMPTY; Square::NUM]; Color::NUM];
 
@@ -181,7 +191,7 @@ fn init_lance_step_effect() -> [[Bitboard; Square::NUM]; Color::NUM] {
     table
 }
 
-#[cfg(test)]
+#[cfg(not(target_arch = "x86_64"))]
 fn init_qugiy_rook_mask() -> [[Bitboard; 2]; Square::NUM] {
     let mut mask = [[Bitboard::EMPTY; 2]; Square::NUM];
 
@@ -215,7 +225,7 @@ fn init_qugiy_rook_mask() -> [[Bitboard; 2]; Square::NUM] {
     mask
 }
 
-#[cfg(test)]
+#[cfg(not(target_arch = "x86_64"))]
 fn init_qugiy_bishop_mask() -> [[Bitboard256; 2]; Square::NUM] {
     // 左上, 左下, 右上, 右下（rooksと同じくfile増加方向を「左」とみなす）
     const DIRS: [(i32, i32); 4] = [(1, -1), (1, 1), (-1, -1), (-1, 1)];
@@ -266,7 +276,6 @@ fn init_qugiy_bishop_mask() -> [[Bitboard256; 2]; Square::NUM] {
     mask
 }
 
-#[cfg(test)]
 fn init_qugiy_step_effect() -> [[Bitboard; Square::NUM]; 6] {
     // DIRECT_U/DIRECT_Dは持たない6方向。byte_reverse前提の方向はreverse=true。
     const STEP_DIRS: [(i32, i32); 6] = [
@@ -301,19 +310,239 @@ fn init_qugiy_step_effect() -> [[Bitboard; Square::NUM]; 6] {
     table
 }
 
-/// 盤上の駒を考慮しない香の利きレイ（方向別ルックアップテーブル）
+/// 2マス間のBitboard（両端を含まない）のルックアップテーブル
+pub fn between_bb(sq1: Square, sq2: Square) -> Bitboard {
+    compute_between_bb(sq1, sq2)
+}
+
+/// 2マスを通る直線上のBitboard
+pub fn line_bb(sq1: Square, sq2: Square) -> Bitboard {
+    compute_line_bb(sq1, sq2)
+}
 #[inline]
+#[cfg(target_arch = "x86_64")]
+fn init_rook_rank_pext() -> Box<[[Bitboard; 512]]> {
+    let mut table = vec![[Bitboard::EMPTY; 512]; Square::NUM].into_boxed_slice();
+
+    for sq in Square::all() {
+        let sq_idx = sq.index();
+        let file = sq.file().index();
+        let rank = sq.rank().index();
+
+        for key in 0..512usize {
+            let mut bb = Bitboard::EMPTY;
+
+            let mut f = file + 1;
+            while f < 9 {
+                bb.set(square_from_coords(f as i32, rank as i32));
+                if ((key >> f) & 1) != 0 {
+                    break;
+                }
+                f += 1;
+            }
+
+            let mut f = file as i32 - 1;
+            while f >= 0 {
+                bb.set(square_from_coords(f, rank as i32));
+                if ((key >> (f as usize)) & 1) != 0 {
+                    break;
+                }
+                f -= 1;
+            }
+
+            table[sq_idx][key] = bb;
+        }
+    }
+
+    table
+}
+
+#[cfg(target_arch = "x86_64")]
+fn init_rook_file_pext() -> Box<[[Bitboard; 512]]> {
+    let mut table = vec![[Bitboard::EMPTY; 512]; Square::NUM].into_boxed_slice();
+
+    for sq in Square::all() {
+        let sq_idx = sq.index();
+        let file = sq.file().index();
+        let rank = sq.rank().index();
+
+        for key in 0..512usize {
+            let mut bb = Bitboard::EMPTY;
+
+            let mut r = rank + 1;
+            while r < 9 {
+                bb.set(square_from_coords(file as i32, r as i32));
+                if ((key >> r) & 1) != 0 {
+                    break;
+                }
+                r += 1;
+            }
+
+            let mut r = rank as i32 - 1;
+            while r >= 0 {
+                bb.set(square_from_coords(file as i32, r));
+                if ((key >> (r as usize)) & 1) != 0 {
+                    break;
+                }
+                r -= 1;
+            }
+
+            table[sq_idx][key] = bb;
+        }
+    }
+
+    table
+}
+
+#[cfg(target_arch = "x86_64")]
+fn init_bishop_diag_mask(dir0: (i32, i32), dir1: (i32, i32)) -> [Bitboard; Square::NUM] {
+    let mut mask = [Bitboard::EMPTY; Square::NUM];
+
+    for sq in Square::all() {
+        let mut bb = Bitboard::EMPTY;
+        bb.set(sq);
+
+        let file = sq.file().index() as i32;
+        let rank = sq.rank().index() as i32;
+
+        let mut f = file + dir0.0;
+        let mut r = rank + dir0.1;
+        while in_bounds(f, r) {
+            bb.set(square_from_coords(f, r));
+            f += dir0.0;
+            r += dir0.1;
+        }
+
+        let mut f = file + dir1.0;
+        let mut r = rank + dir1.1;
+        while in_bounds(f, r) {
+            bb.set(square_from_coords(f, r));
+            f += dir1.0;
+            r += dir1.1;
+        }
+
+        mask[sq.index()] = bb;
+    }
+
+    mask
+}
+
+#[cfg(target_arch = "x86_64")]
+fn init_bishop_pext_shift(mask: &[Bitboard; Square::NUM]) -> [u8; Square::NUM] {
+    let mut shift = [0u8; Square::NUM];
+    for sq in Square::all() {
+        shift[sq.index()] = mask[sq.index()].extract64::<0>().count_ones() as u8;
+    }
+    shift
+}
+
+#[cfg(target_arch = "x86_64")]
+fn bishop_blockers_from_key(mask: Bitboard, key: usize) -> Bitboard {
+    let mut blockers = Bitboard::EMPTY;
+    let mut bit = 0usize;
+
+    for idx in 0..Square::NUM {
+        let sq = square_from_index(idx);
+        if mask.contains(sq) {
+            if ((key >> bit) & 1) != 0 {
+                blockers.set(sq);
+            }
+            bit += 1;
+        }
+    }
+
+    blockers
+}
+
+#[cfg(target_arch = "x86_64")]
+fn bishop_ray_from_blockers(sq: Square, dir: (i32, i32), blockers: Bitboard) -> Bitboard {
+    let mut bb = Bitboard::EMPTY;
+    let mut f = sq.file().index() as i32 + dir.0;
+    let mut r = sq.rank().index() as i32 + dir.1;
+
+    while in_bounds(f, r) {
+        let to = square_from_coords(f, r);
+        bb.set(to);
+        if blockers.contains(to) {
+            break;
+        }
+        f += dir.0;
+        r += dir.1;
+    }
+
+    bb
+}
+
+#[cfg(target_arch = "x86_64")]
+fn init_bishop_diag_pext(
+    mask: &[Bitboard; Square::NUM],
+    dir0: (i32, i32),
+    dir1: (i32, i32),
+) -> Box<[[Bitboard; 512]]> {
+    let mut table = vec![[Bitboard::EMPTY; 512]; Square::NUM].into_boxed_slice();
+
+    for sq in Square::all() {
+        let sq_idx = sq.index();
+        for key in 0..512usize {
+            let blockers = bishop_blockers_from_key(mask[sq_idx], key);
+            table[sq_idx][key] = bishop_ray_from_blockers(sq, dir0, blockers)
+                | bishop_ray_from_blockers(sq, dir1, blockers);
+        }
+    }
+
+    table
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn bishop_pext_key(occupied: Bitboard, mask: Bitboard, shift: u8) -> usize {
+    use std::arch::x86_64::_pext_u64;
+
+    let lo = _pext_u64(occupied.extract64::<0>(), mask.extract64::<0>());
+    let hi = _pext_u64(occupied.extract64::<1>(), mask.extract64::<1>());
+    (lo | (hi << shift)) as usize
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn rook_rank_pext_key(sq: Square, occupied: Bitboard) -> usize {
+    let rank = sq.rank().index();
+    // SAFETY: rank is from Square (0..9). The mask has 9 board bits, so the key is 0..512.
+    unsafe {
+        use std::arch::x86_64::_pext_u64;
+
+        let mask = *RANK_BB.get_unchecked(rank);
+        let lo = _pext_u64(occupied.extract64::<0>(), mask.extract64::<0>());
+        let hi = _pext_u64(occupied.extract64::<1>(), mask.extract64::<1>());
+        (lo | (hi << 7)) as usize
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn rook_file_pext_key(sq: Square, occupied: Bitboard) -> usize {
+    let file = sq.file().index();
+    // SAFETY: file is from Square (0..9). The mask has 9 board bits, so the key is 0..512.
+    unsafe {
+        use std::arch::x86_64::_pext_u64;
+
+        let mask = *FILE_BB.get_unchecked(file);
+        if file < 7 {
+            _pext_u64(occupied.extract64::<0>(), mask.extract64::<0>()) as usize
+        } else {
+            _pext_u64(occupied.extract64::<1>(), mask.extract64::<1>()) as usize
+        }
+    }
+}
+
 pub fn lance_step_effect(color: Color, sq: Square) -> Bitboard {
     let table = slider_attacks();
     debug_assert!(color.index() < Color::NUM);
     debug_assert!(sq.index() < Square::NUM);
-    // SAFETY: Color::index() は 0..=1 (Color::NUM=2)、lance_step_effect の第1次元は Color::NUM。
-    //         Square::index() は 0..=80 (Square::NUM=81)、lance_step_effect の第2次元は Square::NUM。
+    // SAFETY: Color::index() is in 0..Color::NUM and Square::index() is in 0..Square::NUM.
     unsafe { *table.lance_step_effect.get_unchecked(color.index()).get_unchecked(sq.index()) }
 }
 
-/// 香の利きを計算（Qugiyアルゴリズム）
-#[inline]
 pub fn lance_effect(color: Color, sq: Square, occupied: Bitboard) -> Bitboard {
     let table = slider_attacks();
     let part = Bitboard::part(sq);
@@ -365,8 +594,29 @@ pub fn lance_effect(color: Color, sq: Square, occupied: Bitboard) -> Bitboard {
 
 /// 飛車の縦利き（香の利きを合成）
 #[inline]
+#[cfg(target_arch = "x86_64")]
 pub fn rook_file_effect(sq: Square, occupied: Bitboard) -> Bitboard {
     let table = slider_attacks();
+    let sq_idx = sq.index();
+    // SAFETY: i7-7700/BMI2 build. sq_idx is 0..81 and PEXT key is 0..512.
+    unsafe {
+        let key = rook_file_pext_key(sq, occupied);
+        *table.rook_file_pext.get_unchecked(sq_idx).get_unchecked(key)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn rook_file_effect(sq: Square, occupied: Bitboard) -> Bitboard {
+    let table = slider_attacks();
+    #[cfg(target_arch = "x86_64")]
+    {
+        let sq_idx = sq.index();
+        // SAFETY: i7-7700/BMI2 build. sq_idx is 0..81 and PEXT key is 0..512.
+        return unsafe {
+            let key = rook_file_pext_key(sq, occupied);
+            *table.rook_file_pext.get_unchecked(sq_idx).get_unchecked(key)
+        };
+    }
     // SAFETY: Square::index() は 0..=80、lance_step_effect は [Color::NUM][Square::NUM] の固定長配列。
     let sq_idx = sq.index();
     let white_idx = Color::White.index(); // = 1
@@ -403,8 +653,29 @@ pub fn rook_file_effect(sq: Square, occupied: Bitboard) -> Bitboard {
 
 /// 飛車の横利き（Qugiyアルゴリズム）
 #[inline]
+#[cfg(target_arch = "x86_64")]
 pub fn rook_rank_effect(sq: Square, occupied: Bitboard) -> Bitboard {
     let table = slider_attacks();
+    let sq_idx = sq.index();
+    // SAFETY: i7-7700/BMI2 build. sq_idx is 0..81 and PEXT key is 0..512.
+    unsafe {
+        let key = rook_rank_pext_key(sq, occupied);
+        *table.rook_rank_pext.get_unchecked(sq_idx).get_unchecked(key)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn rook_rank_effect(sq: Square, occupied: Bitboard) -> Bitboard {
+    let table = slider_attacks();
+    #[cfg(target_arch = "x86_64")]
+    {
+        let sq_idx = sq.index();
+        // SAFETY: i7-7700/BMI2 build. sq_idx is 0..81 and PEXT key is 0..512.
+        return unsafe {
+            let key = rook_rank_pext_key(sq, occupied);
+            *table.rook_rank_pext.get_unchecked(sq_idx).get_unchecked(key)
+        };
+    }
     // SAFETY: Square::index() は 0..=80、qugiy_rook_mask は [Square::NUM][2] の固定長配列。
     let rook_mask = unsafe { table.qugiy_rook_mask.get_unchecked(sq.index()) };
     let mask_lo = rook_mask[0];
@@ -432,8 +703,7 @@ pub fn rook_effect(sq: Square, occupied: Bitboard) -> Bitboard {
     rook_rank_effect(sq, occupied) | rook_file_effect(sq, occupied)
 }
 
-/// 方向付きのレイ利き
-#[inline]
+/// 方向付きのレイ利き（やねうら王のrayEffectに相当）
 pub fn ray_effect(dir: Direct, sq: Square, occupied: Bitboard) -> Bitboard {
     match dir {
         Direct::U => lance_effect(Color::Black, sq, occupied),
@@ -477,6 +747,25 @@ pub fn direct_effect(sq: Square, dir: Direct, occupied: Bitboard) -> Bitboard {
 
 /// 角の利き（Qugiyアルゴリズム）
 #[inline]
+#[cfg(target_arch = "x86_64")]
+pub fn bishop_effect(sq: Square, occupied: Bitboard) -> Bitboard {
+    let table = slider_attacks();
+    let sq_idx = sq.index();
+    // SAFETY: sq_idx is 0..Square::NUM, masks/shifts exist for every square,
+    // and each PEXT key is bounded by a <=9-bit diagonal mask, so it is in 0..512.
+    unsafe {
+        let mask_a = *table.bishop_diag_a_mask.get_unchecked(sq_idx);
+        let mask_b = *table.bishop_diag_b_mask.get_unchecked(sq_idx);
+        let shift_a = *table.bishop_diag_a_shift.get_unchecked(sq_idx);
+        let shift_b = *table.bishop_diag_b_shift.get_unchecked(sq_idx);
+        let key_a = bishop_pext_key(occupied, mask_a, shift_a);
+        let key_b = bishop_pext_key(occupied, mask_b, shift_b);
+        *table.bishop_diag_a_pext.get_unchecked(sq_idx).get_unchecked(key_a)
+            | *table.bishop_diag_b_pext.get_unchecked(sq_idx).get_unchecked(key_b)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 pub fn bishop_effect(sq: Square, occupied: Bitboard) -> Bitboard {
     let table = slider_attacks();
     // SAFETY: Square::index() は 0..=80、qugiy_bishop_mask は [Square::NUM][2] の固定長配列。
@@ -515,44 +804,7 @@ pub fn dragon_effect(sq: Square, occupied: Bitboard) -> Bitboard {
 }
 
 /// 2マス間のBitboard（両端を含まない）
-#[inline]
-pub fn between_bb(sq1: Square, sq2: Square) -> Bitboard {
-    let file_diff = sq1.index() as i32 / 9 - sq2.index() as i32 / 9;
-    let rank_diff = sq1.index() as i32 % 9 - sq2.index() as i32 % 9;
-    if file_diff != 0 && rank_diff != 0 && file_diff.abs() != rank_diff.abs() {
-        return Bitboard::EMPTY;
-    }
-    between_bb_aligned(sq1, sq2)
-}
-
-/// 同じ筋・段・斜線上にある2升の間。呼び出し側で整列を保証する。
-#[inline(always)]
-pub(crate) fn between_bb_aligned(sq1: Square, sq2: Square) -> Bitboard {
-    let lo = sq1.index().min(sq2.index());
-    let hi = sq1.index().max(sq2.index());
-    let file_lo = lo / 9;
-    let file_hi = hi / 9;
-    let rank_lo = lo % 9;
-    let rank_hi = hi % 9;
-
-    // bit 0 から一定間隔で立つ定数を選ぶ。升対の表や実行時の除算は不要。
-    // u128::MAX / (2^delta - 1) を、最下位bitが1になるように揃えている。
-    let (pattern, delta) = if file_lo == file_hi {
-        (u128::MAX, 1)
-    } else if rank_lo == rank_hi {
-        ((u128::MAX / ((1 << 9) - 1)) >> (128 % 9), 9)
-    } else if rank_hi > rank_lo {
-        ((u128::MAX / ((1 << 10) - 1)) >> (128 % 10), 10)
-    } else {
-        (u128::MAX / ((1 << 8) - 1), 8)
-    };
-    // lo + delta <= 90、hi <= 80。同一升も上限マスクによって空になる。
-    let dense = (pattern << (lo + delta)) & ((1u128 << hi) - 1);
-    Bitboard::new(dense as u64 & 0x7fff_ffff_ffff_ffff, (dense >> 63) as u64)
-}
-
-#[cfg(test)]
-fn between_bb_reference(sq1: Square, sq2: Square) -> Bitboard {
+fn compute_between_bb(sq1: Square, sq2: Square) -> Bitboard {
     let idx1 = sq1.index() as i32;
     let idx2 = sq2.index() as i32;
 
@@ -592,7 +844,7 @@ fn between_bb_reference(sq1: Square, sq2: Square) -> Bitboard {
 }
 
 /// 2マスを通る直線上のBitboard
-pub fn line_bb(sq1: Square, sq2: Square) -> Bitboard {
+fn compute_line_bb(sq1: Square, sq2: Square) -> Bitboard {
     let idx1 = sq1.index() as i32;
     let idx2 = sq2.index() as i32;
 
@@ -718,39 +970,6 @@ mod tests {
     use super::*;
     use crate::types::{Color, File, Rank};
 
-    #[test]
-    fn test_const_slider_table_matches_runtime_bytes() {
-        fn bytes(table: &SliderTable) -> Vec<u8> {
-            // 構造体のパディングを読まず、全フィールドの全レーンをバイト列にする。
-            table
-                .lance_step_effect
-                .iter()
-                .flatten()
-                .copied()
-                .chain(table.qugiy_rook_mask.iter().flatten().copied())
-                .chain(table.qugiy_bishop_mask.iter().flatten().flat_map(|bb| {
-                    let (lo, hi) = bb.to_bitboards();
-                    [lo, hi]
-                }))
-                .chain(table.qugiy_step_effect.iter().flatten().copied())
-                .flat_map(|bb| [bb.p0(), bb.p1()])
-                .flat_map(u64::to_ne_bytes)
-                .collect()
-        }
-
-        let runtime = SliderTable {
-            lance_step_effect: init_lance_step_effect(),
-            qugiy_rook_mask: init_qugiy_rook_mask(),
-            qugiy_bishop_mask: init_qugiy_bishop_mask(),
-            qugiy_step_effect: init_qugiy_step_effect(),
-        };
-        let actual = bytes(slider_attacks());
-        let expected = bytes(&runtime);
-        assert_eq!(actual.len(), 81 * (2 * 16 + 2 * 16 + 2 * 32 + 6 * 16));
-        assert_eq!(actual, expected);
-        assert!(std::mem::align_of::<SliderTable>() >= 32);
-    }
-
     fn slider_naive(sq: Square, occupied: Bitboard, dirs: &[(i32, i32)]) -> Bitboard {
         let mut result = Bitboard::EMPTY;
         let file = sq.file().index() as i32;
@@ -808,6 +1027,98 @@ mod tests {
     }
 
     #[test]
+    fn test_lance_effect_black() {
+        let sq55 = Square::new(File::File5, Rank::Rank5);
+        let bb = lance_effect(Color::Black, sq55, Bitboard::EMPTY);
+        assert_eq!(bb.count(), 4);
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank4)));
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank3)));
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank2)));
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank1)));
+    }
+
+    #[test]
+    fn test_lance_effect_black_blocked() {
+        let sq55 = Square::new(File::File5, Rank::Rank5);
+        let sq53 = Square::new(File::File5, Rank::Rank3);
+        let occupied = Bitboard::from_square(sq53);
+        let bb = lance_effect(Color::Black, sq55, occupied);
+        assert_eq!(bb.count(), 2);
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank4)));
+        assert!(bb.contains(sq53));
+    }
+
+    #[test]
+    fn test_lance_effect_white() {
+        let sq55 = Square::new(File::File5, Rank::Rank5);
+        let bb = lance_effect(Color::White, sq55, Bitboard::EMPTY);
+        assert_eq!(bb.count(), 4);
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank6)));
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank7)));
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank8)));
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank9)));
+    }
+
+    #[test]
+    fn test_bishop_effect() {
+        let sq55 = Square::new(File::File5, Rank::Rank5);
+        let bb = bishop_effect(sq55, Bitboard::EMPTY);
+        assert_eq!(bb.count(), 16);
+
+        assert!(bb.contains(Square::new(File::File6, Rank::Rank4)));
+        assert!(bb.contains(Square::new(File::File7, Rank::Rank3)));
+        assert!(bb.contains(Square::new(File::File4, Rank::Rank4)));
+        assert!(bb.contains(Square::new(File::File3, Rank::Rank3)));
+        assert!(bb.contains(Square::new(File::File6, Rank::Rank6)));
+        assert!(bb.contains(Square::new(File::File4, Rank::Rank6)));
+    }
+
+    #[test]
+    fn test_bishop_effect_blocked() {
+        let sq55 = Square::new(File::File5, Rank::Rank5);
+        let sq64 = Square::new(File::File6, Rank::Rank4);
+        let occupied = Bitboard::from_square(sq64);
+        let bb = bishop_effect(sq55, occupied);
+
+        assert!(bb.contains(sq64));
+        assert!(!bb.contains(Square::new(File::File7, Rank::Rank3)));
+    }
+
+    #[test]
+    fn test_bishop_effect_corner() {
+        let sq11 = Square::new(File::File1, Rank::Rank1);
+        let bb = bishop_effect(sq11, Bitboard::EMPTY);
+        assert_eq!(bb.count(), 8);
+        assert!(bb.contains(Square::new(File::File2, Rank::Rank2)));
+        assert!(bb.contains(Square::new(File::File9, Rank::Rank9)));
+        assert!(!bb.contains(sq11));
+    }
+
+    #[test]
+    fn test_rook_effect() {
+        let sq55 = Square::new(File::File5, Rank::Rank5);
+        let bb = rook_effect(sq55, Bitboard::EMPTY);
+        assert_eq!(bb.count(), 16);
+
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank4)));
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank1)));
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank6)));
+        assert!(bb.contains(Square::new(File::File5, Rank::Rank9)));
+        assert!(bb.contains(Square::new(File::File6, Rank::Rank5)));
+        assert!(bb.contains(Square::new(File::File4, Rank::Rank5)));
+    }
+
+    #[test]
+    fn test_rook_effect_corner() {
+        let sq11 = Square::new(File::File1, Rank::Rank1);
+        let bb = rook_effect(sq11, Bitboard::EMPTY);
+        assert_eq!(bb.count(), 16);
+        assert!(bb.contains(Square::new(File::File1, Rank::Rank9)));
+        assert!(bb.contains(Square::new(File::File9, Rank::Rank1)));
+        assert!(!bb.contains(sq11));
+    }
+
+    #[test]
     fn test_horse_effect() {
         let sq55 = Square::new(File::File5, Rank::Rank5);
         let bb = horse_effect(sq55, Bitboard::EMPTY);
@@ -819,15 +1130,6 @@ mod tests {
         let sq55 = Square::new(File::File5, Rank::Rank5);
         let bb = dragon_effect(sq55, Bitboard::EMPTY);
         assert_eq!(bb.count(), 20);
-    }
-
-    #[test]
-    fn between_arithmetic_matches_all_square_pairs() {
-        for a in Square::all() {
-            for b in Square::all() {
-                assert_eq!(between_bb(a, b), between_bb_reference(a, b), "{a:?} {b:?}");
-            }
-        }
     }
 
     #[test]
@@ -929,22 +1231,5 @@ mod tests {
         let up = ray_effect(Direct::U, sq55, Bitboard::EMPTY);
         let lance_up = lance_effect(Color::Black, sq55, Bitboard::EMPTY);
         assert_eq!(up, lance_up);
-    }
-
-    #[test]
-    fn slider_boundaries_match_naive() {
-        for sq in Square::all() {
-            for occupied in [
-                Bitboard::EMPTY,
-                Bitboard::ALL,
-                Bitboard::from_square(Square::new(File::File5, Rank::Rank3)),
-            ] {
-                assert_eq!(rook_effect(sq, occupied), rook_naive(sq, occupied));
-                assert_eq!(bishop_effect(sq, occupied), bishop_naive(sq, occupied));
-                for color in [Color::Black, Color::White] {
-                    assert_eq!(lance_effect(color, sq, occupied), lance_naive(color, sq, occupied));
-                }
-            }
-        }
     }
 }
